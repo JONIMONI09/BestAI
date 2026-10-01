@@ -67,7 +67,8 @@ Architektur: `server.js` (Node, **keine npm-Abhängigkeiten**) → `hydra-run --
 - ✅ **Zero-Heap-Inferenz** — Gewichte werden nie kopiert, nur gemappt
 - ✅ **Ternäre Linearmathematik** — 2 Bit/Gewicht, keine FP-Multiplikation im Inner Loop
 - ✅ **Koexistenz-Axiom** — `humanity ≤ 0 ⇒ Utility = −∞`, hartes Safety-Gate vor jeder Aktion
-- ✅ **NEON-SIMD-Kernel** — 16 parallele ternäre Akkumulationen auf ARM (auto-aktiv via `__ARM_NEON`)
+- ✅ **NEON-SIMD-Kernel** — 16 parallele ternäre Akkumulationen, **aktiv integriert** in `hydra_engine_step()` auf ARM (`__ARM_NEON`, auto-aktiv); bit-identischer Skalar-Fallback auf x86
+  - *Ehrlichkeit:* Der NEON-Pfad ist nur auf ARM-Builds aktiv (macOS-CI auf ARM64 validiert ihn über die Seed-Roundtrip-Tests; x86-CI deckt den Skalar-Pfad ab). Für x86 gibt es aktuell **keinen** SIMD-Pfad — AVX2 steht auf der Roadmap.
 - ✅ **Härtung** — Header-Validierung, OOB-Schutz, Sättigungsarithmetik, 18 Unit-Tests
 - ✅ **Web-Console** — PC-UI mit Live-Visualisierung (`make ui`)
 - ✅ **C99, keine Abhängigkeiten** — läuft auf 32-Bit ARMv7, x86-64, alles dazwischen
@@ -78,7 +79,7 @@ Architektur: `server.js` (Node, **keine npm-Abhängigkeiten**) → `hydra-run --
 ├── include/hydra_model.h      Public API + Binärformat-Header
 ├── src/hydra_engine.c         mmap-Loader, ternäre Inferenz, Axiom-Gate
 ├── src/main.c                 CLI
-├── src/hydra_neon.h           ARM-NEON-Kernel (optional, auto-erkannt)
+├── src/hydra_neon.h           ARM-NEON-Kernel (aktiv integriert, skal. Fallback auf x86)
 ├── tools/make_dummy_model.py  Testmodell-Generator (Format-Referenz)
 ├── tests/test_engine.c        18 Unit-Tests (inkl. OOB-PoC-Regression)
 ├── server.js                  UI-Server (Node, 0 npm-Dependencies)
@@ -114,7 +115,7 @@ acc_i += (−1) · x_j   für jedes w_ij = −1
 - [ ] Vollständiger Transformer-Forward (RMSNorm, RoPE, SwiGLU) über dem ternären Kern
 - [ ] Min-P-Sampling & Repetition-Penalty
 - [ ] GGUF/safetensors-Import mit automatischer absmean-Ternärisierung
-- [ ] AVX2/AVX-512-LUT-Kernel für x86
+- [ ] AVX2/AVX-512-LUT-Kernel für x86 (aktueller x86-Pfad: rein skalar)
 - [ ] Streaming-Ring-Buffer-KV mit Attention-Sinks
 
 Beiträge willkommen — siehe `docs/FORMAT.md` für die Binärspec, dann los.
