@@ -1,3 +1,8 @@
+---
+name: session-workflow
+description: Mandatory session protocol — read session.md, errors.md and rules.md before touching code, keep the plan updated after every step, log every error immediately.
+---
+
 # Session Workflow — Hydra-Stone
 
 Mandatory working protocol for every session. **A session is not
@@ -18,7 +23,7 @@ complete unless `session.md` and `errors.md` are updated.**
    touches an area with past errors.
 3. **Read `rules.md`** — refresh the standing rules.
 4. **Write the plan into `session.md`** (Plan section): task, steps,
-   acceptance criteria. Commit-worthy changes only, but ALWAYS write it.
+   acceptance criteria. ALWAYS write it, even for small tasks.
 
 ## During work (MANDATORY)
 

@@ -6,6 +6,29 @@
 
 ---
 
+## 2026-10-01 — Skills rejected by UI: missing YAML frontmatter
+
+- **Symptom:** The Skills UI showed the skill but refused to save/use
+  it: *"A skill needs a YAML frontmatter block at the very top, opened
+  and closed with a line of three dashes."* All three skills
+  (`android-ndk-build`, `engine-ci-verify`, `session-workflow`) were
+  plain markdown starting with `# Heading`.
+- **Cause:** Skills are metadata-carrying files; the loader parses a
+  YAML frontmatter block (`---` … `---`) for `name`/`description`
+  before the markdown body. Without it the file is not a valid skill.
+- **Fix:** prepend frontmatter to every SKILL.md:
+  ```yaml
+  ---
+  name: <dir-name>
+  description: <one sentence, what the skill does + when to use>
+  ---
+  ```
+  Validated all three by parsing the YAML and asserting
+  `name == directory name`.
+- **Prevention:** Rules R21/R22 — every SKILL.md starts with
+  frontmatter; parse and validate it before committing (the check
+  script is in the commit message / can be re-run anytime).
+
 ## 2026-10-01 — cppcheck: `%u` format with signed int argument
 
 - **Symptom:** `cppcheck --enable=warning` flagged

@@ -35,22 +35,22 @@
 
 ## Current task
 
-Create agent skill files (`.claude/skills/*/SKILL.md`), plus mandatory
-working-protocol files: `session.md` (this file), `errors.md`,
-`rules.md`.
+Fix agent skills (rejected by UI — missing YAML frontmatter) and add
+the user's new standing rule: NO git checkout by the agent.
 
 ## Plan
 
-- [x] Skill: `android-ndk-build` (build + emulator verification + pitfalls)
-- [x] Skill: `engine-ci-verify` (all local gates, mirrors CI)
-- [x] Skill: `session-workflow` (mandatory session protocol)
-- [x] Create `errors.md` with the full error history from this project
-- [x] Create `rules.md` (standing working rules)
-- [x] Commit + open PR (NOT merge — merging only on explicit user request)
+- [x] Add YAML frontmatter (`name`, `description`) to all 3 SKILL.md files
+- [x] Validate frontmatter (YAML parse, name == dir name, description present)
+- [x] New rule R17 in `rules.md`: NO git checkout — user does checkouts
+- [x] Renumber subsequent rules, add skills rules R21/R22
+- [x] Log the frontmatter error in `errors.md`
+- [x] Update `session.md`, commit + push to existing PR branch (NO checkout)
 
 ## Status / Notes
 
-- PR #7 (CI lint) is still open and intentionally unmerged — awaiting
-  explicit user approval.
-- Next logical steps after this: merge PR #7 on approval; optionally
-  add Android build to CI.
+- PR #8 (skills + protocol) updated in place with the frontmatter fix;
+  still open, awaiting explicit user approval.
+- PR #7 (CI lint) also still open, awaiting user approval.
+- Standing rule now: agent works on the currently checked-out branch;
+  never runs `git checkout`.

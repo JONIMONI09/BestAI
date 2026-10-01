@@ -58,22 +58,37 @@
     documented in the PR body.
 16. **R16 — Never push destructive or unrequested operations** (force
     push, reset --hard, history rewrite, deleting user changes).
+17. **R17 — NO git checkout. The user does checkouts themselves.**
+    The agent never runs `git checkout` (branch switches, detached
+    HEAD). Work on whatever branch is currently checked out in the
+    workspace, or commit on the current branch. (Standing user
+    instruction, 2026-10-01.)
 
 ## 5. Verification loop
 
-17. **R17 — Run the full local gate before committing** (skill:
+18. **R18 — Run the full local gate before committing** (skill:
     `engine-ci-verify`): gcc, clang, cppcheck, python gate, build,
     32 tests, smoke test.
-18. **R18 — Determinism checks use platform-fixed seeds** (the LCG),
+19. **R19 — Determinism checks use platform-fixed seeds** (the LCG),
     never `rand()`, so ubuntu-gcc and macos-clang-ARM64 CI runners
     compare identical sequences across scalar and NEON paths.
-19. **R19 — New platform targets require on-platform verification**
+20. **R20 — New platform targets require on-platform verification**
     (Android = emulator run with logcat evidence), not just a
     successful cross-compile.
 
-## 6. When rules conflict
+## 6. Skills (`.claude/skills/*/SKILL.md`)
+
+21. **R21 — Every SKILL.md starts with YAML frontmatter** delimited by
+    `---` lines, containing at minimum `name` and `description`. A
+    skill without valid frontmatter is silently rejected by the UI.
+    (→ errors.md: skills rejected, missing frontmatter)
+22. **R22 — Validate frontmatter before committing**: parse the YAML,
+    check `name` matches the directory name, check `description` is
+    present and one sentence long.
+
+## 7. When rules conflict
 
 Safety rules (R8, R11) > correctness rules (R5–R7) > session protocol
 (R1–R4) > convenience. If a user request conflicts with R14 (merge
-approval), R14 wins unless the user explicitly overrides it in the
-same session.
+approval) or R17 (no checkout), the user's standing rule wins unless
+they explicitly override it in the same session.

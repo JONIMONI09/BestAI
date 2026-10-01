@@ -1,3 +1,8 @@
+---
+name: android-ndk-build
+description: Build and verify the Hydra-Stone Android APK via NDK/JNI — toolchain bootstrap, gradle build, no-KVM emulator verification, and the 7 known pitfalls with fixes.
+---
+
 # Android NDK Build — Hydra-Stone
 
 Build and verify the Android APK that wraps the Hydra-Stone C engine
