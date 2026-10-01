@@ -1,79 +1,91 @@
-# Hydra-Stone Architektur
+# Hydra-Stone Architecture
 
-## Überblick
+## Overview
 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                      hydra-run (CLI)                       │
 ├────────────────────────────────────────────────────────────┤
-│  hydra_engine_load()  →  mmap() + Header-Validierung       │
-│  hydra_engine_step()  →  ternäre O(1)-Inferenz             │
-│  hydra_verify_axiom() →  Koexistenz-Axiom (Safety-Gate)    │
+│  hydra_engine_load()  →  mmap() + header validation        │
+│  hydra_engine_step()  →  ternary O(1) inference            │
+│  hydra_verify_axiom() →  coexistence axiom (safety gate)   │
 ├────────────────────────────────────────────────────────────┤
-│                 .hydra-Modellformat (v1)                   │
-│  [24B Header][2-Bit ternäre Gewichte, gepackt]             │
+│                 .hydra model format (v1)                   │
+│  [24B header][2-bit ternary weights, packed]               │
 └────────────────────────────────────────────────────────────┘
 ```
 
-## Komponenten
+## Components
 
-| Datei | Aufgabe |
+| File | Purpose |
 |---|---|
-| `include/hydra_model.h` | Public API, Header-Struct, Defines |
-| `src/hydra_engine.c` | Loader (mmap), Inferenz-Schritt, Axiom-Gate |
-| `src/main.c` | CLI-Einstiegspunkt |
-| `src/hydra_neon.h` | NEON SIMD-Kernel — **aktiv integriert**: `step()` nutzt ihn auf ARM in 16er-Chunks; bit-identischer Skalar-Fallback für Reste und x86 |
-| `tools/make_dummy_model.py` | Testmodell-Generator (Reference-Implementierung des Formats) |
-| `tests/test_engine.c` | 16 Unit-Tests |
+| `include/hydra_model.h` | Public API, header struct, defines |
+| `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate |
+| `src/main.c` | CLI entry point (`--json` mode for machine-readable output) |
+| `src/hydra_neon.h` | NEON SIMD kernel — **actively integrated**: `step()` uses it on ARM in 16-lane chunks; bit-identical scalar fallback for remainders and x86 |
+| `tools/make_dummy_model.py` | Test model generator (reference implementation of the format) |
+| `tests/test_engine.c` | 32 unit tests (hand-computed cases, seeded roundtrips, security regressions) |
+| `server.js` | Web console server (Node, zero npm dependencies) |
+| `public/` | Hydra-Stone Console frontend (plain HTML/CSS/JS) |
 
-## Speichermodell: Zero-RAM via mmap
+## Memory Model: Zero-RAM via mmap
 
-1. Gewichte werden **nie** in den Heap kopiert.
-2. `mmap(PROT_READ, MAP_SHARED)` mappt die Datei in den Adressraum.
-3. `madvise(MADV_SEQUENTIAL)` teilt dem Kernel das Zugriffsmuster mit → aggressives Read-Ahead.
-4. Seiten (4 KiB) werden vom Kernel on-demand geladen und bei Speicherdruck sofort wieder freigegeben (clean pages → kein Swap nötig).
-5. Der Laufzeit-Zustand ist ein **fixer** `int8_t[64]`-Vektor → O(1)-RAM.
+1. Weights are **never** copied into the heap.
+2. `mmap(PROT_READ, MAP_SHARED)` maps the file into the address space.
+3. `madvise(MADV_SEQUENTIAL)` tells the kernel the access pattern → aggressive read-ahead.
+4. 4-KiB pages are loaded on demand and evicted immediately under memory pressure (clean pages → no swap needed).
+5. The runtime state is a **fixed** `int8_t[64]` vector → O(1) RAM.
 
-**Konsequenz:** Die inferenzseitige RAM-Nutzung ist unabhängig von der Modellgröße konstant. Ein 1-GB-Modell verbraucht keinen Heap — nur den Page Cache, den der Kernel nach Bedarf evicted.
+**Consequence:** inference-time RAM usage is constant regardless of model size. A 1-GB model consumes no heap — only page cache, which the kernel evicts as needed.
 
-## Ternäre Mathematik
+## Ternary Math
 
-Gewichte: `W ∈ {-1, 0, +1}`, 2 Bit pro Gewicht, 4 Gewichte pro Byte (hier: 2 pro Byte genutzt, 2 Bit reserved).
+Weights: `W ∈ {-1, 0, +1}`, 2 bits per weight, two weights per byte (upper 4 bits reserved).
 
 ```
-00 = 0    01 = +1    10 = -1    11 = reserved (als 0 behandelt)
+00 = 0    01 = +1    10 = -1    11 = reserved (treated as 0)
 ```
 
-Der GEMM-Kern reduziert sich auf Addition/Subtraktion:
+The GEMM core reduces to addition/subtraction:
 
 ```
 y_i = Σ_j w_ij · x_j   →   y_i = Σ_{w=+1} x_j  −  Σ_{w=−1} x_j
 ```
 
-Keine FP32/FP16-Multiplikation im Inner Loop → maximaler ALU-Durchsatz auch ohne FPU (ARMv7-A VFP-frei lauffähig).
+No FP32/FP16 multiplication in the inner loop → maximum ALU throughput even without an FPU (runs on FPU-less ARMv7-A).
 
-## SIMD-Strategie (ehrliche Bestandsaufnahme)
+## SIMD Strategy (Honest Assessment)
 
-| Plattform | Pfad in `hydra_engine_step()` | Status |
+| Platform | Path in `hydra_engine_step()` | Status |
 |---|---|---|
-| ARM64/ARMv7-A mit NEON | `hydra_neon_accumulate_chunk()` — 16 Lanes pro Chunk | **aktiv**, von Seed-Roundtrip-Tests auf macOS-ARM64-CI abgedeckt |
-| ARM, `dim % 16 != 0` | NEON für Vielfache von 16, Skalar für den Rest | aktiv |
-| x86 / x86-64 | rein **skalar** | kein SIMD — AVX2 auf der Roadmap |
+| ARM64/ARMv7-A with NEON | `hydra_neon_accumulate_chunk()` — 16 lanes per chunk | **active**, covered by seeded roundtrip tests on macOS ARM64 CI |
+| ARM, `dim % 16 != 0` | NEON for multiples of 16, scalar for the remainder | active |
+| x86 / x86-64 | purely **scalar** | no SIMD — AVX2 on the roadmap |
 
-Beide Pfade sind **bit-identisch** (gleiche Decodier- und Akkumulationssemantik). Overflow-Analyse NEON: \|w\|≤1, \|token\|≤127, \|state\|≤127 → Produkte ≤ 16129, sicher in int16; Akkumulation in int32.
+Both paths are **bit-identical** (same decode and accumulation semantics). NEON overflow analysis: |w| ≤ 1, |token| ≤ 127, |state| ≤ 127 → products ≤ 16129, safely within int16; accumulation in int32.
 
-**Performance-Implication:** Auf x86 wird die ternäre Arithmetik aktuell nicht SIMD-beschleunigt — der Geschwindigkeitsvorteil dort kommt ausschließlich aus dem 2-Bit-Speicherformat (weniger Speicherbandbreite, mehr Cache-Hits) und der fehlenden FP-Multiplikation. Genuve SIMD-Beschleunigung auf x86 erfordert den AVX2-Kernel (Roadmap).
+**Performance implication:** on x86, the ternary arithmetic is currently *not* SIMD-accelerated — the speed advantage there comes exclusively from the 2-bit storage format (less memory bandwidth, more cache hits) and the absence of FP multiplication. Genuine SIMD acceleration on x86 requires the AVX2 kernel (roadmap).
 
-## Koexistenz-Axiom
+## Testing Strategy
+
+Every test in the suite is falsifiable — no tautological "same input → same output" checks:
+
+- **Hand-computed decoder cases** — single-weight models with hand-derived expected tokens prove the packing bit-order and token derivation are correct.
+- **Seeded roundtrip & variance** — 5 platform-fixed LCG seeds generate random ternary weight patterns. Per seed: all 32 outputs within vocab, and a fresh engine instance must reproduce the bit-identical sequence. Across seeds: sequences must differ (no-op detection).
+- **Security regressions** — bad magic, out-of-bounds weights, and `layers × dim > weights_len` headers must be rejected at load time. The last one is a confirmed OOB-read PoC: before the fix, a crafted header could read up to ~4 GiB past the mmap.
+- **Dual-path validation** — macOS CI runners are ARM64, so the seeded tests exercise the real NEON path; Ubuntu CI covers the scalar path. The platform-fixed LCG guarantees identical sequences on both.
+
+## Coexistence Axiom
 
 ```
 U(s,a) = R(s,a) · I{H(s)=1}  −  ∞ · I{H(s)<1}
 ```
 
-`hydra_verify_axiom()` implementiert das Gate: `humanity <= 0` → Utility auf `-1e9` gedrückt, Rückgabecode 0 (blockiert). Jeder Agent-Action-Pfad muss dieses Gate passieren, bevor externe Effekte ausgelöst werden.
+`hydra_verify_axiom()` implements the gate: `humanity <= 0` → utility pushed to `-1e9`, return code 0 (blocked). Every agent action path must pass this gate before triggering external effects.
 
-## Sicherheits-Design
+## Security Design
 
-- Header-Validierung: Magic, Version, dim/vocab-Grenzen, `weights_offset + weights_len ≤ file_size` (verhindert Out-of-Bounds-Reads hinter dem mmap).
-- State-Update mit Modulo + Sättigung → kein Signed-Overflow-UB.
-- Testabdeckung: Garbage-Input, OOB-Header, NULL-Pointer, Determinismus.
+- Header validation: magic, version, dim/vocab bounds, `weights_offset + weights_len ≤ file_size`, and `layers × dim ≤ weights_len` (prevents out-of-bounds reads past the mmap).
+- State update with clamping (no modulo distortion, no signed-overflow UB).
+- Library logs go to stderr exclusively; stdout stays clean for machine-readable output (`--json`).
+- Test coverage: garbage input, OOB headers, NULL pointers, per-seed reproducibility.
