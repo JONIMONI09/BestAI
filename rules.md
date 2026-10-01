@@ -80,11 +80,15 @@
 
 21. **R21 — Every SKILL.md starts with YAML frontmatter** delimited by
     `---` lines, containing at minimum `name` and `description`. A
-    skill without valid frontmatter is silently rejected by the UI.
-    (→ errors.md: skills rejected, missing frontmatter)
+    skill without valid frontmatter is rejected by the UI.
+    The frontmatter must be **pure ASCII** and the `description`
+    must be a **quoted** scalar — non-ASCII characters (em dashes)
+    in unquoted scalars get the skill rejected as "Not loaded".
+    (→ errors.md: both skill-rejection entries)
 22. **R22 — Validate frontmatter before committing**: parse the YAML,
     check `name` matches the directory name, check `description` is
-    present and one sentence long.
+    present and one sentence long, assert the frontmatter block is
+    ASCII-only.
 
 ## 7. When rules conflict
 

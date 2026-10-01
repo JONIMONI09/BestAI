@@ -1,6 +1,6 @@
 ---
 name: session-workflow
-description: Mandatory session protocol — read session.md, errors.md and rules.md before touching code, keep the plan updated after every step, log every error immediately.
+description: "Mandatory session protocol: read session.md, errors.md and rules.md before touching code, keep the plan updated after every step, log every error immediately."
 ---
 
 # Session Workflow — Hydra-Stone

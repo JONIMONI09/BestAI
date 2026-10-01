@@ -6,6 +6,26 @@
 
 ---
 
+## 2026-10-01 — Skills still "Not loaded" after frontmatter fix: non-ASCII in description
+
+- **Symptom:** After adding valid-looking frontmatter, the Skills UI
+  still showed every skill as `Not loaded` with
+  *"Freebuff could not read this SKILL.md. The frontmatter needs
+  `name: <dir>` (matching the skill's own folder name)"* — even though
+  `name` matched and the YAML parsed locally.
+- **Cause (most probable):** the `description:` values contained the
+  em dash `—` (non-ASCII) inside an unquoted plain YAML scalar; the
+  UI's parser is stricter than standard YAML. Also possible: UI cache
+  lag after the merge.
+- **Fix:** rewrote all three frontmatters as pure ASCII with quoted
+  description scalars:
+  ```yaml
+  description: "...ascii-only, colon inside quotes..."
+  ```
+  Validation script now additionally asserts `fm_raw.isascii()`.
+- **Prevention:** Rule R21 extended — frontmatter must be pure ASCII
+  with quoted description; the validator enforces it before commit.
+
 ## 2026-10-01 — Skills rejected by UI: missing YAML frontmatter
 
 - **Symptom:** The Skills UI showed the skill but refused to save/use

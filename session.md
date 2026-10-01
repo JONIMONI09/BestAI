@@ -35,22 +35,31 @@
 
 ## Current task
 
-Fix agent skills (rejected by UI — missing YAML frontmatter) and add
-the user's new standing rule: NO git checkout by the agent.
+Root cause found: **PR #9 is still OPEN** — the ASCII frontmatter fix
+never reached `main`. `main` still carries the em-dash descriptions
+from PR #8, which is exactly what the Skills UI rejects.
 
 ## Plan
 
-- [x] Add YAML frontmatter (`name`, `description`) to all 3 SKILL.md files
-- [x] Validate frontmatter (YAML parse, name == dir name, description present)
-- [x] New rule R17 in `rules.md`: NO git checkout — user does checkouts
-- [x] Renumber subsequent rules, add skills rules R21/R22
-- [x] Log the frontmatter error in `errors.md`
-- [x] Update `session.md`, commit + push to existing PR branch (NO checkout)
+- [x] Diagnose: main already has frontmatter (PR #8 merged), so UI
+      rejects the parsing itself, not the name match
+- [x] Rewrite all 3 frontmatters: ASCII-only, quoted description
+- [x] Extend validator: assert frontmatter block is ASCII-only
+- [x] Update rules R21/R22 (ASCII + quoted description mandatory)
+- [x] Log second error entry in `errors.md`
+- [x] Push fix branch WITHOUT checkout (git push origin HEAD:refs/heads/…)
+- [x] Open new PR #9 targeting main
+- [x] Verify PR #9 merge status → OPEN, not merged (user decision per R14)
+- [x] Verify origin/main still has the em-dash descriptions (confirmed)
+- [ ] **BLOCKED on user:** merge PR #9, then reload the Skills UI
+- [ ] If still failing after merge: user provides the FULL untruncated
+      error text from the UI dialog
 
 ## Status / Notes
 
-- PR #8 (skills + protocol) updated in place with the frontmatter fix;
-  still open, awaiting explicit user approval.
+- Merge status verified 2026-10-01: PR #9 `state=OPEN, mergedAt=null`.
+  `git show origin/main:.claude/skills/*/SKILL.md` shows the OLD
+  em-dash descriptions on main — the UI is rejecting exactly those.
+- R17 (no checkout) respected throughout: fix branch was created via
+  `git push origin HEAD:refs/heads/fix-skill-frontmatter`.
 - PR #7 (CI lint) also still open, awaiting user approval.
-- Standing rule now: agent works on the currently checked-out branch;
-  never runs `git checkout`.
