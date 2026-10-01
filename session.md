@@ -50,10 +50,16 @@ from PR #8, which is exactly what the Skills UI rejects.
 - [x] Push fix branch WITHOUT checkout (git push origin HEAD:refs/heads/…)
 - [x] Open new PR #9 targeting main
 - [x] Verify PR #9 merge status → OPEN, not merged (user decision per R14)
-- [x] Verify origin/main still has the em-dash descriptions (confirmed)
-- [ ] **BLOCKED on user:** merge PR #9, then reload the Skills UI
-- [ ] If still failing after merge: user provides the FULL untruncated
-      error text from the UI dialog
+- [x] Verify origin/main still had the em-dash descriptions (confirmed)
+- [x] User merged PR #9 (15:46:21Z) — verified via gh + git show origin/main
+- [x] main now has ASCII-quoted frontmatter on all 3 skills (verified,
+      byte-level ASCII check passed)
+- [x] Format cross-checked against reference SKILL.md examples
+      (gemini-cli greeter): identical structure — name + description
+      after --- delimiters
+- [ ] **Awaiting user:** reload Skills UI; confirm all 3 load. If any
+      still shows "Not loaded", the FULL untruncated error text is
+      needed (screenshot text was cut off mid-sentence)
 
 ## Status / Notes
 
