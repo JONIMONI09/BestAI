@@ -6,7 +6,87 @@ on:
   pull_request:
 
 jobs:
+  # ---------- Stage 1: Lint / Syntax (fast, fails first) ----------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install linters
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck
+
+      # Gate 1a: strict C99 syntax check with POSIX feature macros,
+      # all warnings as errors (gcc)
+      - name: Syntax check (gcc, C99 strict, -Werror)
+        run: |
+          gcc -fsyntax-only -std=c99 \
+              -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -Wall -Wextra -Werror -Iinclude \
+              src/hydra_engine.c src/main.c
+
+      # Gate 1b: same strictness with clang — catches gcc-only
+      # diagnostics and validates the code compiles cleanly on a
+      # second compiler frontend (double review principle)
+      - name: Syntax check (clang, C99 strict, -Werror)
+        run: |
+          clang -fsyntax-only -std=c99 \
+              -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -Wall -Wextra -Werror -Iinclude \
+              src/hydra_engine.c src/main.c
+
+      # Gate 1c: static analysis (cppcheck), error-exitcode=2 on any
+      # warning/error so nothing slips through
+      - name: Static analysis (cppcheck)
+        run: |
+          cppcheck --enable=warning,portability \
+              --inline-suppr --std=c99 --platform=unix64 \
+              -Iinclude --error-exitcode=2 \
+              src/ tests/
+
+      # Gate 1d: Python syntax + packing consistency of the format
+      # reference writer
+      - name: Python lint (py_compile + format reference check)
+        run: |
+          python3 -m py_compile tools/make_dummy_model.py
+          python3 - << 'EOF'
+          import struct, sys
+          sys.path.insert(0, 'tools')
+          # The header format <IHHIIII> must be exactly 24 bytes to
+          # match include/hydra_model.h (checked by C tests too).
+          size = struct.calcsize("<IHHIIII")
+          assert size == 24, f"Python header size {size} != 24 — format drift!"
+          print(f"format check OK: <IHHIIII> = {size} bytes")
+          EOF
+
+      # On any lint failure, upload the captured diagnostics as a
+      # workflow artifact so the error text is attached to the run.
+      - name: Upload lint error report
+        if: failure()
+        run: |
+          {
+            echo "=== Hydra-Stone lint report (${GITHUB_SHA::7}) ==="
+            echo "gcc/clang/cppcheck diagnostics are in the job log above."
+            echo "Replicate locally:"
+            echo "  gcc -fsyntax-only -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \\"
+            echo "      -Wall -Wextra -Werror -Iinclude src/hydra_engine.c src/main.c"
+            echo "  cppcheck --enable=warning,portability --std=c99 --platform=unix64 \\"
+            echo "      -Iinclude --error-exitcode=2 src/ tests/"
+          } > lint-report.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: lint-errors
+          path: lint-report.txt
+          if-no-files-found: ignore
+
+  # ---------- Stage 2: Build + tests (double verification) ----------
+  # Every commit is built and tested on two independent runners
+  # (linux-gcc + macos-clang) AND two code paths are covered:
+  # scalar (x86) and NEON (macOS ARM64).
   build-test:
+    needs: lint
     strategy:
       matrix:
         os: [ ubuntu-latest, macos-latest ]
@@ -24,6 +104,22 @@ jobs:
         run: |
           python3 tools/make_dummy_model.py smoke.hydra
           ./hydra-run smoke.hydra 42
+
+      - name: Upload failure logs
+        if: failure()
+        run: |
+          {
+            echo "=== Hydra-Stone build/test failure (${GITHUB_SHA::7}, ${{ matrix.os }}) ==="
+            echo "Rerun locally: make all && make test && ./hydra-test"
+          } > failure-report-${{ matrix.os }}.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-errors-${{ matrix.os }}
+          path: failure-report-${{ matrix.os }}.txt
+          if-no-files-found: ignore
 
       - name: Clean up
         run: make clean

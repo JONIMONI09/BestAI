@@ -65,7 +65,7 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
     }
     if (engine->header.version != HYDRA_VERSION) {
         fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u)\n",
-                engine->header.version, HYDRA_VERSION);
+                (unsigned)engine->header.version, (unsigned)HYDRA_VERSION);
         hydra_engine_unload(engine);
         return -7;
     }
