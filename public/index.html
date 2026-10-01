@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hydra-Stone Console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">⬢</div>
+      <div>
+        <h1>Hydra-Stone</h1>
+        <p class="brand-sub">Ternäre O(1)-Inferenz</p>
+      </div>
+    </div>
+
+    <section class="panel">
+      <h2>Modell</h2>
+      <div id="model-info" class="model-info">
+        <div class="row"><span>Pfad</span><code id="m-path">–</code></div>
+        <div class="row"><span>Dimension</span><code id="m-dim">–</code></div>
+        <div class="row"><span>Vocab</span><code id="m-vocab">–</code></div>
+        <div class="row"><span>Layer</span><code id="m-layers">–</code></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Inferenz-Parameter</h2>
+      <label class="field">
+        <span>Start-Token</span>
+        <input id="token" type="number" min="0" value="42">
+      </label>
+      <label class="field">
+        <span>Steps</span>
+        <input id="steps" type="number" min="1" max="256" value="64">
+      </label>
+      <button id="run" class="btn primary">▶ Inferenz starten</button>
+    </section>
+
+    <section class="panel">
+      <h2>Koexistenz-Axiom</h2>
+      <label class="field">
+        <span>Humanity-Faktor H(s)</span>
+        <input id="humanity" type="range" min="-0.5" max="1" step="0.05" value="1">
+      </label>
+      <div class="axiom-readout">
+        <span id="h-value">1.00</span>
+        <span id="h-verdict" class="verdict allow">ERLAUBT</span>
+      </div>
+    </section>
+
+    <footer class="sidebar-foot">
+      <span>2-Bit ternär · mmap · zero-heap</span>
+    </footer>
+  </aside>
+
+  <!-- Hauptbereich -->
+  <main class="main">
+    <header class="topbar">
+      <h2>Konsole</h2>
+      <div class="stats">
+        <div class="stat"><span id="s-elapsed">–</span><label>ms gesamt</label></div>
+        <div class="stat"><span id="s-per-token">–</span><label>ms / Token</label></div>
+        <div class="stat"><span id="s-throughput">–</span><label>Token/s</label></div>
+      </div>
+    </header>
+
+    <div class="viz-row">
+      <section class="card viz-card">
+        <h3>Token-Stream</h3>
+        <canvas id="token-canvas" width="900" height="220"></canvas>
+      </section>
+      <section class="card state-card">
+        <h3>O(1)-State-Vektor</h3>
+        <div id="state-grid" class="state-grid"></div>
+      </section>
+    </div>
+
+    <section class="card log-card">
+      <h3>Engine-Output</h3>
+      <pre id="log" class="log">[Hydra] Bereit. Modell laden und Inferenz starten.</pre>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

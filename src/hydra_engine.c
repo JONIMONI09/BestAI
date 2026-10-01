@@ -75,7 +75,7 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
         hydra_engine_unload(engine);
         return -8;
     }
-    /* Sicherheits-Check: Gewichte muessen in die Datei passen */
+    /* Sicherheits-Check 1: Gewichte muessen in die Datei passen */
     {
         uint64_t needed = (uint64_t)engine->header.weights_offset + engine->header.weights_len;
         if (needed > (uint64_t)engine->mapped_size) {
@@ -86,8 +86,23 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
         }
     }
 
-    printf("[Hydra] Modell erfolgreich gemappt! Layers: %u, Dim: %u, Vocab: %u\n",
-           engine->header.layers, engine->header.dim, engine->header.vocab_size);
+    /* Sicherheits-Check 2: step() liest layers*dim Bytes — dieser Bereich muss
+     * durch weights_len abgedeckt sein, sonst OOB-Read hinter dem mmap
+     * (PoC-bestaetigt: crafted Header konnte bis 4 GiB hinter Dateiende lesen). */
+    {
+        uint64_t needed_pairs = (uint64_t)engine->header.layers * engine->header.dim;
+        if (needed_pairs > (uint64_t)engine->header.weights_len) {
+            fprintf(stderr, "[Hydra] layers*dim (%llu) > weights_len (%u) — Format inkonsistent\n",
+                    (unsigned long long)needed_pairs, engine->header.weights_len);
+            hydra_engine_unload(engine);
+            return -10;
+        }
+    }
+
+    /* Library-Logs ausschliesslich auf stderr, damit stdout fuer
+     * maschinenlesbare Ausgaben (z.B. --json) sauber bleibt. */
+    fprintf(stderr, "[Hydra] Modell erfolgreich gemappt! Layers: %u, Dim: %u, Vocab: %u\n",
+            engine->header.layers, engine->header.dim, engine->header.vocab_size);
     return 0;
 }
 
@@ -130,11 +145,11 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
         }
     }
 
-    /* Update O(1) State-Vektor mit Saettigung (kein int8-Overflow-UB) */
+    /* Update O(1) State-Vektor: saubere Saettigung ohne Modulo-Verzerrung */
     for (size_t i = 0; i < dim; ++i) {
-        int32_t v = accumulator[i] % 127;
+        int32_t v = accumulator[i];
         if (v > 127)  v = 127;
-        if (v < -127) v = -127;
+        else if (v < -127) v = -127;
         engine->state_vector[i] = (int8_t)v;
     }
 

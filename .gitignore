@@ -2,9 +2,11 @@
 hydra-run
 hydra-test
 *.o
+node_modules/
 
 # Models
 *.hydra
+models/
 
 # Python
 __pycache__/

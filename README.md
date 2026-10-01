@@ -36,9 +36,31 @@ python3 tools/make_dummy_model.py test.hydra
 # 3. Modell in die Engine werfen
 ./hydra-run test.hydra 123
 
-# 4. Unit-Tests (16 Stück)
+# 4. Unit-Tests (18 Stück)
 make test-run
+
+# 5. Weboberfläche starten (PC-optimierte Konsole)
+make ui    # → http://localhost:8787
 ```
+
+## Weboberfläche (PC)
+
+Die **Hydra-Stone Console** ist eine dunkle Terminal-Style-Oberfläche mit:
+
+- **Modell-Panel** — dim/vocab/layers des geladenen Modells
+- **Inferenz-Steuerung** — Start-Token & Steps, Enter startet
+- **Live-Statistiken** — ms gesamt, ms/Token, Token/s
+- **Token-Stream-Chart** — Canvas-Visualisierung der Output-Sequenz
+- **O(1)-State-Heatmap** — 64 State-Zellen live eingefärbt
+- **Koexistenz-Axiom-Slider** — H(s) von −0.5 bis 1.0, Blockiert/ Erlaubt in Echtzeit
+
+Architektur: `server.js` (Node, **keine npm-Abhängigkeiten**) → `hydra-run --json` (C-Engine), Frontend reines HTML/CSS/JS unter `public/`.
+
+| Endpunkt | Methode | Beschreibung |
+|---|---|---|
+| `/api/model` | GET | Header-Info des Modells |
+| `/api/infer` | POST | `{token, steps}` → JSON mit Tokens, State, Timing |
+| `/api/axiom?h=0.5` | GET | Axiom-Gate-Simulation |
 
 ## Features
 
@@ -46,7 +68,8 @@ make test-run
 - ✅ **Ternäre Linearmathematik** — 2 Bit/Gewicht, keine FP-Multiplikation im Inner Loop
 - ✅ **Koexistenz-Axiom** — `humanity ≤ 0 ⇒ Utility = −∞`, hartes Safety-Gate vor jeder Aktion
 - ✅ **NEON-SIMD-Kernel** — 16 parallele ternäre Akkumulationen auf ARM (auto-aktiv via `__ARM_NEON`)
-- ✅ **Härtung** — Header-Validierung, OOB-Schutz, Sättigungsarithmetik, 16 Unit-Tests
+- ✅ **Härtung** — Header-Validierung, OOB-Schutz, Sättigungsarithmetik, 18 Unit-Tests
+- ✅ **Web-Console** — PC-UI mit Live-Visualisierung (`make ui`)
 - ✅ **C99, keine Abhängigkeiten** — läuft auf 32-Bit ARMv7, x86-64, alles dazwischen
 
 ## Projektstruktur
@@ -57,7 +80,9 @@ make test-run
 ├── src/main.c                 CLI
 ├── src/hydra_neon.h           ARM-NEON-Kernel (optional, auto-erkannt)
 ├── tools/make_dummy_model.py  Testmodell-Generator (Format-Referenz)
-├── tests/test_engine.c        16 Unit-Tests
+├── tests/test_engine.c        18 Unit-Tests (inkl. OOB-PoC-Regression)
+├── server.js                  UI-Server (Node, 0 npm-Dependencies)
+├── public/                    Hydra-Stone Console (HTML/CSS/JS)
 ├── docs/ARCHITECTURE.md       Architektur & Mathematik
 ├── docs/FORMAT.md             .hydra-Binärformat-Spezifikation
 └── LICENSE                    MIT
