@@ -1,0 +1,18 @@
+# Build artifacts
+hydra-run
+hydra-test
+*.o
+
+# Models
+*.hydra
+
+# Python
+__pycache__/
+*.pyc
+
+# Archives
+*.zip
+
+# Editor
+.vscode/
+.idea/
