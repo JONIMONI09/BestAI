@@ -22,7 +22,7 @@
 | `include/hydra_model.h` | Public API, Header-Struct, Defines |
 | `src/hydra_engine.c` | Loader (mmap), Inferenz-Schritt, Axiom-Gate |
 | `src/main.c` | CLI-Einstiegspunkt |
-| `src/hydra_neon.h` | NEON SIMD-Kernel (nur auf ARM aktiv, via `__ARM_NEON`) |
+| `src/hydra_neon.h` | NEON SIMD-Kernel — **aktiv integriert**: `step()` nutzt ihn auf ARM in 16er-Chunks; bit-identischer Skalar-Fallback für Reste und x86 |
 | `tools/make_dummy_model.py` | Testmodell-Generator (Reference-Implementierung des Formats) |
 | `tests/test_engine.c` | 16 Unit-Tests |
 
@@ -51,6 +51,18 @@ y_i = Σ_j w_ij · x_j   →   y_i = Σ_{w=+1} x_j  −  Σ_{w=−1} x_j
 ```
 
 Keine FP32/FP16-Multiplikation im Inner Loop → maximaler ALU-Durchsatz auch ohne FPU (ARMv7-A VFP-frei lauffähig).
+
+## SIMD-Strategie (ehrliche Bestandsaufnahme)
+
+| Plattform | Pfad in `hydra_engine_step()` | Status |
+|---|---|---|
+| ARM64/ARMv7-A mit NEON | `hydra_neon_accumulate_chunk()` — 16 Lanes pro Chunk | **aktiv**, von Seed-Roundtrip-Tests auf macOS-ARM64-CI abgedeckt |
+| ARM, `dim % 16 != 0` | NEON für Vielfache von 16, Skalar für den Rest | aktiv |
+| x86 / x86-64 | rein **skalar** | kein SIMD — AVX2 auf der Roadmap |
+
+Beide Pfade sind **bit-identisch** (gleiche Decodier- und Akkumulationssemantik). Overflow-Analyse NEON: \|w\|≤1, \|token\|≤127, \|state\|≤127 → Produkte ≤ 16129, sicher in int16; Akkumulation in int32.
+
+**Performance-Implication:** Auf x86 wird die ternäre Arithmetik aktuell nicht SIMD-beschleunigt — der Geschwindigkeitsvorteil dort kommt ausschließlich aus dem 2-Bit-Speicherformat (weniger Speicherbandbreite, mehr Cache-Hits) und der fehlenden FP-Multiplikation. Genuve SIMD-Beschleunigung auf x86 erfordert den AVX2-Kernel (Roadmap).
 
 ## Koexistenz-Axiom
 

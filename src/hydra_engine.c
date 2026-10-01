@@ -1,4 +1,5 @@
 #include "hydra_model.h"
+#include "hydra_neon.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,18 +132,37 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
 
     /* Layer-Verarbeitung on-the-fly ohne Zwischenpuffer im RAM */
     int32_t accumulator[HYDRA_EMBED_DIM] = {0};
+    /* Token auf 0..127 beschraenkt (Byte-Bereich), damit w1*token auch im
+     * NEON-16-bit-Pfad ohne Overflow bleibt (|w1*token| <= 16129). */
     const int32_t token_val = (int32_t)(token_in & 0x7F);
 
+    /* NEON-Verarbeitung in 16er-Chunks; Rest ueber skalaren Fallback.
+     * Beide Pfade sind bit-identisch (gleiche Decodier-/Akkumulations-
+     * semantik), verifiziert durch die Seed-Roundtrip-Tests.
+     * Ohne __ARM_NEON ist neon_end=0 -> der Skalar-Loop deckt alles ab. */
+#ifdef __ARM_NEON
+    const size_t neon_end = dim / 16 * 16;
+#else
+    const size_t neon_end = 0;
+#endif
+
     for (uint32_t l = 0; l < engine->header.layers; ++l) {
-        for (size_t i = 0; i < dim; ++i) {
+#if defined(__ARM_NEON) && defined(HYDRA_USE_NEON)
+        for (size_t i = 0; i < neon_end; i += 16) {
+            hydra_neon_accumulate_chunk(w_ptr + i, engine->state_vector + i,
+                                        token_val, accumulator + i);
+        }
+#endif
+        for (size_t i = neon_end; i < dim; ++i) {
             /* 2 Ternary-Weights pro Byte, little-endian bit order */
-            uint8_t packed = *w_ptr++;
+            uint8_t packed = w_ptr[i];
             int8_t w1 = (int8_t)hydra_decode_ternary_2bit((uint8_t)(packed & 0x03u));
             int8_t w2 = (int8_t)hydra_decode_ternary_2bit((uint8_t)((packed >> 2) & 0x03u));
 
             /* Reine Akkumulation ohne Gleitkommamultiplikation */
             accumulator[i] += w1 * token_val + w2 * (int32_t)engine->state_vector[i];
         }
+        w_ptr += dim;
     }
 
     /* Update O(1) State-Vektor: saubere Saettigung ohne Modulo-Verzerrung */
