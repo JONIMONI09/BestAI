@@ -35,22 +35,25 @@
 
 ## Current task
 
-Fix agent skills (rejected by UI — missing YAML frontmatter) and add
-the user's new standing rule: NO git checkout by the agent.
+Skills STILL "Not loaded" after the first frontmatter fix — harden the
+frontmatter (pure ASCII, quoted description) and ship to main via a
+new PR branch (without git checkout, per R17).
 
 ## Plan
 
-- [x] Add YAML frontmatter (`name`, `description`) to all 3 SKILL.md files
-- [x] Validate frontmatter (YAML parse, name == dir name, description present)
-- [x] New rule R17 in `rules.md`: NO git checkout — user does checkouts
-- [x] Renumber subsequent rules, add skills rules R21/R22
-- [x] Log the frontmatter error in `errors.md`
-- [x] Update `session.md`, commit + push to existing PR branch (NO checkout)
+- [x] Diagnose: main already has frontmatter (PR #8 merged), so UI
+      rejects the parsing itself, not the name match
+- [x] Rewrite all 3 frontmatters: ASCII-only, quoted description
+- [x] Extend validator: assert frontmatter block is ASCII-only
+- [x] Update rules R21/R22 (ASCII + quoted description mandatory)
+- [x] Log second error entry in `errors.md`
+- [x] Push fix branch WITHOUT checkout (git push origin HEAD:refs/heads/…)
+- [x] Open new PR targeting main
+- [ ] User verifies skills load in the UI (may need a page reload)
 
 ## Status / Notes
 
-- PR #8 (skills + protocol) updated in place with the frontmatter fix;
-  still open, awaiting explicit user approval.
-- PR #7 (CI lint) also still open, awaiting user approval.
-- Standing rule now: agent works on the currently checked-out branch;
-  never runs `git checkout`.
+- PR #8 was merged by the user; its branch can no longer receive
+  changes that reach main → fix ships via a fresh branch/PR.
+- R17 (no checkout) respected: branch created via `git push
+  origin HEAD:refs/heads/<name>`, not via checkout.

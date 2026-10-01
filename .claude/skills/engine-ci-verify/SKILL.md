@@ -1,6 +1,6 @@
 ---
 name: engine-ci-verify
-description: Run all local Hydra-Stone quality gates in CI-identical order — gcc and clang strict syntax, cppcheck, python format gate, build, 32 unit tests, runtime smoke test.
+description: "Run all local Hydra-Stone quality gates in CI-identical order: gcc and clang strict syntax, cppcheck, python format gate, build, 32 unit tests, runtime smoke test."
 ---
 
 # Engine CI Verification — Hydra-Stone
