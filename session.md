@@ -35,9 +35,9 @@
 
 ## Current task
 
-Skills STILL "Not loaded" after the first frontmatter fix — harden the
-frontmatter (pure ASCII, quoted description) and ship to main via a
-new PR branch (without git checkout, per R17).
+Root cause found: **PR #9 is still OPEN** — the ASCII frontmatter fix
+never reached `main`. `main` still carries the em-dash descriptions
+from PR #8, which is exactly what the Skills UI rejects.
 
 ## Plan
 
@@ -48,12 +48,18 @@ new PR branch (without git checkout, per R17).
 - [x] Update rules R21/R22 (ASCII + quoted description mandatory)
 - [x] Log second error entry in `errors.md`
 - [x] Push fix branch WITHOUT checkout (git push origin HEAD:refs/heads/…)
-- [x] Open new PR targeting main
-- [ ] User verifies skills load in the UI (may need a page reload)
+- [x] Open new PR #9 targeting main
+- [x] Verify PR #9 merge status → OPEN, not merged (user decision per R14)
+- [x] Verify origin/main still has the em-dash descriptions (confirmed)
+- [ ] **BLOCKED on user:** merge PR #9, then reload the Skills UI
+- [ ] If still failing after merge: user provides the FULL untruncated
+      error text from the UI dialog
 
 ## Status / Notes
 
-- PR #8 was merged by the user; its branch can no longer receive
-  changes that reach main → fix ships via a fresh branch/PR.
-- R17 (no checkout) respected: branch created via `git push
-  origin HEAD:refs/heads/<name>`, not via checkout.
+- Merge status verified 2026-10-01: PR #9 `state=OPEN, mergedAt=null`.
+  `git show origin/main:.claude/skills/*/SKILL.md` shows the OLD
+  em-dash descriptions on main — the UI is rejecting exactly those.
+- R17 (no checkout) respected throughout: fix branch was created via
+  `git push origin HEAD:refs/heads/fix-skill-frontmatter`.
+- PR #7 (CI lint) also still open, awaiting user approval.
