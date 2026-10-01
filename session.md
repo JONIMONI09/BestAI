@@ -33,39 +33,39 @@
   error-artifact upload. cppcheck caught a real `%u`/signed issue on
   first run.
 
+## Done (earlier today)
+
+- ✅ Skills created + protocol files (PR #8, merged by user)
+- ✅ Frontmatter v1 added (PR branch), then hardening (ASCII + quoted,
+  **PR #9, merged by user at 15:46:21Z**) — main now serves valid
+  skills; user invoked `/android-ndk-build` successfully → skills work
+- ✅ PR #7 (CI lint) — merged by user as part of #8 line? **No: PR #7
+  is still OPEN** (separate lint PR), awaiting approval
+
 ## Current task
 
-Root cause found: **PR #9 is still OPEN** — the ASCII frontmatter fix
-never reached `main`. `main` still carries the em-dash descriptions
-from PR #8, which is exactly what the Skills UI rejects.
+Skill `/android-ndk-build` invoked by user — execute it end-to-end,
+verify every step works, then analyze + optimize the skill itself.
 
 ## Plan
 
-- [x] Diagnose: main already has frontmatter (PR #8 merged), so UI
-      rejects the parsing itself, not the name match
-- [x] Rewrite all 3 frontmatters: ASCII-only, quoted description
-- [x] Extend validator: assert frontmatter block is ASCII-only
-- [x] Update rules R21/R22 (ASCII + quoted description mandatory)
-- [x] Log second error entry in `errors.md`
-- [x] Push fix branch WITHOUT checkout (git push origin HEAD:refs/heads/…)
-- [x] Open new PR #9 targeting main
-- [x] Verify PR #9 merge status → OPEN, not merged (user decision per R14)
-- [x] Verify origin/main still had the em-dash descriptions (confirmed)
-- [x] User merged PR #9 (15:46:21Z) — verified via gh + git show origin/main
-- [x] main now has ASCII-quoted frontmatter on all 3 skills (verified,
-      byte-level ASCII check passed)
-- [x] Format cross-checked against reference SKILL.md examples
-      (gemini-cli greeter): identical structure — name + description
-      after --- delimiters
-- [ ] **Awaiting user:** reload Skills UI; confirm all 3 load. If any
-      still shows "Not loaded", the FULL untruncated error text is
-      needed (screenshot text was cut off mid-sentence)
+- [x] R1: session.md/errors.md/rules.md read; toolchain from the
+      Android session is installed (JDK 17, SDK, NDK r26d, Gradle 8.7)
+- [x] Skill step 1: verify toolchain still present — all OK
+- [x] Skill step 2: gradle assembleDebug → BUILD SUCCESSFUL (17s, 862 KB)
+- [x] APK content check: libhydra.so × 3 ABIs, asset, dex, signature OK,
+      JNI symbols present
+- [x] Skill step 3: emulator booted, APK installed, inference run —
+      logcat `{"ok":true,"steps":32,"dim":64,...}` + UI token stream
+      identical to host (211 388 401 330 ...)
+- [x] Analyze: 6 optimizations identified (portable boot-wait, uiautomator
+      tap, background-start caveat, APK verify step, adb emu kill, daemon tip)
+- [x] Optimize SKILL.md — all 6 folded in, expected outputs documented
+- [x] Frontmatter validator re-run: 3/3 OK
+- [ ] Commit via new branch (NO checkout, R17) + PR (no merge, R14)
 
 ## Status / Notes
 
-- Merge status verified 2026-10-01: PR #9 `state=OPEN, mergedAt=null`.
-  `git show origin/main:.claude/skills/*/SKILL.md` shows the OLD
-  em-dash descriptions on main — the UI is rejecting exactly those.
-- R17 (no checkout) respected throughout: fix branch was created via
-  `git push origin HEAD:refs/heads/fix-skill-frontmatter`.
-- PR #7 (CI lint) also still open, awaiting user approval.
+- Skills UI confirmed working: user invoked /android-ndk-build (the
+  ASCII frontmatter fix on main did the job).
+- R17 (no checkout) and R14 (no merge without approval) stay active.
