@@ -1,6 +1,7 @@
 /* Hydra Unit-Tests
  *
- * Prueft: Packing-Konsistenz, Decoder, Engine-Step, Axiom-Verifizierung.
+ * Prueft: Packing-Konsistenz, Decoder, Engine-Step (inkl. seeded
+ * Roundtrip-/Varianz-Pruefung), Format-Ablehnung, Axiom-Verifizierung.
  * Build: make test  |  Ausfuehrung: ./hydra-test
  */
 #include "hydra_model.h"
@@ -8,6 +9,17 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+
+/* Deterministischer LCG (statt rand()): identische Sequenz auf allen
+ * Plattformen/libc-Implementierungen, damit der Test portabel bleibt. */
+static uint32_t lcg_state;
+
+static void lcg_seed(uint32_t seed) { lcg_state = seed; }
+static uint8_t lcg_byte(void)
+{
+    lcg_state = lcg_state * 1103515245u + 12345u;
+    return (uint8_t)(lcg_state >> 16);
+}
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -53,24 +65,50 @@ static void test_header_size(void)
     CHECK(sizeof(HydraModelHeader) == 24, "Header ist exakt 24 Bytes (struct pack <IHHIIII)");
 }
 
-static void test_decoder_sanity(void)
+/* Echter End-to-End-Wertetest mit handgerechneten Erwartungswerten:
+ * dim=1, layers=1, token=5, state startet 0.
+ *   w=0x01 (w1=+1,w2=0): acc = +1*5 + 0*0 =  5 -> out = (5 + 5 + 1) % 100 = 11
+ *   w=0x02 (w1=-1,w2=0): acc = -1*5           -> out = (5 + 5 + 1) % 100 = 11
+ *   w=0x00 (w1= 0,w2=0): acc =  0             -> out = (0 + 5 + 1) % 100 = 6
+ */
+static int run_single_weight_case(uint8_t weight_byte, uint16_t token_in,
+                                  uint16_t vocab, uint16_t *out)
 {
-    /* Decoder-Logik wird indirekt ueber Step-Verhalten geprueft */
-    HydraEngine e;
-    memset(&e, 0, sizeof(e));
-    e.header.magic = HYDRA_MAGIC;
-    e.header.version = HYDRA_VERSION;
-    e.header.vocab_size = 64;
-    e.header.dim = 8;
-    e.header.layers = 1;
-    e.header.weights_offset = sizeof(HydraModelHeader);
-    e.header.weights_len = 8;
+    const char *path = "/tmp/hydra_decode_case.hydra";
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
 
-    /* Statistische Gewichte: alle +1 */
-    static uint8_t weights[8] = {1,1,1,1,1,1,1,1};
-    (void)weights;
-    /* Diese Pruefung laeuft in test_engine_step mit echtem File */
-    CHECK(1, "Decoder-Sanity (siehe engine_step)");
+    HydraModelHeader h;
+    h.magic = HYDRA_MAGIC;
+    h.version = HYDRA_VERSION;
+    h.vocab_size = vocab;
+    h.dim = 1;
+    h.layers = 1;
+    h.weights_offset = (uint32_t)sizeof(HydraModelHeader);
+    h.weights_len = 1;
+    fwrite(&h, sizeof(h), 1, f);
+    fputc(weight_byte, f);
+    fclose(f);
+
+    HydraEngine e;
+    if (hydra_engine_load(&e, path) != 0) return -1;
+    int rc = hydra_engine_step(&e, token_in, out);
+    hydra_engine_unload(&e);
+    return rc;
+}
+
+static void test_decoder_known_values(void)
+{
+    uint16_t out = 0;
+
+    CHECK(run_single_weight_case(0x01, 5, 100, &out) == 0, "Decoder-Case w1=+1 laeuft");
+    CHECK(out == 11, "Decoder/Token-Ableitung: w=0x01, token=5 -> 11 (handgerechnet)");
+
+    CHECK(run_single_weight_case(0x02, 5, 100, &out) == 0, "Decoder-Case w1=-1 laeuft");
+    CHECK(out == 11, "Decoder/Token-Ableitung: w=0x02, token=5 -> 11 (|acc|)");
+
+    CHECK(run_single_weight_case(0x00, 5, 100, &out) == 0, "Decoder-Case w1=0 laeuft");
+    CHECK(out == 6, "Decoder/Token-Ableitung: w=0x00, token=5 -> 6 (nur token+1)");
 }
 
 static void test_engine_step(void)
@@ -91,17 +129,93 @@ static void test_engine_step(void)
     CHECK(rc == 0, "Step liefert Erfolg");
     CHECK(out < 256, "Output-Token innerhalb Vocab");
 
-    /* State-Saettigung:accumulator bleibt innerhalb int8-Bereich,
-     * kein Overflow/Verzerrung durch Modulo mehr. Indirekt geprueft
-     * ueber deterministische, vocab-beschraenkte Outputs. */
-    CHECK(1, "State-Saettigung (indirekt via Step-Determinismus)");
-
-    /* Determinismus */
-    uint16_t out2 = 0;
-    hydra_engine_step(&e, 7, &out2);
-    CHECK(out == out2, "Step ist deterministisch");
-
     hydra_engine_unload(&e);
+}
+
+/* Echte Roundtrip-/Varianz-Pruefung (ersetzt den alten Tautologie-Test):
+ * - 5 verschiedene Seeds erzeugen zufaellige ternaere Gewichtsmuster
+ * - je Seed: 32 Steps, jeder Output muss < vocab sein
+ * - je Seed: zweiter Lauf mit frischer Engine muss identische Sequenz
+ *   liefern (Reproduzierbarkeit PRO SEED)
+ * - ueber Seeds hinweg muessen die Sequenzen variieren (Packing-
+ *   Roundtrip und Token-Ableitung reagieren wirklich auf die Gewichte)
+ */
+#define VARIANCE_SEEDS 5
+#define VARIANCE_STEPS 32
+
+static void test_seed_roundtrip_variance(void)
+{
+    static const uint32_t seeds[VARIANCE_SEEDS] = {
+        1u, 42u, 1337u, 0xC0FFEEDBu, 987654321u
+    };
+    static uint16_t seqs[VARIANCE_SEEDS][VARIANCE_STEPS];
+    const char *path = "/tmp/hydra_seed_model.hydra";
+    const uint16_t vocab = 256;
+    const uint32_t dim = 32, layers = 2;
+
+    for (int s = 0; s < VARIANCE_SEEDS; ++s) {
+        /* Zufaellige ternare Gewichte aus Seed erzeugen (2 Codes/Byte,
+         * Codes 0/1/2 gleichverteilt, 3 ausgeschlossen -> Format-konform) */
+        lcg_seed(seeds[s]);
+        FILE *f = fopen(path, "wb");
+        if (!f) { perror("fopen"); exit(1); }
+        HydraModelHeader h;
+        h.magic = HYDRA_MAGIC;
+        h.version = HYDRA_VERSION;
+        h.vocab_size = vocab;
+        h.dim = dim;
+        h.layers = layers;
+        h.weights_offset = (uint32_t)sizeof(HydraModelHeader);
+        h.weights_len = dim * layers;
+        fwrite(&h, sizeof(h), 1, f);
+        for (uint32_t i = 0; i < h.weights_len; ++i) {
+            uint8_t c1 = (uint8_t)(lcg_byte() % 3u);
+            uint8_t c2 = (uint8_t)(lcg_byte() % 3u);
+            fputc((int)(c1 | (uint8_t)(c2 << 2)), f);
+        }
+        fclose(f);
+
+        /* Lauf 1 */
+        HydraEngine e;
+        if (hydra_engine_load(&e, path) != 0) {
+            CHECK(0, "Seeded-Modell laedt");
+            continue;
+        }
+        uint16_t tok = 7;
+        int all_in_vocab = 1;
+        for (int t = 0; t < VARIANCE_STEPS; ++t) {
+            uint16_t next = 0;
+            if (hydra_engine_step(&e, tok, &next) != 0) { all_in_vocab = 0; break; }
+            if (next >= vocab) all_in_vocab = 0;
+            seqs[s][t] = next;
+            tok = next;
+        }
+        hydra_engine_unload(&e);
+        CHECK(all_in_vocab, "Seed-Modell: alle 32 Outputs < vocab");
+
+        /* Lauf 2: frische Engine, gleicher Seed -> identische Sequenz */
+        if (hydra_engine_load(&e, path) != 0) {
+            CHECK(0, "Seeded-Modell laedt (2. Lauf)");
+            continue;
+        }
+        int reproducible = 1;
+        tok = 7;
+        for (int t = 0; t < VARIANCE_STEPS; ++t) {
+            uint16_t next = 0;
+            hydra_engine_step(&e, tok, &next);
+            if (next != seqs[s][t]) { reproducible = 0; break; }
+            tok = next;
+        }
+        hydra_engine_unload(&e);
+        CHECK(reproducible, "Seed reproduzierbar: identische Sequenz ueber Engine-Instanzen");
+    }
+
+    /* Varianz ueber Seeds: nicht alle Sequenzen duerfen identisch sein */
+    int any_diff = 0;
+    for (int s = 1; s < VARIANCE_SEEDS && !any_diff; ++s) {
+        if (memcmp(seqs[0], seqs[s], sizeof(seqs[0])) != 0) any_diff = 1;
+    }
+    CHECK(any_diff, "Varianz: verschiedene Seeds erzeugen verschiedene Sequenzen");
 }
 
 static void test_engine_rejects_garbage(void)
@@ -190,8 +304,9 @@ int main(void)
     printf("=== Hydra Engine Unit-Tests ===\n\n");
 
     test_header_size();
-    test_decoder_sanity();
+    test_decoder_known_values();
     test_engine_step();
+    test_seed_roundtrip_variance();
     test_engine_rejects_garbage();
     test_engine_rejects_bounds_violation();
     test_engine_rejects_inconsistent_weights_len();
