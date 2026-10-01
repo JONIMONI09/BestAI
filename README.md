@@ -1,125 +1,134 @@
 # Hydra-Stone
 
-**Zero-RAM, ternäre O(1)-Inferenz-Engine — wirf jedes `.hydra`-Modell hinein und los.**
+**Zero-RAM, ternary O(1) inference engine — drop in any `.hydra` model and go.**
 
 ```bash
-./hydra-run mein_modell.hydra 123
+./hydra-run my_model.hydra 123
 ```
 
-Hydra-Stone ist eine C99-Engine, die Sprachmodell-Gewichte als **2-Bit-Ternärwerte** ({-1, 0, +1}) direkt aus der Datei über `mmap` streamt — ohne sie jemals in den Heap zu laden. Der Inferenzschritt besteht aus reinen Integer-Additionen, der RAM-Verbrauch ist **unabhängig von der Modellgröße konstant (O(1))**.
+Hydra-Stone is a C99 engine that streams language-model weights as **2-bit ternary values** ({-1, 0, +1}) directly from disk via `mmap` — never loading them into the heap. The inference step consists purely of integer additions; RAM usage is **constant (O(1)) regardless of model size**.
 
 ---
 
-## Warum das schnell ist
+## Why It's Fast
 
-| Ansatz | Multiplikationen/Token | RAM-Wachstum | Typischer Flaschenhals |
+| Approach | Multiplications/Token | RAM Growth | Typical Bottleneck |
 |---|---|---|---|
-| FP32 Transformer | O(N² · d) | KV-Cache wächst unbeschränkt | HBM-Bandbreite |
-| INT8-Quantisierung | O(N² · d) | KV-Cache wächst unbeschränkt | Dequantisierungs-Overhead |
-| **Hydra-Stone (ternär + mmap)** | **0** (nur Addition) | **keines (O(1)-State)** | nur Disk/Cache-Bandbreite |
+| FP32 Transformer | O(N² · d) | KV cache grows unbounded | HBM bandwidth |
+| INT8 quantization | O(N² · d) | KV cache grows unbounded | Dequantization overhead |
+| **Hydra-Stone (ternary + mmap)** | **0** (addition only) | **none (O(1) state)** | disk/cache bandwidth only |
 
-Drei Hebel:
+Three levers:
 
-1. **Ternäre Gewichte** — keine Multiplikation nötig: `y = Σ_{w=+1} x − Σ_{w=−1} x`
-2. **mmap-Paging** — der Kernel lädt nur die 4-KiB-Seiten, die der Compute-Cursor tatsächlich berührt; bei Speicherdruck werden saubere Seiten sofort wieder freigegeben (kein Swap).
-3. **O(1)-Rekurrenz-State** — statt einem wachsenden KV-Cache trägt ein fixer `int8_t[64]`-Vektor den Zustand.
+1. **Ternary weights** — no multiplication needed: `y = Σ_{w=+1} x − Σ_{w=−1} x`
+2. **mmap paging** — the kernel loads only the 4-KiB pages the compute cursor actually touches; under memory pressure, clean pages are evicted immediately (no swap).
+3. **O(1) recurrent state** — instead of a growing KV cache, a fixed `int8_t[64]` vector carries the state.
 
-## Schnellstart
+## Quick Start
 
 ```bash
-# 1. Kompilieren
+# 1. Compile
 make
 
-# 2. Test-Modell generieren
+# 2. Generate a test model
 python3 tools/make_dummy_model.py test.hydra
 
-# 3. Modell in die Engine werfen
+# 3. Feed the model to the engine
 ./hydra-run test.hydra 123
 
-# 4. Unit-Tests (18 Stück)
+# 4. Unit tests (32)
 make test-run
 
-# 5. Weboberfläche starten (PC-optimierte Konsole)
+# 5. Start the web console (desktop-optimized)
 make ui    # → http://localhost:8787
 ```
 
-## Weboberfläche (PC)
+## Web Console (Desktop)
 
-Die **Hydra-Stone Console** ist eine dunkle Terminal-Style-Oberfläche mit:
+The **Hydra-Stone Console** is a dark terminal-style desktop UI featuring:
 
-- **Modell-Panel** — dim/vocab/layers des geladenen Modells
-- **Inferenz-Steuerung** — Start-Token & Steps, Enter startet
-- **Live-Statistiken** — ms gesamt, ms/Token, Token/s
-- **Token-Stream-Chart** — Canvas-Visualisierung der Output-Sequenz
-- **O(1)-State-Heatmap** — 64 State-Zellen live eingefärbt
-- **Koexistenz-Axiom-Slider** — H(s) von −0.5 bis 1.0, Blockiert/ Erlaubt in Echtzeit
+- **Model panel** — dim/vocab/layers of the loaded model
+- **Inference controls** — start token & steps; Enter triggers a run
+- **Live statistics** — total ms, ms/token, tokens/s
+- **Token stream chart** — canvas visualization of the output sequence
+- **O(1) state heatmap** — 64 state cells, colored live
+- **Coexistence axiom slider** — H(s) from −0.5 to 1.0, Blocked/Allowed in real time
 
-Architektur: `server.js` (Node, **keine npm-Abhängigkeiten**) → `hydra-run --json` (C-Engine), Frontend reines HTML/CSS/JS unter `public/`.
+Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --json` (C engine); frontend is plain HTML/CSS/JS under `public/`.
 
-| Endpunkt | Methode | Beschreibung |
+| Endpoint | Method | Description |
 |---|---|---|
-| `/api/model` | GET | Header-Info des Modells |
-| `/api/infer` | POST | `{token, steps}` → JSON mit Tokens, State, Timing |
-| `/api/axiom?h=0.5` | GET | Axiom-Gate-Simulation |
+| `/api/model` | GET | Header info of the model |
+| `/api/infer` | POST | `{token, steps}` → JSON with tokens, state, timing |
+| `/api/axiom?h=0.5` | GET | Axiom gate simulation |
 
 ## Features
 
-- ✅ **Zero-Heap-Inferenz** — Gewichte werden nie kopiert, nur gemappt
-- ✅ **Ternäre Linearmathematik** — 2 Bit/Gewicht, keine FP-Multiplikation im Inner Loop
-- ✅ **Koexistenz-Axiom** — `humanity ≤ 0 ⇒ Utility = −∞`, hartes Safety-Gate vor jeder Aktion
-- ✅ **NEON-SIMD-Kernel** — 16 parallele ternäre Akkumulationen, **aktiv integriert** in `hydra_engine_step()` auf ARM (`__ARM_NEON`, auto-aktiv); bit-identischer Skalar-Fallback auf x86
-  - *Ehrlichkeit:* Der NEON-Pfad ist nur auf ARM-Builds aktiv (macOS-CI auf ARM64 validiert ihn über die Seed-Roundtrip-Tests; x86-CI deckt den Skalar-Pfad ab). Für x86 gibt es aktuell **keinen** SIMD-Pfad — AVX2 steht auf der Roadmap.
-- ✅ **Härtung** — Header-Validierung, OOB-Schutz, Sättigungsarithmetik, 18 Unit-Tests
-- ✅ **Web-Console** — PC-UI mit Live-Visualisierung (`make ui`)
-- ✅ **C99, keine Abhängigkeiten** — läuft auf 32-Bit ARMv7, x86-64, alles dazwischen
+- ✅ **Zero-heap inference** — weights are never copied, only mapped
+- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores 2 weights per byte (4 bits/weight effective); true 2-bit packing via 4 weights/byte is planned for v2 — see `docs/FORMAT.md`.
+- ✅ **Coexistence axiom** — `humanity ≤ 0 ⇒ Utility = −∞`, hard safety gate before any action
+- ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
+  - *Honesty note:* the NEON path is active on ARM builds only (macOS CI runs on ARM64 and validates it via the seeded roundtrip tests; x86 CI covers the scalar path). There is currently **no** SIMD path on x86 — AVX2 is on the roadmap.
+- ✅ **Hardening** — header validation, OOB protection, saturating arithmetic, 32 unit tests
+- ✅ **Web console** — desktop UI with live visualization (`make ui`)
+- ✅ **C99, zero dependencies** — runs on 32-bit ARMv7, x86-64, and everything in between
 
-## Projektstruktur
+## Project Structure
 
 ```
-├── include/hydra_model.h      Public API + Binärformat-Header
-├── src/hydra_engine.c         mmap-Loader, ternäre Inferenz, Axiom-Gate
+├── include/hydra_model.h      Public API + binary format header
+├── src/hydra_engine.c         mmap loader, ternary inference, axiom gate
 ├── src/main.c                 CLI
-├── src/hydra_neon.h           ARM-NEON-Kernel (aktiv integriert, skal. Fallback auf x86)
-├── tools/make_dummy_model.py  Testmodell-Generator (Format-Referenz)
-├── tests/test_engine.c        18 Unit-Tests (inkl. OOB-PoC-Regression)
-├── server.js                  UI-Server (Node, 0 npm-Dependencies)
+├── src/hydra_neon.h           ARM NEON kernel (actively integrated; scalar fallback on x86)
+├── tools/make_dummy_model.py  Test model generator (format reference)
+├── tests/test_engine.c        32 unit tests (incl. OOB PoC regression, seeded roundtrips)
+├── server.js                  UI server (Node, 0 npm dependencies)
 ├── public/                    Hydra-Stone Console (HTML/CSS/JS)
-├── docs/ARCHITECTURE.md       Architektur & Mathematik
-├── docs/FORMAT.md             .hydra-Binärformat-Spezifikation
+├── docs/ARCHITECTURE.md       Architecture & math
+├── docs/FORMAT.md             .hydra binary format specification
 └── LICENSE                    MIT
 ```
 
-## Die Mathematik in 60 Sekunden
+## The Math in 60 Seconds
 
-**Quantisierung (absmean):**
+**Quantization (absmean):**
 ```
 γ = 1 / mean(|W|)          W̃ = clip(round(γ · W), -1, +1)
 ```
 
-**Forward-Schritt ohne Multiplikation:**
+**Forward step without multiplication:**
 ```
-acc_i += (+1) · x_j   für jedes w_ij = +1
-acc_i += (−1) · x_j   für jedes w_ij = −1
+acc_i += (+1) · x_j   for every w_ij = +1
+acc_i += (−1) · x_j   for every w_ij = −1
 ```
 
-**Speicherbedarf pro Parameter: 2 Bit** (FP16: 16 Bit → **8× kleiner**, INT4: 4 Bit → **2× kleiner**).
+**Memory footprint per parameter: 2 bits** (FP16: 16 bits → **8× smaller**, INT4: 4 bits → **2× smaller**).
 
-| Parameter | FP16 | INT4 | Hydra 2-Bit |
+| Parameters | FP16 | INT4 | Hydra 2-Bit |
 |---|---|---|---|
 | 0.5 B | 1000 MiB | 250 MiB | 125 MiB |
 | 1.0 B | 2000 MiB | 500 MiB | 250 MiB |
 | 1.5 B | 3000 MiB (OOM) | 750 MiB | 375 MiB |
 
+## Testing Strategy
+
+The test suite goes beyond smoke checks — every test can fail:
+
+- **Hand-computed decoder cases** — known weight bytes with hand-derived expected tokens (e.g. `w=0x01, token=5 → 11`); any packing bit-order or token-derivation error fails immediately.
+- **Seeded roundtrip & variance** — 5 deterministic LCG seeds generate random ternary weight patterns; per seed, all 32 outputs must stay within vocab and a second run with a *fresh engine instance* must reproduce the bit-identical sequence. Sequences must differ across seeds (detects a no-op engine).
+- **Security regressions** — crafted headers (bad magic, out-of-bounds weights, `layers × dim > weights_len`) must be rejected at load; the last case is a confirmed out-of-bounds read PoC.
+- **Cross-platform determinism** — the LCG is platform-fixed so Ubuntu (scalar path) and macOS/ARM64 (NEON path) CI runners validate identical semantics on both code paths.
+
 ## Roadmap
 
-- [ ] Vollständiger Transformer-Forward (RMSNorm, RoPE, SwiGLU) über dem ternären Kern
-- [ ] Min-P-Sampling & Repetition-Penalty
-- [ ] GGUF/safetensors-Import mit automatischer absmean-Ternärisierung
-- [ ] AVX2/AVX-512-LUT-Kernel für x86 (aktueller x86-Pfad: rein skalar)
-- [ ] Streaming-Ring-Buffer-KV mit Attention-Sinks
+- [ ] Full transformer forward pass (RMSNorm, RoPE, SwiGLU) on top of the ternary core
+- [ ] Min-P sampling & repetition penalty
+- [ ] GGUF/safetensors import with automatic absmean ternarization
+- [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
+- [ ] Streaming ring-buffer KV with attention sinks
 
-Beiträge willkommen — siehe `docs/FORMAT.md` für die Binärspec, dann los.
+Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.
 
-## Lizenz
+## License
 
-MIT — siehe [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
