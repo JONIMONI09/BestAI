@@ -1,8 +1,9 @@
 CC ?= gcc
 CFLAGS ?= -O3 -Wall -Wextra -Iinclude
 LDFLAGS ?= -lm
+NODE ?= node
 
-.PHONY: all test clean
+.PHONY: all test ui clean
 
 all: hydra-run
 
@@ -16,6 +17,12 @@ hydra-test: src/hydra_engine.c tests/test_engine.c include/hydra_model.h
 
 test-run: hydra-test
 	./hydra-test
+
+# Weboberflaeche: Demo-Modell bauen und Server starten (Port via PORT, Default 8787)
+ui: hydra-run
+	mkdir -p models
+	python3 tools/make_dummy_model.py models/demo.hydra
+	$(NODE) server.js
 
 clean:
 	rm -f hydra-run hydra-test *.hydra
