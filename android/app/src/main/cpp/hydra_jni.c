@@ -18,17 +18,27 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 }
 
 /* Stream one generated token to Kotlin via a Java callback:
- * callback.onToken(int step, int token) */
-static void emit_token(JNIEnv *env, jobject callback, int step, int token)
+ * callback.onToken(int step, int token)
+ * Returns 0 on success, -1 if the callback threw (stream must stop). */
+static int emit_token(JNIEnv *env, jobject callback, int step, int token)
 {
-    if (!env || !callback) return;
+    if (!env || !callback) return 0;
     jclass cls = (*env)->GetObjectClass(env, callback);
-    if (!cls) return;
+    if (!cls) return -1;
     jmethodID mid = (*env)->GetMethodID(env, cls, "onToken", "(II)V");
     if (mid) {
         (*env)->CallVoidMethod(env, callback, mid, step, token);
+        /* Wirft der Kotlin-Callback, bleibt die Ausnahme pending und jeder
+         * weitere JNI-Call ist undefiniert. Klar melden und abbrechen. */
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            LOGE("onToken callback threw at step %d - aborting token stream", step);
+            (*env)->DeleteLocalRef(env, cls);
+            return -1;
+        }
     }
     (*env)->DeleteLocalRef(env, cls);
+    return 0;
 }
 
 /*
@@ -55,6 +65,14 @@ Java_dev_hydrastone_HydraBridge_runInference(
     if (steps < 1) steps = 1;
     if (steps > 256) steps = 256;
 
+    /* Negative startTokens werden abgewiesen statt stillschweigend
+     * umgewickelt: (-5 % 512) = -5 -> (uint16_t)65531 war ein valider,
+     * aber semantisch falscher Seed. */
+    if (startToken < 0) {
+        LOGE("negative startToken rejected: %d", (int)startToken);
+        return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"negative startToken\"}");
+    }
+
     HydraEngine engine;
     int rc = hydra_engine_load(&engine, path);
     (*env)->ReleaseStringUTFChars(env, modelPath, path);
@@ -78,7 +96,12 @@ Java_dev_hydrastone_HydraBridge_runInference(
             hydra_engine_unload(&engine);
             return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"step failed\"}");
         }
-        emit_token(env, callback, s, next);
+        if (emit_token(env, callback, s, next) != 0) {
+            /* Stream abbruecken statt weiter Tokens zu erzeugen. */
+            LOGE("inference aborted at step %d after callback failure", s);
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"callback failed\"}");
+        }
         tok = next;
     }
     long elapsed_us = (clock() - t0) * 1000000L / CLOCKS_PER_SEC;

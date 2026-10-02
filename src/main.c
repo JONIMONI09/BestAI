@@ -1,4 +1,6 @@
 #include "hydra_model.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +13,7 @@
  *
  * Standard: menschenlesbare Ausgabe auf stdout, Engine-Logs auf stderr.
  * --json:   maschinenlesbares JSON (tokens, state, timing) fuer die Web-UI.
+ * --help:   Verwendung und Exit-Code 0.
  */
 
 static double now_ms(void)
@@ -18,6 +21,32 @@ static double now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static void usage(const char *argv0, FILE *out)
+{
+    fprintf(out, "Verwendung: %s <modell.hydra> [start_token] [steps] [--json]\n", argv0);
+    fprintf(out, "\n");
+    fprintf(out, "  <modell.hydra>   Pfad zu einer .hydra-Modell-Datei (Pflicht)\n");
+    fprintf(out, "  start_token      Start-Token-ID, 0..vocab-1 (Standard: 42)\n");
+    fprintf(out, "  steps            Anzahl Inferenzschritte, 1..256 (Standard: 16)\n");
+    fprintf(out, "  --json           Maschinenlesbare Ausgabe auf stdout\n");
+    fprintf(out, "  --help           Diese Hilfe anzeigen\n");
+    fprintf(out, "\n");
+    fprintf(out, "Beispiel: %s models/demo.hydra 123 32 --json\n", argv0);
+    fprintf(out, "Tipp: Modell erzeugen mit: python3 tools/make_dummy_model.py <ziel>\n");
+}
+
+/* strtol mit strengem Zahlencheck: kein Unsinn, kein Overflow, kein
+ * stillschweigend gekapptes Grenzwert-Literal. */
+static int parse_long_arg(const char *arg, long *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(arg, &end, 10);
+    if (end == arg || *end != '\0' || errno == ERANGE || v < 0) return -1;
+    *out = v;
+    return 0;
 }
 
 static void print_json(const HydraEngine *e, const uint16_t *tokens,
@@ -47,27 +76,45 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0], stdout);
+            return 0;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "[Hydra] Unbekannte Option: %s\n", argv[i]);
+            usage(argv[0], stderr);
+            return 1;
         } else if (!model_path) {
             model_path = argv[i];
         } else {
-            char *end = NULL;
-            long v = strtol(argv[i], &end, 10);
-            if (end == argv[i] || *end != '\0' || v < 0) {
-                fprintf(stderr, "[Hydra] Ungueltiges Argument: %s\n", argv[i]);
+            long v;
+            if (parse_long_arg(argv[i], &v) != 0) {
+                fprintf(stderr, "[Hydra] Ungueltiges Argument: %s "
+                                "(erwartet: nichtnegative Ganzzahl <= %ld)\n",
+                        argv[i], LONG_MAX);
                 return 1;
             }
             if (start_token == -1) start_token = v;
             else if (steps == -1)  steps = v;
+            else {
+                /* Zusaetzliche Positionsargumente werden nicht stillschweigend
+                 * verworfen (BUG-12) — ein Tippfehler faellt sonst nie auf. */
+                fprintf(stderr, "[Hydra] Zu viele Argumente: %s "
+                                "(max. <modell> [start_token] [steps])\n", argv[i]);
+                usage(argv[0], stderr);
+                return 1;
+            }
         }
     }
 
     if (!model_path) {
-        fprintf(stderr, "Verwendung: %s <modell.hydra> [start_token] [steps] [--json]\n", argv[0]);
-        fprintf(stderr, "Tipp: Erzeuge vorher ein Modell mit: python3 tools/make_dummy_model.py\n");
+        fprintf(stderr, "[Hydra] Fehlende Modelldatei.\n");
+        usage(argv[0], stderr);
         return 1;
     }
 
-    /* Defaults fuer optionale Positional-Argumente */
+    /* Defaults fuer optionale Positional-Argumente; ausserhalb liegender
+     * Werte werden explizit geklemmt und nicht mehr stillschweigend
+     * akzeptiert. */
     if (start_token == -1) start_token = 42;
     if (steps == -1) steps = 16;
     if (steps < 1)   steps = 1;

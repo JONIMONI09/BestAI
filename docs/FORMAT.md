@@ -15,7 +15,9 @@ Offset  Size  Field           Type
 24      ...   weights         uint8[] (2 ternary weights per byte)
 ```
 
-The header is **exactly 24 bytes** (`#pragma pack(1)`, `struct pack "<IHHIIII>"` in Python).
+The header is **exactly 24 bytes** (`#pragma pack(1)`, `struct pack "<IHHIIII"` in Python).
+
+The loader decodes these fields with **explicit little-endian readers** (`rd_u16le` / `rd_u32le`) rather than `memcpy`-ing the struct into native integers, so files load identically on big-endian hosts.
 
 ## Weight Packing
 
@@ -53,14 +55,16 @@ header = struct.pack("<IHHIIII", MAGIC, VERSION, VOCAB, DIM, LAYERS,
 1. `magic == 0x48594452`
 2. `version == 1`
 3. `1 <= dim <= 64` and `1 <= vocab_size <= 1024`
-4. `weights_offset + weights_len <= file_size` — prevents out-of-bounds reads past the mmap.
-5. `layers * dim <= weights_len` — the inference step reads exactly `layers × dim` packed bytes, so the declared weight region must cover them. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
+4. `layers <= 4096` (`HYDRA_MAX_LAYERS`) — bounds the worst-case accumulator magnitude to `4096 × 254`, well below `INT32_MAX`. (Discovered via proof-of-concept: without this rule, `layers = 16909321` with `dim = 1` and all weights `+1` overflows a signed accumulator after ~16.9 MB of file.)
+5. `weights_offset >= 24` — the weight region may not overlap the header, otherwise header bytes would be executed as weights.
+6. `weights_offset + weights_len <= file_size` — prevents out-of-bounds reads past the mmap.
+7. `layers * dim <= weights_len` — the inference step reads exactly `layers × dim` packed bytes, so the declared weight region must cover them. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
 
-If any rule is violated, the mapping is torn down immediately and a negative error code is returned.
+If any rule is violated, the mapping is torn down immediately through a single cleanup path and a negative error code is returned (`-5` magic, `-7` version, `-8` dim/vocab, `-9` file bounds, `-10` weight region, `-11` layer cap, `-12` header overlap).
 
 ## Known Density Limitation (Honest Note)
 
-The format stores **2 weights per byte (4 bits/weight effective)** while the README's comparison table advertises the 2-bit/weight density that 4-weights-per-byte packing would achieve. The upper 4 bits are reserved. Moving to 4 weights per byte is planned for v2 and would halve file sizes; until then, the advertised "2 bits" figures describe the *target* density, not the current on-disk density.
+The format stores **2 weights per byte, i.e. 4 bits per weight on disk**; the upper 4 bits are reserved. Because the reserved code `11` is treated as `0`, a byte carries only `log₂(9) ≈ 3.17` bits of information — so the honest figure is "4 bits/weight allocated, ~3.17 bits of information". Moving to 4 weights per byte is planned for v2 and would reach the advertised 2 bits/weight; until then, the "2-bit" label describes the *target* density, not the current one.
 
 ## Planned Extensions (v2)
 
@@ -68,3 +72,4 @@ The format stores **2 weights per byte (4 bits/weight effective)** while the REA
 - Per-layer scale factors (γ from absmean quantization)
 - 4-weights-per-byte packing (true 2 bits/weight)
 - Checksum (xxHash) over the weight region
+- **Aggregated container** holding only `A[i] = Σ_l w1[l][i]` and `B[i] = Σ_l w2[l][i]`, signalled by a `HYDRA_AGGREGATE_V2` flag. The layer loop in v1 is algebraically redundant (see "Known Structural Redundancy" in `docs/ARCHITECTURE.md`), so v1 models compress losslessly into this form. v1 files keep loading unchanged.

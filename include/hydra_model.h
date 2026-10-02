@@ -9,6 +9,12 @@
 
 #define HYDRA_EMBED_DIM   64
 #define HYDRA_MAX_VOCAB   1024
+/* Layer cap: bounds the worst-case accumulator magnitude in step().
+ * 4096 layers * 254 (max |w1*token| + |w2*state| with vocab<=1024)
+ * = 1_040_384 < INT32_MAX, so the accumulation cannot overflow even
+ * without the int64_t accumulator. The cap is the actual fix; the
+ * int64_t accumulator is defence in depth. */
+#define HYDRA_MAX_LAYERS  4096
 
 /* Ternary alphabet: 00=0, 01=+1, 10=-1, 11=reserved */
 #define HYDRA_TERNARY_ZERO 0u

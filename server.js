@@ -119,16 +119,48 @@ const server = http.createServer(async (req, res) => {
   try {
     /* ---------- API ---------- */
     if (url.pathname === '/api/model' && req.method === 'GET') {
-      const p = safeModelPath(url.searchParams.get('path') || DEFAULT_MODEL) || DEFAULT_MODEL;
+      /* Wie /api/infer: ein explizit angefragter, aber unzulaessiger Pfad
+       * wird mit 400 quittiert statt auf das Defaultmodell zurueckzufallen. */
+      const reqPath = url.searchParams.get('path');
+      let p = DEFAULT_MODEL;
+      if (reqPath) {
+        p = safeModelPath(reqPath);
+        if (!p) return sendJSON(res, 400, { error: 'invalid model path' });
+      }
       const info = await loadModelInfo(p);
       return sendJSON(res, 200, info);
     }
 
     if (url.pathname === '/api/infer' && req.method === 'POST') {
-      const body = JSON.parse((await readBody(req)) || '{}');
-      const token = Math.max(0, Math.min(0xFFFF, parseInt(body.token, 10) || 0));
-      const steps = Math.max(1, Math.min(256, parseInt(body.steps, 10) || 16));
-      const p = safeModelPath(body.path || DEFAULT_MODEL) || DEFAULT_MODEL;
+      /* Bugfix (Audit): JSON.parse('null') liefert null, '[]' ein Array —
+       * body.token warf dann einen TypeError und antwortete mit HTTP 500
+       * samt internem Fehlertext. Body-Form jetzt explizit pruefen. */
+      let body;
+      try {
+        body = JSON.parse((await readBody(req)) || '{}');
+      } catch (e) {
+        return sendJSON(res, 400, { error: 'invalid JSON body' });
+      }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJSON(res, 400, { error: 'body must be a JSON object' });
+      }
+
+      const tokenRaw = body.token === undefined ? 0 : Number(body.token);
+      const stepsRaw = body.steps === undefined ? 16 : Number(body.steps);
+      if (!Number.isFinite(tokenRaw) || !Number.isFinite(stepsRaw)) {
+        return sendJSON(res, 400, { error: 'token and steps must be finite numbers' });
+      }
+      const token = Math.max(0, Math.min(0xFFFF, Math.trunc(tokenRaw)));
+      const steps = Math.max(1, Math.min(256, Math.trunc(stepsRaw)));
+
+      /* Ein explizit angefragter, aber unzulaessiger Modellpfad darf nicht
+       * stillschweigend auf das Defaultmodell zurueckfallen — der Client
+       * wuerde ein Ergebnis fuer ein voellig anderes Modell bekommen. */
+      let p = DEFAULT_MODEL;
+      if (body.path !== undefined && body.path !== null && body.path !== '') {
+        p = safeModelPath(body.path);
+        if (!p) return sendJSON(res, 400, { error: 'invalid model path' });
+      }
       const result = await runInference(p, token, steps);
       return sendJSON(res, 200, result);
     }
