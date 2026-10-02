@@ -132,9 +132,26 @@
     present and one sentence long, assert the frontmatter block is
     ASCII-only.
 
+31. **R31 — Every change goes through a pull request, in English.** No
+    work is pushed straight to `main`: create a branch, open a PR, let the
+    user merge (R14). All commit messages, PR titles, PR bodies, code
+    comments, documentation (`README.md`, `docs/`, `errors.md`,
+    `session.md`) and in-app user-facing strings are written **in
+    English**, so that every reader can understand them. Existing German
+    prose in older log messages may stay (it is engine stderr, not
+    documentation), but nothing new is written in German. If the user
+    writes to me in German, the *conversation* stays German, the
+    *artefacts* stay English.
+32. **R32 — Measure before claiming.** A performance statement, a speedup,
+    a memory claim or a device number must come from a command that was
+    actually executed, and the report must say on which machine it ran. If
+    the measurement cannot be taken in the current environment (no device,
+    no emulator), the report says "blocked, not measured" - never an
+    estimate dressed as a result.
+
 ## 8. When rules conflict
 
 Safety rules (R8, R14, R25, R27) > correctness rules (R5–R11) > session
-protocol (R1–R4) > convenience. If a user request conflicts with R17
+protocol (R1–R4) > documentation rules (R31) > convenience. If a user request conflicts with R17
 (merge approval) or R20 (no checkout), the user's standing rule wins
 unless they explicitly override it in the same session.

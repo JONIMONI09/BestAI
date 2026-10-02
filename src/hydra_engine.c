@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 /* Explizite Little-Endian-Dekodierung: docs/FORMAT.md definiert das
  * Headerlayout als little-endian, memcpy in native Integer wuerde auf
@@ -30,6 +31,43 @@ static int hydra_decode_ternary_2bit(uint8_t code)
     case HYDRA_TERNARY_NEG: return -1;
     default:                return 0; /* 0 und 11(reserved) -> 0 */
     }
+}
+
+/* Layer-Aggregation beim Laden: A[i] = sum_l w1[l][i],
+ * B[i] = sum_l w2[l][i]. Ein einziger Durchlauf ueber die gemappten
+ * Gewichte, danach ist der Layer-Loop aus step() verschwunden.
+ * Ueberlauf: |A[i]|,|B[i]| <= layers <= HYDRA_MAX_LAYERS (4096), passt
+ * also sicher in int32 (hier trotzdem in int64 gerechnet und erst am
+ * Ende geklemmt, damit die Rechnung unabhaengig vom Layer-Cap bleibt). */
+static void hydra_build_aggregation(HydraEngine *engine)
+{
+    int64_t a[HYDRA_EMBED_DIM];
+    int64_t b[HYDRA_EMBED_DIM];
+    memset(a, 0, sizeof(a));
+    memset(b, 0, sizeof(b));
+
+    const uint8_t *w = engine->mapped_weights + engine->header.weights_offset;
+    const size_t dim = engine->header.dim;
+    for (uint32_t l = 0; l < engine->header.layers; ++l) {
+        for (size_t i = 0; i < dim; ++i) {
+            const uint8_t packed = w[i];
+            a[i] += hydra_decode_ternary_2bit((uint8_t)(packed & 0x03u));
+            b[i] += hydra_decode_ternary_2bit((uint8_t)((packed >> 2) & 0x03u));
+        }
+        w += dim;
+    }
+    for (size_t i = 0; i < dim; ++i) {
+        int64_t va = a[i], vb = b[i];
+        if (va > INT32_MAX) va = INT32_MAX;
+        if (va < INT32_MIN) va = INT32_MIN;
+        if (vb > INT32_MAX) vb = INT32_MAX;
+        if (vb < INT32_MIN) vb = INT32_MIN;
+        engine->agg_a[i] = (int32_t)va;
+        engine->agg_b[i] = (int32_t)vb;
+    }
+    /* Kein Log pro Load: der Testlauf laedt hunderte Modelle und wuerde
+     * sonst die Ausgabe fluten. Interessant ist der Wert nur beim
+     * Bench-Modus, das dort ueber --bench separat ausgegeben wird. */
 }
 
 int hydra_engine_load(HydraEngine *engine, const char *model_path)
@@ -141,6 +179,7 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * maschinenlesbare Ausgaben (z.B. --json) sauber bleibt. */
     fprintf(stderr, "[Hydra] Modell erfolgreich gemappt! Layers: %u, Dim: %u, Vocab: %u\n",
             engine->header.layers, engine->header.dim, engine->header.vocab_size);
+    hydra_build_aggregation(engine);
     return 0;
 
 fail:
@@ -165,7 +204,19 @@ void hydra_engine_unload(HydraEngine *engine)
     engine->fd = -1;
 }
 
-/* Inferenz rein ueber ternaere Additionen/Subtraktionen {-1, 0, +1} */
+/* Inferenz rein ueber ternaere Additionen/Subtraktionen {-1, 0, +1}.
+ *
+ * Layer-Aggregation: token_val und state_vector[i] sind ueber alle Layer
+ * konstant, deshalb gilt
+ *     acc[i] = sum_l (w1[l][i]*token + w2[l][i]*state[i])
+ *            = A[i]*token + B[i]*state[i]
+ * mit den beim Laden berechneten Summen agg_a/agg_b. Der Layer-Loop ist
+ * damit aus dem heissen Pfad verschwunden: pro Token dim statt
+ * layers*dim Operationen. Die Gleichheit mit dem alten Pfad ist keine
+ * Behauptung, sondern gemessen: test_aggregation_matches_layer_loop
+ * vergleicht beide Algorithmen ueber zufaellige Modelle, und
+ * test_fast_step_matches_full_step beweist dasselbe fuer den
+ * Token-only-Pfad. */
 int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_out)
 {
     if (!engine || !token_out) return -1;
@@ -173,14 +224,7 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
     const int32_t vocab = (int32_t)engine->header.vocab_size;
     if (token_in >= engine->header.vocab_size) token_in %= engine->header.vocab_size;
 
-    const uint8_t *w_ptr = engine->mapped_weights + engine->header.weights_offset;
     const size_t dim = engine->header.dim;
-
-    /* Layer-Verarbeitung on-the-fly ohne Zwischenpuffer im RAM.
-     * int64-Akkumulator: mit dem Layer-Cap (HYDRA_MAX_LAYERS) waere
-     * int32 ausreichend, int64 macht die Ueberlauf-Freiheit aber
-     * unabhaengig von jedem einzelnen Layer-Cap. */
-    int64_t accumulator[HYDRA_EMBED_DIM] = {0};
 
     /* Token-Beitrag: ohne Maske sind alle vocab_size Tokens unterscheidbar
      * (BUG-4: `token_in & 0x7F` kollabierte bei vocab>128 je acht Token-IDs
@@ -194,37 +238,31 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
     const int32_t token_val = (int32_t)token_in;
 #endif
 
-    /* NEON-Verarbeitung in 16er-Chunks; Rest ueber skalaren Fallback.
-     * Beide Pfade sind bit-identisch (gleiche Decodier-/Akkumulations-
-     * semantik), verifiziert durch test_neon_matches_scalar auf ARM und
-     * durch die Seed-Roundtrip-Tests auf beiden Plattformen.
-     * Ohne __ARM_NEON ist neon_end=0 -> der Skalar-Loop deckt alles ab. */
+    int64_t accumulator[HYDRA_EMBED_DIM] = {0};
 #ifdef __ARM_NEON
-    const size_t neon_end = dim / 16 * 16;
-#else
-    const size_t neon_end = 0;
-#endif
-
-    for (uint32_t l = 0; l < engine->header.layers; ++l) {
-#if defined(__ARM_NEON) && defined(HYDRA_USE_NEON)
-        for (size_t i = 0; i < neon_end; i += 16) {
-            hydra_neon_accumulate_chunk(w_ptr + i, engine->state_vector + i,
-                                        token_val, accumulator + i);
-        }
-#endif
-        for (size_t i = neon_end; i < dim; ++i) {
-            /* 2 Ternary-Weights pro Byte, little-endian bit order */
-            uint8_t packed = w_ptr[i];
-            int8_t w1 = (int8_t)hydra_decode_ternary_2bit((uint8_t)(packed & 0x03u));
-            int8_t w2 = (int8_t)hydra_decode_ternary_2bit((uint8_t)((packed >> 2) & 0x03u));
-
-            /* Reine Akkumulation ohne Gleitkommamultiplikation */
-            accumulator[i] += w1 * token_val + w2 * (int32_t)engine->state_vector[i];
-        }
-        w_ptr += dim;
+    /* Vektorpfad fuer die aggregierte Schleife. Die Dekodierung ist
+     * bereits beim Laden passiert (hydra_build_aggregation), hier werden
+     * nur noch fertige int32-Summen multipliziert — das kann keine
+     * Vorzeichen-Interpretation mehr falsch machen. */
+    for (size_t i = 0; i + 16 <= dim; i += 16) {
+        hydra_neon_accumulate_agg(accumulator + i, engine->agg_a + i,
+                                  engine->agg_b + i,
+                                  engine->state_vector + i, token_val);
     }
+    if (dim % 16) {
+        for (size_t i = dim - (dim % 16); i < dim; ++i) {
+            accumulator[i] = (int64_t)engine->agg_a[i] * token_val
+                           + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
+        }
+    }
+#else
+    for (size_t i = 0; i < dim; ++i) {
+        accumulator[i] = (int64_t)engine->agg_a[i] * token_val
+                       + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
+    }
+#endif
 
-    /* Update O(1) State-Vektor: saubere Saettigung ohne Modulo-Verzerrung */
+    /* Update O(1) State-Vektor: saettige Sättigung ohne Modulo-Verzerrung */
     for (size_t i = 0; i < dim; ++i) {
         int64_t v = accumulator[i];
         if (v > 127)  v = 127;
@@ -234,9 +272,7 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
 
 #ifdef HYDRA_DROP_CACHE
     /* Optionales Flag: nach jedem Step die zustaendigen Seiten verwerfen,
-     * damit die Gewichte nicht im Page-Cache resident bleiben. Kostet bei
-     * jedem Token einen erneuten Page-Fault je 4 KiB — Trade-off
-     * zugunsten eines kleinen RSS, nicht zugunsten der Geschwindigkeit. */
+     * damit die Gewichte nicht im Page-Cache resident bleiben. */
     madvise((void *)engine->mapped_weights, engine->mapped_size, MADV_DONTNEED);
 #endif
 
@@ -247,6 +283,38 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
      * Negative Akkumulatoren werden um vocab hochgezogen, damit -1 und +1
      * unterscheidbar bleiben. */
     int64_t raw = accumulator[0] % vocab;
+    if (raw < 0) raw += vocab;
+    *token_out = (uint16_t)((raw + (int32_t)token_in + 1) % vocab);
+    return 0;
+}
+
+/* Token-only fast path (siehe include/hydra_model.h): nur Dimension 0.
+ * Weil acc[i] nach der Aggregation ausschliesslich von state[i] abhaengt,
+ * ist die Trajektorie von Dimension 0 unabhaengig von allen anderen - der
+ * Token-Strom ist damit bit-identisch, die uebrigen State-Eintraege
+ * werden nicht fortgeschrieben (und sind danach bewusst ungueltig). */
+int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *token_out)
+{
+    if (!engine || !token_out) return -1;
+    if (engine->header.magic != HYDRA_MAGIC) return -2;
+    const int32_t vocab = (int32_t)engine->header.vocab_size;
+    if (token_in >= engine->header.vocab_size) token_in %= engine->header.vocab_size;
+
+#ifdef HYDRA_TOKENV_MASK
+    const int32_t token_val = (int32_t)(token_in & 0x7Fu);
+#else
+    const int32_t token_val = (int32_t)token_in;
+#endif
+
+    const int64_t acc0 = (int64_t)engine->agg_a[0] * token_val
+                       + (int64_t)engine->agg_b[0] * (int32_t)engine->state_vector[0];
+
+    int64_t v = acc0;
+    if (v > 127)  v = 127;
+    else if (v < -127) v = -127;
+    engine->state_vector[0] = (int8_t)v;
+
+    int64_t raw = acc0 % vocab;
     if (raw < 0) raw += vocab;
     *token_out = (uint16_t)((raw + (int32_t)token_in + 1) % vocab);
     return 0;

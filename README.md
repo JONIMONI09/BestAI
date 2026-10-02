@@ -149,6 +149,47 @@ Everything shown comes from the engine. There is no simulated output anywhere in
 
 **How the trainer works.** The engine's update is `acc[i] = Σ (w1·token + w2·state[i])` with the next token decoded from `acc[0]`. Only column 0 influences the decoder, so the trainer searches ternary moves there (`0/±1`), accepts a move only when replaying the **complete** sample afterwards yields more correct steps, and returns the best snapshot over all epochs. Accuracy therefore never drops below the seed weights. The engine has a small capacity by design — the console reports the real number instead of hiding it.
 
+## Performance
+
+The inference step is now two multiply-adds per dimension, not two per
+(layer x dimension):
+
+```
+python3 tools/make_dummy_model.py models/demo.hydra
+./hydra-run models/demo.hydra 0 --bench 50000
+{"mode":"bench","engine":"cpu","dim":64,"layers":4,"ns_per_token_full":135.44,
+ "ns_per_token_fast":19.22,"speedup":7.05,"tokens_equal":true}
+```
+
+* **Layer aggregation** — `A[i] = sum_l w1[l][i]` and `B[i] = sum_l w2[l][i]`
+  are computed once at load time, because the token and the state vector
+  are constant across layers. The layer loop left the hot path.
+* **`--fast` (token-only)** — only dimension 0 is computed. After
+  aggregation the dimensions are independent, so the token stream is
+  **bit-identical** while the arithmetic drops to a single multiply-add.
+  The remaining state entries are intentionally left stale.
+
+Both are covered by equivalence tests against a reference implementation
+that lives in the test file, plus negative controls. On the Android app the
+**Benchmark** button runs the same three-path measurement across JNI
+(`HydraBridge.benchmark()`). Whether a GPU would beat any of this is
+analysed — with a measurement — in [`docs/gpu-feasibility.md`](docs/gpu-feasibility.md).
+
+## Error reporting
+
+Every layer has a crash handler, and every report can be copied as plain
+text:
+
+| Layer | What is caught | Where it shows up |
+|---|---|---|
+| Web console | `window.onerror`, unhandled promise rejections, failed engine/training requests | a dialog with a **Copy details** button, plus an "Errors" button in the top bar that lists everything recorded this session |
+| Console server | uncaught exceptions, unhandled rejections, failed requests | `GET /api/errors`, polled by the console every second and shown in the same dialog |
+| Android app | every uncaught exception on every thread | `last-crash.txt` in private storage, and `CrashActivity` with a **Copy report** button |
+
+The clipboard path falls back from the async Clipboard API to a hidden
+textarea, because the console is often opened over plain HTTP on a LAN
+address where `navigator.clipboard` does not exist.
+
 ## Quality Gates
 
 Every push and pull request runs the following. Each gate was verified locally **and** proven to fail on a deliberately reverted fix before being adopted — a linter that cannot fail is worthless.
@@ -165,6 +206,7 @@ Every push and pull request runs the following. Each gate was verified locally *
 | NEON | AArch64 build under qemu + scalar/NEON parity check | platform-divergent SIMD |
 | Web | ESLint 10 (`server.js`, `public/app.js`) | undefined vars, `eval`, sloppy globals |
 | Android | Android Lint (must report **no issues**) | missing icon, hardcoded strings, API misuse, orientation locks |
+| Android | APK permission gate (`aapt dump permissions`) | the app opens files through SAF, which needs **no** permission — any dangerous permission must be a decision, not a surprise |
 | Android | NDK clang build (stricter than host gcc) | JNI/Android header issues |
 | Security | CodeQL (`c-cpp`, `javascript-typescript`, `security-extended`) | taint flows from HTTP input into `open()`/`execFile` |
 | Security | Semgrep | pattern-based security rules |

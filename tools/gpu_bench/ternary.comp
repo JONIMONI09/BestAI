@@ -1,0 +1,54 @@
+#version 310 es
+/* Hydra-Stone GPU feasibility benchmark — the kernel.
+ *
+ * This is deliberately the SAME arithmetic as the CPU reference in
+ * gpu_bench.c and as hydra_engine_step() after layer aggregation:
+ *
+ *   acc[i] = A[i] * token + B[i] * state[i]
+ *   state[i] = clamp(acc[i], -127, 127)
+ *
+ * A[] and B[] are the layer sums already computed at load time
+ * (hydra_build_aggregation). The ternary decoding is NOT repeated here on
+ * purpose: it happens once, not per token, and repeating it per token would
+ * make the GPU look better than the engine it is supposed to replace.
+ *
+ * Compile with:
+ *   glslangValidator -V --target-env opengl ternary.comp -o ternary.comp.spv
+ */
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer Agg {
+    int A[];
+    int B[];
+};
+
+layout(std430, binding = 1) buffer StateBuf {
+    int state[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutBuf {
+    int acc[];
+};
+
+layout(std140, binding = 0) uniform Params {
+    int token;
+    int dim;
+    int offsetB;
+    int pad;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(params.dim)) {
+        return;
+    }
+    /* A[] and B[] share one buffer; B starts at `dim`. */
+    int a = (offsetB == 0) ? A[i] : A[i + uint(offsetB)];
+    int b = (offsetB == 0) ? B[i] : B[i + uint(offsetB)];
+
+    int v = a * params.token + b * state[i];
+    /* Same saturation as the C engine. */
+    state[i] = clamp(v, -127, 127);
+    acc[i] = v;
+}

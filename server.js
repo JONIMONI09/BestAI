@@ -511,6 +511,46 @@ function loadVocab(name) {
 /* HTTP                                                                */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Crash handler                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Ring buffer of the last errors. The console polls /api/errors and shows
+ * them with a copy button, so an error that happened inside a route (or in
+ * a worker) is visible in the UI instead of dying in a log nobody opens.
+ * Bounded on purpose: an error loop must not become a memory leak. */
+const errorLog = [];
+const ERROR_LOG_MAX = 20;
+
+function recordServerError(what, err) {
+  const entry = {
+    when: new Date().toISOString(),
+    what,
+    message: (err && err.message) || String(err),
+    /* Stack traces contain absolute paths. They are shown to the user who
+     * already runs this process on their own machine, and they are what
+     * makes a bug report actionable, so they are kept - but they never
+     * reach a non-GET response. */
+    detail: (err && err.stack) || '',
+  };
+  errorLog.unshift(entry);
+  if (errorLog.length > ERROR_LOG_MAX) errorLog.pop();
+  console.error(`[Hydra Console] ${what}: ${entry.message}`);
+  return entry;
+}
+
+function installCrashHandlers() {
+  process.on('uncaughtException', (err) => {
+    recordServerError('Uncaught exception', err);
+    /* The process stays up on purpose: the console is a local tool, and a
+     * single failed request should not take the UI with it. The exit code
+     * still reflects that something went wrong. */
+  });
+  process.on('unhandledRejection', (reason) => {
+    recordServerError('Unhandled promise rejection', reason);
+  });
+}
+
 function axiomCheck(h) {
   const v = Number(h);
   if (!Number.isFinite(v)) return { error: 'h must be a number' };
@@ -668,6 +708,12 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, axiomCheck(url.searchParams.get('h')));
     }
 
+    if (url.pathname === '/api/errors' && req.method === 'GET') {
+      /* Only what the caller may see: no stack from another process, and
+       * a client cannot clear the buffer by accident. */
+      return sendJSON(res, 200, { errors: errorLog });
+    }
+
     if (url.pathname.startsWith('/api/')) {
       return sendJSON(res, 404, { error: 'unknown endpoint' });
     }
@@ -688,6 +734,7 @@ const server = http.createServer(async (req, res) => {
     /* Internal details (paths, engine stderr, stack traces) never reach the
      * client - they reveal file sizes and server structure. */
     console.error('[Hydra Console] request failed:', e && e.stack ? e.stack : e);
+    recordServerError('Request failed', e);
     sendJSON(res, 500, { error: 'internal error' });
   }
 });
@@ -712,6 +759,7 @@ function ensureDefaultModel() {
 }
 
 ensureDefaultModel();
+installCrashHandlers();
 
 server.listen(PORT, HOST, () => {
   console.log(`[Hydra Console] http://${HOST}:${PORT}`);

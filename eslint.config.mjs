@@ -94,6 +94,8 @@ export default [
         requestAnimationFrame: 'readonly',
         performance: 'readonly',
         AbortController: 'readonly',
+        navigator: 'readonly',
+        location: 'readonly',
       },
     },
     rules: {
