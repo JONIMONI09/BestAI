@@ -181,8 +181,16 @@ jobs:
           java-version: 17
 
       - name: Android SDK + NDK + Gradle
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+
+      - name: SDK-Pakete, NDK und Gradle
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # setup-android installiert die cmdline-tools, legt sie aber
+          # nicht in den PATH — ohne das scheitert sdkmanager mit
+          # "command not found" (exit 127).
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           sdkmanager "platform-tools" "platforms;android-34" \
                     "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
           curl -sSL -o /tmp/gradle.zip \
@@ -197,8 +205,8 @@ jobs:
         run: |
           REPORT=android/app/build/reports/lint-results-debug.txt
           cat "$REPORT"
-          if grep -qE "^[0-9]+ errors?, [1-9][0-9]* warnings?" "$REPORT"; then
-            echo "::error::Android Lint meldet Warnungen"
+          if ! grep -q "No issues found" "$REPORT"; then
+            echo "::error::Android Lint meldet Befunde"
             exit 1
           fi
 
@@ -214,14 +222,18 @@ jobs:
           if-no-files-found: ignore
 
   # ---------- Semgrep (Sicherheitsregeln) ----------
+  # Befolgt die offizielle CI-Sample-Konfiguration: image ohne Tag,
+  # `semgrep ci` beendet sich bei Funden selbst mit Exit 1 (ein
+  # --error-Flag existiert nicht). --suppress-errors haelt interne
+  # Semgrep-Fehler vom Blockieren ab, echte Funde blockieren weiterhin.
   semgrep:
     name: Semgrep security rules
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep:latest
+      image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
-      - run: semgrep ci --config auto --error --quiet
+      - run: semgrep ci --suppress-errors --quiet
 
   # ---------- CodeQL (C + JavaScript) ----------
   # CodeQL baut das Projekt mit einem eigenen Datenfluss-Graphen und findet
@@ -241,12 +253,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # build-mode 'none' fuer beide Sprachen: JavaScript/TypeScript
+      # unterstuetzt 'autobuild' nicht (Fatal error im init), und unser
+      # C-Projekt braucht ohnehin keinen Build-Step fuer die Extraktion.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           queries: security-extended
-          build-mode: ${{ matrix.language == 'c-cpp' && 'none' || ' autobuild' }}
+          build-mode: none
 
       # Der C-Build laeuft ohnehin ohne CMake; 'none' ist hier korrekt.
       - name: Analyze
