@@ -573,6 +573,23 @@
   ausgefuehrt: mit entfernter `publish`-Ausgabe meldet der Test
   FEHLGESCHLAGEN (exit 1) — das Gate kann also tatsaechlich rot werden.
 
+## 2026-10-02 — Workflow-Dispatch per API nicht moeglich (403, App-Rechte)
+
+- **Symptom:** `gh workflow run release.yml --ref <branch>` antwortet mit
+  `HTTP 403: Resource not accessible by integration`.
+- **Cause:** Die verwaltete GitHub-App-Credential darf Workflows ausloesen
+  lesen, aber kein `workflow_dispatch`-Event erzeugen — dafuer fehlt die
+  Actions-Schreibberechtigung der App. Das ist keine Eigenschaft des
+  Repositorys und laesst sich im Workflow nicht beheben.
+- **Fix:** Von Hand im Actions-Tab *Run workflow* starten — das nutzt die
+  Berechtigung des angemeldeten Users. Fuer den Fall, dass die App den
+  Dispatch kuenftig selbst testen soll, muss ihre Berechtigung auf
+  `Actions: write` erhoeht werden.
+- **Prevention:** CI-Artefakte, die eine App ohne Schreibrecht auf
+  Actions nicht erzeugen kann (Dispatch, Re-Run, Release-Publish),
+  getrennt verifizieren: Logik lokal, Trigger manuell, Publish-Pfad
+  ausschliesslich nach ausdruecklicher Freigabe.
+
 ## 2026-10-02 — Skills-UI meldet "Not loaded" trotz korrektem Frontmatter
 
 - **Symptom:** Die Skills-UI zeigt alle drei Skills als *Not loaded*

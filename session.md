@@ -146,7 +146,12 @@ following the CVE cross-check and linter audit from the previous pass.
       Dry-Run, Unsinn-Tag, publish ohne Tag) — **Negativkontrolle
       ausgefuehrt**, Test schlaegt bei kaputter Datei fehl (exit 1)
 - [x] Neuer Job `release-config` in `lint.yml`: YAML-Validierung aller
-      Workflows + Versionslogik-Test
+      Workflows + Versionslogik-Test — auf PR #14 **gruen** (14/14 Checks)
+- [x] PR #14 eroeffnet; End-to-End-Dispatch versucht, aber von der
+      Umgebung blockiert: `gh workflow run` → **HTTP 403**, die
+      verwaltete GitHub-App darf kein `workflow_dispatch`-Event erzeugen.
+      Der manuelle Weg (Actions-Tab → Run workflow) nutzt die
+      User-Berechtigung und ist der einzige verbleibende Test-Schritt
 - [ ] Merge des PRs — **Freigabe des Users noetig** (R14)
 
 ## Status / Notes
