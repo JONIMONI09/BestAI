@@ -126,28 +126,30 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # Gleiche Reihenfolge wie in lint.yml: cmdline-tools explizit
-      # installieren, weil android-actions/setup-android das Paket "tools"
-      # mitinstalliert, das es nicht mehr gibt (exit 1).
-      - name: Android cmdline-tools
+      # Gleiche Reihenfolge wie in lint.yml: eigenes SDK-Root, cmdline-tools
+      # explizit installieren (android-actions/setup-android scheitert am
+      # nicht mehr existierenden Paket "tools") und ausschliesslich die
+      # gepinnten Pakete laden, damit der Release-Build exakt der lokal
+      # verifizierten Toolchain entspricht.
+      - name: Android SDK isoliert aufsetzen (nur API 34)
         run: |
           set -e
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          cd /tmp
+          SDK="$RUNNER_TEMP/android-sdk"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          mkdir -p "$SDK/cmdline-tools"
+          cd "$RUNNER_TEMP"
           curl -sSLO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          rm -rf /tmp/cmdline && unzip -q commandlinetools-linux-11076708_latest.zip -d /tmp/cmdline
-          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
-          mv /tmp/cmdline/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-
-      - name: SDK-Pakete, NDK und Gradle
-        run: |
+          rm -rf "$RUNNER_TEMP/cmdline"
+          unzip -q commandlinetools-linux-11076708_latest.zip -d "$RUNNER_TEMP/cmdline"
+          mv "$RUNNER_TEMP/cmdline/cmdline-tools" "$SDK/cmdline-tools/latest"
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" \
                     "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
-          curl -sSL -o /tmp/gradle.zip \
+          curl -sSL -o gradle.zip \
             https://services.gradle.org/distributions/gradle-8.7-bin.zip
-          unzip -q /tmp/gradle.zip -d /opt
+          unzip -q gradle.zip -d /opt
 
       - name: Build APK
         working-directory: android
@@ -178,14 +180,19 @@ jobs:
         run: |
           APK="dist/hydra-stone-${{ needs.version.outputs.version }}-android-arm64v8a-armeabiv7a-x86_64.apk"
           test -f "$APK"
-          /opt/android-sdk/build-tools/34.0.0/apksigner verify --print-certs "$APK"
-          /opt/android-sdk/build-tools/34.0.0/aapt list "$APK" > apk-contents.txt
+          # Pfade relativ zum isolierten SDK-Root (ANDROID_HOME wird im
+          # SDK-Schritt via GITHUB_ENV gesetzt) — kein hart kodiertes
+          # /opt/android-sdk, das auf dem Runner nicht existiert.
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          test -x "$BT/apksigner" || { echo "::error::apksigner fehlt"; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK"
+          "$BT/aapt" list "$APK" > apk-contents.txt
           for abi in arm64-v8a armeabi-v7a x86_64; do
             grep -q "lib/$abi/libhydra.so" apk-contents.txt || {
               echo "::error::libhydra.so fehlt fuer $abi"; exit 1; }
           done
           grep -q 'assets/demo.hydra' apk-contents.txt
-          /opt/android-sdk/build-tools/34.0.0/aapt dump badging "$APK" \
+          "$BT/aapt" dump badging "$APK" \
             | grep -E "^package:|^sdkVersion:|^application-label:"
       - name: Android Lint muss fehlerfrei sein
         working-directory: android
