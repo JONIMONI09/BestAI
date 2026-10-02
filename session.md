@@ -172,8 +172,35 @@ documentation base is in one language.
       test expectation in the skill file matches
 - [x] Verification: `make test` → `=== 49 Tests, 0 failures ===`; final
       grep over all tracked `.md` files finds no German left
-- [ ] Final grep for German leftovers in `.md` files
-- [ ] Commit + PR — **no merge**
+- [x] Final grep for German leftovers in `.md` files → none
+- [x] PR #16 merged by the user (merge commit `1cc31d7`), main verified
+      green: CI 4/4 and Lint & Security 9/9
+
+## Round 2026-10-02 (build everything on main, verify the JNI bridge)
+
+- [x] **Analysis — why main never built the APK:** `release.yml` only ran
+      on `v*.*.*` tags or a manual dispatch, and `ci.yml` contained no
+      Android job at all. So the app was never built on a normal push,
+      and no release appeared because no tag existed.
+- [x] New job `android-apk` in `ci.yml`: builds `assembleDebug` +
+      `assembleRelease` on every push and pull request, verifies the
+      signature with `apksigner`, checks all three ABIs and the model
+      asset with `aapt`, and uploads the APK as a workflow artifact
+- [x] New job `jni-signatures` in `ci.yml`: `javac -h` derives the JNI
+      header from `HydraBridge.kt`; `tools/jni_signature_check.sh`
+      proves every native method exists in `hydra_jni.c` with a
+      matching parameter list. **Negative control executed** — a bridge
+      declaring one unimplemented method makes it exit 1
+- [x] Reusable composite action `.github/actions/setup-android` so the
+      SDK bootstrap exists once instead of per workflow
+- [x] CI translated to English: comments, step names, `::error::`/
+      `::notice::` messages and the release notes body
+- [x] Verified locally: `assembleDebug` + `assembleRelease` build,
+      `apksigner verify` passes (debug key fallback), `libhydra.so` for
+      arm64-v8a/armeabi-v7a/x86_64 and `assets/demo.hydra` present
+- [ ] Merge the PR — **user approval needed** (R14)
+- [ ] Tag `v1.0.0` on `main` afterwards so the release workflow creates
+      the first GitHub Release
 
 ## Status / Notes
 
