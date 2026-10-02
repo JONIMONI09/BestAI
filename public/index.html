@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,83 +8,150 @@
 </head>
 <body>
 <div class="app">
-  <!-- Sidebar -->
-  <aside class="sidebar">
+
+  <!-- ── Top bar ─────────────────────────────────────────────── -->
+  <header class="topbar">
     <div class="brand">
-      <div class="brand-mark">⬢</div>
+      <span class="brand-mark" aria-hidden="true">⬢</span>
       <div>
         <h1>Hydra-Stone</h1>
-        <p class="brand-sub">Ternäre O(1)-Inferenz</p>
+        <p>Ternary inference console</p>
       </div>
     </div>
 
-    <section class="panel">
-      <h2>Modell</h2>
-      <div id="model-info" class="model-info">
-        <div class="row"><span>Pfad</span><code id="m-path">–</code></div>
-        <div class="row"><span>Dimension</span><code id="m-dim">–</code></div>
-        <div class="row"><span>Vocab</span><code id="m-vocab">–</code></div>
-        <div class="row"><span>Layer</span><code id="m-layers">–</code></div>
-      </div>
-    </section>
+    <label class="model-picker">
+      <span>Model</span>
+      <select id="model-select" aria-label="Select model"></select>
+    </label>
 
-    <section class="panel">
-      <h2>Inferenz-Parameter</h2>
-      <label class="field">
-        <span>Start-Token</span>
-        <input id="token" type="number" min="0" value="42">
-      </label>
-      <label class="field">
-        <span>Steps</span>
-        <input id="steps" type="number" min="1" max="256" value="64">
-      </label>
-      <button id="run" class="btn primary">▶ Inferenz starten</button>
-    </section>
+    <div class="chips" id="model-chips"></div>
 
-    <section class="panel">
-      <h2>Koexistenz-Axiom</h2>
-      <label class="field">
-        <span>Humanity-Faktor H(s)</span>
-        <input id="humanity" type="range" min="-0.5" max="1" step="0.05" value="1">
-      </label>
-      <div class="axiom-readout">
-        <span id="h-value">1.00</span>
-        <span id="h-verdict" class="verdict allow">ERLAUBT</span>
-      </div>
-    </section>
-
-    <footer class="sidebar-foot">
-      <span>2-Bit ternär · mmap · zero-heap</span>
-    </footer>
-  </aside>
-
-  <!-- Hauptbereich -->
-  <main class="main">
-    <header class="topbar">
-      <h2>Konsole</h2>
-      <div class="stats">
-        <div class="stat"><span id="s-elapsed">–</span><label>ms gesamt</label></div>
-        <div class="stat"><span id="s-per-token">–</span><label>ms / Token</label></div>
-        <div class="stat"><span id="s-throughput">–</span><label>Token/s</label></div>
-      </div>
-    </header>
-
-    <div class="viz-row">
-      <section class="card viz-card">
-        <h3>Token-Stream</h3>
-        <canvas id="token-canvas" width="900" height="220"></canvas>
-      </section>
-      <section class="card state-card">
-        <h3>O(1)-State-Vektor</h3>
-        <div id="state-grid" class="state-grid"></div>
-      </section>
+    <div class="topbar-actions">
+      <span class="status" id="status" data-state="idle">connecting…</span>
+      <button id="toggle-settings" class="btn ghost" aria-expanded="false">Settings</button>
     </div>
+  </header>
 
-    <section class="card log-card">
-      <h3>Engine-Output</h3>
-      <pre id="log" class="log">[Hydra] Bereit. Modell laden und Inferenz starten.</pre>
+  <!-- ── Workspace ───────────────────────────────────────────── -->
+  <main class="workspace">
+
+    <!-- Chat -->
+    <section class="panel chat" aria-label="Chat">
+      <div class="panel-head">
+        <h2>Chat</h2>
+        <div class="seg" role="group" aria-label="Reply format">
+          <button class="seg-btn is-active" id="view-words">Words</button>
+          <button class="seg-btn" id="view-tokens">Tokens</button>
+        </div>
+      </div>
+
+      <div class="messages" id="messages" role="log" aria-live="polite"></div>
+
+      <form class="composer" id="composer">
+        <textarea id="input" rows="2" placeholder="Type text — words are mapped to token IDs via the vocabulary. Empty input uses the start token from Settings."></textarea>
+        <div class="composer-actions">
+          <span class="hint" id="input-hint"></span>
+          <button class="btn primary" id="send" type="submit">Send</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Live output -->
+    <section class="panel output" aria-label="Engine output">
+      <div class="panel-head">
+        <h2>Engine output</h2>
+        <div class="metrics">
+          <span><b id="m-total">–</b> ms</span>
+          <span><b id="m-per-token">–</b> ms/token</span>
+          <span><b id="m-tps">–</b> tok/s</span>
+        </div>
+      </div>
+
+      <div class="chart-wrap">
+        <canvas id="token-chart" height="180" aria-label="Token stream"></canvas>
+      </div>
+
+      <h3 class="mini-head">State vector (O(1), saturated to ±127)</h3>
+      <div class="state-strip" id="state-strip"></div>
+
+      <h3 class="mini-head">Raw engine log</h3>
+      <pre class="log" id="log">waiting for the first run…</pre>
+    </section>
+
+    <!-- Training -->
+    <section class="panel train" aria-label="Training">
+      <div class="panel-head">
+        <h2>Train a model</h2>
+        <span class="badge" id="train-badge">no model trained yet</span>
+      </div>
+      <p class="explain">
+        One sample per line. <code>1 2 3 -&gt; 2 3 4</code> gives explicit input and
+        target tokens; <code>1 2 3</code> trains the next-token shift. Words are
+        resolved through the vocabulary when one is stored for this model.
+        Training writes a real <code>.hydra</code> file and is verified against the
+        compiled C engine before it is reported as successful.
+      </p>
+
+      <div class="train-grid">
+        <label class="field"><span>Name</span><input id="train-name" value="chat-model"></label>
+        <label class="field"><span>Vocab</span><input id="train-vocab" type="number" min="2" max="1024" value="64"></label>
+        <label class="field"><span>Dim</span><input id="train-dim" type="number" min="2" max="64" value="16"></label>
+        <label class="field"><span>Layers</span><input id="train-layers" type="number" min="1" max="4096" value="12"></label>
+        <label class="field"><span>Epochs</span><input id="train-epochs" type="number" min="1" max="50" value="20"></label>
+      </div>
+
+      <textarea id="train-corpus" rows="7" spellcheck="false">3 3 3 3 -&gt; 7 7 7 7
+1 2 3 4 -&gt; 9 8 7 6
+5 5 5 -&gt; 1 1 1</textarea>
+
+      <div class="train-actions">
+        <button class="btn primary" id="train-run">Train</button>
+        <span class="hint" id="train-hint"></span>
+      </div>
+
+      <div class="train-result" id="train-result" hidden></div>
     </section>
   </main>
+
+  <!-- ── Settings drawer ──────────────────────────────────────── -->
+  <aside class="settings" id="settings" aria-label="Settings" aria-hidden="true">
+    <div class="panel-head">
+      <h2>Settings</h2>
+      <button class="btn ghost" id="settings-close" aria-label="Close settings">✕</button>
+    </div>
+
+    <label class="field">
+      <span>Start token (used when the message is empty)</span>
+      <input id="opt-token" type="number" min="0" max="65535" value="42">
+    </label>
+    <label class="field">
+      <span>Steps per message</span>
+      <input id="opt-steps" type="number" min="1" max="256" value="16">
+    </label>
+
+    <h3 class="mini-head">Coexistence axiom</h3>
+    <label class="field">
+      <span>Humanity factor H(s)</span>
+      <input id="opt-humanity" type="range" min="-0.5" max="1" step="0.05" value="1">
+    </label>
+    <div class="axiom">
+      <span id="axiom-value">1.00</span>
+      <span class="verdict allow" id="axiom-verdict">ALLOWED</span>
+    </div>
+
+    <h3 class="mini-head">Vocabulary (token ↔ word)</h3>
+    <p class="explain">Stored per model. Used by the chat and by training.</p>
+    <textarea id="vocab-text" rows="8" spellcheck="false" placeholder="hello 1&#10;world 2"></textarea>
+    <div class="train-actions">
+      <button class="btn" id="vocab-save">Save vocabulary</button>
+      <span class="hint" id="vocab-hint"></span>
+    </div>
+
+    <h3 class="mini-head">Model</h3>
+    <div class="kv" id="model-detail"></div>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
 </div>
 <script src="app.js"></script>
 </body>

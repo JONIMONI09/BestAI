@@ -48,6 +48,31 @@ export default [
     },
   },
   {
+    // Node scripts (trainer + its test) share the server's environment.
+    files: ['tools/*.js'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'commonjs',
+      globals: {
+        require: 'readonly',
+        module: 'writable',
+        process: 'readonly',
+        console: 'readonly',
+        Buffer: 'readonly',
+        __dirname: 'readonly',
+      },
+    },
+    rules: {
+      'no-eval': 'error',
+      'no-implied-eval': 'error',
+      'no-new-func': 'error',
+      'no-var': 'error',
+      'prefer-const': 'error',
+      eqeqeq: ['error', 'smart'],
+      'no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+    },
+  },
+  {
     files: ['public/app.js'],
     languageOptions: {
       ecmaVersion: 2022,
@@ -61,6 +86,7 @@ export default [
         setInterval: 'readonly',
         clearInterval: 'readonly',
         requestAnimationFrame: 'readonly',
+        performance: 'readonly',
       },
     },
     rules: {

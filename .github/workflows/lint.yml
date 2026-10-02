@@ -167,6 +167,16 @@ jobs:
         run: |
           node --check server.js
           node --check public/app.js
+          node --check tools/hydra_train.js
+          node --check tools/console_train_test.js
+
+      # The console can TRAIN a model. That is only believable if the
+      # compiled C engine is shown to reproduce the trained token stream,
+      # so this runs the trainer and the real binary against each other.
+      - name: Console trainer is verified against the C engine
+        run: |
+          make -s all
+          node tools/console_train_test.js
 
   # ---------- Release-Konfiguration ----------
   release-config:

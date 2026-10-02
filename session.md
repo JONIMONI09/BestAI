@@ -243,3 +243,25 @@ documentation base is in one language.
   tab on `main` (empty tag = dry run) exercises the release chain
   end to end. The automated credential cannot dispatch workflows
   (HTTP 403, no `actions: write`).
+## Round 2026-10-02 (console rebuild: settings, chat, real training)
+
+- [x] Analysis: the old console was a three-input demo page in German with
+      no model handling, no settings and no training; `models/demo.hydra`
+      was not even tracked, so a clean checkout had no model at all
+- [x] `tools/hydra_train.js`: real trainer, mirrors `hydra_engine_step`
+      line by line; hill climbing on the whole-sample score, best
+      snapshot returned, writes a real `.hydra`
+- [x] `tools/console_train_test.js`: trains, writes the file, then runs the
+      COMPILED `hydra-run` and asserts the token stream matches bit for
+      bit; includes a negative control (garbage model must be rejected)
+- [x] Server: `/api/models`, `/api/train`, `/api/vocab` (GET+PUT), plus
+      auto-generation of the demo model on startup
+- [x] UI rewrite: modern dark console, chat with vocabulary mapping,
+      model picker, live token chart, state heat strip, settings drawer,
+      training panel showing real before/after accuracy and the engine
+      verification
+- [x] Verified locally: ESLint clean, `node --check` clean, trainer test
+      green, server smoke tests over all endpoints, path traversal still
+      404, APK/CI untouched
+- [x] CI: `web-lint` now also runs the trainer test against the real engine
+- [ ] PR + merge — **user approval needed** (R14)
