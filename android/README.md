@@ -48,8 +48,52 @@ Install on a device/emulator, tap **Run inference**. The app:
    can mmap a real file),
 2. calls `HydraBridge.runInference(path, token, steps, callback)`,
 3. streams each generated token back to the UI via a JNI callback,
-4. prints a JSON summary: `{"ok":true,"steps":32,"elapsed_us":…, "dim":64,"vocab":512,"layers":4,"axiom_allowed":true}`
+4. prints a JSON summary: `{"ok":true,"steps":32,"emitted":32,"elapsed_us":…, "dim":64,"vocab":512,"layers":4,"axiom_allowed":true}`
 
 Verified on the Android emulator (API 24, x86_64): inference completed
 with identical token sequences to the host CLI — the engine is
 deterministic across architectures on the same ABI's code path.
+
+## Cancel is real, not cosmetic
+
+**Cancel run** sets a flag in the native layer (`HydraBridge.cancel()`); the JNI loop checks
+it once per step, so the run stops within one step and answers
+`{"ok":false,"cancelled":true,…}`. The UI prints *cancelled*, not *error*. The flag is cleared
+at the start of every run, so a cancel between two runs cannot kill the next one. The button
+is disabled while nothing is running.
+
+Honest scope: this cancels the token loop only. It is not a process kill, and a cancel
+pressed during the final `hydra_engine_unload()` still lets that finish.
+
+The batching policy — when a block of tokens crosses into Kotlin, and the guarantee that the
+last partial block is always emitted with `done=true` — lives in
+`android/app/src/main/cpp/hydra_batch.h` and is shared with the host test
+`tests/test_jni_batch.c` (`make test-run`), so it is verified without a device.
+
+## Crash reports are written first, shown next launch
+
+`CrashHandler` does exactly two things when the process is dying:
+
+1. writes the report (thread, stack, Android version, device, ABI, timestamp) to
+   `filesDir/last-crash.txt`, and
+2. delegates to the previous handler so the platform still handles the crash.
+
+It does **not** start an Activity: the handler runs on the crashing thread while the process
+is milliseconds from death, so that request is unreliable. On the next launch `MainActivity`
+finds the file and opens `CrashActivity`, which offers **Copy report** and **Delete report**.
+Logs contain no prompt text and no model bytes.
+
+### Testing the crash path on a debug build
+
+```bash
+adb shell am start -n dev.hydrastone/.MainActivity --ez crash_test true
+```
+
+This throws on a background thread on purpose. The app dies, relaunch it, and the report
+screen appears. The extra is ignored unless the APK is debuggable
+(`FLAG_DEBUGGABLE`), so a release build cannot be crashed by an intent.
+
+**Not verified here:** no device or emulator is available in this container, so the
+end-to-end chain above has not been executed. What *is* enforced on every push is the
+contract it depends on — write before delegate, no Activity from the handler, report
+surfaced on next start, copy and delete actions (`bash tools/android_crash_check.sh`).

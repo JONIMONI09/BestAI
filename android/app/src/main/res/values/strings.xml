@@ -7,6 +7,7 @@
     <string name="default_start_token">42</string>
     <string name="default_steps">32</string>
     <string name="action_run">Run inference</string>
+    <string name="action_cancel">Cancel run</string>
     <string name="action_import_model">Import .hydra model…</string>
     <string name="action_benchmark">Benchmark (ns/token)</string>
     <plurals name="log_bench_start">
@@ -29,6 +30,8 @@
         <item quantity="other">[Hydra] %1$d tokens</item>
     </plurals>
     <string name="log_batch_done">[Hydra] stream complete</string>
+    <string name="log_cancelled">[Hydra] cancelled — the native loop stopped at the next step; the result is discarded.</string>
+    <string name="log_cancel_armed">[Hydra] cancel requested — the run stops within one step.</string>
     <string name="log_unexpected_per_token">[Hydra] unexpected per-token callback at %1$d = %2$d</string>
     <string name="log_import_start">[Hydra] importing %1$s…</string>
     <string name="log_import_ok">[Hydra] model replaced: %1$s</string>
@@ -56,7 +59,10 @@
     <string name="crash_copy">Copy report</string>
     <string name="crash_copied">Copied to the clipboard</string>
     <string name="crash_copy_failed">Clipboard unavailable — select the text instead</string>
+    <string name="crash_delete">Delete report</string>
+    <string name="crash_deleted">Report deleted</string>
     <string name="crash_close">Close</string>
+    <string name="crash_previous">The app stopped unexpectedly last time. Tap to read the saved report.</string>
     <string name="log_result">[Hydra] result: %1$s</string>
     <string name="log_wall">[Hydra] wall time: %1$d ms</string>
     <string name="log_ok">[Hydra] OK — C engine executed on Android.</string>

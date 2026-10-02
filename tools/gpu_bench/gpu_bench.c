@@ -24,11 +24,16 @@
  * BUILD (NDK, arm64):
  *   aarch64-linux-android24-clang -O2 tools/gpu_bench/gpu_bench.c \
  *       -lEGL -lGLESv2 -o gpu_bench
- * The shader must be compiled to SPIR-V with glslangValidator and placed
- * next to the binary as ternary.comp.spv:
- *   glslangValidator -V --target-env opengl tools/gpu_bench/ternary.comp -o ternary.comp.spv
- * There is no glslang on the build host used for this repository, so the
- * .spv is intentionally NOT committed rather than committed unverified.
+ * BUILD (host, CPU path only — CI does this on every push):
+ *   cc -O2 tools/gpu_bench/gpu_bench.c -lEGL -lGLESv2 -o gpu_bench
+ *
+ * The shader is compiled AT RUNTIME from GLSL ES 3.10 source with
+ * glShaderSource/glCompileShader. The earlier version loaded a
+ * precompiled SPIR-V blob, which had two problems: nothing in the build
+ * produced that blob (no glslangValidator anywhere), and SPIR-V shader
+ * loading is NOT a core OpenGL ES 3.1 feature — glShaderBinary with
+ * GL_SHADER_BINARY_FORMAT_SPIR_V is an extension. Runtime GLSL
+ * compilation is the portable path every GLES 3.1 device supports.
  *
  * RUN (on the device):
  *   ./gpu_bench --dim 64 --layers 4 --k 1,16,64,256 --steps 1000
@@ -36,6 +41,12 @@
  * Output is one JSON object per line so it can be piped straight into a
  * plotting script.
  */
+/* The GLES/EGL half is optional at compile time. CI builds this file
+ * WITHOUT -DHYDRA_WITH_GLES on a machine that has no GLES headers, so it
+ * can still verify the CPU reference path and the JSON contract; the
+ * device build defines HYDRA_WITH_GLES and gets the GPU path. Two build
+ * modes, one file, and the CPU measurement is identical in both. */
+#ifdef HYDRA_WITH_GLES
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
@@ -46,20 +57,12 @@
  * avoid. */
 #include <GLES3/gl3ext.h>
 
-/* The NDK headers declare glShaderBinary() but not the SPIR-V entry
- * points glSpecializeShader()/glGetBufferSubData(). They are core GLES
- * 3.1, so the prototypes are declared here and resolved through
- * eglGetProcAddress — declaring them is correct, replacing them with
- * guessed constants would not be. */
-#ifndef GL_SHADER_BINARY_FORMAT_SPIR_V
-#define GL_SHADER_BINARY_FORMAT_SPIR_V 0x9551
-#endif
-typedef void (GL_APIENTRY *HydraSpecializeShader)(GLuint, const GLchar *,
-                                                  const GLuint, const GLuint *,
-                                                  const GLuint *);
+/* glGetBufferSubData is core GLES 3.1 but is not declared by every
+ * NDK header, so the prototype is declared here and resolved through
+ * eglGetProcAddress. */
 typedef void (GL_APIENTRY *HydraGetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void *);
-static HydraSpecializeShader g_specialize_shader = NULL;
 static HydraGetBufferSubData g_get_buffer_sub_data = NULL;
+#endif /* HYDRA_WITH_GLES */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,6 +103,7 @@ static double now_ns(void)
 }
 
 /* ---- GLES 3.1 plumbing ------------------------------------------- */
+#ifdef HYDRA_WITH_GLES
 typedef struct {
     EGLDisplay dpy;
     EGLContext ctx;
@@ -111,7 +115,44 @@ typedef struct {
     GLuint ubo;        /* uniform block: token, dim, offsetB */
 } Gpu;
 
-static int gpu_init(Gpu *g, GLuint *shader_spv, size_t spv_bytes)
+static char *read_file(const char *path, size_t *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = '\0';
+    *out_len = got;
+    return buf;
+}
+
+/* Compiles the GLSL source at runtime. GLES 3.1 guarantees this path;
+ * SPIR-V binary loading is optional and was the reason the previous
+ * version of this file could not run anywhere. */
+static GLuint compile_shader_from_source(const char *source)
+{
+    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[2048];
+        glGetShaderInfoLog(shader, (GLsizei)sizeof(log), NULL, log);
+        fprintf(stderr, "[gpu] GLSL compile failed:\n%s\n", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static int gpu_init(Gpu *g, const char *glsl_source)
 {
     memset(g, 0, sizeof(*g));
 
@@ -134,27 +175,16 @@ static int gpu_init(Gpu *g, GLuint *shader_spv, size_t spv_bytes)
     if (g->ctx == EGL_NO_CONTEXT) return -4;
     if (!eglMakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g->ctx)) return -5;
 
-    g_specialize_shader =
-        (HydraSpecializeShader)eglGetProcAddress("glSpecializeShader");
     g_get_buffer_sub_data =
         (HydraGetBufferSubData)eglGetProcAddress("glGetBufferSubData");
-    if (!g_specialize_shader || !g_get_buffer_sub_data) {
-        fprintf(stderr, "[gpu] driver is missing glSpecializeShader/glGetBufferSubData\n");
+    if (!g_get_buffer_sub_data) {
+        fprintf(stderr, "[gpu] driver is missing glGetBufferSubData\n");
         return -8;
     }
 
-    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-    glShaderBinary(1, &shader, GL_SHADER_BINARY_FORMAT_SPIR_V, shader_spv,
-                   (GLsizei)spv_bytes);
-    g_specialize_shader(shader, "main", 0, NULL, NULL);
+    GLuint shader = compile_shader_from_source(glsl_source);
+    if (!shader) return -6;
     GLint ok = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[1024];
-        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
-        fprintf(stderr, "[gpu] shader compile failed: %s\n", log);
-        return -6;
-    }
     g->prog = glCreateProgram();
     glAttachShader(g->prog, shader);
     glLinkProgram(g->prog);
@@ -210,6 +240,7 @@ static void gpu_run(Gpu *g, uint32_t dim, int32_t token)
     glDispatchCompute((GLuint)((dim + 127) / 128), 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
+#endif /* HYDRA_WITH_GLES */
 
 int main(int argc, char **argv)
 {
@@ -268,25 +299,26 @@ int main(int argc, char **argv)
            dim, layers, steps, cpu_ns);
     fflush(stdout);
 
+#ifdef HYDRA_WITH_GLES
     /* ---- GPU measurement ---- */
-    FILE *f = fopen("ternary.comp.spv", "rb");
-    if (!f) {
+    const char *shader_path = getenv("GPU_BENCH_SHADER");
+    if (!shader_path || !*shader_path) shader_path = "ternary.comp";
+    size_t glsl_len = 0;
+    char *glsl = read_file(shader_path, &glsl_len);
+    if (!glsl) {
         printf("{\"device\":\"gpu\",\"dim\":%u,\"layers\":%u,\"measured\":false,"
-               "\"reason\":\"ternary.comp.spv not found - compile the shader with glslangValidator first\"}\n",
+               "\"reason\":\"shader source not found (set GPU_BENCH_SHADER)\"}\n",
                dim, layers);
         return 2;
     }
-    fseek(f, 0, SEEK_END);
-    long spv_bytes = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    GLuint *spv = (GLuint *)malloc((size_t)spv_bytes);
-    if (!spv || fread(spv, 1, (size_t)spv_bytes, f) != (size_t)spv_bytes) { fclose(f); return 2; }
-    fclose(f);
+    fprintf(stderr, "[gpu] shader source: %s (%zu bytes)\n", shader_path, glsl_len);
 
     Gpu g;
-    int rc = gpu_init(&g, spv, (size_t)spv_bytes);
+    int rc = gpu_init(&g, glsl);
     if (rc != 0) {
-        printf("{\"device\":\"gpu\",\"dim\":%u,\"measured\":false,\"reason\":\"EGL init failed (%d)\"}\n", dim, rc);
+        printf("{\"device\":\"gpu\",\"dim\":%u,\"measured\":false,"
+               "\"reason\":\"EGL init failed (%d)\"}\n", dim, rc);
+        free(glsl);
         return 2;
     }
 
@@ -336,6 +368,16 @@ int main(int argc, char **argv)
     }
 
     gpu_destroy(&g);
-    free(w); free(A); free(B); free(state); free(acc); free(spv);
+    free(glsl);
+#else
+    /* No GLES in this build: the CPU line above is still a real
+     * measurement, and this line says exactly why there is no GPU line. */
+    (void)k_values;
+    printf("{\"device\":\"gpu\",\"dim\":%u,\"layers\":%u,\"measured\":false,"
+           "\"reason\":\"built without -DHYDRA_WITH_GLES (CPU reference only)\"}\n",
+           dim, layers);
+#endif /* HYDRA_WITH_GLES */
+
+    free(w); free(A); free(B); free(state); free(acc);
     return 0;
 }

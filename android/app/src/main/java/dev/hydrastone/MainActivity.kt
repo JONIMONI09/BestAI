@@ -32,7 +32,13 @@ class MainActivity : ComponentActivity() {
     private lateinit var output: TextView
     private lateinit var tokenInput: EditText
     private lateinit var stepsInput: EditText
+    private lateinit var runButton: Button
+    private lateinit var cancelButton: Button
     private var modelFile: File? = null
+
+    /** True while an inference thread is alive. Gates Run/Cancel. */
+    @Volatile
+    private var running = false
 
     /** Log lines shown so far; capped so a 256-token run cannot grow without bound. */
     private val lineCount = StringBuilder()
@@ -90,7 +96,17 @@ class MainActivity : ComponentActivity() {
         root.addView(stepsInput)
 
         val run = Button(this).apply { setText(R.string.action_run) }
+        runButton = run
         root.addView(run)
+
+        /* Cancel is a real, cooperative cancel: it sets a flag the native
+         * loop checks once per step (HydraBridge.cancel). It is disabled
+         * while nothing runs, so it can never look like it does something
+         * it does not. */
+        val cancel = Button(this).apply { setText(R.string.action_cancel) }
+        cancelButton = cancel
+        cancel.isEnabled = false
+        root.addView(cancel)
 
         val bench = Button(this).apply { setText(R.string.action_benchmark) }
         root.addView(bench)
@@ -127,14 +143,36 @@ class MainActivity : ComponentActivity() {
         }
 
         run.setOnClickListener { startInference() }
+        cancel.setOnClickListener {
+            /* Cooperative and asynchronous: the flag is set here, the
+             * inference thread returns within one step. */
+            HydraBridge.cancel()
+            log(getString(R.string.log_cancel_armed))
+        }
         bench.setOnClickListener { runBenchmark() }
+
+        /* A report written during the previous session surfaces here, not
+         * in the middle of the crash: the handler only writes the file and
+         * delegates to the platform. */
+        val pending = CrashHandler.pendingReport(filesDir)
+        if (pending != null) {
+            log(getString(R.string.crash_previous))
+            startActivity(
+                android.content.Intent(this, CrashActivity::class.java)
+                    .putExtra(CrashActivity.EXTRA_REPORT, pending)
+            )
+        }
+
+        maybeRunCrashTest()
     }
 
     private fun startInference() {
+        if (running) return
         val startToken = tokenInput.text.toString().toIntOrNull() ?: 42
         val steps = (stepsInput.text.toString().toIntOrNull() ?: 32).coerceIn(1, 256)
         val file = modelFile ?: return
         lineCount.clear()
+        setRunning(true)
         log(resources.getQuantityString(R.plurals.log_running, steps, startToken, steps))
 
         val t0 = SystemClock.elapsedRealtime()
@@ -162,13 +200,49 @@ class MainActivity : ComponentActivity() {
                     }
                 )
                 val wall = SystemClock.elapsedRealtime() - t0
-                log(getString(R.string.log_result, json))
-                log(getString(R.string.log_wall, wall))
-                log(getString(R.string.log_ok))
+                /* A cancelled run is reported as cancelled, never as a
+                 * failure: the user asked for it. */
+                if (json.contains("\"cancelled\":true")) {
+                    log(getString(R.string.log_cancelled))
+                } else {
+                    log(getString(R.string.log_result, json))
+                    log(getString(R.string.log_wall, wall))
+                    log(getString(R.string.log_ok))
+                }
             } catch (e: Throwable) {
                 log(getString(R.string.log_error, e.message))
+            } finally {
+                setRunning(false)
             }
         }.start()
+    }
+
+    /** Run and Cancel are mutually exclusive; only Cancel is live mid-run. */
+    private fun setRunning(value: Boolean) {
+        running = value
+        runOnUiThread {
+            runButton.isEnabled = !value
+            cancelButton.isEnabled = value
+        }
+    }
+
+    /**
+     * Debug-only crash trigger: `adb shell am start -n dev.hydrastone/.MainActivity --ez crash_test true`
+     *
+     * It proves the whole chain - handler writes the file, platform kills
+     * the process, next launch shows the report - which cannot be checked
+     * without a device. Gated on FLAG_DEBUGGABLE so a release build cannot
+     * be made to crash by an intent.
+     */
+    private fun maybeRunCrashTest() {
+        if (!intent.getBooleanExtra(EXTRA_CRASH_TEST, false)) return
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) {
+            log("[Hydra] crash_test ignored: this build is not debuggable")
+            return
+        }
+        log("[Hydra] crash_test: throwing on a background thread on purpose")
+        Thread { throw IllegalStateException("Hydra-Stone crash test (debug build only)") }
+            .start()
     }
 
     /**
@@ -311,6 +385,7 @@ class MainActivity : ComponentActivity() {
         }
 
     private companion object {
+        const val EXTRA_CRASH_TEST = "crash_test"
         const val HEADER_BYTES = 24
         const val HYDRA_MAGIC = 0x48594452L
         const val HYDRA_VERSION = 1

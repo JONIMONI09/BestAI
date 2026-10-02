@@ -32,6 +32,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { execFile, execFileSync } = require('child_process');
+const { randomUUID } = require('node:crypto');
 const trainer = require('./tools/hydra_train');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
@@ -214,18 +215,65 @@ function uploadTarget(name) {
   return file;
 }
 
-function engineJson(args) {
+/* Real cancellation.
+ *
+ * execFile gives us the ChildProcess, and an HTTP request that the client
+ * has already abandoned gives us nothing - Node does not tell the server
+ * that the socket is gone. So each in-flight engine run is registered with
+ * an id that the client sends back, and `req.on('close')` kills the child.
+ * That is the difference between "the answer was thrown away" and "the
+ * work stopped": the previous Cancel button did the former and called it
+ * the latter.
+ *
+ * SIGTERM first, SIGKILL after a grace period, so a process wedged in a
+ * syscall cannot pin a core forever. */
+const runningEngines = new Map();
+
+function killEngine(id, reason) {
+  const entry = runningEngines.get(id);
+  if (!entry) return false;
+  entry.cancelled = reason || 'cancelled';
+  try {
+    entry.child.kill('SIGTERM');
+  } catch {
+    /* already gone */
+  }
+  const t = setTimeout(() => {
+    try {
+      entry.child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }, 2000);
+  if (typeof t.unref === 'function') t.unref();
+  runningEngines.set(id, entry);
+  return true;
+}
+
+function engineJson(args, requestId) {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       HYDRA_RUN,
       args,
       { timeout: ENGINE_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
       (err, stdout, stderr) => {
+        /* The entry has to be read BEFORE the map slot is dropped,
+         * otherwise the "was this killed on purpose?" flag is always null
+         * and a cancelled run is reported as an engine failure. */
+        const entry = requestId ? runningEngines.get(requestId) : null;
+        if (requestId) runningEngines.delete(requestId);
         if (err) {
           /* stderr goes to the server log, never into the HTTP response. */
           const e = new Error('engine failed');
           e.detail = stderr || String(err.message);
-          return reject(e);
+          /* A kill we asked for shows up as err.killed / err.signal, and
+           * so does a kill we recorded in the entry. Reporting either as a
+           * plain engine failure would put a red error on the screen for
+           * something the user asked for. */
+          e.cancelled = Boolean(entry && entry.cancelled)
+            || Boolean(err.killed) || err.signal === 'SIGTERM';
+          reject(e);
+          return;
         }
         try {
           resolve(JSON.parse(stdout));
@@ -234,15 +282,18 @@ function engineJson(args) {
         }
       },
     );
+    if (requestId) {
+      runningEngines.set(requestId, { child, cancelled: false });
+    }
   });
 }
 
 /* prompt: optional token sequence fed through the engine before generation.
  * An empty prompt keeps the old single-seed behaviour (token). */
-function runInference(modelPath, token, steps, prompt) {
+function runInference(modelPath, token, steps, prompt, requestId) {
   const args = [modelPath, String(token), String(steps), '--json'];
   if (Array.isArray(prompt) && prompt.length > 0) args.push('--prompt', prompt.join(','));
-  return engineJson(args);
+  return engineJson(args, requestId);
 }
 
 function loadModelInfo(modelPath) {
@@ -358,7 +409,7 @@ function parseCorpus(text, vocabMap) {
   return { samples, unknown: Array.from(unknown) };
 }
 
-async function handleTrain(body) {
+async function handleTrain(body, requestId) {
   const name = modelKey(String(body.name || 'trained-model').toLowerCase());
   if (name === null) {
     return { error: 'invalid name: use letters, digits, dot, dash and underscore' };
@@ -400,7 +451,7 @@ async function handleTrain(body) {
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
     return { error: 'invalid target path' };
   }
-  const verification = await verifyModelFile(file, cfg, samples[0].input[0], 8);
+  const verification = await verifyModelFile(file, cfg, samples[0].input[0], 8, requestId);
   if (!verification.match) {
     return { error: 'verification failed: engine and trainer disagree', verification };
   }
@@ -429,7 +480,7 @@ async function handleTrain(body) {
  * and compare it with what the COMPILED C engine produces. If the two
  * disagree the file is wrong, and we refuse to report success.
  */
-async function verifyModelFile(file, cfg, seedToken, steps) {
+async function verifyModelFile(file, cfg, seedToken, steps, requestId) {
   const dim = clampInt(cfg.dim, 1, MAX_VERIFY_DIM, 32);
   const buf = fs.readFileSync(file);
   const header = {
@@ -450,7 +501,12 @@ async function verifyModelFile(file, cfg, seedToken, steps) {
     token = r.out;
   }
 
-  const engine = await engineJson([file, String(seedToken), String(steps), '--json']);
+  /* Registered under the caller's id so a client that hangs up during the
+   * verification run can stop that engine too. */
+  const engine = await engineJson(
+    [file, String(seedToken), String(steps), '--json'],
+    requestId,
+  );
   return {
     header,
     simulated,
@@ -656,8 +712,48 @@ const server = http.createServer(async (req, res) => {
         p = safeModelPath(body.path);
         if (!p) return sendJSON(res, 400, { error: 'invalid model path' });
       }
-      const result = await runInference(p, token, steps, prompt);
-      return sendJSON(res, 200, result);
+      /* Every request gets an id so the engine process can be addressed.
+       * req.on('close') fires when the client goes away for ANY reason,
+       * including a completed response - so the flag is cleared on
+       * completion and only an actually-abandoned request kills. */
+      /* The client may supply its own id so that an explicit
+       * POST /api/cancel can address this exact run; otherwise we mint
+       * one. */
+      const supplied = typeof body.request_id === 'string' && body.request_id.length <= 64
+        ? body.request_id
+        : null;
+      const requestId = supplied || randomUUID();
+      let finished = false;
+      /* The response stream is the signal, not the request stream.
+       * Measured: with only req.on('close'), an aborted fetch never fired
+       * the hook and the engine ran to completion - the Cancel button
+       * dropped the answer and kept the work. res.on('close') fires when
+       * the connection dies mid-response, and 'finish' always comes first
+       * for a request that completed, so the flag separates the two. */
+      res.on('finish', () => { finished = true; runningEngines.delete(requestId); });
+      res.on('close', () => {
+        if (!finished) killEngine(requestId, 'client disconnected');
+      });
+
+      try {
+        const result = await runInference(p, token, steps, prompt, requestId);
+        return sendJSON(res, 200, result);
+      } catch (e) {
+        if (e && e.cancelled) {
+          /* Deliberately NOT logged as a server error: the user asked for
+           * this, and the crash log exists for things that went wrong.
+           *
+           * A client that only pressed POST /api/cancel is still waiting
+           * for an answer, so it gets one - 409 with an explicit
+           * "cancelled", never a 500 that reads like an engine failure.
+           * A client that hung up needs nothing; the write is a no-op. */
+          if (!res.writableEnded && !res.destroyed) {
+            sendJSON(res, 409, { error: 'cancelled', cancelled: true, id: requestId });
+          }
+          return;
+        }
+        throw e;
+      }
     }
 
     if (url.pathname === '/api/train' && req.method === 'POST') {
@@ -673,7 +769,18 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.corpus !== 'string' || body.corpus.length === 0) {
         return sendJSON(res, 400, { error: 'corpus is required' });
       }
-      const out = await handleTrain(body);
+      /* Honest cancellation for training: the hill climbing itself runs
+       * in-process (trainer.train is synchronous JavaScript), so a client
+       * that hangs up cannot interrupt it - only the engine verification
+       * call at the end is a child process, and that one is killed. Saying
+       * so is better than a killEngine(trainId) that never matches. */
+      const trainId = randomUUID();
+      let trainFinished = false;
+      res.on('finish', () => { trainFinished = true; });
+      res.on('close', () => {
+        if (!trainFinished) killEngine(trainId, 'client disconnected');
+      });
+      const out = await handleTrain(body, trainId);
       if (out.error) return sendJSON(res, 400, out);
       return sendJSON(res, 200, out);
     }
@@ -706,6 +813,21 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/axiom' && req.method === 'GET') {
       return sendJSON(res, 200, axiomCheck(url.searchParams.get('h')));
+    }
+
+    if (url.pathname === '/api/cancel' && req.method === 'POST') {
+      let body;
+      try {
+        body = JSON.parse((await readBody(req)) || '{}');
+      } catch {
+        return sendJSON(res, 400, { error: 'invalid JSON body' });
+      }
+      const id = String(body.id || '');
+      if (!runningEngines.has(id)) {
+        return sendJSON(res, 404, { error: 'no such running engine call' });
+      }
+      killEngine(id, 'cancelled by the client');
+      return sendJSON(res, 200, { ok: true, id, killed: true });
     }
 
     if (url.pathname === '/api/errors' && req.method === 'GET') {

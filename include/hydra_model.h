@@ -57,13 +57,28 @@ typedef struct {
 int hydra_engine_load(HydraEngine *engine, const char *model_path);
 void hydra_engine_unload(HydraEngine *engine);
 int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
-/* Token-only fast path: berechnet ausschliesslich Dimension 0. Weil die
- * Dimensionen nach der Aggregation unabhaengig voneinander sind
- * (acc[i] haengt nur an state[i]), liefert dieser Pfad BIT-IDENTISCHE
- * Token-Ströme wie der volle Pfad - die Zustandsvektoren der Dimensionen
- * 1..dim-1 werden dabei nicht fortgeschrieben und sind danach nicht mehr
- * gueltig. Genau das ist der Trick: 64x weniger Arbeit pro Token fuer
- * reine Inferenz ohne Zustandsanzeige. */
+/* Token-only fast path: computes dimension 0 ONLY. Because the dimensions
+ * are independent after the aggregation (acc[i] depends only on state[i]),
+ * this path produces BIT-IDENTICAL token streams to the full path - the
+ * state vectors of dimensions 1..dim-1 are NOT advanced and are therefore
+ * STALE afterwards. That is the trick: 64x less work per token for pure
+ * inference with no state display.
+ *
+ * CONTRACT FOR CALLERS AND UIs (this is the part that used to be implicit):
+ *
+ *   - After any hydra_engine_step_fast() call, ONLY state[0] is valid.
+ *     state[1..dim-1] still holds the values from before the call.
+ *   - A UI must therefore NOT render a full state strip from a run that
+ *     used this function. Showing state[1..63] next to a token-only run
+ *     displays stale numbers as if they were the current state.
+ *   - If a state vector is needed, use hydra_engine_step() (which updates
+ *     all dimensions) or expose state[0] alone and label it as such.
+ *
+ * The web console uses the full path (server.js never passes --fast), which
+ * is why it may show the whole strip. The Android JNI bridge also uses the
+ * full path today. tests/test_engine.c verifies the token equality AND the
+ * staleness of state[1..dim-1], so this comment cannot drift away from the
+ * behaviour without a test noticing. */
 int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
 /* Prefill: faedt eine ganze Token-Sequenz durch die Engine, ohne sie
  * auszugeben. Danach ist der State so weit gelaufen, wie das Prompt ihn
