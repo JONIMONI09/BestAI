@@ -67,7 +67,7 @@ check('training performed flips', result.flips > 0, `flips=${result.flips}`);
 
 // Write the model and let the real C engine judge it.
 const modelPath = path.join(TMP, 'trained.hydra');
-const size = train.writeModelFile(modelPath, { ...cfg, ...result });
+const size = train.writeModelFile(TMP, 'trained.hydra', { ...cfg, ...result });
 check('model file has the expected size', size === 24 + cfg.layers * cfg.dim, `size=${size}, expected ${24 + cfg.layers * cfg.dim}`);
 
 function engineTokens(model, seedToken, steps) {

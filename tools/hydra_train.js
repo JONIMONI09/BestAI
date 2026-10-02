@@ -27,6 +27,7 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 
 const MAGIC = 0x48594452; // "HYDR"
 const VERSION = 1;
@@ -94,8 +95,22 @@ function pack(w1, w2, layers, dim) {
   return out;
 }
 
-/** Serialise a complete .hydra file. */
-function writeModelFile(file, { vocab, dim, layers, w1, w2 }) {
+/**
+ * Serialise a complete .hydra file into `dir`, creating it when needed.
+ *
+ * The file name is resolved and then verified to be inside `dir`. The
+ * caller only ever supplies a basename, but a path sink that is not itself
+ * guarded is a CodeQL `js/path-injection` alert - and an alert that has to be
+ * suppressed is worth avoiding.
+ */
+function writeModelFile(dir, baseName, { vocab, dim, layers, w1, w2 }) {
+  const resolvedDir = path.resolve(dir);
+  const file = path.resolve(resolvedDir, baseName);
+  const rel = path.relative(resolvedDir, file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error('refusing to write outside the target directory');
+  }
+  fs.mkdirSync(resolvedDir, { recursive: true });
   const body = pack(w1, w2, layers, dim);
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(MAGIC, 0);

@@ -282,13 +282,12 @@ async function handleTrain(body) {
     })(),
   );
   const result = trainer.train(cfg, samples, epochs);
-  fs.mkdirSync(TRAINED_DIR, { recursive: true });
-  /* `name` passed modelKey(), so this cannot escape TRAINED_DIR. */
-  const file = path.join(TRAINED_DIR, name + '.hydra');
-  if (path.dirname(path.resolve(file)) !== path.resolve(TRAINED_DIR)) {
+  const bytes = trainer.writeModelFile(TRAINED_DIR, name + '.hydra', { ...cfg, ...result });
+  const file = path.resolve(TRAINED_DIR, name + '.hydra');
+  const rel = path.relative(path.resolve(TRAINED_DIR), file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
     return { error: 'invalid target path' };
   }
-  const bytes = trainer.writeModelFile(file, { ...cfg, ...result });
   const verification = await verifyModelFile(file, cfg, samples[0].input[0], 8);
   if (!verification.match) {
     return { error: 'verification failed: engine and trainer disagree', verification };
@@ -373,7 +372,11 @@ function modelKey(name) {
 function vocabFile(name) {
   const key = modelKey(name);
   if (key === null) return null;
-  return path.join(VOCAB_DIR, `${key}.json`);
+  const dir = path.resolve(VOCAB_DIR);
+  const file = path.resolve(dir, `${key}.json`);
+  const rel = path.relative(dir, file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return file;
 }
 
 function loadVocab(name) {
