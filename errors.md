@@ -736,3 +736,39 @@
 - **Prevention:** never let a parser fail *silently* to an empty default -
   if it cannot parse what it wrote, that is a bug, not a fallback. A GET
   that returns `{}` after a `PUT` reported success is a lie.
+
+## 2026-10-02 — "No releases published": the release only ever ran on a tag push
+
+- **Symptom:** the repository page showed "No releases published", 0 tags,
+  and a manually created tag `v1.0.0` produced only the two source-code
+  archives plus a "Create release from tag" button - no APK, no binaries.
+- **Cause:** `release.yml` was triggered exclusively by
+  `push: tags: ['v*.*.*']`. Pushing to `main` therefore built nothing, and
+  a tag pushed by hand started a build but the publish step is gated on
+  the run producing the release for the tag - a tag alone is not a
+  release. The tag had also been re-pointed to an old commit
+  (`03421a9`, before the two release-run fixes), so even a correct
+  automatic run would have shipped the pre-fix binaries. A tag on an
+  older commit plus a deleted release is indistinguishable from "nothing
+  happened".
+- **Fix:** `release.yml` now also runs on `push: branches: [main]`. On
+  every main push it resolves the version from the existing tags
+  (no tags -> `v1.0.0`; tag on an older commit -> patch bump; tag
+  already on this commit -> reuse), creates the tag if needed (via a
+  token push, which does **not** re-trigger the tag workflow, so the
+  build runs exactly once) and then upserts the release:
+  `gh release view` decides between `gh release edit` + `upload --clobber`
+  and `gh release create`. A final step asserts that all five expected
+  assets are actually attached, so "release exists" can no longer mean
+  "release without APK".
+- **Prevention:** a release pipeline must be idempotent and must not
+  depend on a human pushing a tag. The state it acts on has to come from
+  the remote (`git ls-remote --tags`, the release API), never from local
+  state, and every run has to end in a verifiable assertion.
+- **Bug found by the local test while writing this:** parsing
+  `"v1.0.9 <sha>"` with `while read -r name sha` pushes the rest of the
+  line into `sha` and swallows the following lines, and `read -r a b c`
+  without `IFS=.` leaves `b`/`c` empty - both silently produced the wrong
+  version. Two dedicated cases in `tools/ci_release_version_test.sh`
+  (multi-line tag list, non-lexicographic comparison `v1.0.9` vs
+  `v1.2.0`) now pin this.

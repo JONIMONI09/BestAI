@@ -265,3 +265,39 @@ documentation base is in one language.
       404, APK/CI untouched
 - [x] CI: `web-lint` now also runs the trainer test against the real engine
 - [ ] PR + merge — **user approval needed** (R14)
+
+## Round 2026-10-02 (automatic release on every main push)
+
+- [x] Analysis of the screenshots: repo showed "No releases published",
+      0 tags; the hand-made tag `v1.0.0` pointed at `03421a9`, a commit
+      from *before* the two release-run fixes, and the release itself was
+      gone. Root cause: `release.yml` was triggered only by
+      `push: tags`, so a push to `main` never built anything and a tag
+      alone never produced a release.
+- [x] `release.yml` now also runs on `push: branches: [main]` and decides
+      on its own: no tags -> `v1.0.0`; tag on an older commit -> patch
+      bump; tag already on this commit -> reuse. Dry-run tags
+      (`v0.0.0-ci.<run>`) never count as a base.
+- [x] `ensure-tag` job creates the tag through the checked-out
+      credentials. A token push does not trigger workflows, so the build
+      runs exactly once (no double build from the tag trigger).
+- [x] `publish` is now an explicit upsert: `gh release view` ->
+      `gh release edit` + `gh release upload --clobber`, otherwise
+      `gh release create --target <main sha>`. A verify step asserts that
+      all five expected assets are attached, so a release can never be
+      "successful" while missing the APK.
+- [x] `tools/ci_release_version_test.sh` extended from 5 to 10 cases
+      (main push without tags, dry-run tag, new commit -> patch bump,
+      semver max over several tags, tag already on main) and it checks
+      the new `create_tag`/`create_release` outputs. All 10 pass; the
+      negative control (a deliberately broken copy of the workflow) still
+      fails, so the test is not vacuous.
+- [x] Two real bugs were caught by the new cases: `while read -r name
+      sha` swallowing the rest of a multi-line tag list, and a missing
+      `IFS=.` in the semver split (both produced a wrong version
+      silently).
+- [x] Verified: all workflow YAML parses, `bash -n` clean on every `run:`
+      block of `release.yml`.
+- [ ] PR + merge — **user approval needed** (R14). After the merge the
+      next push to `main` creates `v1.0.0` with the real artifacts,
+      because the repository currently has no tag and no release at all.

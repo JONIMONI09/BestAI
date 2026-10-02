@@ -17,6 +17,7 @@ run_case() {
   shift 6
   # Erwartungswerte werden nur im Erfolgsfall geprueft.
   local expect_tag="${1:-}" expect_version="${2:-}" expect_code="${3:-}" expect_pub="${4:-}"
+  local ref_type="${REF_TYPE:-tag}" head_sha="${HEAD_SHA:-aaa}" tag_list="${TAG_LIST:-}"
 
   local out rc
   out="$(mktemp)"
@@ -33,6 +34,7 @@ PY
 )"
 
   EVENT="$event" REF_NAME="$ref" INPUT_TAG="$tag" INPUT_PUBLISH="$publish" \
+  REF_TYPE="$ref_type" HEAD_SHA="$head_sha" TAG_LIST="$tag_list" \
   RUN_NUMBER="4242" GITHUB_OUTPUT="$out" GITHUB_STEP_SUMMARY="$out.summary" \
     bash -euo pipefail -c "$script" >/dev/null 2>&1
   rc=$?
@@ -49,11 +51,19 @@ PY
     return
   fi
 
-  local got_tag got_ver got_code got_pub
+  local got_tag got_ver got_code got_pub got_ctag got_crel
   got_tag="$(sed -n 's/^tag=//p' "$out")"
   got_ver="$(sed -n 's/^version=//p' "$out")"
   got_code="$(sed -n 's/^version_code=//p' "$out")"
   got_pub="$(sed -n 's/^publish=//p' "$out")"
+  got_ctag="$(sed -n 's/^create_tag=//p' "$out")"
+  got_crel="$(sed -n 's/^create_release=//p' "$out")"
+  if [ "$got_ctag" != "${EXPECT_CREATE_TAG:-false}" ] || \
+     [ "$got_crel" != "${EXPECT_CREATE_RELEASE:-false}" ]; then
+    echo "FAIL  $desc: create_tag=$got_ctag create_release=$got_crel" \
+         "(erwartet ${EXPECT_CREATE_TAG:-false}/${EXPECT_CREATE_RELEASE:-false})"
+    fail=1
+  fi
 
   if [ "$got_tag" != "$expect_tag" ] || [ "$got_ver" != "$expect_version" ] ||
      [ "$got_code" != "$expect_code" ] || [ "$got_pub" != "$expect_pub" ]; then
@@ -65,6 +75,28 @@ PY
   fi
   rm -f "$out" "$out.summary"
 }
+
+SHA_MAIN=bbbb1111
+SHA_OLD=cccc2222
+SHA_TAGSHA=dddd3333
+
+# --- Push auf main: das ist der Fall, den der Nutzer gesehen hat -------
+EXPECT_CREATE_TAG=true EXPECT_CREATE_RELEASE=true \
+  REF_TYPE=branch HEAD_SHA=$SHA_MAIN TAG_LIST="" \
+  run_case "main ohne Tag -> v1.0.0"  push main "" "" 0 v1.0.0 1.0.0 10000 true
+EXPECT_CREATE_TAG=true EXPECT_CREATE_RELEASE=true \
+  REF_TYPE=branch HEAD_SHA=$SHA_MAIN TAG_LIST="v0.0.0-ci.99 dddd0000" \
+  run_case "Dry-Run-Tag zaehlt nicht" push main "" "" 0 v1.0.0 1.0.0 10000 true
+EXPECT_CREATE_TAG=true EXPECT_CREATE_RELEASE=true \
+  REF_TYPE=branch HEAD_SHA=$SHA_MAIN TAG_LIST="v1.0.0 $SHA_TAGSHA" \
+  run_case "main-Push auf neuem Commit -> v1.0.1" push main "" "" 0 v1.0.1 1.0.1 10001 true
+EXPECT_CREATE_TAG=true EXPECT_CREATE_RELEASE=true \
+  REF_TYPE=branch HEAD_SHA=$SHA_MAIN TAG_LIST="v1.0.9 $SHA_OLD
+v1.2.0 $SHA_OLD" \
+  run_case "hoechstes Tag gewinnt, kein String-Vergleich" push main "" "" 0 v1.2.1 1.2.1 10201 true
+EXPECT_CREATE_TAG=false EXPECT_CREATE_RELEASE=true \
+  REF_TYPE=branch HEAD_SHA=$SHA_TAGSHA TAG_LIST="v1.0.0 $SHA_TAGSHA" \
+  run_case "Tag steht schon auf main -> Release updaten" push main "" "" 0 v1.0.0 1.0.0 10000 true
 
 run_case "Tag-Push v1.2.3"          push            v1.2.3 ""     ""      0 v1.2.3 1.2.3 10203 true
 run_case "Dispatch mit Tag+publish"  workflow_dispatch main v1.2.3 true  0 v1.2.3 1.2.3 10203 true

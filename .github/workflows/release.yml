@@ -9,9 +9,21 @@ name: Release
 # signature). If the HYDRA_KEYSTORE* secrets are set, it is signed with
 # a real release key and the release body says so.
 #
-# Two triggers:
-#   1. push of a v*.*.* tag  -> builds and publishes the release
-#   2. workflow_dispatch      -> manual build without a tag push. With no
+# Three triggers:
+#   1. push to main          -> THE AUTOMATIC RELEASE. Every time main
+#      changes the workflow decides on its own whether the current main
+#      commit already has a release:
+#        * no tag yet             -> creates the next version tag
+#        * tag exists, release    -> updates it: rebuilds every artifact
+#          missing or outdated       and re-uploads (--clobber)
+#        * release exists, no     -> (re)creates the release
+#          tag
+#        * tag points at an older -> creates a new, higher version tag
+#          commit
+#      This is idempotent: a second run without a new commit finds the
+#      release complete and does nothing.
+#   2. push of a v*.*.* tag  -> builds and publishes that exact tag
+#   3. workflow_dispatch      -> manual build without a tag push. With no
 #      tag input this is a pure dry run: all five jobs build (including
 #      APK signature verification and NDK/JNI compilation) but nothing is
 #      published. With a tag and publish=true the run behaves exactly
@@ -20,6 +32,7 @@ name: Release
 
 on:
   push:
+    branches: [ 'main' ]
     tags: [ 'v*.*.*' ]
   workflow_dispatch:
     inputs:
@@ -40,12 +53,33 @@ jobs:
   version:
     name: Resolve version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
       version_code: ${{ steps.v.outputs.version_code }}
       publish: ${{ steps.v.outputs.publish }}
+      create_tag: ${{ steps.v.outputs.create_tag }}
+      create_release: ${{ steps.v.outputs.create_release }}
     steps:
+      # Alle Tags des Repos, eine Zeile pro Tag: "v1.2.3 <sha>".
+      # Wird fuer den main-Push gebraucht, um festzustellen, ob es
+      # ueberhaupt schon eine Version gibt und auf welchem Commit sie steht.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: List existing version tags
+        id: t
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<EOF"
+            git ls-remote --tags --refs origin \
+              | awk '{print $2, $1}' | sed 's#refs/tags/##' || true
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # Werte kommen ueber env, nicht per ${{ }} im Skript: sonst wuerde ein
       # frei eingegebener Tag als Shell-Code ausgefuehrt (Script Injection).
       - name: Derive version from tag
@@ -53,13 +87,64 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          HEAD_SHA: ${{ github.sha }}
+          TAG_LIST: ${{ steps.t.outputs.list }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_PUBLISH: ${{ inputs.publish }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
-          if [ "$EVENT" = "push" ]; then
+          CREATE_TAG=false
+          CREATE_RELEASE=false
+
+          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            # ---- Automatic release on every push to main -------------
+            # Hoechste existierende vMAJOR.MINOR.PATCH bestimmen. Nur
+            # streng numerische Tags zaehlen; "v0.0.0-ci.<run>" ist eine
+            # Dry-Run-Marke und darf nie zur Basis werden.
+            BEST=""; BEST_SHA=""
+            # Pro Zeile genau ein Tag: read -r name sha wuerde den Rest
+            # einer Zeile in sha schieben und die Folgezeilen verschlucken.
+            while read -r line; do
+              [ -n "${line:-}" ] || continue
+              name="${line%% *}"; sha="${line##* }"
+              [ "$name" = "$sha" ] && sha=""
+              [[ "$name" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
+              cur="${name#v}"
+              if [ -z "$BEST" ]; then BEST="$name"; BEST_SHA="$sha"; continue; fi
+              # semver-Vergleich ohne sort -V (nicht ueberall gleich)
+              IFS=. read -r bm bi bp <<< "${BEST#v}"
+              IFS=. read -r cm ci cp <<< "$cur"
+              if [ "$cm" -gt "$bm" ] || { [ "$cm" -eq "$bm" ] && [ "$ci" -gt "$bi" ]; } \
+                 || { [ "$cm" -eq "$bm" ] && [ "$ci" -eq "$bi" ] && [ "$cp" -gt "$bp" ]; }; then
+                BEST="$name"; BEST_SHA="$sha"
+              fi
+            done <<< "$TAG_LIST"
+
+            if [ -z "$BEST" ]; then
+              TAG="v1.0.0"
+              CREATE_TAG=true
+              CREATE_RELEASE=true
+              echo "::notice::No version tag exists - creating $TAG for main@${HEAD_SHA:0:7}"
+            elif [ "$BEST_SHA" = "$HEAD_SHA" ]; then
+              # Tag steht bereits auf diesem main-Commit: Release
+              # existiert oder wird erzwungen neu aufgebaut und
+              # hochgeladen (upsert, s.u.). Kein neuer Tag noetig.
+              TAG="$BEST"
+              CREATE_TAG=false
+              CREATE_RELEASE=true
+              echo "::notice::$TAG already points at main@${HEAD_SHA:0:7} - release will be created or updated"
+            else
+              IFS=. read -r bm bi bp <<< "${BEST#v}"
+              TAG="v${bm}.${bi}.$(( bp + 1 ))"
+              CREATE_TAG=true
+              CREATE_RELEASE=true
+              echo "::notice::$TAG is on ${BEST_SHA:0:7}, main is ${HEAD_SHA:0:7} - creating $TAG"
+            fi
+            PUBLISH=true
+          elif [ "$EVENT" = "push" ]; then
             TAG="$REF_NAME"
             PUBLISH=true
           else
@@ -86,7 +171,41 @@ jobs:
           echo "version=$V"    >> "$GITHUB_OUTPUT"
           echo "version_code=$CODE" >> "$GITHUB_OUTPUT"
           echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "create_tag=$CREATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "create_release=$CREATE_RELEASE" >> "$GITHUB_OUTPUT"
           echo "Release ${TAG} -> versionCode ${CODE}, publish=${PUBLISH}"
+
+  # Legt den Tag an, den der main-Push gerade berechnet hat. Der Push
+  # erfolgt bewusst ueber die GitHub-Refs-API und nicht ueber "git push":
+  # ein Token-Push loest keinen weiteren push:-Tags-Workflow aus, sonst
+  # laeuft derselbe Build doppelt.
+  ensure-tag:
+    name: Create version tag
+    needs: version
+    if: needs.version.outputs.create_tag == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Checkout persistiert die Repository-Credentials, deshalb reicht
+      # ein normaler Push. Ein Push mit diesem Token loest keinen weiteren
+      # push:-Tags-Workflow aus - der Build laeuft genau einmal.
+      - name: Point the tag at this commit (idempotent)
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::notice::Tag $TAG already exists - keeping it"
+            exit 0
+          fi
+          git tag -f "$TAG" "$SHA"
+          git push origin "refs/tags/$TAG"
+          echo "::notice::Created tag $TAG on ${SHA:0:7}"
 
   build-linux:
     name: CLI (Linux)
@@ -278,22 +397,20 @@ jobs:
           sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Create the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: Hydra-Stone ${{ needs.version.outputs.tag }}
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: true
-          files: |
-            dist/*.apk
-            dist/hydra-run-linux-x64
-            dist/hydra-run-linux-arm64
-            dist/hydra-run-macos-arm64
-            dist/SHA256SUMS.txt
-          body: |
-            ## Hydra-Stone ${{ needs.version.outputs.tag }}
+      # Der Release-Text wird als Datei geschrieben und dann per gh-CLI
+      # hochgeladen. Das ist der entscheidende Schritt fuer "aktualisieren
+      # statt neu anlegen": gh release upload --clobber ersetzt jedes
+      # vorhandene Asset gleichen Namens, und gh release edit aktualisiert
+      # Titel/Text, ohne dass der Release geloescht werden muss.
+      # Quoted heredoc ('EOF'): Backticks und $ im Markdown koennen so
+      # nicht als Shell-Code interpretiert werden. Versionsangaben kommen
+      # aus env, nicht aus ${{ }} (Script-Injection-Schutz).
+      - name: Release notes
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          cat > notes.md <<'EOF'
+            ## Hydra-Stone $TAG
 
             ### Android APK - directly installable
 
@@ -358,3 +475,69 @@ jobs:
             for the Google Play Store. For Play Store releases store
             `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS`
             and `HYDRA_KEY_PASSWORD` as repository secrets.
+          EOF
+          head -3 notes.md
+
+      # Idempotenter Upsert. Genau diese Abfrage entscheidet zwischen
+      # "create" und "update" - und sie fragt die Release-API ab, nicht
+      # irgendeinen lokalen Zustand:
+      #   * Release existiert nicht -> create (mit Target-Commit)
+      #   * Release existiert        -> edit (Titel/Text) + upload --clobber
+      # Der abschliessende Check beweist, dass danach wirklich alle
+      # erwarteten Assets haengen; ein Release ohne APK waere ein Fehler,
+      # kein Erfolg.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+          CREATE: ${{ needs.version.outputs.create_release }}
+        run: |
+          set -euo pipefail
+          NOTES="$GITHUB_WORKSPACE/notes.md"
+          test -f "$NOTES"
+          cd dist
+          shopt -s nullglob
+          ASSETS=(*.apk hydra-run-linux-x64 hydra-run-linux-arm64 \
+                  hydra-run-macos-arm64 SHA256SUMS.txt)
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::no artifacts to publish"
+            exit 1
+          fi
+          echo "Publishing ${#ASSETS[@]} assets for $TAG"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG exists - updating it"
+            gh release edit "$TAG" --title "Hydra-Stone $TAG" \
+               --notes-file "$NOTES" --draft=false --prerelease=false
+          else
+            echo "::notice::Release $TAG does not exist - creating it"
+            gh release create "$TAG" --title "Hydra-Stone $TAG" \
+               --notes-file "$NOTES" --target "$SHA" \
+               --draft=false --prerelease=false
+          fi
+
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber
+
+      - name: Verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          NAMES="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          echo "$NAMES"
+          for want in SHA256SUMS.txt hydra-run-linux-x64 hydra-run-linux-arm64 \
+                     hydra-run-macos-arm64 hydra-stone-debug.apk; do
+            grep -qx "$want" <<< "$NAMES" || {
+              echo "::error::release $TAG is missing asset $want"
+              exit 1
+            }
+          done
+          grep -q -- '-android-.*\.apk$' <<< "$NAMES" || {
+            echo "::error::release $TAG has no release APK"
+            exit 1
+          }
+          echo "::notice::Release $TAG is complete"
