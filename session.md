@@ -210,9 +210,22 @@ documentation base is in one language.
       `assets/demo.hydra` present
 - [x] PR #18: **17/17 checks green**, including the two new jobs
       `Android APK build` and `JNI bridge (javac)`
-- [ ] Merge the PR — **user approval needed** (R14)
-- [ ] Directly afterwards: push tag `v1.0.0` on `main` so
-      `release.yml` creates the first GitHub Release
+- [x] PR #18 merged (merge commit `03421a9`) — 16/16 checks green
+- [x] `v1.0.0` pushed → **first `release.yml` run ever failed** in two
+      jobs, both configuration bugs only a real tag run can hit:
+      `dist/` was never created in the Linux CLI job, and an unset
+      GitHub secret arrives as an EMPTY string, so
+      `file(System.getenv("HYDRA_KEYSTORE")!!)` called `file("")`
+- [x] PR #20 fixes both (keystore path via `takeIf { isNotBlank() }`),
+      16/16 green; replayed locally with `HYDRA_KEYSTORE=""`
+- [x] Tag `v1.0.0` re-pointed at the fixed `main` tip `a0ba722`
+- [x] **Release published:** https://github.com/JONIMONI09/BestAI/releases/tag/v1.0.0
+      - `hydra-stone-1.0.0-android-arm64v8a-armeabiv7a-x86_64.apk`
+        (671 664 B, signature verified, `libhydra.so` for all three
+        ABIs, `assets/demo.hydra` present, versionCode 10000)
+      - `hydra-stone-debug.apk`, three CLI binaries, `SHA256SUMS.txt`
+- [x] Downloaded the released APK and its checksum:
+      `f5dced81…0eda7` — identical, integrity chain verified end to end
 
 ## Status / Notes
 
