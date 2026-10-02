@@ -146,4 +146,4 @@ Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+see [LICENSE](LICENSE).
