@@ -523,6 +523,28 @@
   Commit gegen die offizielle Doku pruefen (R26). Workflow-Fehler
   zusaetzlich lokal simulieren, bevor sie in den PR gehen.
 
+## 2026-10-02 — "OldTargetApi" nur im CI, nicht lokal (Runner-SDK)
+
+- **Symptom:** Nach dem SDK-Fix lief `Android lint` durch, meldete aber
+  `0 errors, 1 warnings` mit
+  `Warning: Not targeting the latest versions of Android [OldTargetApi]`
+  und das Gate (grep "No issues found") wurde rot.
+- **Cause:** Der gehostete Runner bringt ein vorgebautes SDK mit, das
+  zusaetzlich `platforms;android-35` und `android-36` enthaelt. Lint
+  beurteilt `OldTargetApi` gegen die *vorhandenen* Platforms. Lokal ist
+  ausschliesslich `android-34` installiert — dort meldet Lint
+  `No issues found`. Dieselbe Toolchain, zwei Ergebnisse: die Warnung
+  kam also aus der Runner-Umgebung, nicht aus dem Projekt.
+- **Fix:** Beide Workflows richten ein eigenes SDK-Root
+  (`$RUNNER_TEMP/android-sdk`) ein und installieren dort ausschliesslich
+  die gepinnten Pakete. Zusaetzlich haengt `release.yml` die
+  build-tools-Pfade an `ANDROID_HOME` statt an ein hart kodiertes
+  `/opt/android-sdk`, das auf dem Runner nicht existiert.
+- **Prevention:** Bei "nur im CI"-Befunden zuerst die Umgebung des
+  Runners gegen die lokale Toolchain stellen (Differenzanalyse), bevor
+  man Code oder Lint-Konfiguration aendert. Ein Gate darf nicht
+  kosmetisch aufgeweicht werden, um einen Umgebungsfehler zu verstecken.
+
 ## 2026-10-02 — Skills-UI meldet "Not loaded" trotz korrektem Frontmatter
 
 - **Symptom:** Die Skills-UI zeigt alle drei Skills als *Not loaded*

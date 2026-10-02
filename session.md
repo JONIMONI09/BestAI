@@ -117,6 +117,13 @@ following the CVE cross-check and linter audit from the previous pass.
 - [x] Neuer Branch `fix/android-lint-cmdline-tools` direkt auf
       `origin/main` gebaut (Plumbing, **kein `git checkout`** — R17/R20),
       PR eroeffnet, **kein Merge** (R14)
+- [x] **PR #13: 13/13 Checks gruen.** Der erste Lauf zeigte noch
+      `OldTargetApi` — Ursache war das vorgebaute Runner-SDK
+      (platforms 35/36), lokal ist nur 34 installiert. Fix: eigenes
+      SDK-Root mit ausschliesslich gepinnten Paketen
+- [x] Nebenbefund dabei korrigiert: `release.yml` nutzte die
+      build-tools ueber das hart kodierte `/opt/android-sdk`, das auf dem
+      GitHub-Runner nicht existiert — jetzt ueber `ANDROID_HOME`
 
 ## Status / Notes
 
