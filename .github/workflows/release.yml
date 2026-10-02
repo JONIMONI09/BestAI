@@ -1,22 +1,22 @@
 name: Release
 
-# Erzeugt aus einem Git-Tag (v*.*.*) ein GitHub Release mit:
-#   - hydra-run fuer linux-x64, linux-arm64 und macos-arm64
-#   - einem installierbaren, signierten Android-APK (arm64-v8a, armeabi-v7a, x86_64)
-#   - SHA256-Pruefsummen fuer jedes Artefakt
+# Creates a GitHub Release from a git tag (v*.*.*) containing:
+#   - hydra-run for linux-x64, linux-arm64 and macos-arm64
+#   - an installable, signed Android APK (arm64-v8a, armeabi-v7a, x86_64)
+#   - SHA256 checksums for every artifact
 #
-# Das APK ist ohne zusaetzliche Secrets sofort installierbar (Debug-Signatur).
-# Sind HYDRA_KEYSTORE*-Secrets gesetzt, wird mit einem echten Release-Key
-# signiert; das steht dann im Release-Body.
+# Without extra secrets the APK is immediately installable (debug
+# signature). If the HYDRA_KEYSTORE* secrets are set, it is signed with
+# a real release key and the release body says so.
 #
-# Zwei Ausloeser:
-#   1. push auf ein Tag v*.*.*  -> baut und veroeffentlicht das Release
-#   2. workflow_dispatch        -> manueller Build ohne Tag-Push moeglich.
-#      Ohne Tag-Eingabe laeuft ein reiner Dry-Run: alle fuenf Jobs bauen
-#      (inkl. APK-Signatur-Pruefung und NDK/JNI-Kompilierung), aber es
-#      wird nichts veroeffentlicht. Mit Tag + publish=true verhaelt sich
-#      der Lauf wie ein Tag-Push. Damit ist die Release-Kette testbar,
-#      ohne jedes Mal ein Tag pushen zu muessen.
+# Two triggers:
+#   1. push of a v*.*.* tag  -> builds and publishes the release
+#   2. workflow_dispatch      -> manual build without a tag push. With no
+#      tag input this is a pure dry run: all five jobs build (including
+#      APK signature verification and NDK/JNI compilation) but nothing is
+#      published. With a tag and publish=true the run behaves exactly
+#      like a tag push. That makes the release chain testable without
+#      pushing a tag every time.
 
 on:
   push:
@@ -69,13 +69,13 @@ jobs:
               # Dry-Run: synthetisches Tag, kein Push noetig, nichts publiziert.
               TAG="v0.0.0-ci.${RUN_NUMBER}"
               PUBLISH=false
-              echo "::notice::Kein Tag angegeben — Dry-Run mit ${TAG}. Es wird kein Release veroeffentlicht."
+              echo "::notice::No tag given - dry run with ${TAG}. No release will be published."
             fi
           fi
 
           V="${TAG#v}"
           if [[ ! "$V" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-            echo "::error::Tag '${TAG}' entspricht nicht vMAJOR.MINOR.PATCH"
+            echo "::error::Tag '${TAG}' does not match vMAJOR.MINOR.PATCH"
             exit 1
           fi
           MAJ="${BASH_REMATCH[1]}"; MIN="${BASH_REMATCH[2]}"; PAT="${BASH_REMATCH[3]}"
@@ -212,7 +212,7 @@ jobs:
             echo "$HYDRA_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
             echo "HYDRA_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           else
-            echo "::warning::Kein Keystore-Secret gesetzt — APK wird debug-signiert ausgeliefert (installierbar, nicht Play-Store-faehig)."
+            echo "::warning::No keystore secret set - the APK is shipped debug-signed (installable, not Play-Store-ready)."
           fi
           /opt/gradle-8.7/bin/gradle assembleRelease --no-daemon -q
           /opt/gradle-8.7/bin/gradle assembleDebug   --no-daemon -q
@@ -220,27 +220,27 @@ jobs:
              "../dist/hydra-stone-${{ needs.version.outputs.version }}-android-arm64v8a-armeabiv7a-x86_64.apk"
           cp app/build/outputs/apk/debug/app-debug.apk ../dist/hydra-stone-debug.apk
 
-      # Ohne diese Pruefung koennte ein unsigniertes oder unvollstaendiges
-      # APK als Release-Artefakt landen.
+      # Without this check an unsigned or incomplete APK could end up as a
+      # release artifact.
       - name: Verify the APK is signed, complete and installable
         run: |
           APK="dist/hydra-stone-${{ needs.version.outputs.version }}-android-arm64v8a-armeabiv7a-x86_64.apk"
           test -f "$APK"
-          # Pfade relativ zum isolierten SDK-Root (ANDROID_HOME wird im
-          # SDK-Schritt via GITHUB_ENV gesetzt) — kein hart kodiertes
-          # /opt/android-sdk, das auf dem Runner nicht existiert.
+          # Paths relative to the isolated SDK root (ANDROID_HOME is set via
+          # GITHUB_ENV in the SDK step) - no hardcoded /opt/android-sdk,
+          # which does not exist on the runner.
           BT="$ANDROID_HOME/build-tools/34.0.0"
-          test -x "$BT/apksigner" || { echo "::error::apksigner fehlt"; exit 1; }
+          test -x "$BT/apksigner" || { echo "::error::apksigner is missing"; exit 1; }
           "$BT/apksigner" verify --print-certs "$APK"
           "$BT/aapt" list "$APK" > apk-contents.txt
           for abi in arm64-v8a armeabi-v7a x86_64; do
             grep -q "lib/$abi/libhydra.so" apk-contents.txt || {
-              echo "::error::libhydra.so fehlt fuer $abi"; exit 1; }
+              echo "::error::libhydra.so missing for $abi"; exit 1; }
           done
           grep -q 'assets/demo.hydra' apk-contents.txt
           "$BT/aapt" dump badging "$APK" \
             | grep -E "^package:|^sdkVersion:|^application-label:"
-      - name: Android Lint muss fehlerfrei sein
+      - name: Android Lint must be error-free
         working-directory: android
         run: |
           /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
@@ -258,8 +258,8 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [ version, build-linux, build-macos, build-android ]
-    # Beim manuellen Dry-Run wird nichts veroeffentlicht — die vier Build-Jobs
-    # laufen trotzdem komplett durch.
+    # In a manual dry run nothing is published - the four build jobs still
+    # run to completion.
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -271,7 +271,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Gesamt-Pruefsummenliste
+      - name: Combined checksum list
         run: |
           cd dist
           sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt
@@ -294,65 +294,66 @@ jobs:
           body: |
             ## Hydra-Stone ${{ needs.version.outputs.tag }}
 
-            ### Android APK — direkt installierbar
+            ### Android APK - directly installable
 
-            | Datei | Inhalt |
+            | File | Contents |
             |---|---|
             | `hydra-stone-*-android-*.apk` | Release-Build, arm64-v8a + armeabi-v7a + x86_64 |
             | `hydra-stone-debug.apk` | Debug-Build, identischer Code |
 
-            Installation per Sideload (Android 7.0 / API 24 oder neuer):
+            Install via sideload (Android 7.0 / API 24 or newer):
 
             ```bash
-            # Option A: am Telefon — APK herunterladen, antippen und
-            #            "Unbekannte Quellen" fuer den Browser erlauben
-            # Option B: per adb
+            # Option A: on the phone - download the APK, tap it and allow
+            #            "Unknown sources" for the browser
+            # Option B: via adb
             adb install -r hydra-stone-*-android-*.apk
             ```
 
-            Enthalten: `libhydra.so` fuer alle drei ABIs (die C-Engine selbst,
-            NEON-Pfad auf ARM), `assets/demo.hydra`, Launcher-Icon. Die App fuehrt
-            beim Start eine Inferenz aus und zeigt den Token-Stream live an.
+            Contains `libhydra.so` for all three ABIs (the C engine itself,
+            NEON path on ARM), `assets/demo.hydra` and the launcher icon. The
+            app runs an inference on startup and shows the token stream live.
 
             ### CLI
 
-            | Datei | Plattform |
+            | File | Platform |
             |---|---|
-            | `hydra-run-linux-x64` | Linux x86-64, statisch gelinkt |
-            | `hydra-run-linux-arm64` | Linux ARM64 (AArch64), statisch gelinkt |
-            | `hydra-run-macos-arm64` | macOS Apple Silicon (clang, NEON aktiv) |
+            | `hydra-run-linux-x64` | Linux x86-64, statically linked |
+            | `hydra-run-linux-arm64` | Linux ARM64 (AArch64), statically linked |
+            | `hydra-run-macos-arm64` | macOS Apple Silicon (clang, NEON enabled) |
 
             ```bash
             python3 tools/make_dummy_model.py demo.hydra
             ./hydra-run-linux-x64 demo.hydra 42 8 --json
             ```
 
-            Die x64- und arm64-Binaerdateien werden vor dem Release gegeneinander
-            geprueft: sie muessen bitidentische Token- **und** State-Vektoren
-            liefern. Ein Release mit abweichenden Ergebnissen wird nicht erzeugt.
+            The x64 and arm64 binaries are checked against each other before
+            the release: they must produce bit-identical token **and** state
+            vectors. A release with differing results is never created.
 
-            ### Integritaet
+            ### Integrity
 
             ```
             sha256sum -c SHA256SUMS.txt
             ```
 
-            ### Was vor diesem Release geprueft wurde
+            ### What was verified before this release
 
             - **C:** gcc-strict, clang-strict, GCC `-fanalyzer`, Clang Static
               Analyzer, clang-tidy (bugprone/cert/concurrency), cppcheck,
               flawfinder (Schwelle 4)
-            - **C-Laufzeit:** vollstaendige Testsuite unter AddressSanitizer +
+            - **C runtime:** full test suite under AddressSanitizer +
               UndefinedBehaviorSanitizer
-            - **NEON:** ARM64-Build unter qemu; Token- und State-Vektoren
-              bitidentisch zum skalaren Pfad
-            - **Web:** ESLint 10 auf Server und Frontend
-            - **Android:** Android Lint mit 0 Findings, NDK-clang-Build fuer 3 ABIs
+            - **NEON:** ARM64 build under qemu; token and state vectors
+              bit-identical to the scalar path
+            - **Web:** ESLint 10 on server and frontend
+            - **Android:** Android Lint with 0 findings, NDK clang build for 3 ABIs
+            - **JNI:** `javac -h` header check against the C bridge
 
-            ### Signatur-Hinweis
+            ### Signature note
 
-            Wird dieses Release ohne hinterlegtes Keystore-Secret gebaut, ist das
-            APK mit dem Debug-Schluessel signiert: vollstaendig installierbar, aber
-            nicht fuer den Google Play Store geeignet. Fuer Play-Store-Releases
+            If this release was built without a stored keystore secret, the APK
+            is signed with the debug key: fully installable, but not suitable
+            for the Google Play Store. For Play Store releases store
             `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS`
-            und `HYDRA_KEY_PASSWORD` als Repository-Secrets hinterlegen.
+            and `HYDRA_KEY_PASSWORD` as repository secrets.
