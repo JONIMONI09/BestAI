@@ -168,6 +168,29 @@ jobs:
           node --check server.js
           node --check public/app.js
 
+  # ---------- Release-Konfiguration ----------
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ohne diesen Gate koennte ein Tippfehler im Release-Workflow erst beim
+      # Tag-Push auffallen — dann ist es zu spaet, weil das Tag existiert.
+      - name: Workflow-YAML ist syntaktisch gueltig
+        run: |
+          for f in .github/workflows/*.yml; do
+            python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" \
+              || { echo "::error::$f ist kein gueltiges YAML"; exit 1; }
+          done
+
+      # Der Ausloeser- und Versions-Logik des Release-Workflows wird lokal
+      # nachgespielt: Tag-Push, manueller Publish, Dry-Run ohne Tag und ein
+      # ungueltiges Tag. Der Test liest das Skript direkt aus release.yml
+      # und kann daher nicht von der YAML abweichen.
+      - name: Release-Ausloeser und Versionslogik (Negativkontrolle inklusive)
+        run: bash tools/ci_release_version_test.sh
+
   # ---------- Android ----------
   android-lint:
     name: Android lint
@@ -180,29 +203,33 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # android-actions/setup-android@v3 installiert selbst das nicht mehr
-      # existierende Paket "tools" und bricht mit exit 1 ab. Deshalb die
-      # cmdline-tools hier explizit — dieselbe Reihenfolge, die auch lokal
-      # in docs/ANDROID_SKILL.md dokumentiert und erprobt ist.
-      - name: Android cmdline-tools
+      # Zwei Fehlerquellen in einem Schritt:
+      # 1) android-actions/setup-android@v3 installiert selbst das nicht
+      #    mehr existierende Paket "tools" und bricht mit exit 1 ab.
+      # 2) Der Runner bringt ein vorgebautes SDK mit (platforms 35/36).
+      #    Lint meldet targetSdk 34 dann als "OldTargetApi", obwohl exakt
+      #    diese Toolchain-Kombination lokal verifiziert ist. Deshalb ein
+      #    eigenes SDK-Root, das ausschliesslich die gepinnten Pakete
+      #    erhaelt — dieselbe Reihenfolge wie in docs/ANDROID_SKILL.md.
+      - name: Android SDK isoliert aufsetzen (nur API 34)
         run: |
           set -e
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          cd /tmp
+          SDK="$RUNNER_TEMP/android-sdk"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          mkdir -p "$SDK/cmdline-tools"
+          cd "$RUNNER_TEMP"
           curl -sSLO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          rm -rf /tmp/cmdline && unzip -q commandlinetools-linux-11076708_latest.zip -d /tmp/cmdline
-          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
-          mv /tmp/cmdline/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-
-      - name: SDK-Pakete, NDK und Gradle
-        run: |
+          rm -rf "$RUNNER_TEMP/cmdline"
+          unzip -q commandlinetools-linux-11076708_latest.zip -d "$RUNNER_TEMP/cmdline"
+          mv "$RUNNER_TEMP/cmdline/cmdline-tools" "$SDK/cmdline-tools/latest"
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" \
                     "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
-          curl -sSL -o /tmp/gradle.zip \
+          curl -sSL -o gradle.zip \
             https://services.gradle.org/distributions/gradle-8.7-bin.zip
-          unzip -q /tmp/gradle.zip -d /opt
+          unzip -q gradle.zip -d /opt
 
       - name: Android Lint (muss 0 Findings liefern)
         working-directory: android

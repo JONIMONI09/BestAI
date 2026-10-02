@@ -8,6 +8,15 @@ name: Release
 # Das APK ist ohne zusaetzliche Secrets sofort installierbar (Debug-Signatur).
 # Sind HYDRA_KEYSTORE*-Secrets gesetzt, wird mit einem echten Release-Key
 # signiert; das steht dann im Release-Body.
+#
+# Zwei Ausloeser:
+#   1. push auf ein Tag v*.*.*  -> baut und veroeffentlicht das Release
+#   2. workflow_dispatch        -> manueller Build ohne Tag-Push moeglich.
+#      Ohne Tag-Eingabe laeuft ein reiner Dry-Run: alle fuenf Jobs bauen
+#      (inkl. APK-Signatur-Pruefung und NDK/JNI-Kompilierung), aber es
+#      wird nichts veroeffentlicht. Mit Tag + publish=true verhaelt sich
+#      der Lauf wie ein Tag-Push. Damit ist die Release-Kette testbar,
+#      ohne jedes Mal ein Tag pushen zu muessen.
 
 on:
   push:
@@ -15,9 +24,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to publish a release for'
-        required: true
+        description: 'Tag to publish (vMAJOR.MINOR.PATCH). Empty = build-only dry run.'
+        required: false
         type: string
+      publish:
+        description: 'Create the GitHub Release (ignored without a tag)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,17 +44,49 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
       version_code: ${{ steps.v.outputs.version_code }}
+      publish: ${{ steps.v.outputs.publish }}
     steps:
+      # Werte kommen ueber env, nicht per ${{ }} im Skript: sonst wuerde ein
+      # frei eingegebener Tag als Shell-Code ausgefuehrt (Script Injection).
       - name: Derive version from tag
         id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          set -euo pipefail
+
+          if [ "$EVENT" = "push" ]; then
+            TAG="$REF_NAME"
+            PUBLISH=true
+          else
+            TAG="${INPUT_TAG:-}"
+            PUBLISH="${INPUT_PUBLISH:-false}"
+            if [ -z "$TAG" ]; then
+              # Dry-Run: synthetisches Tag, kein Push noetig, nichts publiziert.
+              TAG="v0.0.0-ci.${RUN_NUMBER}"
+              PUBLISH=false
+              echo "::notice::Kein Tag angegeben — Dry-Run mit ${TAG}. Es wird kein Release veroeffentlicht."
+            fi
+          fi
+
           V="${TAG#v}"
-          MAJ="${V%%.*}"; REST="${V#*.}"; MIN="${REST%%.*}"; PAT="${V##*.}"
-          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
-          echo "version=$V"      >> "$GITHUB_OUTPUT"
-          echo "version_code=$(( MAJ * 10000 + MIN * 100 + PAT ))" >> "$GITHUB_OUTPUT"
-          echo "Release $TAG -> versionCode $(( MAJ * 10000 + MIN * 100 + PAT ))"
+          if [[ ! "$V" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            echo "::error::Tag '${TAG}' entspricht nicht vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          MAJ="${BASH_REMATCH[1]}"; MIN="${BASH_REMATCH[2]}"; PAT="${BASH_REMATCH[3]}"
+          CODE=$(( MAJ * 10000 + MIN * 100 + PAT ))
+          if [ "$CODE" -lt 1 ]; then CODE=1; fi
+
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "version=$V"    >> "$GITHUB_OUTPUT"
+          echo "version_code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Release ${TAG} -> versionCode ${CODE}, publish=${PUBLISH}"
 
   build-linux:
     name: CLI (Linux)
@@ -126,28 +172,30 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # Gleiche Reihenfolge wie in lint.yml: cmdline-tools explizit
-      # installieren, weil android-actions/setup-android das Paket "tools"
-      # mitinstalliert, das es nicht mehr gibt (exit 1).
-      - name: Android cmdline-tools
+      # Gleiche Reihenfolge wie in lint.yml: eigenes SDK-Root, cmdline-tools
+      # explizit installieren (android-actions/setup-android scheitert am
+      # nicht mehr existierenden Paket "tools") und ausschliesslich die
+      # gepinnten Pakete laden, damit der Release-Build exakt der lokal
+      # verifizierten Toolchain entspricht.
+      - name: Android SDK isoliert aufsetzen (nur API 34)
         run: |
           set -e
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          cd /tmp
+          SDK="$RUNNER_TEMP/android-sdk"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          mkdir -p "$SDK/cmdline-tools"
+          cd "$RUNNER_TEMP"
           curl -sSLO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          rm -rf /tmp/cmdline && unzip -q commandlinetools-linux-11076708_latest.zip -d /tmp/cmdline
-          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
-          mv /tmp/cmdline/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-
-      - name: SDK-Pakete, NDK und Gradle
-        run: |
+          rm -rf "$RUNNER_TEMP/cmdline"
+          unzip -q commandlinetools-linux-11076708_latest.zip -d "$RUNNER_TEMP/cmdline"
+          mv "$RUNNER_TEMP/cmdline/cmdline-tools" "$SDK/cmdline-tools/latest"
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" \
                     "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
-          curl -sSL -o /tmp/gradle.zip \
+          curl -sSL -o gradle.zip \
             https://services.gradle.org/distributions/gradle-8.7-bin.zip
-          unzip -q /tmp/gradle.zip -d /opt
+          unzip -q gradle.zip -d /opt
 
       - name: Build APK
         working-directory: android
@@ -178,14 +226,19 @@ jobs:
         run: |
           APK="dist/hydra-stone-${{ needs.version.outputs.version }}-android-arm64v8a-armeabiv7a-x86_64.apk"
           test -f "$APK"
-          /opt/android-sdk/build-tools/34.0.0/apksigner verify --print-certs "$APK"
-          /opt/android-sdk/build-tools/34.0.0/aapt list "$APK" > apk-contents.txt
+          # Pfade relativ zum isolierten SDK-Root (ANDROID_HOME wird im
+          # SDK-Schritt via GITHUB_ENV gesetzt) — kein hart kodiertes
+          # /opt/android-sdk, das auf dem Runner nicht existiert.
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          test -x "$BT/apksigner" || { echo "::error::apksigner fehlt"; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK"
+          "$BT/aapt" list "$APK" > apk-contents.txt
           for abi in arm64-v8a armeabi-v7a x86_64; do
             grep -q "lib/$abi/libhydra.so" apk-contents.txt || {
               echo "::error::libhydra.so fehlt fuer $abi"; exit 1; }
           done
           grep -q 'assets/demo.hydra' apk-contents.txt
-          /opt/android-sdk/build-tools/34.0.0/aapt dump badging "$APK" \
+          "$BT/aapt" dump badging "$APK" \
             | grep -E "^package:|^sdkVersion:|^application-label:"
       - name: Android Lint muss fehlerfrei sein
         working-directory: android
@@ -205,6 +258,9 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [ version, build-linux, build-macos, build-android ]
+    # Beim manuellen Dry-Run wird nichts veroeffentlicht — die vier Build-Jobs
+    # laufen trotzdem komplett durch.
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
