@@ -252,6 +252,25 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
     return 0;
 }
 
+int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)
+{
+    if (!engine || (n > 0 && !tokens)) return -1;
+    if (engine->header.magic != HYDRA_MAGIC) return -2;
+    /* Alle Prompt-Token ausser dem letzten werden verworfen: sie treiben
+     * nur den State. Der letzte Prompt-Token ist der Seed fuer die erste
+     * erzeugte Position (out = f(acc + token_in)), der Aufrufer kennt ihn
+     * bereits und muss ihn nicht zurueckbekommen.
+     *
+     * Ein Token wird also durch exakt dieselbe Kernfunktion geschickt wie
+     * in einem normalen Lauf - es gibt keine zweite, abweichende
+     * Prompt-Implementierung, die von step() abweichen koennte. */
+    for (size_t i = 0; i + 1 < n; ++i) {
+        uint16_t discarded = 0;
+        if (hydra_engine_step(engine, tokens[i], &discarded) != 0) return -3;
+    }
+    return 0;
+}
+
 int hydra_verify_axiom(float humanity_factor, float proposed_score, float *safe_score)
 {
     if (!safe_score) return -1;

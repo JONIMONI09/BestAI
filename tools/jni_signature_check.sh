@@ -45,16 +45,44 @@ if not fns:
 JMAP = {
     "String": "String",
     "Int": "int",
+    "IntArray": "int[]",
     "Boolean": "boolean",
     "Long": "long",
     "Double": "double",
     "Callback": "dev.hydrastone.%s.Callback" % cls,
 }
 
+# The Callback interface must mirror the Kotlin declaration, because the C
+# bridge looks the method up BY NAME AND SIGNATURE
+# (GetMethodID(..., "onTokens", "([IZ)V")). A stub with a stale onToken
+# would still pass the native-method check while the real bridge could
+# never find its callback at runtime.
+CB_DECL = re.search(r"interface\s+Callback\s*\{(.*?)\}", src, re.S)
+if not CB_DECL:
+    sys.exit("no Callback interface found in " + kt_path)
+cb_methods = []
+for mm in re.finditer(r"fun\s+(\w+)\s*\(([^)]*)\)\s*(?::\s*([\w.<>\[\]]+))?", CB_DECL.group(1)):
+    name, params = mm.group(1), mm.group(2)
+    # Kotlin laesst den Rueckgabetyp bei Unit weg ("fun f(): Unit" und
+    # "fun f()" sind dasselbe) - der Stub braucht in beiden Faellen void.
+    ret = (mm.group(3) or "Unit").strip()
+    jret = {"Unit": "void", "Int": "int", "Boolean": "boolean", "String": "String"}.get(ret)
+    if jret is None:
+        sys.exit("unsupported callback return type: " + ret)
+    ps = []
+    for p in (x.strip() for x in params.split(",")):
+        if not p:
+            continue
+        pname, ptype = (x.strip() for x in p.split(":"))
+        ps.append("%s %s" % (JMAP.get(ptype, "?"), pname))
+    cb_methods.append("void %s(%s);" % (name, ", ".join(ps)))
+if not cb_methods:
+    sys.exit("Callback interface has no methods in " + kt_path)
+
 out = ["package dev.hydrastone;", "",
        "/** Generated from %s - do not edit. */" % kt_path,
        "public final class %s {" % cls,
-       "    public interface Callback { void onToken(int step, int token); }"]
+       "    public interface Callback { %s }" % " ".join(cb_methods)]
 for name, params, ret in fns:
     ret_j = JMAP.get(ret.strip())
     if ret_j is None:
@@ -141,6 +169,60 @@ if [ "$checked" -eq 0 ]; then
   echo "FAIL: no native method was verified"
   exit 1
 fi
+
+# ---- 5: the callback lookup in C must match the Kotlin interface -----
+# The native method signature check above says nothing about the callback:
+# the C bridge looks the method up at runtime with GetMethodID(name, sig).
+# If Kotlin declares onToken(int,int) and C calls onTokens(int[],boolean),
+# every native signature check still passes while the app can never
+# receive a single token. So the JVM descriptor of each callback method is
+# derived from the generated stub and must appear in hydra_jni.c.
+cb_sig="$(python3 - "$WORK/dev/hydrastone/HydraBridge.java" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"interface\s+Callback\s*\{(.*?)\}", src, re.S)
+if not m:
+    sys.exit("no Callback interface in the generated stub")
+body = m.group(1)
+out = []
+for mm in re.finditer(r"void\s+(\w+)\s*\(([^)]*)\)\s*;", body):
+    name = mm.group(1)
+    jt = {"int": "I", "int[]": "[I", "boolean": "Z", "long": "J",
+          "java.lang.String": "Ljava/lang/String;"}
+    params = []
+    for p in (x.strip() for x in mm.group(2).split(",")):
+        if not p:
+            continue
+        jtype = p.rsplit(" ", 1)[0]
+        if jtype not in jt:
+            sys.exit("unsupported callback param type: " + jtype)
+        params.append(jt[jtype])
+    out.append("%s(%s)V" % (name, "".join(params)))
+print(" ".join(out))
+PY
+)" || { echo "FAIL: could not derive the callback descriptor"; exit 1; }
+
+echo "--- callback descriptor ---"
+echo "derived: $cb_sig"
+for sig in $cb_sig; do
+  name="${sig%%(*}"
+  # Die JVM-Signatur ist "(params)return" - die oeffnende Klammer gehoert
+  # dazu und wird hier wieder ergaenzt.
+  desc="(${sig#*(}"
+  # GetMethodID takes name and descriptor as two separate strings, and the
+  # descriptor contains [ and ] which would open a character class in a
+  # regex (grep: "Unmatched ["), so both greps are fixed-string.
+  if ! grep -qF "\"$name\"" "$JNI_C"; then
+    echo "FAIL: the C bridge never looks up the callback method $name"
+    exit 1
+  fi
+  if ! grep -qF "\"$desc\"" "$JNI_C"; then
+    echo "FAIL: the C bridge looks up $name with a different descriptor than $desc"
+    exit 1
+  fi
+  echo "ok    callback $name looked up as $desc in $JNI_C"
+done
+
 if [ "$fail" != "0" ]; then
   echo "JNI-SIGNATURE-CHECK: FAILED"
   exit 1

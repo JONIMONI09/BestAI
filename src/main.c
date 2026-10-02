@@ -9,10 +9,15 @@
 /* Hydra-Stone CLI
  *
  * Verwendung:
- *   hydra-run <modell.hydra> [start_token] [steps] [--json]
+ *   hydra-run <modell.hydra> [start_token] [steps] [--json] [--prompt t1,t2,...]
  *
  * Standard: menschenlesbare Ausgabe auf stdout, Engine-Logs auf stderr.
  * --json:   maschinenlesbares JSON (tokens, state, timing) fuer die Web-UI.
+ * --prompt: komma-getrennte Token-IDs, die VOR der Generierung durch die
+ *           Engine geschickt werden (Prefill). Der letzte Prompt-Token ist
+ *           der Seed; steps zaehlen wie bisher nur die erzeugten Tokens.
+ *           Ohne --prompt gilt start_token als Seed (unveraendertes
+ *           Verhalten).
  * --help:   Verwendung und Exit-Code 0.
  */
 
@@ -25,15 +30,18 @@ static double now_ms(void)
 
 static void usage(const char *argv0, FILE *out)
 {
-    fprintf(out, "Verwendung: %s <modell.hydra> [start_token] [steps] [--json]\n", argv0);
+    fprintf(out, "Verwendung: %s <modell.hydra> [start_token] [steps] [--json] "
+                 "[--prompt t1,t2,...]\n", argv0);
     fprintf(out, "\n");
     fprintf(out, "  <modell.hydra>   Pfad zu einer .hydra-Modell-Datei (Pflicht)\n");
     fprintf(out, "  start_token      Start-Token-ID, 0..vocab-1 (Standard: 42)\n");
-    fprintf(out, "  steps            Anzahl Inferenzschritte, 1..256 (Standard: 16)\n");
+    fprintf(out, "  steps            Anzahl erzeugter Inferenzschritte, 1..256 (Standard: 16)\n");
     fprintf(out, "  --json           Maschinenlesbare Ausgabe auf stdout\n");
+    fprintf(out, "  --prompt LIST    Komma-getrennte Token-IDs als Prefill vor der Generierung\n");
     fprintf(out, "  --help           Diese Hilfe anzeigen\n");
     fprintf(out, "\n");
     fprintf(out, "Beispiel: %s models/demo.hydra 123 32 --json\n", argv0);
+    fprintf(out, "Beispiel: %s models/demo.hydra 0 8 --prompt 7,9,11 --json\n", argv0);
     fprintf(out, "Tipp: Modell erzeugen mit: python3 tools/make_dummy_model.py <ziel>\n");
 }
 
@@ -49,8 +57,45 @@ static int parse_long_arg(const char *arg, long *out)
     return 0;
 }
 
+/* --prompt parsen: streng. Leere Eintraege, Nicht-Ziffern, Ueberlaenge
+ * und Werte oberhalb von 65535 werden abgewiesen statt stillschweigend
+ * gekappt - ein gekappter Seed waere ein falsches Modellresultat. */
+#define MAX_PROMPT 256
+
+static int parse_prompt(const char *arg, uint16_t *out, size_t cap, size_t *n_out)
+{
+    const char *p = arg;
+    size_t n = 0;
+    if (!arg || !*arg) return -1;
+    while (*p) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(p, &end, 10);
+        if (end == p || errno == ERANGE || v < 0 || v > 65535) return -1;
+        if (n >= cap) {
+            fprintf(stderr, "[Hydra] Prompt zu lang (max %d Tokens)\n", MAX_PROMPT);
+            return -1;
+        }
+        out[n++] = (uint16_t)v;
+        if (*end == '\0') break;
+        if (*end != ',') {
+            fprintf(stderr, "[Hydra] Prompt-Fehler an '%s' (erwartet: Ziffern, Kommas)\n", end);
+            return -1;
+        }
+        p = end + 1;
+        if (*p == '\0') { /* trailing comma */
+            fprintf(stderr, "[Hydra] Prompt endet auf einem Komma\n");
+            return -1;
+        }
+    }
+    if (n == 0) return -1;
+    *n_out = n;
+    return 0;
+}
+
 static void print_json(const HydraEngine *e, const uint16_t *tokens,
-                       int n, uint16_t start, double elapsed_ms)
+                       int n, uint16_t start, double elapsed_ms,
+                       const uint16_t *prompt, size_t prompt_n)
 {
     printf("{\"tokens\":[");
     for (int i = 0; i < n; ++i) {
@@ -61,9 +106,17 @@ static void print_json(const HydraEngine *e, const uint16_t *tokens,
         printf("%s%d", i ? "," : "", (int)e->state_vector[i]);
     }
     printf("],\"dim\":%u,\"vocab\":%u,\"layers\":%u,\"start_token\":%u,"
-           "\"steps\":%d,\"elapsed_ms\":%.3f}",
+           "\"steps\":%d,\"elapsed_ms\":%.3f",
            e->header.dim, e->header.vocab_size, e->header.layers,
            (unsigned)start, n, elapsed_ms);
+    /* Das Prompt wird mit ausgegeben: die Web-UI muss nachweisen koennen,
+     * dass wirklich die ganze Sequenz in die Engine gegangen ist und
+     * nicht nur ihr erstes Token. */
+    printf(",\"prompt\":[");
+    for (size_t i = 0; i < prompt_n; ++i) {
+        printf("%s%u", i ? "," : "", (unsigned)prompt[i]);
+    }
+    printf("]}");
 }
 
 int main(int argc, char **argv)
@@ -72,10 +125,25 @@ int main(int argc, char **argv)
     long start_token = -1;   /* Sentinel: noch nicht gesetzt */
     long steps = -1;
     int json_mode = 0;
+    uint16_t prompt[MAX_PROMPT];
+    size_t prompt_n = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[i], "--prompt") == 0) {
+            /* Fehlendes Argument explizit abweisen: argv[i+1] == NULL ist
+             * ein Benutzerfehler, kein leeres Prompt. */
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "[Hydra] --prompt braucht eine kommagetrennte Token-Liste\n");
+                usage(argv[0], stderr);
+                return 1;
+            }
+            if (parse_prompt(argv[i + 1], prompt, MAX_PROMPT, &prompt_n) != 0) {
+                fprintf(stderr, "[Hydra] Ungueltiges --prompt: '%s'\n", argv[i + 1]);
+                return 1;
+            }
+            ++i;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0], stdout);
             return 0;
@@ -120,6 +188,10 @@ int main(int argc, char **argv)
     if (steps < 1)   steps = 1;
     if (steps > 256) steps = 256;
 
+    /* --prompt gewinnt ueber das positionelle start_token: der Seed ist
+     * dann das LETZTE Prompt-Token. Das ist explizit, nicht still. */
+    if (prompt_n > 0) start_token = prompt[prompt_n - 1];
+
     HydraEngine engine;
     if (hydra_engine_load(&engine, model_path) != 0) {
         return 1;
@@ -136,6 +208,18 @@ int main(int argc, char **argv)
     }
 
     uint16_t current = (uint16_t)start_token;
+
+    /* Prefill zuerst: das Prompt laeuft durch die Engine, danach wird
+     * generiert. Die Prompt-Tokens selbst werden NICHT ausgegeben -
+     * steps bleibt die Anzahl der erzeugten Tokens. */
+    if (prompt_n > 0) {
+        if (hydra_engine_prefill(&engine, prompt, prompt_n) != 0) {
+            free(tokens);
+            hydra_engine_unload(&engine);
+            return 1;
+        }
+    }
+
     double t0 = now_ms();
     for (long s = 0; s < steps; ++s) {
         uint16_t next = 0;
@@ -150,11 +234,17 @@ int main(int argc, char **argv)
     double elapsed = now_ms() - t0;
 
     if (json_mode) {
-        print_json(&engine, tokens, (int)steps, (uint16_t)start_token, elapsed);
+        print_json(&engine, tokens, (int)steps, (uint16_t)start_token, elapsed,
+                   prompt, prompt_n);
         printf("\n");
     } else {
         printf("[Hydra] Starte O(1) Inferenzschleife. Eingangs-Token: %ld, Steps: %ld\n",
                start_token, steps);
+        if (prompt_n > 0) {
+            printf("[Prompt]: ");
+            for (size_t p = 0; p < prompt_n; ++p) printf("%u ", (unsigned)prompt[p]);
+            printf("\n");
+        }
         printf("[Tokens]: ");
         for (long s = 0; s < steps; ++s) {
             printf("%u ", (unsigned)tokens[s]);

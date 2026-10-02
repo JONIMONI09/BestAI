@@ -60,6 +60,12 @@ export default [
         console: 'readonly',
         Buffer: 'readonly',
         __dirname: 'readonly',
+        URL: 'readonly',
+        fetch: 'readonly',
+        AbortController: 'readonly',
+        AbortSignal: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
       },
     },
     rules: {
@@ -87,6 +93,7 @@ export default [
         clearInterval: 'readonly',
         requestAnimationFrame: 'readonly',
         performance: 'readonly',
+        AbortController: 'readonly',
       },
     },
     rules: {

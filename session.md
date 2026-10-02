@@ -301,3 +301,63 @@ documentation base is in one language.
 - [ ] PR + merge — **user approval needed** (R14). After the merge the
       next push to `main` creates `v1.0.0` with the real artifacts,
       because the repository currently has no tag and no release at all.
+
+## Round 2026-10-02 (audit: UI/UX bugs, model loading, engine prompt)
+
+Audit of the reported findings against the actual code first. Result:
+
+- **Part 4 was already done in main.** `hydra_neon.h` uses the
+  mask-then-subtract decode (`vsubq_u8(p1n1)` on 0x01-normalised masks),
+  `HYDRA_MAX_LAYERS` 4096 is enforced with `rc=-11`, the accumulator is
+  `int64_t`, and `test_neon_matches_scalar` exists. Nothing was changed
+  there except strengthening the test.
+- **Part 3.1/3.2 were already done.** `ci.yml` builds and tests on x86-64
+  (ubuntu + macos), runs the AArch64/NEON build under qemu, and uses
+  `cppcheck --error-exitcode=2`; sanitizers live in `lint.yml`.
+  `release.yml` already builds the APK, verifies it and attaches it to the
+  release, so a second `android-release.yml` would only duplicate it.
+
+Work actually done:
+
+- [x] Engine: `hydra_engine_prefill()` + CLI `--prompt`, JSON echoes the
+      prompt. C tests: prefill equals a manual prompt run, prefill is not a
+      no-op, n=0/NULL handling (7 new assertions).
+- [x] NEON: new `test_neon_all_ternary_codes` writes a model whose weights
+      contain **all four** 2-bit codes (00/01/10/11) and compares NEON with
+      the scalar reference, plus a negative control proving that a +1 and a
+      -1 model really do differ. Re-introducing the original `vsubq` sign
+      bug was proven to fail the suite (3 failures, exit 1).
+- [x] Console 1.1/1.2/1.3: reverse vocabulary map, re-render on view
+      toggle, full prompt to the engine.
+- [x] Console 1.4: Send/Train disabled while a request runs, Cancel aborts
+      via `AbortController` (the engine process is deliberately left
+      running), `finally` always re-enables.
+- [x] Console 1.5: real `<label>` for the composer, focus trap + Escape +
+      focus return in the drawer, state cells 9.5px -> 11px with a darker
+      colour range and a per-cell `aria-label`, hidden chart/state summary
+      text.
+- [x] Console 1.6: chat / engine output / training are now tabs, state
+      vector and raw log are collapsed `<details>`, chart + metrics stay
+      visible.
+- [x] 2.1: `POST /api/models/upload` — streamed to a temp file with a
+      64 MiB cap, header validated against the same rules as the C loader,
+      renamed into `models/uploaded/` only when valid.
+- [x] 2.2: SAF import in the Android app (`OpenDocument`, `*/*`), streamed
+      copy into `filesDir` via a `.tmp` file + atomic rename, same header
+      validation, demo model kept as fallback, no persistable URI grant.
+- [x] 2.3: JNI callback is now `onTokens(IntArray, done)` with 16-token
+      batches and exactly one `done=true` call; all tokens are logged
+      instead of the first 8.
+- [x] Server binds to 127.0.0.1 unless `HYDRA_ALLOW_REMOTE=1`.
+- [x] 3.3: `tools/server_test.js` (node:test, 15 cases) covering listing,
+      bad input, path escapes, prompt plumbing, upload accept/reject and
+      the loopback-only binding. Wired into `lint.yml` (`web-lint`).
+- [x] CI: a new `build-test` step proves the prompt reaches the engine and
+      rejects malformed prompts; negative control (prefill turned into a
+      no-op) verified to fail.
+- [x] Local verification: `make test` 56/0, ARM/NEON 62/0 under qemu,
+      ESLint clean, `node --test tools/server_test.js` 15/15,
+      `jni_signature_check.sh` green with 3 working negative controls,
+      gradle `assembleDebug assembleRelease lintDebug` green with
+      "0 errors, 0 warnings".
+- [ ] PR + merge — **user approval needed** (R14).

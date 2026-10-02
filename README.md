@@ -6,6 +6,12 @@
 ./hydra-run my_model.hydra 123
 ```
 
+A whole token sequence can be fed in as a prompt — every token before the last one is run through the engine as context, the last one is the seed for the generated continuation:
+
+```bash
+./hydra-run my_model.hydra 0 16 --prompt 7,9,11 --json
+```
+
 Hydra-Stone is a C99 engine that streams ternary weights ({-1, 0, +1}) directly from disk via `mmap`. The inference step consists purely of integer additions.
 
 **Memory claim, stated honestly:** the engine performs **no heap allocation at all** — the only process memory it uses is the O(1) `int8_t[64]` state vector. The weight pages themselves are owned by the kernel page cache and are reclaimed under memory pressure by LRU eviction. The engine cannot and does not keep the model's resident set size at zero; build with `-DHYDRA_DROP_CACHE` to explicitly hand touched pages back after every step.
@@ -77,7 +83,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
   - *Honesty note:* the NEON path is active on ARM builds only. It is **not** merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the NEON kernel **in the same ARM build** and requires bit-identical token sequences *and* state vectors. The x86 path is purely scalar; AVX2 is on the roadmap.
-- ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation, 49 unit tests
+- ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation, 56 unit tests (62 on ARM with NEON)
 - ✅ **Web console** — desktop UI with live visualization (`make ui`)
 - ✅ **Android** — NDK/JNI build of the same C source, verified on-device
 - ✅ **C99, zero dependencies** — runs on 32-bit ARMv7, x86-64, and everything in between
@@ -92,6 +98,8 @@ adb install -r hydra-stone-<version>-android-arm64v8a-armeabiv7a-x86_64.apk
 ```
 
 The APK bundles the same C engine (`libhydra.so` for arm64-v8a, armeabi-v7a and x86_64 — NEON active on ARM), the packed demo model, and a launcher icon. Tapping **Run inference** executes the engine and streams the tokens live.
+
+**Importing your own model.** *Import .hydra model…* opens the system file picker (Storage Access Framework, `*/*` because `.hydra` has no reliable MIME mapping). The chosen file is streamed into the app's private storage, validated against the same header rules the C loader enforces, and only then renamed into place and used — the demo model stays as the fallback when nothing valid has been imported. Tokens are delivered from the JNI layer in blocks of 16 instead of one call per token; the per-token JNI transition cost more than the engine step itself at this model size.
 
 Release artifacts:
 
@@ -112,16 +120,30 @@ Release artifacts:
 
 **Manual runs.** The release workflow can also be started from the Actions tab (*Run workflow*) without pushing a tag. Leave **tag** empty to get a build-only dry run: all jobs run — CLI binaries, APK build, signature verification, Android Lint, x64/arm64 parity — but **no release is published**. Enter a tag and tick **publish** to behave exactly like a tag push. The trigger and version logic are regression-tested by `tools/ci_release_version_test.sh` (job `release-config`), which replays the script straight out of the workflow file for five input cases.
 
+**Automatic releases on every push to `main`.** The same workflow also runs on `push: branches: [main]`. It then decides on its own, from the remote tags: no tag yet → create `v1.0.0`; tag pointing at an older commit → patch bump; tag already on this commit → reuse it. The tag is created through the job credential, which does not re-trigger the tag trigger, so the build runs exactly once. Publishing is an explicit upsert — `gh release view` decides between `gh release edit` + `upload --clobber` and `gh release create` — and a final step asserts that all five expected assets are attached, so a release can never be "successful" while missing the APK. The version resolution is regression-tested for ten input cases, including a negative control against a deliberately broken copy of the workflow.
+
+**APK signing.** No `HYDRA_KEYSTORE*` secret is configured in this repository, so the release APK is signed with the **debug key**: fully sideloadable, not Play-Store-ready. The release body says exactly that instead of claiming a signed release. Store `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS` and `HYDRA_KEY_PASSWORD` as repository secrets to get a real release signature; the workflow decodes them only when the value is non-blank (an unconfigured secret arrives as an empty string, which once broke the first real release run).
+
 ## Web console
 
 `make ui` (or `node server.js`) serves a dependency-free console on `PORT` (default 8787).
 
+**Binding.** The console binds to `127.0.0.1` only. It exposes an engine that loads files from disk, so listening on every interface has to be an explicit decision:
+
+```bash
+HYDRA_ALLOW_REMOTE=1 node server.js   # then also reachable from the LAN
+```
+
 | Area | What it does |
 |---|---|
-| **Chat** | Type text, get a real reply from the compiled C engine. Words are mapped to token IDs through the stored vocabulary; a word without an ID is reported as unknown instead of being guessed. Replies can be shown as words or raw token IDs. |
-| **Models** | Every `*.hydra` file under `models/` is listed with its real header (dim, vocab, layers, size, validity) and can be selected. Trained models are marked. |
+| **Chat** | Type text, get a real reply from the compiled C engine. Words are mapped to token IDs through the stored vocabulary; a word without an ID is reported as unknown instead of being guessed. Replies can be shown as words or raw token IDs. **The whole prompt is fed to the engine**, not just its first token — `hydra_engine_prefill()` runs every prompt token through the same core step before generation starts. |
+| **Models** | Every `*.hydra` file under `models/` is listed with its real header (dim, vocab, layers, size, validity) and can be selected. Trained and uploaded models are marked. |
+| **Upload** | **Upload model** in the top bar stores a `.hydra` into `models/uploaded/` (`POST /api/models/upload?name=…`). The bytes are streamed to disk (64 MiB cap), then validated against the same rules the C loader enforces — magic, version, dim/vocab/layers bounds, `weights_offset`/`weights_len` inside the file, `layers × dim` covered by `weights_len`. An invalid file is rejected with the reason and never reaches a model path. |
+| **Engine output** | Token chart with metrics; the state vector and the raw log are collapsed by default. |
 | **Training** | Paste a corpus (`3 3 3 3 -> 7 7 7 7`, or `1 2 3` for next-token training), pick vocab/dim/layers/epochs and train. Training writes a real `.hydra` file and is **verified against the compiled engine** before it is reported as successful; accuracy before/after is measured, never estimated. |
-| **Settings** | Start token, steps, coexistence-axiom factor, per-model vocabulary editor. |
+| **Settings** | Start token, steps, coexistence-axiom factor, per-model vocabulary editor. The drawer traps focus, closes on Escape and returns focus to its toggle. |
+
+Only one inference runs at a time: **Send** and **Train** are disabled while a request is in flight and a **Cancel** button aborts it client-side (the engine process is deliberately left running — killing it would also kill any other request).
 
 Everything shown comes from the engine. There is no simulated output anywhere in the console.
 

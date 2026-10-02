@@ -169,6 +169,7 @@ jobs:
           node --check public/app.js
           node --check tools/hydra_train.js
           node --check tools/console_train_test.js
+          node --check tools/server_test.js
 
       # The console can TRAIN a model. That is only believable if the
       # compiled C engine is shown to reproduce the trained token stream,
@@ -177,6 +178,16 @@ jobs:
         run: |
           make -s all
           node tools/console_train_test.js
+
+      # The HTTP surface: routing, input validation, path escapes, model
+      # upload and the prompt plumbing. The server is started as a real
+      # child process, so this asserts the endpoints the browser really
+      # talks to - including that the console is not reachable off
+      # loopback without HYDRA_ALLOW_REMOTE=1.
+      - name: Server endpoints (node:test)
+        run: |
+          make -s all
+          node --test tools/server_test.js
 
   # ---------- Release-Konfiguration ----------
   release-config:
