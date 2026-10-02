@@ -361,3 +361,48 @@ Work actually done:
       gradle `assembleDebug assembleRelease lintDebug` green with
       "0 errors, 0 warnings".
 - [ ] PR + merge — **user approval needed** (R14).
+
+## Round 2026-10-02 (GPU feasibility: measure, optimise the CPU, honest PoC)
+
+Audit first: Phase 1.3 (JNI batching), SAF import, the `labs()` sign fix
+and the APK-in-release workflow were **already merged** in PR #26/#24 —
+recorded in `docs/gpu-feasibility.md` so nobody repeats them.
+
+- [x] rules.md: **R31** (every change through a PR, English artefacts) and
+      **R32** (measure before claiming; say "blocked" when a number cannot
+      be taken)
+- [x] Phase 1.1 — layer aggregation `A[i] = sum_l w1`, `B[i] = sum_l w2`
+      computed once at load. Equivalence against a **reference
+      implementation inside the test file** (not the engine's own scalar
+      branch): 4 seeds x {1,4,37} layers, identical tokens *and* state.
+      Negative control: shifting `B[0]` by one makes it fail.
+- [x] The NEON kernel was rewritten for the aggregated loop instead of
+      being left dead — otherwise the ARM path would have silently fallen
+      back to scalar while its own tests still passed.
+- [x] Phase 1.2 — `hydra_engine_step_fast()` + `--fast`, dimension 0 only.
+      Bit-identical token streams proven over 3 models x 32 tokens, plus a
+      negative control.
+- [x] Phase 0 — `--bench` in the CLI (JSON, warmup, MONOTONIC) and
+      `HydraBridge.benchmark()` in JNI measuring native-only vs per-token
+      callback vs batched callback. Measured here: **132–149 ns/token full,
+      18–19 ns/token fast, ~7.2x**, unchanged at 256 layers.
+- [x] Crash handler in all three applications: window errors and unhandled
+      rejections in the console, uncaught exceptions in the Node server
+      (`GET /api/errors`, polled by the UI), and a default
+      `UncaughtExceptionHandler` on Android writing `last-crash.txt` and
+      showing `CrashActivity` with a clipboard copy button.
+- [x] Permissions gate in `ci.yml`: the APK must not request any dangerous
+      permission. SAF needs none; verified locally with `aapt`.
+- [x] Phase 2 — `tools/gpu_bench/`: GLES 3.1 compute benchmark, CPU
+      reference + GPU path + K sweep, checksum gate. **Compiles for arm64
+      with the NDK, never executed** — no device, and no `glslangValidator`
+      for the shader, so the `.spv` is deliberately not committed.
+- [x] `docs/gpu-feasibility.md`: measured vs blocked separated, conclusion
+      "do not start v2 yet" with the reasoning.
+- [x] UI: focus-visible rings, `prefers-reduced-motion`, empty state for
+      the engine panel, 44px touch targets on small screens.
+- [x] Verified: `make test` 61/0, ARM/NEON 67/0 under qemu, gcc+clang
+      `-Werror`, cppcheck, ASan+UBSan 61/0, ESLint clean, `node --test`
+      18/18, trainer test, JNI gate (2 native methods), gradle
+      `assembleDebug assembleRelease lintDebug` = *No issues found*.
+- [ ] PR + merge — **user approval needed** (R14)

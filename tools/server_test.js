@@ -427,6 +427,9 @@ test('public/app.js initialises against the real markup without throwing', async
       console,
       performance: globalThis.performance,
       AbortController,
+      navigator: { clipboard: null },
+      location: { href: 'http://127.0.0.1/' },
+      setInterval: () => 0,
       Object,
       Array,
       Number,
@@ -444,6 +447,51 @@ test('public/app.js initialises against the real markup without throwing', async
     globalThis.fetch = realFetch;
   }
   assert.deepStrictEqual(errors.map((e) => e.message), [], 'app.js must initialise cleanly');
+});
+
+test('/api/errors exposes the crash log and reports a real failure', async () => {
+  const { status, body } = await json('/api/errors');
+  assert.strictEqual(status, 200);
+  assert.ok(Array.isArray(body.errors));
+
+  /* Provoke a real 500 by taking the engine binary away for one request:
+   safeModelPath still succeeds, the execFile then fails, and the route
+   lands in the outer catch. Restored immediately afterwards. */
+  const bin = path.join(ROOT, 'hydra-run');
+  const hidden = path.join(ROOT, 'hydra-run.hidden-for-test');
+  const { body: list2 } = await json('/api/models');
+  const model = list2.models.find((m) => m.valid) || list2.models[0];
+  fs.renameSync(bin, hidden);
+  let bad;
+  try {
+    bad = await postJSON('/api/infer', { path: model.path, token: 1, steps: 1 });
+  } finally {
+    fs.renameSync(hidden, bin);
+  }
+  assert.strictEqual(bad.status, 500, `expected a 500, got ${bad.status}`);
+  assert.strictEqual(bad.body.error, 'internal error',
+    'the client must not learn what failed internally');
+
+  const after = await json('/api/errors');
+  assert.ok(after.body.errors.length > body.errors.length,
+    'a failed request must be recorded in the crash log');
+  const last = after.body.errors[0];
+  assert.ok(last.when && last.message, 'an error entry needs a timestamp and a message');
+  /* Stack traces must never be echoed back into a regular response. */
+  assert.ok(!JSON.stringify(bad.body).includes('at Object.'),
+    'the HTTP response must not leak stack traces');
+});
+
+test('the crash dialog and the error button exist and are wired', () => {
+  const js = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+  const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
+  assert.match(html, /id="error-dialog"/, 'the crash dialog must exist');
+  assert.match(html, /id="error-copy"/, 'the copy button must exist');
+  assert.match(html, /id="errors-open"/, 'the error indicator must exist');
+  assert.match(js, /addEventListener\('error'/, 'window.onerror must be handled');
+  assert.match(js, /addEventListener\('unhandledrejection'/, 'promise rejections must be handled');
+  assert.match(js, /clipboard/, 'the copy must use the clipboard API with a fallback');
+  assert.match(js, /execCommand\('copy'\)/, 'a non-secure-context fallback must exist');
 });
 
 test('the server does not listen on a public interface by default', async () => {

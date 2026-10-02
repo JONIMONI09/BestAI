@@ -262,6 +262,176 @@ static void write_seeded_model(const char *path, uint32_t seed,
  * ausfuehren wuerde. Ohne diese Tests koennte prefill() ein No-op sein
  * und niemand wuerde es merken - genau das war der urspruengliche Fehler
  * in der Web-UI, die nur tokens[0] an die Engine gab. */
+/* Referenzimplementierung des ALTEN Algorithmus: ein Decode- und
+ * Mul-Add pro (Layer, Dim), ohne jede Aggregation. Sie ist die
+ * unabhaengige Referenz, gegen die die neue Engine geprueft wird - ein
+ * Test, der die neue Formel mit sich selbst vergleicht, wuerde nichts
+ * beweisen. */
+static void ref_step_layer_loop(const HydraModelHeader *h, const uint8_t *w,
+                                int8_t *state, uint16_t token_in, uint16_t *out)
+{
+    int64_t acc[HYDRA_EMBED_DIM];
+    memset(acc, 0, sizeof(acc));
+    const int32_t vocab = (int32_t)h->vocab_size;
+    if (token_in >= h->vocab_size) token_in %= h->vocab_size;
+#ifdef HYDRA_TOKENV_MASK
+    const int32_t token_val = (int32_t)(token_in & 0x7Fu);
+#else
+    const int32_t token_val = (int32_t)token_in;
+#endif
+    const uint8_t *p = w;
+    for (uint32_t l = 0; l < h->layers; ++l) {
+        for (uint32_t i = 0; i < h->dim; ++i) {
+            uint8_t c1 = (uint8_t)(p[i] & 0x03u);
+            uint8_t c2 = (uint8_t)((p[i] >> 2) & 0x03u);
+            int w1 = (c1 == HYDRA_TERNARY_POS) ? 1 : (c1 == HYDRA_TERNARY_NEG ? -1 : 0);
+            int w2 = (c2 == HYDRA_TERNARY_POS) ? 1 : (c2 == HYDRA_TERNARY_NEG ? -1 : 0);
+            acc[i] += (int64_t)(w1 * token_val + w2 * state[i]);
+        }
+        p += h->dim;
+    }
+    for (uint32_t i = 0; i < h->dim; ++i) {
+        int64_t v = acc[i];
+        if (v > 127) v = 127; else if (v < -127) v = -127;
+        state[i] = (int8_t)v;
+    }
+    int64_t raw = acc[0] % vocab;
+    if (raw < 0) raw += vocab;
+    *out = (uint16_t)((raw + (int32_t)token_in + 1) % vocab);
+}
+
+/* Layer-Aggregation: die verdichtete Engine muss bit-identisch zum
+ * alten Layer-Loop sein - gleiche Tokens UND gleiche State-Vektoren,
+ * ueber mehrere Seeds und Layerzahlen hinweg. */
+static void test_aggregation_matches_layer_loop(void)
+{
+    static const uint32_t seeds[4] = {7u, 99u, 0xBEEFu, 2024u};
+    static const uint32_t layer_counts[3] = {1u, 4u, 37u};
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+
+    int all_match = 1, any_ran = 0;
+    for (int si = 0; si < 4 && all_match; ++si) {
+        for (int li = 0; li < 3 && all_match; ++li) {
+            const uint32_t dim = 16, layers = layer_counts[li];
+            const uint16_t vocab = 512;
+            write_seeded_model(path, seeds[si], dim, layers, vocab);
+
+            uint8_t *wbytes = (uint8_t *)malloc((size_t)dim * layers);
+            if (!wbytes) { perror("malloc"); exit(1); }
+            FILE *rf = fopen(path, "rb");
+            if (!rf) { perror("fopen"); exit(1); }
+            if (fseek(rf, (long)sizeof(HydraModelHeader), SEEK_SET) != 0 ||
+                fread(wbytes, 1, (size_t)dim * layers, rf) != (size_t)dim * layers) {
+                fprintf(stderr, "weights unreadable\n"); exit(1);
+            }
+            fclose(rf);
+
+            HydraEngine e;
+            if (hydra_engine_load(&e, path) != 0) { all_match = 0; free(wbytes); break; }
+            HydraModelHeader h = e.header;
+            int8_t ref_state[HYDRA_EMBED_DIM];
+            memset(ref_state, 0, sizeof(ref_state));
+
+            uint16_t tok = (uint16_t)(3 + si);
+            for (int t = 0; t < 24; ++t) {
+                uint16_t a = 0, b = 0;
+                if (hydra_engine_step(&e, tok, &a) != 0) { all_match = 0; break; }
+                ref_step_layer_loop(&h, wbytes, ref_state, tok, &b);
+                if (a != b) { all_match = 0; break; }
+                if (memcmp(e.state_vector, ref_state, sizeof(ref_state)) != 0) { all_match = 0; break; }
+                tok = a;
+                any_ran = 1;
+            }
+            hydra_engine_unload(&e);
+            free(wbytes);
+        }
+    }
+    unlink(path);
+    CHECK(any_ran, "Aggregations-Vergleich hat tatsaechlich Schritte ausgefuehrt");
+    CHECK(all_match, "Layer-Aggregation == alter Layer-Loop (Token + State, alle Seeds/Layer)");
+}
+
+/* Token-only Fast Path: muss exakt denselben Token-Strom liefern wie der
+ * volle Pfad. Das ist die Behauptung, die den 64x-Speedup trägt, also
+ * wird sie gemessen und nicht angenommen. */
+static void test_fast_step_matches_full_step(void)
+{
+    static const uint32_t seeds[3] = {11u, 0x5EEDu, 777u};
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+
+    int all_match = 1;
+    for (int si = 0; si < 3 && all_match; ++si) {
+        const uint32_t dim = 32, layers = 5;
+        const uint16_t vocab = 256;
+        write_seeded_model(path, seeds[si], dim, layers, vocab);
+
+        uint16_t full[32], fast[32];
+        HydraEngine e;
+
+        if (hydra_engine_load(&e, path) != 0) { all_match = 0; break; }
+        uint16_t tok = (uint16_t)(9 + si);
+        for (int t = 0; t < 32; ++t) {
+            if (hydra_engine_step(&e, tok, &full[t]) != 0) { all_match = 0; break; }
+            tok = full[t];
+        }
+        hydra_engine_unload(&e);
+
+        if (hydra_engine_load(&e, path) != 0) { all_match = 0; break; }
+        tok = (uint16_t)(9 + si);
+        for (int t = 0; t < 32; ++t) {
+            if (hydra_engine_step_fast(&e, tok, &fast[t]) != 0) { all_match = 0; break; }
+            tok = fast[t];
+        }
+        hydra_engine_unload(&e);
+
+        if (memcmp(full, fast, sizeof(full)) != 0) all_match = 0;
+    }
+    unlink(path);
+    CHECK(all_match, "Token-only Fast Path liefert bit-identische Token-Stroeme");
+}
+
+/* Negativkontrolle: die Fast-Path-Aequivalenz darf nicht trivial sein.
+ * Ein Fast Path, der den Token dekrementiert statt korrekt zu rechnen,
+ * muss sofort auffallen. */
+static void test_fast_step_negative_control(void)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    const uint32_t dim = 16, layers = 3;
+    const uint16_t vocab = 256;
+    write_seeded_model(path, 4242u, dim, layers, vocab);
+
+    uint16_t full[16], fast[16], broken[16];
+    HydraEngine e;
+    if (hydra_engine_load(&e, path) != 0) { CHECK(0, "Negativkontroll-Modell laedt"); unlink(path); return; }
+    uint16_t tok = 5;
+    for (int t = 0; t < 16; ++t) {
+        hydra_engine_step(&e, tok, &full[t]);
+        tok = full[t];
+    }
+    hydra_engine_unload(&e);
+
+    if (hydra_engine_load(&e, path) != 0) { CHECK(0, "Negativkontroll-Modell laedt (2)"); unlink(path); return; }
+    tok = 5;
+    for (int t = 0; t < 16; ++t) {
+        hydra_engine_step_fast(&e, tok, &fast[t]);
+        tok = fast[t];
+    }
+    hydra_engine_unload(&e);
+
+    /* Absichtlich kaputt: jeder Token um 1 verschoben. */
+    for (int t = 0; t < 16; ++t) {
+        broken[t] = (uint16_t)((fast[t] + 1) % vocab);
+    }
+    unlink(path);
+
+    CHECK(memcmp(full, fast, sizeof(full)) == 0, "Negativkontrolle A: Fast Path == voll");
+    CHECK(memcmp(full, broken, sizeof(full)) != 0,
+          "Negativkontrolle B: ein verschobener Fast Path waere aufgefallen");
+}
+
 static void test_prefill_equivalence(void)
 {
     char path[64];
@@ -812,6 +982,9 @@ int main(void)
     test_engine_step();
     test_seed_roundtrip_variance();
     test_prefill_equivalence();
+    test_aggregation_matches_layer_loop();
+    test_fast_step_matches_full_step();
+    test_fast_step_negative_control();
 #ifdef __ARM_NEON
     test_neon_matches_scalar();
     test_neon_all_ternary_codes();

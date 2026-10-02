@@ -41,12 +41,30 @@ typedef struct {
     size_t mapped_size;
     HydraModelHeader header;
     int8_t state_vector[HYDRA_EMBED_DIM]; /* O(1) Zustand */
+
+    /* Layer-Aggregation: weil token_val und state_vector[] innerhalb
+     * eines step() ueber alle Layer konstant sind, gilt
+     *   acc[i] = sum_l (w1[l][i]*token + w2[l][i]*state[i])
+     *          = A[i]*token + B[i]*state[i]
+     * Die beiden Summen werden einmalig beim Laden berechnet. Damit
+     * kostet ein Token dim Multiplikationen statt layers*dim.
+     * |A| <= layers <= HYDRA_MAX_LAYERS, |B| <= layers, also int32. */
+    int32_t agg_a[HYDRA_EMBED_DIM];
+    int32_t agg_b[HYDRA_EMBED_DIM];
 } HydraEngine;
 
 /* Engine-Funktionen */
 int hydra_engine_load(HydraEngine *engine, const char *model_path);
 void hydra_engine_unload(HydraEngine *engine);
 int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
+/* Token-only fast path: berechnet ausschliesslich Dimension 0. Weil die
+ * Dimensionen nach der Aggregation unabhaengig voneinander sind
+ * (acc[i] haengt nur an state[i]), liefert dieser Pfad BIT-IDENTISCHE
+ * Token-Ströme wie der volle Pfad - die Zustandsvektoren der Dimensionen
+ * 1..dim-1 werden dabei nicht fortgeschrieben und sind danach nicht mehr
+ * gueltig. Genau das ist der Trick: 64x weniger Arbeit pro Token fuer
+ * reine Inferenz ohne Zustandsanzeige. */
+int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
 /* Prefill: faedt eine ganze Token-Sequenz durch die Engine, ohne sie
  * auszugeben. Danach ist der State so weit gelaufen, wie das Prompt ihn
  * getrieben hat, und hydra_engine_step() erzeugt die Fortsetzung.

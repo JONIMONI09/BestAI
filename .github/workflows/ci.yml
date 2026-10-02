@@ -313,6 +313,23 @@ jobs:
             fi
           done
           grep -q 'assets/demo.hydra' apk-unzip.txt
+
+          # Permission gate: the app opens files through the Storage
+          # Access Framework, which needs NO permission at all. Any
+          # dangerous permission that shows up here is either a dependency
+          # asking for something the app never uses, or something we added
+          # on purpose — either way it must be a decision, not a surprise.
+          "$BT/aapt" dump permissions "$APK" > apk-permissions.txt
+          echo "--- requested permissions ---"; cat apk-permissions.txt
+          for dangerous in INTERNET READ_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE \
+                           MANAGE_EXTERNAL_STORAGE RECORD_AUDIO CAMERA \
+                           ACCESS_FINE_LOCATION READ_PHONE_STATE; do
+            if grep -q "android.permission.$dangerous" apk-permissions.txt; then
+              echo "::error::the APK requests $dangerous - SAF needs no permission"
+              exit 1
+            fi
+          done
+          echo "ok: no dangerous permission is requested"
           mkdir -p dist
           cp "$APK" "dist/hydra-stone-ci-${{ github.run_number }}.apk"
           sha256sum "dist/hydra-stone-ci-${{ github.run_number }}.apk" | tee dist/SHA256SUMS.txt

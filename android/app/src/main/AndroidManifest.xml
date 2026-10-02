@@ -12,6 +12,17 @@
              Letterboxing auf Chromebooks/Tablets (Android-Lint
              LockedOrientationActivity/DiscouragedApi). Die UI ist vertikal
              aufgebaut und funktioniert in beiden Orientierungen. -->
+        <!-- Started by CrashHandler from a plain Context after an
+             uncaught exception: it must be launchable without
+             MainActivity being alive, and it is not user-facing, so it is
+             not exported. -->
+        <activity
+            android:name=".CrashActivity"
+            android:exported="false"
+            android:process=":crash"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">

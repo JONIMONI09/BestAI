@@ -14,6 +14,13 @@ object HydraBridge {
     interface Callback {
         /** Called on the calling (background) thread. */
         fun onTokens(tokens: IntArray, done: Boolean)
+
+        /**
+         * The old per-token shape. Not used by runInference() any more;
+         * only benchmark() calls it, so the delta can be measured instead
+         * of assumed.
+         */
+        fun onToken(step: Int, token: Int)
     }
 
     init {
@@ -30,6 +37,23 @@ object HydraBridge {
     external fun runInference(
         modelPath: String,
         prompt: IntArray,
+        steps: Int,
+        callback: Callback
+    ): String
+
+    /**
+     * Phase 0 measurement on the real device. Runs the same model three
+     * times and returns JSON with ns/token for:
+     *  - the native loop alone (no JNI),
+     *  - a JNI callback per token,
+     *  - the shipping batched callback (16 tokens per call).
+     *
+     * [callback] must also implement onToken(step, token): the benchmark
+     * calls it deliberately, to measure the cost of the old per-token
+     * shape against the new batched one.
+     */
+    external fun benchmark(
+        modelPath: String,
         steps: Int,
         callback: Callback
     ): String

@@ -737,6 +737,57 @@
   if it cannot parse what it wrote, that is a bug, not a fallback. A GET
   that returns `{}` after a `PUT` reported success is a lie.
 
+## 2026-10-02 — Layer aggregation silently deleted the NEON kernel
+
+- **Symptom:** the aggregated step passed every test on x86, and the first
+  ARM build produced a NEON compiler warning about a loop the optimiser
+  believed could run forever.
+- **Cause:** after moving `sum_l w1` / `sum_l w2` into two int32 arrays at
+  load time, the per-layer decode kernel in `hydra_neon.h` had no caller
+  any more. The ARM path would have fallen back to scalar *silently* —
+  every NEON test would still pass, because both sides of the comparison
+  would have been the scalar loop. That is the worst possible outcome: the
+  SIMD path disappears and the test suite certifies it.
+- **Fix:** `hydra_neon.h` was rewritten to vectorise the *aggregated*
+  multiply-add (`acc[i] += A[i]*token + B[i]*state[i]`) instead, and the
+  decode — which is now architecture-independent and happens once at load
+  — left the hot path entirely. `test_neon_matches_scalar` and
+  `test_neon_all_ternary_codes` compare the engine against a scalar
+  reference that still does the full per-layer decode.
+- **Prevention:** an optimisation that deletes code must keep that code's
+  tests meaningful. Here the ARM test would have passed with the NEON path
+  disabled — which is why the equivalence test uses a *reference
+  implementation in the test file*, not the engine's own scalar branch.
+
+## 2026-10-02 — The token-only fast path was almost shipped without a proof
+
+- **Symptom:** none. That is the point: the optimisation was correct, but
+  "64x less work" was an assumption until it was measured.
+- **Cause:** the argument that the fast path cannot change the token stream
+  — after aggregation, `acc[i]` depends only on `state[i]`, so dimension 0
+  is independent of all other dimensions — is a proof sketch, and a proof
+  sketch is not a measurement.
+- **Fix:** `test_fast_step_matches_full_step` compares both paths token by
+  token over three seeded models, and `test_fast_step_negative_control`
+  proves the comparison would notice a deliberately shifted fast path.
+- **Prevention:** any "this cannot change the result" claim ships with a
+  test that fails when it is wrong, and with a negative control proving the
+  test can fail.
+
+## 2026-10-02 — Benchmarks that lie about what they measure
+
+- **Symptom:** the first `--bench` implementation reported a number
+  without saying which path produced it.
+- **Cause:** two separate traps. `clock()` measures CPU time and excludes
+  driver wait time — exactly the time a GPU comparison needs — and a
+  benchmark run without a warmup mostly measures the page cache rather
+  than the kernel.
+- **Fix:** `clock_gettime(CLOCK_MONOTONIC)` and an explicit warmup pass in
+  both the CLI benchmark and `HydraBridge.benchmark()`. The JNI benchmark
+  reloads the model per pass so no pass inherits a saturated state vector.
+- **Prevention:** a benchmark that cannot state *which* path, *how* the
+  time was taken and *what it warmed up* is not a measurement.
+
 ## 2026-10-02 — Words mode printed token IDs, the toggle did nothing, and the prompt was thrown away
 
 - **Symptom:** in the web console the "Words" view showed numbers, switching

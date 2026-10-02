@@ -31,6 +31,7 @@
 
     <div class="topbar-actions">
       <span class="status" id="status" data-state="idle">connecting…</span>
+      <button class="btn ghost small" id="errors-open" hidden>Errors</button>
       <button id="toggle-settings" class="btn ghost">Settings</button>
     </div>
   </header>
@@ -84,8 +85,10 @@
         </div>
       </div>
 
+      <p class="empty" id="engine-empty">No run yet — send a message on the Chat tab and the token stream shows up here.</p>
+
       <div class="chart-wrap">
-        <canvas id="token-chart" height="180" role="img" aria-labelledby="chart-summary"></canvas>
+        <canvas id="token-chart" height="180" role="img" aria-labelledby="chart-summary" hidden></canvas>
         <!-- Text alternative for the canvas: the pixels are unreadable to a
              screen reader, the numbers are not. -->
         <p class="visually-hidden" id="chart-summary">No token stream yet.</p>
@@ -198,6 +201,22 @@
     <p class="hint err" id="upload-hint" role="status" aria-live="polite"></p>
     <div class="train-actions">
       <button class="btn primary" id="upload-confirm" value="default">Upload</button>
+    </div>
+  </dialog>
+
+  <!-- Crash handler: catches window errors, unhandled promise rejections
+       and errors the server reported, and shows them with a copy button.
+       Plain <dialog> again for the focus trap and Escape. -->
+  <dialog class="dialog error-dialog" id="error-dialog" aria-labelledby="error-title">
+    <form method="dialog" class="dialog-head">
+      <h2 id="error-title">Something went wrong</h2>
+      <button class="btn ghost" value="close" aria-label="Close error dialog">✕</button>
+    </form>
+    <p class="hint err" id="error-summary" role="alert"></p>
+    <pre class="error-detail" id="error-detail" tabindex="0"></pre>
+    <div class="train-actions">
+      <button class="btn primary" id="error-copy" type="button">Copy details</button>
+      <button class="btn" value="close">Dismiss</button>
     </div>
   </dialog>
 

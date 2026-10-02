@@ -38,6 +38,8 @@ static void usage(const char *argv0, FILE *out)
     fprintf(out, "  steps            Anzahl erzeugter Inferenzschritte, 1..256 (Standard: 16)\n");
     fprintf(out, "  --json           Maschinenlesbare Ausgabe auf stdout\n");
     fprintf(out, "  --prompt LIST    Komma-getrennte Token-IDs als Prefill vor der Generierung\n");
+    fprintf(out, "  --bench [N]      Benchmark: N Schritte (Default 10000), JSON auf stdout\n");
+    fprintf(out, "  --fast           Token-only Fast Path, nur Dimension 0\n");
     fprintf(out, "  --help           Diese Hilfe anzeigen\n");
     fprintf(out, "\n");
     fprintf(out, "Beispiel: %s models/demo.hydra 123 32 --json\n", argv0);
@@ -119,18 +121,124 @@ static void print_json(const HydraEngine *e, const uint16_t *tokens,
     printf("]}");
 }
 
+/* ------------------------------------------------------------------ */
+/* Benchmark                                                            */
+/* ------------------------------------------------------------------ */
+
+/* Phase-0-Messung: ein Aufruf, drei Pfade, eine JSON-Zeile.
+ *
+ *   native_loop : reiner C-Step im Prozess, ohne JNI, ohne Callback.
+ *                  Das ist die untere Schranke - alles andere ist
+ *                  mindestens so teuer.
+ *   fast_token  : derselbe Aufruf ueber hydra_engine_step_fast (nur
+ *                  Dimension 0), um den Hebel messbar zu machen.
+ *
+ * Der JNI-Anteil (Callback pro Token vs. gebuendelt) kann hier nicht
+ * gemessen werden - dafuer gibt es HydraBridge.benchmark() in der
+ * Android-App. Diese Zahl fehlt in CLI-Benchmarks bewusst; sie wird
+ * nicht geschaetzt.
+ *
+ * Warmup: ein kompletter Durchlauf ueber das Modell, damit die
+ * mmap-Seiten im Page-Cache liegen. Ohne Warmup misst man in erster
+ * Linie den Page-Cache, nicht den Kernel. */
+static double bench_run(const char *model_path, uint16_t start_token, long steps,
+                        int fast_mode, uint16_t *first_out)
+{
+    HydraEngine e;
+    if (hydra_engine_load(&e, model_path) != 0) return -1.0;
+
+    /* Warmup: ein voller Durchlauf, damit die mmap-Seiten im Page-Cache
+     * liegen. Ohne das misst man den Page-Cache, nicht den Kernel. */
+    uint16_t tok = start_token;
+    for (long i = 0; i < e.header.layers; ++i) {
+        uint16_t n = 0;
+        if (fast_mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
+        else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
+        tok = n;
+    }
+
+    /* Messung. clock_gettime(CLOCK_MONOTONIC) statt clock(): clock() misst
+     * CPU-Zeit und schliesst Treiberwartezeit aus - genau die Zeit, die
+     * eine GPU-Vergleichsmessung zeigen soll. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (long s = 0; s < steps; ++s) {
+        uint16_t n = 0;
+        if (fast_mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
+        else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
+        tok = n;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double ns = ((double)(t1.tv_sec - t0.tv_sec) * 1e9 +
+                 (double)(t1.tv_nsec - t0.tv_nsec)) / (double)steps;
+    if (first_out) *first_out = tok;
+    hydra_engine_unload(&e);
+    return ns;
+}
+
+static int run_benchmark(const char *model_path, const HydraModelHeader *h,
+                         uint16_t start_token, long steps)
+{
+
+    if (steps < 1) {
+        fprintf(stderr, "[Hydra] --bench braucht mindestens 1 Schritt\n");
+        return 1;
+    }
+
+    /* Jeder Pfad laedt sein eigenes Modell: der State-Vektor ist
+     * Zustand, und ein zweiter Lauf auf einem gesättigten Vektor ist ein
+     * anderes Experiment als ein frischer Start. */
+    uint16_t sink = 0;
+    double ns_full = bench_run(model_path, start_token, steps, 0, &sink);
+    if (ns_full < 0) { fprintf(stderr, "[Hydra] Bench: Modell konnte nicht geladen werden\n"); return 1; }
+    uint16_t sink_fast = 0;
+    double ns_fast = bench_run(model_path, start_token, steps, 1, &sink_fast);
+    if (ns_fast < 0) { fprintf(stderr, "[Hydra] Bench: Fast Path fehlgeschlagen\n"); return 1; }
+
+    /* Beide Ströme muessen identisch sein - sonst vergleicht der Benchmark
+     * zwei verschiedene Algorithmen und die Zahlen sind Muell. */
+    printf("{\"mode\":\"bench\",\"engine\":\"cpu\",\"model\":\"%s\","
+           "\"dim\":%u,\"layers\":%u,\"vocab\":%u,\"steps\":%ld,"
+           "\"warmup_layers\":%u,"
+           "\"ns_per_token_full\":%.2f,\"ns_per_token_fast\":%.2f,"
+           "\"speedup\":%.3f,\"tokens_equal\":%s,"
+           "\"note\":\"JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device\"}",
+           model_path, h->dim, h->layers, h->vocab_size, steps,
+           h->layers, ns_full, ns_fast, ns_fast > 0 ? ns_full / ns_fast : 0.0,
+           sink == sink_fast ? "true" : "false");
+    printf("\n");
+    return sink == sink_fast ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *model_path = NULL;
     long start_token = -1;   /* Sentinel: noch nicht gesetzt */
     long steps = -1;
     int json_mode = 0;
+    int fast_mode = 0;
+    int bench_mode = 0;
+    long bench_steps = 10000;
     uint16_t prompt[MAX_PROMPT];
     size_t prompt_n = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[i], "--fast") == 0) {
+            fast_mode = 1;
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            bench_mode = 1;
+            /* Optionales N direkt nach --bench; ein Following-Token wie
+             * "--json" wird nicht als Zahl akzeptiert. */
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                if (parse_long_arg(argv[i + 1], &bench_steps) != 0) {
+                    fprintf(stderr, "[Hydra] --bench erwartet eine positive Ganzzahl\n");
+                    return 1;
+                }
+                ++i;
+            }
         } else if (strcmp(argv[i], "--prompt") == 0) {
             /* Fehlendes Argument explizit abweisen: argv[i+1] == NULL ist
              * ein Benutzerfehler, kein leeres Prompt. */
@@ -207,6 +315,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (bench_mode) {
+        const int rc = run_benchmark(model_path, &engine.header,
+                                     (uint16_t)start_token, bench_steps);
+        free(tokens);
+        hydra_engine_unload(&engine);
+        return rc;
+    }
+
     uint16_t current = (uint16_t)start_token;
 
     /* Prefill zuerst: das Prompt laeuft durch die Engine, danach wird
@@ -223,7 +339,10 @@ int main(int argc, char **argv)
     double t0 = now_ms();
     for (long s = 0; s < steps; ++s) {
         uint16_t next = 0;
-        if (hydra_engine_step(&engine, current, &next) != 0) {
+        const int step_rc = fast_mode
+            ? hydra_engine_step_fast(&engine, current, &next)
+            : hydra_engine_step(&engine, current, &next);
+        if (step_rc != 0) {
             free(tokens);
             hydra_engine_unload(&engine);
             return 1;

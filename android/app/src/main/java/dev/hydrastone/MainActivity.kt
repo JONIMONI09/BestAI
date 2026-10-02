@@ -55,6 +55,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        /* Crash handler first: anything that goes wrong from here on is
+         * caught and shown with a copy button. */
+        CrashHandler.appContext = applicationContext
+        CrashHandler.install()
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 48, 48, 48)
@@ -86,6 +91,9 @@ class MainActivity : ComponentActivity() {
 
         val run = Button(this).apply { setText(R.string.action_run) }
         root.addView(run)
+
+        val bench = Button(this).apply { setText(R.string.action_benchmark) }
+        root.addView(bench)
 
         output = TextView(this).apply {
             typeface = android.graphics.Typeface.MONOSPACE
@@ -119,6 +127,7 @@ class MainActivity : ComponentActivity() {
         }
 
         run.setOnClickListener { startInference() }
+        bench.setOnClickListener { runBenchmark() }
     }
 
     private fun startInference() {
@@ -143,12 +152,50 @@ class MainActivity : ComponentActivity() {
                             ) + tokens.joinToString(", "))
                             if (done) log(getString(R.string.log_batch_done))
                         }
+
+                        /* Only benchmark() still uses the per-token shape.
+                         * A normal run must never take this path — if it
+                         * did, the batching would be silently undone. */
+                        override fun onToken(step: Int, token: Int) {
+                            log(getString(R.string.log_unexpected_per_token, step, token))
+                        }
                     }
                 )
                 val wall = SystemClock.elapsedRealtime() - t0
                 log(getString(R.string.log_result, json))
                 log(getString(R.string.log_wall, wall))
                 log(getString(R.string.log_ok))
+            } catch (e: Throwable) {
+                log(getString(R.string.log_error, e.message))
+            }
+        }.start()
+    }
+
+    /**
+     * Phase 0 measurement on the device: native loop vs per-token JNI vs
+     * batched JNI. The result is logged as raw JSON because every number
+     * in it is one the reader can check against the code.
+     */
+    private fun runBenchmark() {
+        val file = modelFile ?: return
+        val steps = (stepsInput.text.toString().toIntOrNull() ?: 32).coerceIn(1, 200000)
+        lineCount.clear()
+        log(resources.getQuantityString(R.plurals.log_bench_start, steps, steps))
+
+        Thread {
+            try {
+                val json = HydraBridge.benchmark(
+                    file.absolutePath, steps,
+                    object : HydraBridge.Callback {
+                        override fun onTokens(tokens: IntArray, done: Boolean) = Unit
+                        // Deliberately does nothing: the benchmark measures
+                        // the CALLING CONVENTION, not the UI work. A real
+                        // run updates a TextView per token, which is more
+                        // expensive still - so these numbers are a floor.
+                        override fun onToken(step: Int, token: Int) = Unit
+                    }
+                )
+                log(getString(R.string.log_bench_result, json))
             } catch (e: Throwable) {
                 log(getString(R.string.log_error, e.message))
             }
