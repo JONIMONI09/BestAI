@@ -101,7 +101,22 @@ following the CVE cross-check and linter audit from the previous pass.
 - [x] `errors.md`: 5 neue Einträge; `rules.md`: R25–R30 (Linter-
       Falsifizierbarkeit, Web-Verifikation, Fehler-Leak, Symlink-Pfade)
 - [x] README: Release-/APK-Abschnitt, Linter-Tabelle, Projektstruktur
-- [ ] Commit (kein Checkout) + PR — **kein Merge**
+- [x] Commit (kein Checkout) + PR — **kein Merge**
+- [x] PR #12 und #11 vom User **gemergt** (main: `cfdb34f`) — alle
+      offenen PRs sind damit geschlossen
+
+## Runde 2026-10-02 (CI-Fix-Runde nach Merge)
+
+- [x] Status geklaert: `main` ist gruen bis auf `Android lint`
+      (13/14 Jobs gruen) — Ursache ist **nicht** der Code
+- [x] Fehlerursache im Log verifiziert: `android-actions/setup-android@v3`
+      ruft `sdkmanager tools` auf; das Paket existiert nicht mehr
+      (`Warning: Failed to find package 'tools'` → exit 1)
+- [x] Fix: cmdline-tools explizit herunterladen/entpacken + PATH,
+      Lizenz-Akzeptanz explizit, in **lint.yml und release.yml**
+- [x] Neuer Branch `fix/android-lint-cmdline-tools` direkt auf
+      `origin/main` gebaut (Plumbing, **kein `git checkout`** — R17/R20),
+      PR eroeffnet, **kein Merge** (R14)
 
 ## Status / Notes
 

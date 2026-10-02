@@ -126,7 +126,21 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Android SDK + NDK + Gradle
+      # Gleiche Reihenfolge wie in lint.yml: cmdline-tools explizit
+      # installieren, weil android-actions/setup-android das Paket "tools"
+      # mitinstalliert, das es nicht mehr gibt (exit 1).
+      - name: Android cmdline-tools
+        run: |
+          set -e
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd /tmp
+          curl -sSLO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf /tmp/cmdline && unzip -q commandlinetools-linux-11076708_latest.zip -d /tmp/cmdline
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mv /tmp/cmdline/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+      - name: SDK-Pakete, NDK und Gradle
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" \
