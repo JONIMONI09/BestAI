@@ -82,6 +82,54 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 - ✅ **Android** — NDK/JNI build of the same C source, verified on-device
 - ✅ **C99, zero dependencies** — runs on 32-bit ARMv7, x86-64, and everything in between
 
+## Releases & the Android APK
+
+Every `v*.*.*` tag produces a GitHub Release containing a **directly installable APK**:
+
+```bash
+# Install on a phone / emulator (Android 7.0 / API 24+)
+adb install -r hydra-stone-<version>-android-arm64v8a-armeabiv7a-x86_64.apk
+```
+
+The APK bundles the same C engine (`libhydra.so` for arm64-v8a, armeabi-v7a and x86_64 — NEON active on ARM), the packed demo model, and a launcher icon. Tapping **Run inference** executes the engine and streams the tokens live.
+
+Release artifacts:
+
+| File | Platform |
+|---|---|
+| `hydra-stone-*-android-*.apk` | Android, all three ABIs |
+| `hydra-stone-debug.apk` | Android debug build, same code |
+| `hydra-run-linux-x64` | Linux x86-64, statically linked |
+| `hydra-run-linux-arm64` | Linux ARM64, statically linked |
+| `hydra-run-macos-arm64` | macOS Apple Silicon (NEON active) |
+| `SHA256SUMS.txt` | integrity check for every file |
+
+**Release gates.** The release job refuses to publish unless every one of these passes: the x64 and arm64 CLI binaries produce **bit-identical token and state vectors**; the APK is signature-verified and contains `libhydra.so` for all three ABIs plus the model asset; Android Lint reports no findings.
+
+**Signing.** Without repository secrets the APK is signed with the debug key — fully installable by sideloading, but not Play-Store-ready. Supplying `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS` and `HYDRA_KEY_PASSWORD` switches the build to a real release key, and the release body states which one was used.
+
+## Quality Gates
+
+Every push and pull request runs the following. Each gate was verified locally **and** proven to fail on a deliberately reverted fix before being adopted — a linter that cannot fail is worthless.
+
+| Surface | Gate | Catches |
+|---|---|---|
+| C | `gcc -fsyntax-only -Werror`, `clang -fsyntax-only -Werror` | strict C99 violations, two compiler frontends |
+| C | GCC `-fanalyzer` | NULL derefs, leaks, use-after-free paths |
+| C | Clang Static Analyzer | interprocedural path analysis |
+| C | clang-tidy (`bugprone`, `cert`, `concurrency`, `clang-analyzer`) | API misuse patterns |
+| C | cppcheck | dead code, resource misuse |
+| C | flawfinder (level ≥ 4) | known-dangerous C functions |
+| C | **ASan + UBSan** on the full test suite | out-of-bounds, signed overflow, UB — *this is the gate that flagged the layer-overflow bug as `signed integer overflow: 2147483640 + 127`* |
+| NEON | AArch64 build under qemu + scalar/NEON parity check | platform-divergent SIMD |
+| Web | ESLint 10 (`server.js`, `public/app.js`) | undefined vars, `eval`, sloppy globals |
+| Android | Android Lint (must report **no issues**) | missing icon, hardcoded strings, API misuse, orientation locks |
+| Android | NDK clang build (stricter than host gcc) | JNI/Android header issues |
+| Security | CodeQL (`c-cpp`, `javascript-typescript`, `security-extended`) | taint flows from HTTP input into `open()`/`execFile` |
+| Security | Semgrep | pattern-based security rules |
+
+Local reproduction is documented in the `/engine-ci-verify` skill.
+
 ## Project Structure
 
 ```
@@ -90,12 +138,19 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 ├── src/main.c                 CLI
 ├── src/hydra_neon.h           ARM NEON kernel (actively integrated; scalar fallback on x86)
 ├── tools/make_dummy_model.py  Test model generator (format reference)
-├── tests/test_engine.c        49 unit tests (incl. NEON-vs-scalar, OOB + overflow PoC regressions)
+├── tests/test_engine.c        49 unit tests (x86) / 51 on ARM (incl. NEON-vs-scalar, OOB + overflow PoC regressions)
 ├── android/                   NDK/JNI app wrapping the same C source
-├── server.js                  UI server (Node, 0 npm dependencies)
+├── server.js                  UI server (Node, 0 runtime dependencies; ESLint is dev-only)
 ├── public/                    Hydra-Stone Console (HTML/CSS/JS)
 ├── docs/ARCHITECTURE.md       Architecture & math
 ├── docs/FORMAT.md             .hydra binary format specification
+├── docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
+├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
+├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
+├── .github/workflows/release.yml tag → installable APK + CLI binaries
+├── errors.md                  Every bug: symptom / cause / fix / prevention
+├── rules.md                   Standing working rules
+├── session.md                 Live session plan and history
 └── LICENSE                    MIT
 ```
 
@@ -132,6 +187,16 @@ The test suite goes beyond smoke checks — every test can fail:
 - **Security regressions** — crafted headers (bad magic, out-of-bounds weights, `layers × dim > weights_len`, `weights_offset` pointing into the header, `layers = 16 909 321` signed-overflow PoC) must be rejected at load. Every one of these was a real, reproduced bug first.
 - **Axiom edge cases** — `NaN`, `±Inf` and negative `humanity_factor` must all block (`NaN ≤ 0` is false in IEEE-754, so the finiteness check is load-bearing).
 - **Cross-platform determinism** — verified empirically: host x86-64 (scalar), ARM64 under NEON, and the Android emulator all produce the identical token sequence for the same model.
+
+## Running the Web Console
+
+The server itself has **zero runtime npm dependencies**. ESLint is a dev-only dependency used by the lint gate.
+
+```bash
+npm ci        # only needed to run the linter
+npm run lint
+make ui       # builds hydra-run + the demo model and serves on :8787
+```
 
 ## Roadmap
 

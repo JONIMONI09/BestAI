@@ -97,21 +97,44 @@
 
 ## 6. Skills (`.claude/skills/*/SKILL.md`)
 
-25. **R25 — Every SKILL.md starts with YAML frontmatter** delimited by
+25. **R25 — A new lint gate must fail once.** Before a linter or CI gate
+    counts as protection, it must be proven to fail on a deliberately
+    reverted fix (negative control). A gate that never goes red is
+    decoration, which is the "KEIN Fake" failure mode in the other
+    direction. (→ errors.md: linter-audit entry, incl. the tool-by-tool
+    table of what each one actually catches)
+26. **R26 — Check research against reality before acting on it.**
+    CVE IDs, tool names and API behaviour are verified on the web and in
+    a local run, never taken from a description. A wrong CVE attribution
+    is itself a documentation bug. (→ verified CVE-2025-2439/2445,
+    CVE-2025-53630, CVE-2026-27940/33298/70638)
+27. **R27 — Never leak internal detail in an error response.** Stack
+    traces, absolute paths, file sizes and subprocess stderr go to the
+    server log; the client gets an opaque error. (→ errors.md: server
+    detail disclosure)
+28. **R28 — Path checks validate the resolved target, not the name.**
+    `path.resolve` is lexical and follows no symlink; use `realpath` (or
+    `O_NOFOLLOW`) so a symlink inside the allowed directory cannot point
+    outside it. (→ errors.md: symlink model path)
+
+## 7. Skills (`.claude/skills/*/SKILL.md`)
+
+29. **R29 — Every SKILL.md starts with YAML frontmatter** delimited by
     `---` lines, containing at minimum `name` and `description`. A
     skill without valid frontmatter is rejected by the UI.
     The frontmatter must be **pure ASCII** and the `description`
     must be a **quoted** scalar — non-ASCII characters (em dashes)
     in unquoted scalars get the skill rejected as "Not loaded".
-    (→ errors.md: both skill-rejection entries)
-26. **R26 — Validate frontmatter before committing**: parse the YAML,
+    (→ errors.md: both skill-rejection entries; skill bodies may use
+    non-ASCII — only the frontmatter block must be pure ASCII)
+30. **R30 — Validate frontmatter before committing**: parse the YAML,
     check `name` matches the directory name, check `description` is
     present and one sentence long, assert the frontmatter block is
     ASCII-only.
 
-## 7. When rules conflict
+## 8. When rules conflict
 
-Safety rules (R8, R14) > correctness rules (R5–R11) > session protocol
-(R1–R4) > convenience. If a user request conflicts with R17 (merge
-approval) or R20 (no checkout), the user's standing rule wins unless
-they explicitly override it in the same session.
+Safety rules (R8, R14, R25, R27) > correctness rules (R5–R11) > session
+protocol (R1–R4) > convenience. If a user request conflicts with R17
+(merge approval) or R20 (no checkout), the user's standing rule wins
+unless they explicitly override it in the same session.

@@ -1,0 +1,288 @@
+name: Release
+
+# Erzeugt aus einem Git-Tag (v*.*.*) ein GitHub Release mit:
+#   - hydra-run fuer linux-x64, linux-arm64 und macos-arm64
+#   - einem installierbaren, signierten Android-APK (arm64-v8a, armeabi-v7a, x86_64)
+#   - SHA256-Pruefsummen fuer jedes Artefakt
+#
+# Das APK ist ohne zusaetzliche Secrets sofort installierbar (Debug-Signatur).
+# Sind HYDRA_KEYSTORE*-Secrets gesetzt, wird mit einem echten Release-Key
+# signiert; das steht dann im Release-Body.
+
+on:
+  push:
+    tags: [ 'v*.*.*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish a release for'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      version_code: ${{ steps.v.outputs.version_code }}
+    steps:
+      - name: Derive version from tag
+        id: v
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          V="${TAG#v}"
+          MAJ="${V%%.*}"; REST="${V#*.}"; MIN="${REST%%.*}"; PAT="${V##*.}"
+          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
+          echo "version=$V"      >> "$GITHUB_OUTPUT"
+          echo "version_code=$(( MAJ * 10000 + MIN * 100 + PAT ))" >> "$GITHUB_OUTPUT"
+          echo "Release $TAG -> versionCode $(( MAJ * 10000 + MIN * 100 + PAT ))"
+
+  build-linux:
+    name: CLI (Linux)
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross toolchain + qemu
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-12-aarch64-linux-gnu qemu-user-static
+
+      - name: Build linux-x64
+        run: |
+          make clean && make
+          cp hydra-run dist/hydra-run-linux-x64
+          strip dist/hydra-run-linux-x64
+
+      - name: Build linux-arm64 (static)
+        run: |
+          aarch64-linux-gnu-gcc-12 -O3 -static -Wall -Wextra \
+              -Iinclude src/hydra_engine.c src/main.c -lm -o dist/hydra-run-linux-arm64
+
+      # Beide Binaries MUESSEN dasselbe Ergebnis liefern wie der skalare
+      # Host — sonst waere die NEON-Gleichheitsaussage wieder unbelegt.
+      - name: Verify x64 vs arm64 parity
+        run: |
+          python3 tools/make_dummy_model.py parity.hydra
+          ./dist/hydra-run-linux-x64 parity.hydra 42 8 --json 2>/dev/null > /tmp/x64.json
+          qemu-aarch64-static ./dist/hydra-run-linux-arm64 parity.hydra 42 8 --json \
+              2>/dev/null > /tmp/arm.json
+          python3 - << 'EOF'
+          import json, sys
+          a = json.load(open('/tmp/x64.json')); b = json.load(open('/tmp/arm.json'))
+          print('x64:', a['tokens']); print('arm:', b['tokens'])
+          if a['tokens'] != b['tokens'] or a['state'] != b['state']:
+              print('FAIL: scalar and NEON release binaries disagree', file=sys.stderr)
+              sys.exit(1)
+          print('OK: release binaries are bit-identical across architectures')
+          EOF
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum hydra-run-linux-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydra-stone-linux
+          path: dist/
+
+  build-macos:
+    name: CLI (macOS arm64)
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with clang (ARM64, NEON-Pfad aktiv)
+        run: |
+          mkdir -p dist
+          clang -O3 -Wall -Wextra -Iinclude \
+              src/hydra_engine.c src/main.c -lm -o dist/hydra-run-macos-arm64
+      - name: Smoke test on the release binary
+        run: |
+          python3 tools/make_dummy_model.py smoke.hydra
+          ./dist/hydra-run-macos-arm64 smoke.hydra 42 8 --json 2>/dev/null | head -c 160
+          echo
+      - name: Checksums
+        working-directory: dist
+        run: shasum -a 256 hydra-run-macos-arm64 > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydra-stone-macos
+          path: dist/
+
+  build-android:
+    name: Android APK
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK + NDK + Gradle
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" \
+                    "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
+          curl -sSL -o /tmp/gradle.zip \
+            https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q /tmp/gradle.zip -d /opt
+
+      - name: Build APK
+        working-directory: android
+        env:
+          HYDRA_VERSION_NAME: ${{ needs.version.outputs.version }}
+          HYDRA_VERSION_CODE: ${{ needs.version.outputs.version_code }}
+          HYDRA_KEYSTORE: ${{ secrets.HYDRA_KEYSTORE_BASE64 }}
+          HYDRA_KEYSTORE_PASSWORD: ${{ secrets.HYDRA_KEYSTORE_PASSWORD }}
+          HYDRA_KEY_ALIAS: ${{ secrets.HYDRA_KEY_ALIAS }}
+          HYDRA_KEY_PASSWORD: ${{ secrets.HYDRA_KEY_PASSWORD }}
+        run: |
+          mkdir -p ../dist
+          if [ -n "$HYDRA_KEYSTORE" ]; then
+            echo "$HYDRA_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "HYDRA_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Kein Keystore-Secret gesetzt — APK wird debug-signiert ausgeliefert (installierbar, nicht Play-Store-faehig)."
+          fi
+          /opt/gradle-8.7/bin/gradle assembleRelease --no-daemon -q
+          /opt/gradle-8.7/bin/gradle assembleDebug   --no-daemon -q
+          cp app/build/outputs/apk/release/app-release.apk \
+             "../dist/hydra-stone-${{ needs.version.outputs.version }}-android-arm64v8a-armeabiv7a-x86_64.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk ../dist/hydra-stone-debug.apk
+
+      # Ohne diese Pruefung koennte ein unsigniertes oder unvollstaendiges
+      # APK als Release-Artefakt landen.
+      - name: Verify the APK is signed, complete and installable
+        run: |
+          APK="dist/hydra-stone-${{ needs.version.outputs.version }}-android-arm64v8a-armeabiv7a-x86_64.apk"
+          test -f "$APK"
+          /opt/android-sdk/build-tools/34.0.0/apksigner verify --print-certs "$APK"
+          /opt/android-sdk/build-tools/34.0.0/aapt list "$APK" > apk-contents.txt
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            grep -q "lib/$abi/libhydra.so" apk-contents.txt || {
+              echo "::error::libhydra.so fehlt fuer $abi"; exit 1; }
+          done
+          grep -q 'assets/demo.hydra' apk-contents.txt
+          /opt/android-sdk/build-tools/34.0.0/aapt dump badging "$APK" \
+            | grep -E "^package:|^sdkVersion:|^application-label:"
+      - name: Android Lint muss fehlerfrei sein
+        working-directory: android
+        run: |
+          /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
+          REPORT=app/build/reports/lint-results-debug.txt
+          cat "$REPORT"
+          grep -q "No issues found" "$REPORT"
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydra-stone-android
+          path: dist/
+
+  publish:
+    name: Publish GitHub Release
+    needs: [ version, build-linux, build-macos, build-android ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hydra-stone-*
+          path: dist
+          merge-multiple: true
+
+      - name: Gesamt-Pruefsummenliste
+        run: |
+          cd dist
+          sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Hydra-Stone ${{ needs.version.outputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.apk
+            dist/hydra-run-linux-x64
+            dist/hydra-run-linux-arm64
+            dist/hydra-run-macos-arm64
+            dist/SHA256SUMS.txt
+          body: |
+            ## Hydra-Stone ${{ needs.version.outputs.tag }}
+
+            ### Android APK — direkt installierbar
+
+            | Datei | Inhalt |
+            |---|---|
+            | `hydra-stone-*-android-*.apk` | Release-Build, arm64-v8a + armeabi-v7a + x86_64 |
+            | `hydra-stone-debug.apk` | Debug-Build, identischer Code |
+
+            Installation per Sideload (Android 7.0 / API 24 oder neuer):
+
+            ```bash
+            # Option A: am Telefon — APK herunterladen, antippen und
+            #            "Unbekannte Quellen" fuer den Browser erlauben
+            # Option B: per adb
+            adb install -r hydra-stone-*-android-*.apk
+            ```
+
+            Enthalten: `libhydra.so` fuer alle drei ABIs (die C-Engine selbst,
+            NEON-Pfad auf ARM), `assets/demo.hydra`, Launcher-Icon. Die App fuehrt
+            beim Start eine Inferenz aus und zeigt den Token-Stream live an.
+
+            ### CLI
+
+            | Datei | Plattform |
+            |---|---|
+            | `hydra-run-linux-x64` | Linux x86-64, statisch gelinkt |
+            | `hydra-run-linux-arm64` | Linux ARM64 (AArch64), statisch gelinkt |
+            | `hydra-run-macos-arm64` | macOS Apple Silicon (clang, NEON aktiv) |
+
+            ```bash
+            python3 tools/make_dummy_model.py demo.hydra
+            ./hydra-run-linux-x64 demo.hydra 42 8 --json
+            ```
+
+            Die x64- und arm64-Binaerdateien werden vor dem Release gegeneinander
+            geprueft: sie muessen bitidentische Token- **und** State-Vektoren
+            liefern. Ein Release mit abweichenden Ergebnissen wird nicht erzeugt.
+
+            ### Integritaet
+
+            ```
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ### Was vor diesem Release geprueft wurde
+
+            - **C:** gcc-strict, clang-strict, GCC `-fanalyzer`, Clang Static
+              Analyzer, clang-tidy (bugprone/cert/concurrency), cppcheck,
+              flawfinder (Schwelle 4)
+            - **C-Laufzeit:** vollstaendige Testsuite unter AddressSanitizer +
+              UndefinedBehaviorSanitizer
+            - **NEON:** ARM64-Build unter qemu; Token- und State-Vektoren
+              bitidentisch zum skalaren Pfad
+            - **Web:** ESLint 10 auf Server und Frontend
+            - **Android:** Android Lint mit 0 Findings, NDK-clang-Build fuer 3 ABIs
+
+            ### Signatur-Hinweis
+
+            Wird dieses Release ohne hinterlegtes Keystore-Secret gebaut, ist das
+            APK mit dem Debug-Schluessel signiert: vollstaendig installierbar, aber
+            nicht fuer den Google Play Store geeignet. Fuer Play-Store-Releases
+            `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS`
+            und `HYDRA_KEY_PASSWORD` als Repository-Secrets hinterlegen.

@@ -39,7 +39,11 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
     engine->fd = -1;
 
     int rc;
-    engine->fd = open(model_path, O_RDONLY | O_CLOEXEC);
+    /* O_NOFOLLOW: ein Symlink im Modellpfad wuerde auf eine Datei ausserhalb
+     * des vorgesehenen Verzeichnisses zeigen koennen. Der Web-Console-Pfad
+     * loest Symlinks bereits ueber realpath() auf, aber die Engine-API ist
+     * auch aus JNI heraus aufrufbar — die Schranke gehoert deshalb hierher. */
+    engine->fd = open(model_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (engine->fd < 0) {
         perror("[Hydra] Fehler beim Oeffnen der Modelldatei");
         return -2;

@@ -67,6 +67,11 @@ static void wr_u32le(FILE *f, uint32_t v)
     fwrite(b, 1, 4, f);
 }
 
+/* clang-tidy bugprone-easily-swappable-parameters: die Parameter sind
+ * absichtlich positional (das ist der Kern des little-endian-Formattests).
+ * Jede Aufrufstelle übergibt benannte Konstanten; die Checks sind deshalb
+ * hier unterdrückt, in src/ bleiben sie aktiv. */
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void wr_header(FILE *f, uint16_t vocab, uint32_t dim, uint32_t layers,
                       uint32_t off, uint32_t wlen)
 {
@@ -120,6 +125,7 @@ static void test_header_endianness(void)
  * w=+1 sowie w=-1 auf denselben Token abgebildet. Der Wert wurde bewusst
  * angepasst — siehe errors.md, Eintrag "labs() vernichtet Vorzeichen".
  */
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static int run_single_weight_case(uint8_t weight_byte, uint16_t token_in,
                                   uint16_t vocab, uint16_t *out)
 {
@@ -234,6 +240,7 @@ static void test_engine_step(void)
 #define VARIANCE_SEEDS 5
 #define VARIANCE_STEPS 32
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void write_seeded_model(const char *path, uint32_t seed,
                                uint32_t dim, uint32_t layers, uint16_t vocab)
 {
@@ -512,6 +519,45 @@ static void test_engine_rejects_offset_in_header(void)
     unlink(path);
 }
 
+/* BUG (Server-Symlink-Audit): ein Symlink im Modellpfad zeigte auf eine
+ * Datei ausserhalb des vorgesehenen Verzeichnisses; die Engine oeffnete
+ * sie und die Fehlermeldung verriet sogar deren Groesse. O_NOFOLLOW muss
+ * das abweisen — auch fuer Aufrufer ausserhalb der Web-Console (JNI). */
+static void test_engine_rejects_symlink(void)
+{
+    char real[64], link[64];
+    tmp_path_new(real, sizeof(real));
+
+    FILE *f = fopen(real, "wb");
+    if (!f) { perror("fopen"); exit(1); }
+    const uint32_t dim = 4, layers = 1;
+    wr_header(f, 64u, dim, layers, (uint32_t)sizeof(HydraModelHeader), dim * layers);
+    for (uint32_t i = 0; i < dim * layers; ++i) fputc(0x01, f);
+    fclose(f);
+
+    /* Eigener Name, aber die Datei existiert nicht — Platz fuer den Link. */
+    tmp_path_new(link, sizeof(link));
+    unlink(link);
+    if (symlink(real, link) != 0) {
+        perror("symlink");
+        unlink(real);
+        return;
+    }
+
+    HydraEngine e;
+    int rc = hydra_engine_load(&e, link);
+    CHECK(rc == -2, "Symlink im Modellpfad wird abgelehnt (O_NOFOLLOW, kein following)");
+    hydra_engine_unload(&e);
+
+    /* Kontrolle: dasselbe Modell ueber den echten Pfad laedt. */
+    rc = hydra_engine_load(&e, real);
+    CHECK(rc == 0, "Gegenprobe: gleiches Modell ueber den echten Pfad laedt");
+    hydra_engine_unload(&e);
+
+    unlink(real);
+    unlink(link);
+}
+
 static void test_axiom(void)
 {
     float score = 0.0f;
@@ -562,6 +608,7 @@ int main(void)
     test_engine_rejects_inconsistent_weights_len();
     test_engine_rejects_layer_overflow();
     test_engine_rejects_offset_in_header();
+    test_engine_rejects_symlink();
     test_axiom();
 
     printf("\n=== %d Tests, %d Fehler ===\n", tests_run, tests_failed);

@@ -11,8 +11,10 @@ android {
         applicationId = "dev.hydrastone"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // Im Release-Workflow aus dem Git-Tag ableiten (v1.2.3 -> 10203),
+        // damit das APK eindeutig einer Version zugeordnet ist.
+        versionCode = (System.getenv("HYDRA_VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("HYDRA_VERSION_NAME") ?: "1.0.0"
 
         ndkVersion = "26.3.11579264"
 
@@ -37,9 +39,33 @@ android {
         }
     }
 
+    signingConfigs {
+        // Release-Signierung: bevorzugt ein echtes Keystore aus den
+        // CI-Secrets. Ohne diese Secrets wird auf den Debug-Schluessel
+        // zurueckgefallen, damit das APK trotzdem installierbar bleibt —
+        // es wird dann im Release-Body ausdruecklich als Debug-signiert
+        // gekennzeichnet (KEIN Fake).
+        create("release") {
+            val storePath = System.getenv("HYDRA_KEYSTORE")
+            if (storePath != null && file(storePath).exists()) {
+                storeFile = file(storePath)
+                storePassword = System.getenv("HYDRA_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("HYDRA_KEY_ALIAS")
+                keyPassword = System.getenv("HYDRA_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = if (System.getenv("HYDRA_KEYSTORE") != null &&
+                file(System.getenv("HYDRA_KEYSTORE")!!).exists()
+            ) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 

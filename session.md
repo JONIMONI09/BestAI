@@ -33,6 +33,14 @@
   error-artifact upload. cppcheck caught a real `%u`/signed issue on
   first run.
 
+- ✅ **2026-10-02 — Bugfix audit (PR #11, offen):** NEON-Vorzeicheninversion
+  (PoC: x86 `211,388,...` vs. ARM `211,28,...`) und Layer-Overflow (UB)
+  gefixt, dazu 12 weitere Befunde; `test_neon_matches_scalar` vergleicht
+  NEON und Skalar **im selben Build** und fand sofort einen zweiten,
+  latenten Lane-Offset-Bug. 49 Tests x86 / 51 ARM.
+- ✅ **2026-10-02 — Web-Console, Skills, Android-APK:** siehe
+  "Done (earlier today)" und `docs/ANDROID_SKILL.md`.
+
 ## Done (earlier today)
 
 - ✅ Skills created + protocol files (PR #8, merged by user)
@@ -44,63 +52,67 @@
 
 ## Current task
 
-**Bugfix audit for Hydra-Stone** — 14 findings across the C engine, the
-NEON kernel, the CLI, the tests, `server.js` and the JNI bridge.
-Order: correctness-critical (BUG 1–3), semantics/portability (4–9),
-documentation (10–12), audit of unreviewed files (13–14).
+**Security/lint hardening + GitHub Release with an installable APK**,
+following the CVE cross-check and linter audit from the previous pass.
 
 ## Plan
 
-- [x] R1: `session.md` / `errors.md` / `rules.md` read first
-- [x] **PoC before fix (R8):** installed `gcc-12-aarch64-linux-gnu` +
-      `qemu-user-static`; reproduced BUG-1 — x86 gave
-      `211,388,401,330,...`, ARM gave `211,28,137,170,...`. NEON had
-      every ternary weight sign-inverted
-- [x] BUG-1: NEON decode normalised to `0x01`/`0xFF` masks
-- [x] BUG-2: `HYDRA_MAX_LAYERS 4096` (error −11) + `int64_t` accumulator
-      in `step()` and in the NEON kernel
-- [x] BUG-3: documented the algebraic layer-loop redundancy in
-      `docs/ARCHITECTURE.md` + proposed an `HYDRA_AGGREGATE_V2` container.
-      v1 format deliberately unchanged (breaking change not requested)
-- [x] BUG-4: removed `token_in & 0x7F`; old behaviour behind
-      `-DHYDRA_TOKENV_MASK`
-- [x] BUG-5: symmetric modulo instead of `labs()`; the `w=0x02`
-      expectation changed 11 → 1 **with the justification in the comment**
-- [x] BUG-6: `weights_offset >= sizeof(header)` (error −12)
-- [x] BUG-7: single `goto fail` cleanup, `fd = -1`
-- [x] BUG-8: opt-in `-DHYDRA_DROP_CACHE`; Zero-RAM claims rewritten to
-      what is actually provable
-- [x] BUG-9: `isfinite()` guards in the axiom gate
-- [x] BUG-10: explicit `rd_u16le`/`rd_u32le` loader + LE test writers
-- [x] BUG-11: `mkstemp()` + `unlink()` in every test
-- [x] BUG-12: `--help`, unknown-option rejection, surplus-argument
-      rejection, `errno == ERANGE`
-- [x] BUG-13: README density claims corrected to the real 4 bits/weight
-- [x] BUG-14: `server.js` audited with live curl probes; `hydra_jni.c`
-      audited; verified findings only
-- [x] New tests: NEON-vs-scalar same-build comparison (49 total)
-- [x] **Caught a second, latent NEON defect** with the new test: the
-      int64 store offsets were scaled wrong, so lanes 8–15 were never
-      written. Fixed to 0/4/8/12
-- [x] Verification: 47/47 x86, **49/49 ARM/NEON (qemu)**, all lint gates
-      green, `gradle assembleDebug` green, APK installed on the
-      emulator
-- [x] On-device proof: Android UI token stream
-      `211,36,185,410,7,40,197,478` — bit-identical to host x86 **and**
-      ARM/NEON. Three platforms, one sequence
-- [x] `errors.md`: 13 new entries; `rules.md`: R9–R11 + R24 added,
-      renumbered R1–R26
-- [x] Docs: README, ARCHITECTURE, FORMAT
-- [ ] Commit (no checkout) + PR — **no merge** (R17/R20)
+- [x] Web-Verifikation aller CVE-IDs aus dem Audit:
+      CVE-2025-2439 und CVE-2025-2445 (Cortex.cpp, bestaetigt ueber
+      Tenable/Snyk), CVE-2025-53630 (`gguf_init_from_file_impl`,
+      NVD), CVE-2026-27940 (gleiche Funktion, spaetere Korrektur),
+      CVE-2026-33298 (`ggml_nbytes`, CVE.org/Red Hat),
+      CVE-2026-70638 (llama.cpp Android-JNI `new_1batch`, Builds
+      b1886–b7445, NVD) — **alle IDs und Zuordnungen korrekt**
+- [x] Web-Recherche zu den besten Linter 2026 (C / Android / JS)
+- [x] Jedes Werkzeug lokal installiert und **mit Negativkontrolle**
+      geprueft (Fix temporaer zurueckbauen, Gate muss fehlschlagen):
+      - `gcc -fanalyzer`, `clang --analyze`, cppcheck → kein Befund
+      - clang-tidy → 3 echte `bugprone-easily-swappable-parameters`,
+        nach NOLINT mit Begruendung 0
+      - flawfinder `-m 2` → 29 Fehlalarme, `-m 4` → 0
+      - **ASan+UBSan → `signed integer overflow: 2147483640 + 127`**
+        auf dem ungefixten Code, 0 auf dem gefixten
+      - Android Lint → 5 Warnings, nach Fix „No issues found"
+      - ESLint 10 → 7 Fehler, nach Fix 0
+- [x] **Neue Befunde aus dem Audit reproduziert und gefixt:**
+      - Symlink im Modellpfad umging `safeModelPath()`
+        (verifiziert: Fehler verriet `/etc/hostname`-Groesse)
+      - Server gab interne Engine-Details an den Client
+      - 6 globale Funktionen im Frontend (`no-implicit-globals`)
+- [x] Härtungen: `O_NOFOLLOW` im Loader + `realpath`/`lstat` im Server,
+      generische 500-Antworten, IIFE im Frontend
+- [x] Regressionstests: `test_engine_rejects_symlink()` (schlägt ohne
+      `O_NOFOLLOW` fehl — Negativkontrolle ausgeführt)
+- [x] Android: Vektor-Icon (adaptiv + Fallback + monochrome), alle
+      UI-Texte als Ressourcen, `plurals`, Backup-Regeln, kein
+      Orientierungs-Lock → **Android Lint: keine Befunde**
+- [x] Release: signierte `assembleRelease`-Konfiguration mit
+      Keystore-Secret **und** Debug-Fallback; Version aus Git-Tag
+- [x] `.github/workflows/lint.yml`: 7 Jobs (c-lint, sanitizers, jni-lint,
+      web-lint, android-lint, semgrep, codeql)
+- [x] `.github/workflows/release.yml`: 5 Jobs, parallele Linux-/macOS-/
+      Android-Builds, Paritäts-Gate, APK-Verifikation, SHA256SUMS
+- [x] Release-Kette lokal komplett nachgespielt (Binaries + APK +
+      Checksummen)
+- [x] **Release-APK auf dem Emulator installiert und ausgeführt**:
+      `adb install` → Success, Token-Sequenz
+      `211,36,185,410,7,40,197,478` — identisch zu Host und ARM/NEON
+- [x] `errors.md`: 5 neue Einträge; `rules.md`: R25–R30 (Linter-
+      Falsifizierbarkeit, Web-Verifikation, Fehler-Leak, Symlink-Pfade)
+- [x] README: Release-/APK-Abschnitt, Linter-Tabelle, Projektstruktur
+- [ ] Commit (kein Checkout) + PR — **kein Merge**
 
 ## Status / Notes
 
-- The two critical bugs (NEON sign inversion, layer overflow) are fixed
-  and each now has a falsifiable regression test.
-- The NEON-vs-scalar test is the structural fix for the class of bug:
-  the documentation had claimed "bit-identical" for a version that was
-  not, because nothing ever compared the two paths to each other.
-- Layer-loop redundancy documented, not "fixed" — collapsing it would
-  be a breaking format change.
-- Open PRs from earlier sessions (#7 CI lint, #10 skill optimisation)
-  are still awaiting the user's merge approval.
+- Der wichtigste Erkenntnis dieser Runde: **UBSan ist das einzige Gate,
+  das die echte Arithmetic-UB meldet.** Alle statischen Analyseren waren
+  blind dafür. Deshalb ist der Sanitizer-Job Pflicht und nicht optional.
+- `flawfinder` bleibt auf Schwelle 4 — auf Schwelle 2 meldet es jeden
+  `fopen`/`mkstemp` und jedes char-Array, also nur Rauschen.
+- CVE-2026-70638 (llama.cpp JNI-Multiplikations-Overflow) ist die
+  Fehlerklasse, nach der `hydra_jni.c` durchsucht wurde: die JNI-Brücke
+ _allokiert_ nichts aus Headerfeldern, sondern clamped nur, deshalb
+  nicht anwendbar.
+- Offene PRs (#7 CI-Lint, #10 Skill-Optimierung, #11 Bugfix-Audit)
+  warten weiterhin auf die Merge-Freigabe des Users.

@@ -1,12 +1,19 @@
 # Build artifacts
 hydra-run
 hydra-test
+hydra-run-*
+hydra-test-*
 *.o
 node_modules/
+# package-lock.json wird bewusst MIT committed: `npm ci` in der CI
+# braucht ihn fuer reproduzierbare Linter-Versionen.
 
 # Models
 *.hydra
 models/
+
+# Release staging (produced by .github/workflows/release.yml)
+dist/
 
 # Python
 __pycache__/

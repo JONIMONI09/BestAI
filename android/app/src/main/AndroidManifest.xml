@@ -2,9 +2,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application
-        android:label="Hydra-Stone"
-        android:theme="@android:style/Theme.Material.Light.DarkActionBar">
-        <activity android:name=".MainActivity" android:exported="true">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.Light.DarkActionBar"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules">
+        <!-- Kein android:screenOrientation: eine fixe Orientierung erzeugt
+             Letterboxing auf Chromebooks/Tablets (Android-Lint
+             LockedOrientationActivity/DiscouragedApi). Die UI ist vertikal
+             aufgebaut und funktioniert in beiden Orientierungen. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Fallback fuer API 24/25, die keine adaptiven Icons kennen (minSdk 24).
+     Zeichnet Hintergrund und Vordergrund in ein einziges Vektor-Icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path
+        android:fillColor="#0B0F14"
+        android:pathData="M4,4 h40 a4,4 0 0 1 4,4 v32 a4,4 0 0 1 -4,4 h-40 a4,4 0 0 1 -4,-4 v-32 a4,4 0 0 1 4,-4 z" />
+    <path android:fillColor="#34D399" android:pathData="M11,12 h6 v24 h-6 z" />
+    <path android:fillColor="#F87171" android:pathData="M21,18 h6 v18 h-6 z" />
+    <path android:fillColor="#6B7A8A" android:pathData="M31,15 h6 v21 h-6 z" />
+</vector>

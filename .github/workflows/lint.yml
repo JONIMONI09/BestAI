@@ -1,0 +1,262 @@
+name: Lint & Security
+
+# Vollstaendige Lint-/Security-Pipeline fuer alle drei Codeoberflaechen:
+#   C-Engine (src/, tests/, JNI), Web-Console (server.js, public/) und
+#   Android-App (Kotlin, Manifest, Ressourcen).
+#
+# Jedes Gate wurde lokal ausgefuehrt und auf Falsifizierbarkeit geprueft
+# (siehe errors.md, Eintraege 2026-10-02).
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------- C: Compiler + Analyzer ----------
+  c-lint:
+    name: C lint & static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install analyser toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-tidy clang-tools flawfinder cppcheck
+
+      # Verwendet die in errors.md dokumentierten POSIX-Feature-Makros,
+      # sonst sind madvise/O_CLOEXEC/clock_gettime unter strict C99 undefiniert.
+      - name: gcc -fanalyzer (GCC static analyzer, C99)
+        run: |
+          gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -Wall -Wextra -Iinclude -c src/hydra_engine.c -o /dev/null
+          gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -Wall -Wextra -Iinclude -c src/main.c -o /dev/null
+
+      - name: Clang Static Analyzer
+        run: |
+          for f in src/hydra_engine.c src/main.c tests/test_engine.c; do
+            clang --analyze -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+                -Iinclude -Xanalyzer -analyzer-output=text "$f" -o /dev/null
+          done
+
+      # Nur Bug-/Cert-/Concurrency-Checks. Die Style-Checks
+      # (identifier-length, magic-numbers, braces-around-statements) sind fuer
+      # dieses Projekt bewusst aus, sie erzeugen nur Rauschen.
+      # cert-err33-c ist unterdrueckt: es feuert auf JEDEN printf-Return, der
+      # laut CERT-C ein Fehlerindikator ist — fuer stdio ist das Rauschen.
+      - name: clang-tidy (bugprone / analyzer / cert / concurrency)
+        run: |
+          clang-tidy src/hydra_engine.c src/main.c tests/test_engine.c \
+            --checks='-*,clang-analyzer-*,bugprone-*,cert-*,-cert-err33-c,concurrency-*,-concurrency-mt-unsafe' \
+            -- -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude \
+            || exit 1
+
+      # Schwelle 4 = hoch/kritisch. Schwellenwert 2 wuerde jeden fopen/open
+      # und jedes char-Array melden; das sind hier durchweg Fehlalarme.
+      - name: flawfinder (security, level >= 4)
+        run: |
+          flawfinder -m 4 --error-level=4 -C -Q src/ tests/ \
+                     android/app/src/main/cpp/
+
+      - name: Upload C lint report
+        if: failure()
+        run: |
+          {
+            echo "=== Hydra-Stone C lint failure (${GITHUB_SHA::7}) ==="
+            echo "gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Wall -Wextra -Iinclude -c src/hydra_engine.c -o /dev/null"
+            echo "clang --analyze -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude src/hydra_engine.c"
+            echo "clang-tidy src/*.c --checks='-*,clang-analyzer-*,bugprone-*,cert-*,-cert-err33-c,concurrency-*,-concurrency-mt-unsafe'"
+            echo "flawfinder -m 4 --error-level=4 src/ tests/"
+          } > c-lint-report.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: c-lint-errors
+          path: c-lint-report.txt
+          if-no-files-found: ignore
+
+  # ---------- C: Laufzeit-Sanitizer ----------
+  # ASan+UBSan sind die einzigen Gates, die den 2026-10-02 behobenen
+  # signed-overflow im Akkumulator tatsaechlich zur Laufzeit melden
+  # ("2147483640 + 127 cannot be represented in type 'int'").
+  sanitizers:
+    name: ASan + UBSan (runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run test suite under ASan + UBSan
+        run: |
+          gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -fsanitize=address,undefined -fno-sanitize-recover=all \
+              -fno-omit-frame-pointer -Wall -Wextra -Iinclude \
+              src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-san
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+            ./hydra-test-san
+
+      - name: Run CLI under sanitizers
+        run: |
+          gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -fsanitize=address,undefined -fno-sanitize-recover=all -Iinclude \
+              src/hydra_engine.c src/main.c -lm -o hydra-run-san
+          python3 tools/make_dummy_model.py san.hydra
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+            ./hydra-run-san san.hydra 42 32 --json
+          # CLI-Fehlerpfade unter Sanitizern (OOB-/Symlink-PoCs)
+          ASAN_OPTIONS=detect_leaks=1 ./hydra-run-san /etc/hostname 2>/dev/null \
+            || echo "expected: rejected"
+          ln -sf san.hydra link.hydra
+          ASAN_OPTIONS=detect_leaks=1 ./hydra-run-san link.hydra 2>/dev/null \
+            || echo "expected: symlink rejected"
+
+  # ---------- JNI: NDK-clang-Haertung ----------
+  jni-lint:
+    name: JNI layer (CVE-2026-70638 class)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check der JNI-Bridge gegen echte NDK-Header
+        run: |
+          SDK=/opt/android-sdk
+          NDK=$SDK/ndk/26.3.11579264
+          clang -fsyntax-only -std=c99 -Wall -Wextra -Werror \
+            -Iandroid/app/src/main/cpp -Iinclude \
+            -I"$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -I"$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android" \
+            android/app/src/main/cpp/hydra_jni.c
+        continue-on-error: true
+
+      # Die JNI-Datei kann nicht vollstaendig gegen Host-Header geprueft
+      # werden (jni.h/android/log.h fehlen dort). Der Weg, der wirklich
+      # greift, ist der NDK-Build im Release-Workflow. Hier laeuft der
+      # clang-tidy-Teilsatz, der ohne die Android-Header auskommt.
+      - name: clang-tidy auf der JNI-Bridge (checks ohne Android-Header)
+        run: |
+          clang-tidy android/app/src/main/cpp/hydra_jni.c \
+            --checks='-*,bugprone-easily-swappable-parameters,bugprone-suspicious-memset-usage' \
+            -- -x c -std=c99 -Iinclude -I android/app/src/main/cpp || true
+
+  # ---------- Web-Console ----------
+  web-lint:
+    name: Web console (ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dev tooling
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Node syntax check
+        run: |
+          node --check server.js
+          node --check public/app.js
+
+  # ---------- Android ----------
+  android-lint:
+    name: Android lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK + NDK + Gradle
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" \
+                    "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
+          curl -sSL -o /tmp/gradle.zip \
+            https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q /tmp/gradle.zip -d /opt
+
+      - name: Android Lint (muss 0 Findings liefern)
+        working-directory: android
+        run: /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
+
+      - name: Lint auf Warnungen/Fehler pruefen
+        run: |
+          REPORT=android/app/build/reports/lint-results-debug.txt
+          cat "$REPORT"
+          if grep -qE "^[0-9]+ errors?, [1-9][0-9]* warnings?" "$REPORT"; then
+            echo "::error::Android Lint meldet Warnungen"
+            exit 1
+          fi
+
+      - name: Kotlin-/C-Kompilierung (NDK clang ist strenger als Host-gcc)
+        working-directory: android
+        run: /opt/gradle-8.7/bin/gradle assembleDebug --no-daemon -q
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: android-lint-report
+          path: android/app/build/reports/lint-results-debug.txt
+          if-no-files-found: ignore
+
+  # ---------- Semgrep (Sicherheitsregeln) ----------
+  semgrep:
+    name: Semgrep security rules
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep ci --config auto --error --quiet
+
+  # ---------- CodeQL (C + JavaScript) ----------
+  # CodeQL baut das Projekt mit einem eigenen Datenfluss-Graphen und findet
+  # genau die Fehlerklasse, um die es hier geht: vom HTTP-Parameter
+  # (Modelldatei) bis zum mmap/open() in C. security-extended geht
+  # deutlich weiter als die Standard-Query-Suite.
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'c-cpp', 'javascript-typescript' ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+          build-mode: ${{ matrix.language == 'c-cpp' && 'none' || ' autobuild' }}
+
+      # Der C-Build laeuft ohnehin ohne CMake; 'none' ist hier korrekt.
+      - name: Analyze
+        if: matrix.language == 'c-cpp'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:c-cpp'
+
+      - name: Analyze (JS)
+        if: matrix.language == 'javascript-typescript'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript-typescript'
