@@ -1,11 +1,11 @@
 name: Lint & Security
 
-# Vollstaendige Lint-/Security-Pipeline fuer alle drei Codeoberflaechen:
-#   C-Engine (src/, tests/, JNI), Web-Console (server.js, public/) und
-#   Android-App (Kotlin, Manifest, Ressourcen).
+# Complete lint/security pipeline for all three code surfaces:
+#   C engine (src/, tests/, JNI), web console (server.js, public/) and
+#   Android app (Kotlin, manifest, resources).
 #
-# Jedes Gate wurde lokal ausgefuehrt und auf Falsifizierbarkeit geprueft
-# (siehe errors.md, Eintraege 2026-10-02).
+# Every gate was executed locally and checked for falsifiability
+# (see errors.md, entries of 2026-10-02).
 
 on:
   push:
@@ -44,11 +44,11 @@ jobs:
                 -Iinclude -Xanalyzer -analyzer-output=text "$f" -o /dev/null
           done
 
-      # Nur Bug-/Cert-/Concurrency-Checks. Die Style-Checks
-      # (identifier-length, magic-numbers, braces-around-statements) sind fuer
-      # dieses Projekt bewusst aus, sie erzeugen nur Rauschen.
-      # cert-err33-c ist unterdrueckt: es feuert auf JEDEN printf-Return, der
-      # laut CERT-C ein Fehlerindikator ist — fuer stdio ist das Rauschen.
+      # Only bug/cert/concurrency checks. The style checks
+      # (identifier-length, magic-numbers, braces-around-statements) are
+      # deliberately off for this project, they only produce noise.
+      # cert-err33-c is suppressed: it fires on EVERY printf return, which
+      # CERT-C calls an error indicator — for stdio that is just noise.
       - name: clang-tidy (bugprone / analyzer / cert / concurrency)
         run: |
           clang-tidy src/hydra_engine.c src/main.c tests/test_engine.c \
@@ -56,8 +56,8 @@ jobs:
             -- -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude \
             || exit 1
 
-      # Schwelle 4 = hoch/kritisch. Schwellenwert 2 wuerde jeden fopen/open
-      # und jedes char-Array melden; das sind hier durchweg Fehlalarme.
+      # Level 4 = high/critical. Level 2 would report every fopen/open
+      # and every char array; those are false positives here.
       - name: flawfinder (security, level >= 4)
         run: |
           flawfinder -m 4 --error-level=4 -C -Q src/ tests/ \
@@ -82,9 +82,9 @@ jobs:
           path: c-lint-report.txt
           if-no-files-found: ignore
 
-  # ---------- C: Laufzeit-Sanitizer ----------
-  # ASan+UBSan sind die einzigen Gates, die den 2026-10-02 behobenen
-  # signed-overflow im Akkumulator tatsaechlich zur Laufzeit melden
+  # ---------- C: runtime sanitizers ----------
+  # ASan+UBSan are the only gates that actually report at runtime the
+  # signed overflow in the accumulator fixed on 2026-10-02
   # ("2147483640 + 127 cannot be represented in type 'int'").
   sanitizers:
     name: ASan + UBSan (runtime)
@@ -117,7 +117,7 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1 ./hydra-run-san link.hydra 2>/dev/null \
             || echo "expected: symlink rejected"
 
-  # ---------- JNI: NDK-clang-Haertung ----------
+  # ---------- JNI: NDK clang hardening ----------
   jni-lint:
     name: JNI layer (CVE-2026-70638 class)
     runs-on: ubuntu-latest
@@ -135,11 +135,11 @@ jobs:
             android/app/src/main/cpp/hydra_jni.c
         continue-on-error: true
 
-      # Die JNI-Datei kann nicht vollstaendig gegen Host-Header geprueft
-      # werden (jni.h/android/log.h fehlen dort). Der Weg, der wirklich
-      # greift, ist der NDK-Build im Release-Workflow. Hier laeuft der
-      # clang-tidy-Teilsatz, der ohne die Android-Header auskommt.
-      - name: clang-tidy auf der JNI-Bridge (checks ohne Android-Header)
+      # The JNI file cannot be checked in full against host headers
+      # (jni.h/android/log.h are missing there). The path that really
+      # protects us is the NDK build in the Android jobs. Here we run the
+      # clang-tidy subset that does not need the Android headers.
+      - name: clang-tidy on the JNI bridge (checks without Android headers)
         run: |
           clang-tidy android/app/src/main/cpp/hydra_jni.c \
             --checks='-*,bugprone-easily-swappable-parameters,bugprone-suspicious-memset-usage' \
@@ -175,20 +175,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Ohne diesen Gate koennte ein Tippfehler im Release-Workflow erst beim
-      # Tag-Push auffallen — dann ist es zu spaet, weil das Tag existiert.
-      - name: Workflow-YAML ist syntaktisch gueltig
+      # Without this gate a typo in the release workflow would only surface
+      # on a tag push — by then the tag already exists and it is too late.
+      - name: Workflow YAML is syntactically valid
         run: |
           for f in .github/workflows/*.yml; do
             python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" \
-              || { echo "::error::$f ist kein gueltiges YAML"; exit 1; }
+              || { echo "::error::$f is not valid YAML"; exit 1; }
           done
 
-      # Der Ausloeser- und Versions-Logik des Release-Workflows wird lokal
-      # nachgespielt: Tag-Push, manueller Publish, Dry-Run ohne Tag und ein
-      # ungueltiges Tag. Der Test liest das Skript direkt aus release.yml
-      # und kann daher nicht von der YAML abweichen.
-      - name: Release-Ausloeser und Versionslogik (Negativkontrolle inklusive)
+      # The trigger and version logic of the release workflow is replayed
+      # locally: tag push, manual publish, dry run without a tag and an
+      # invalid tag. The test reads the script straight out of release.yml
+      # and therefore cannot drift from the YAML.
+      - name: Release trigger and version logic (including negative control)
         run: bash tools/ci_release_version_test.sh
 
   # ---------- Android ----------
@@ -203,15 +203,15 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # Zwei Fehlerquellen in einem Schritt:
-      # 1) android-actions/setup-android@v3 installiert selbst das nicht
-      #    mehr existierende Paket "tools" und bricht mit exit 1 ab.
-      # 2) Der Runner bringt ein vorgebautes SDK mit (platforms 35/36).
-      #    Lint meldet targetSdk 34 dann als "OldTargetApi", obwohl exakt
-      #    diese Toolchain-Kombination lokal verifiziert ist. Deshalb ein
-      #    eigenes SDK-Root, das ausschliesslich die gepinnten Pakete
-      #    erhaelt — dieselbe Reihenfolge wie in docs/ANDROID_SKILL.md.
-      - name: Android SDK isoliert aufsetzen (nur API 34)
+      # Two failure sources handled in one step:
+      # 1) android-actions/setup-android@v3 installs the retired "tools"
+      #    package itself and fails with exit 1.
+      # 2) The runner ships a prebuilt SDK (platforms 35/36). Lint then
+      #    reports targetSdk 34 as "OldTargetApi" even though exactly this
+      #    toolchain combination is the locally verified one. Hence an own
+      #    SDK root that receives nothing but the pinned packages — the same
+      #    sequence as documented in docs/ANDROID_SKILL.md.
+      - name: Set up an isolated Android SDK (API 34 only)
         run: |
           set -e
           SDK="$RUNNER_TEMP/android-sdk"
@@ -231,16 +231,16 @@ jobs:
             https://services.gradle.org/distributions/gradle-8.7-bin.zip
           unzip -q gradle.zip -d /opt
 
-      - name: Android Lint (muss 0 Findings liefern)
+      - name: Android Lint (must report 0 findings)
         working-directory: android
         run: /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
 
-      - name: Lint auf Warnungen/Fehler pruefen
+      - name: Check the lint report for warnings/errors
         run: |
           REPORT=android/app/build/reports/lint-results-debug.txt
           cat "$REPORT"
           if ! grep -q "No issues found" "$REPORT"; then
-            echo "::error::Android Lint meldet Befunde"
+            echo "::error::Android Lint reported findings"
             exit 1
           fi
 
@@ -258,8 +258,8 @@ jobs:
   # ---------- Semgrep (Sicherheitsregeln) ----------
   # Befolgt die offizielle CI-Sample-Konfiguration: image ohne Tag,
   # `semgrep ci` beendet sich bei Funden selbst mit Exit 1 (ein
-  # --error-Flag existiert nicht). --suppress-errors haelt interne
-  # Semgrep-Fehler vom Blockieren ab, echte Funde blockieren weiterhin.
+  # the --error flag does not exist). --suppress-errors keeps internal
+  # Semgrep errors from blocking the run, real findings still block.
   semgrep:
     name: Semgrep security rules
     runs-on: ubuntu-latest
@@ -271,9 +271,9 @@ jobs:
 
   # ---------- CodeQL (C + JavaScript) ----------
   # CodeQL baut das Projekt mit einem eigenen Datenfluss-Graphen und findet
-  # genau die Fehlerklasse, um die es hier geht: vom HTTP-Parameter
-  # (Modelldatei) bis zum mmap/open() in C. security-extended geht
-  # deutlich weiter als die Standard-Query-Suite.
+  # exactly the bug class this is about: from the HTTP parameter (model
+  # file) down to mmap/open() in C. security-extended goes considerably
+  # further than the standard query suite.
   codeql:
     name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
@@ -287,9 +287,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # build-mode 'none' fuer beide Sprachen: JavaScript/TypeScript
-      # unterstuetzt 'autobuild' nicht (Fatal error im init), und unser
-      # C-Projekt braucht ohnehin keinen Build-Step fuer die Extraktion.
+      # build-mode 'none' for both languages: JavaScript/TypeScript does
+      # not support 'autobuild' (fatal error during init), and our C
+      # project needs no build step for extraction anyway.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -297,7 +297,7 @@ jobs:
           queries: security-extended
           build-mode: none
 
-      # Der C-Build laeuft ohnehin ohne CMake; 'none' ist hier korrekt.
+      # The C build runs without CMake anyway, so 'none' is correct here.
       - name: Analyze
         if: matrix.language == 'c-cpp'
         uses: github/codeql-action/analyze@v3

@@ -604,3 +604,77 @@
   (BOM/CRLF/tabs) and read the expected-name source — the error message
   names the target and therefore reveals whether the parser or the file
   is the problem.
+## 2026-10-02 — The APK was only ever built on a tag
+
+- **Symptom:** `main` was green on every check, but the Android app was
+  never built on a normal push and the repository showed "No releases
+  published".
+- **Cause:** `release.yml` triggers only on `v*.*.*` tags (plus the
+  manual dispatch), and `ci.yml` had no Android job at all — the
+  `android-lint` job builds only what lint needs, not a signed APK. So
+  a broken Gradle/NDK build would have surfaced first at release time,
+  and no tag had ever been pushed.
+- **Fix:** new `android-apk` job in `ci.yml` runs on every push and pull
+  request: `assembleDebug` + `assembleRelease`, `apksigner verify`, ABIs
+  and asset checked with `aapt`, APK uploaded as an artifact. The tag
+  push remains the only trigger that publishes a release.
+- **Prevention:** every shippable artifact must be produced by a
+  non-release job as well. A gate that only runs on release day is not a
+  gate, it is a surprise.
+
+## 2026-10-02 — JNI bridge had no machine-checked contract
+
+- **Symptom:** `HydraBridge.kt` declares `external fun runInference(...)`
+  and `hydra_jni.c` implements `Java_dev_hydrastone_HydraBridge_runInference`,
+  but nothing verified that the two still match. Renaming one side would
+  only fail at runtime on a device.
+- **Cause:** no test in the chain looked at the JNI symbol names; the
+  existing Android gates compile both sides independently.
+- **Fix:** `tools/jni_signature_check.sh` generates an equivalent Java
+  class from the Kotlin declarations, runs `javac -h` on it and compares
+  the generated header against the C file — symbol name and parameter
+  list. It runs as job `jni-signatures`. The check also surfaced a real
+  discrepancy: javac derives the receiver as `jobject` (a Kotlin
+  `object` member is an instance method) while the C bridge declares
+  `jclass`. It is harmless — the parameter is unused — and the script
+  reports it as a `note` instead of hiding it.
+- **Prevention:** derive expectations with the same toolchain that will
+  consume them (`javac -h`), never by hand. Negative control executed:
+  an extra unimplemented method makes the gate exit 1.
+
+## 2026-10-02 — CI output and release notes were still German
+
+- **Symptom:** after the documentation was translated, the CI step names,
+  `::error::`/`::notice::` messages, the workflow comments and the entire
+  release notes body were still German — a repository that presents
+  itself as an English project published English docs and German release
+  notes.
+- **Cause:** the translation pass covered tracked `.md` files only; the
+  YAML files were not part of that inventory.
+- **Fix:** `lint.yml`, `release.yml` and `vibeworks-check.yml` translated
+  (comments, step names, error messages, release body). `ci.yml` was
+  already English.
+- **Prevention:** when switching the documentation language, grep the
+  whole repository including workflows — the user-visible text is what
+  counts, not only the files with a `.md` suffix.
+
+## 2026-10-02 — Every CI-built APK shipped without the model asset
+
+- **Symptom:** the new `android-apk` job failed on its first run even
+  though all three ABIs were built and packaged. The failure was not an
+  ABI: it was `grep -q 'assets/demo.hydra'`.
+- **Cause:** `android/app/src/main/assets/demo.hydra` existed on the
+  developer machine but was never tracked by git. Every clean checkout —
+  i.e. every CI run and every release run — therefore built an APK
+  without the demo model, and the app would have failed at runtime with
+  "model file not found". The old `release.yml` had the same
+  `grep -q 'assets/demo.hydra'` check, so the first real tag run would
+  have failed the same way.
+- **Fix:** the asset is now tracked, and `tools/make_dummy_model.py` is
+  deterministic (three runs, one sha256), so CI regenerates it and
+  compares it with the committed file — gate 1e in `ci.yml`. The
+  artifact upload also runs on failure so a broken APK can still be
+  inspected.
+- **Prevention:** every file the packager reads has to be tracked. Ask
+  what a clean checkout contains, not what the workstation contains; a
+  build that only works locally is not a build.
