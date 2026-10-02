@@ -108,6 +108,8 @@ Release artifacts:
 
 **Signing.** Without repository secrets the APK is signed with the debug key — fully installable by sideloading, but not Play-Store-ready. Supplying `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS` and `HYDRA_KEY_PASSWORD` switches the build to a real release key, and the release body states which one was used.
 
+**Manual runs.** The release workflow can also be started from the Actions tab (*Run workflow*) without pushing a tag. Leave **tag** empty to get a build-only dry run: all jobs run — CLI binaries, APK build, signature verification, Android Lint, x64/arm64 parity — but **no release is published**. Enter a tag and tick **publish** to behave exactly like a tag push. The trigger and version logic are regression-tested by `tools/ci_release_version_test.sh` (job `release-config`), which replays the script straight out of the workflow file for five input cases.
+
 ## Quality Gates
 
 Every push and pull request runs the following. Each gate was verified locally **and** proven to fail on a deliberately reverted fix before being adopted — a linter that cannot fail is worthless.
@@ -211,4 +213,4 @@ Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.
 
 ## License
 
-see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

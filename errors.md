@@ -545,6 +545,34 @@
   man Code oder Lint-Konfiguration aendert. Ein Gate darf nicht
   kosmetisch aufgeweicht werden, um einen Umgebungsfehler zu verstecken.
 
+## 2026-10-02 — Manuelles Release war unbrauchbar (Pflicht-Tag-Eingabe, stille Fehlversion)
+
+- **Symptom:** `release.yml` hatte zwar `workflow_dispatch`, aber mit
+  `required: true` fuer das Tag-Input. Ein manueller Lauf war damit nur
+  moeglich, wenn man von Hand ein existierendes Tag eintippt — also ohne
+  neuen Push nicht testbar. Ein Lauf ohne Eingabe (z. B. per API)
+  lieferte zudem `TAG=main`, `version=main`, `versionCode=0`: die
+  Arithmetik `$(( MAJ * 10000 ))` wertet ein unbekanntes Wort als 0 aus,
+  statt einen Fehler zu melden.
+- **Cause:** Das Input war als Pflichtfeld modelliert ("Existing tag to
+  publish a release for"), obwohl der eigentliche Zweck ein *testbarer*
+  Build ist. Zusaetzlich wurde das Tag-Format nie validiert und
+  `versionCode` nie gegen 0 geprueft.
+- **Fix:** `tag` ist optional, `publish` ist ein Boolean (Default
+  `false`). Ohne Tag laeuft ein Dry-Run mit synthetischem Tag
+  `v0.0.0-ci.<run_number>`, der `publish`-Job ist ueber
+  `if: needs.version.outputs.publish == 'true'` deaktiviert. Das Tag
+  wird gegen `vMAJOR.MINOR.PATCH` geprueft (Fehler statt Release mit
+  Versionsnamen "main"), `versionCode` ist mindestens 1, und alle
+  Eingaben kommen ueber `env:` statt per `${{ }}` im Skript (kein
+  Shell-Injection-Risiko). Der Tag-Push-Trigger bleibt unveraendert.
+- **Prevention:** Jeder Dispatch-Pfad braucht eine Negativkontrolle.
+  `tools/ci_release_version_test.sh` spielt die Versionslogik direkt aus
+  der YAML nach (Tag-Push, manueller Publish, Dry-Run, ungueltiges Tag)
+  und laeuft als Job `release-config` in `lint.yml`. Negativkontrolle
+  ausgefuehrt: mit entfernter `publish`-Ausgabe meldet der Test
+  FEHLGESCHLAGEN (exit 1) — das Gate kann also tatsaechlich rot werden.
+
 ## 2026-10-02 — Skills-UI meldet "Not loaded" trotz korrektem Frontmatter
 
 - **Symptom:** Die Skills-UI zeigt alle drei Skills als *Not loaded*
