@@ -44,7 +44,7 @@ make all && make test && ./hydra-test
 #    sudo apt-get install -y gcc-12-aarch64-linux-gnu qemu-user-static
 aarch64-linux-gnu-gcc-12 -O2 -static -Wall -Wextra -Iinclude \
     src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm
-qemu-aarch64-static ./hydra-test-arm          # expect: 49 Tests, 0 Fehler
+qemu-aarch64-static ./hydra-test-arm          # expect: 49 Tests, 0 failures
 
 aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
     src/hydra_engine.c src/main.c -o hydra-run-arm
@@ -63,10 +63,10 @@ python3 tools/make_dummy_model.py smoke.hydra && ./hydra-run smoke.hydra 42
 
 # 8. Optional build-flag variants (both must stay green)
 gcc -O2 -DHYDRA_TOKENV_MASK -Iinclude src/hydra_engine.c tests/test_engine.c \
-    -lm -o /tmp/t-mask && /tmp/t-mask          # expect: 46 Tests, 0 Fehler
+    -lm -o /tmp/t-mask && /tmp/t-mask          # expect: 46 Tests, 0 failures
 aarch64-linux-gnu-gcc-12 -O2 -static -DHYDRA_DROP_CACHE -Iinclude \
     src/hydra_engine.c tests/test_engine.c -lm -o /tmp/t-drop
-qemu-aarch64-static /tmp/t-drop                # expect: 51 Tests, 0 Fehler
+qemu-aarch64-static /tmp/t-drop                # expect: 51 Tests, 0 failures
 
 rm -f smoke.hydra parity.hydra hydra-run hydra-test hydra-run-arm hydra-test-arm
 ```
@@ -119,14 +119,14 @@ Toolchain install for L1–L5 (once per machine):
 ## Expected result
 
 - Gates 1-4: silent, exit 0
-- Gate 5: `49 Tests, 0 Fehler` (x86 scalar path; the 2 NEON comparison
+- Gate 5: `49 Tests, 0 failures` (x86 scalar path; the 2 NEON comparison
   tests are compiled out there)
-- Gate 6: `51 Tests, 0 Fehler` on ARM (the 2 extra tests are the
+- Gate 6: `51 Tests, 0 failures` on ARM (the 2 extra tests are the
   NEON-vs-scalar comparison), then `x86: [...]` / `arm: [...]` with
   **identical** token and state arrays
 - Gate 7: 16 tokens printed + axiom check allows at 1.0, blocks at 0.0
 - L1–L4, L6: no output, exit 0
-- L5: `49 Tests, 0 Fehler` and no sanitizer diagnostics
+- L5: `49 Tests, 0 failures` and no sanitizer diagnostics
 - L7: Android Lint "No issues found"
 
 ## Notes

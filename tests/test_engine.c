@@ -13,6 +13,7 @@
 #include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* Deterministischer LCG (statt rand()): identische Sequenz auf allen
  * Plattformen/libc-Implementierungen, damit der Test portabel bleibt. */
@@ -519,17 +520,19 @@ static void test_engine_rejects_offset_in_header(void)
     unlink(path);
 }
 
-/* BUG (Server-Symlink-Audit): ein Symlink im Modellpfad zeigte auf eine
- * Datei ausserhalb des vorgesehenen Verzeichnisses; die Engine oeffnete
- * sie und die Fehlermeldung verriet sogar deren Groesse. O_NOFOLLOW muss
- * das abweisen — auch fuer Aufrufer ausserhalb der Web-Console (JNI). */
+/* BUG (server symlink audit): a symlink in the model path pointed at a
+ * file outside the intended directory; the engine opened it and the
+ * error message even revealed its size. O_NOFOLLOW must reject that —
+ * also for callers outside the web console (JNI). */
 static void test_engine_rejects_symlink(void)
 {
     char real[64], link[64];
     tmp_path_new(real, sizeof(real));
 
-    FILE *f = fopen(real, "wb");
-    if (!f) { perror("fopen"); exit(1); }
+    int fd = open(real, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
     const uint32_t dim = 4, layers = 1;
     wr_header(f, 64u, dim, layers, (uint32_t)sizeof(HydraModelHeader), dim * layers);
     for (uint32_t i = 0; i < dim * layers; ++i) fputc(0x01, f);
@@ -611,6 +614,6 @@ int main(void)
     test_engine_rejects_symlink();
     test_axiom();
 
-    printf("\n=== %d Tests, %d Fehler ===\n", tests_run, tests_failed);
+    printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;
 }
