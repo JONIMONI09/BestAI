@@ -6,6 +6,81 @@
 
 ---
 
+## 2026-10-02 — The 413 that was never delivered
+
+- **Symptom:** uploading a 100 MiB model produced an **empty response** and
+  a curl transport error instead of "file too large". The route wanted to
+  answer 413 and the answer was destroyed one line earlier.
+- **Cause:** `streamToTmpFile()` called `req.destroy()` at the moment the
+  cap was exceeded, and `req.destroy()` takes the socket with it. The
+  handler then called `sendJSON()` on a socket that no longer existed. The
+  client cannot learn the refusal from anything else: the only channel is
+  the response.
+- **Fix:** the order is now stop reading -> answer -> close.
+  `req.unpipe(out)` + `req.pause()` freeze the upload, the route sends the
+  413 (with `Connection: close`) and only then destroys the request, after
+  `res.on('finish')`. Two paths were added, because they fail differently:
+  a `Content-Length` pre-check refuses before a single byte is written, and
+  the streaming guard covers clients that send chunked without declaring a
+  size. The body also carries `limitBytes`, `limitHuman` and `raiseWith`,
+  so the console can say how to fix it instead of only that it failed.
+- **Prevention:** a test must assert the *whole* round trip, not the status
+  on the server side. `assert.strictEqual(res.status, 413)` would have
+  passed on the server while the client saw nothing. The regression tests
+  now check `text.length > 0` and parse the body, and the negative control
+  (re-adding `req.destroy()`) reproduces `ECONNRESET` on the chunked path.
+- **Second bug found while fixing it:** the console hardcoded nothing, but
+  the Android import's limit message was a fixed string ("exceeds the 64
+  MiB limit") that would have been wrong the moment the cap changed. It
+  now formats the real limit.
+
+## 2026-10-02 — "wrong magic" is a hex value, not an answer
+
+- **Symptom:** a user importing their own GGUF model was told
+  `not a .hydra file (wrong magic)`. Correct, and useless: it does not say
+  what they held or what to do about it.
+- **Cause:** one string for every possible mismatch, written when the only
+  interesting case was a corrupt file.
+- **Fix:** one analysis function (`analyseHydraFile`) now produces the
+  verdict, and both the upload route and `GET /api/models/inspect` quote
+  it, so the two can never disagree. Known magics are named (GGUF, ZIP,
+  ELF, PNG, gzip, bzip2) with advice attached; an unknown one still prints
+  both values. The Android import applies the same rules under the same ids
+  (`magic`, `version`, `dim`, `vocab`, `layers`, `weights_offset`,
+  `weights_fit`, `pairs_covered`, `shape_within_format_ceiling`) and logs
+  every violated rule, not just the first.
+- **Prevention:** the consistency test ("the upload refusal and the inspect
+  report state the same reason") is what keeps two implementations of one
+  rule set from drifting. The Android side is covered statically by
+  `tools/android_header_check.sh`, since no emulator is available.
+
+## 2026-10-02 — A diagnostics endpoint must not become a file-read oracle
+
+- **Symptom:** the first version of `/api/models/inspect` answered
+  `400 invalid model path` for a model that simply did not exist.
+- **Cause:** `safeModelPath()` resolves with `realpath()`, which fails for
+  a missing file, so "not allowed" and "not there" collapse into one
+  answer. A caller could not tell a typo from a refusal.
+- **Fix:** the route checks the shape of the path first (suffix, NUL,
+  stays inside ROOT) and answers 404 for a path that does not exist, then
+  hands the real resolution to `safeModelPath()` as before. Outside paths
+  are still 400, and a test asserts it - the endpoint reads model files
+  only.
+- **Prevention:** an endpoint that answers questions about the filesystem
+  must distinguish "not allowed" from "absent"; both were 400 before.
+
+## 2026-10-02 — `pkill -f "node server.js"` killed the test shell itself
+
+- **Symptom:** two verification commands returned no output at all and
+  timed out, and the server they had started was not the problem.
+- **Cause:** `pkill -f` matches the full command line - including the
+  command line of the shell that is running the `pkill`, which contains
+  the string `node server.js`. The shell killed itself mid-command.
+- **Fix:** `pkill -f "^node server.js"` anchors the pattern to the start
+  of the command line.
+- **Prevention:** when a cleanup command names a string that appears in its
+  own invocation, anchor it or use the pid.
+
 ## 2026-10-02 — A reachability probe is not a bind-address test (sandbox published the console)
 
 - **Symptom:** the existing test `the server does not listen on a public

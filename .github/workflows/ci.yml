@@ -322,6 +322,12 @@ jobs:
       - name: Crash reporting and cancel contract
         run: bash tools/android_crash_check.sh
 
+      # Same idea for the model header check: the Android import must apply
+      # the same rules as the C loader and the web console, name the format
+      # the user actually picked (GGUF), and add offsets in 64 bits.
+      - name: Android model header diagnostics
+        run: bash tools/android_header_check.sh
+
   # ---------- Stage 3b: the APK is built on every push ----------
   # Previously the APK was only built by the release workflow, i.e. only
   # on a tag. main therefore never proved that the app still builds.

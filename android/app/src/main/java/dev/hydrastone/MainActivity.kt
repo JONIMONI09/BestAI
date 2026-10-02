@@ -280,11 +280,15 @@ class MainActivity : ComponentActivity() {
      * Copy an imported model into filesDir, validate its 24-byte header and
      * only then make it the active model.
      *
-     * The header check mirrors the C loader (include/hydra_model.h): magic,
-     * version, dim/vocab bounds, layers cap, weights offset/length inside the
-     * file and layers*dim covered by weights_len. Accepting a file the engine
-     * would only reject later would leave the app with a model that fails on
-     * every Run.
+     * The header check mirrors the C loader (include/hydra_model.h) rule for
+     * rule - the same rules the web console reports through
+     * GET /api/models/inspect - so a file rejected here is refused there for
+     * the same stated reason. Accepting a file the engine would only reject
+     * later would leave the app with a model that fails on every Run.
+     *
+     * On rejection every violated rule is logged, not just the first one: a
+     * user who picked the wrong file needs the whole list, and "wrong magic"
+     * on its own told nobody what they actually held.
      */
     private fun importModel(uri: Uri) {
         val displayName = queryDisplayName(uri) ?: "imported.hydra"
@@ -303,7 +307,7 @@ class MainActivity : ComponentActivity() {
                             if (n < 0) break
                             bytes += n
                             if (bytes > MAX_UPLOAD_BYTES) {
-                                throw IllegalStateException(getString(R.string.err_too_large))
+                                throw IllegalStateException(getString(R.string.err_too_large_human, formatBytes(MAX_UPLOAD_BYTES)))
                             }
                             out.write(buf, 0, n)
                         }
@@ -311,10 +315,15 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val error = validateHydraHeader(tmp, bytes)
-                if (error != null) {
+                val report = analyseHydraFile(tmp, bytes)
+                if (!report.valid) {
                     tmp.delete()
-                    log(getString(R.string.log_import_rejected, error))
+                    // The header itself, so the user can see what they picked.
+                    log(getString(R.string.log_import_header, report.describe()))
+                    for (rule in report.rules.filter { !it.ok }) {
+                        log("  - ${rule.id}: ${rule.message}")
+                    }
+                    log(getString(R.string.log_import_rejected, report.firstViolation()))
                     return@Thread
                 }
 
@@ -341,36 +350,164 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    /** Returns null when the file is a valid .hydra, otherwise the reason. */
-    private fun validateHydraHeader(file: File, size: Long): String? {
-        if (size < HEADER_BYTES) return getString(R.string.err_too_small)
+    /**
+     * The result of a header check: the values that were read plus one entry
+     * per rule with its verdict.
+     */
+    private data class HeaderRule(val id: String, val ok: Boolean, val message: String)
+
+    private data class HeaderReport(
+        val bytes: Long,
+        val fields: Map<String, Long> = emptyMap(),
+        val detected: String? = null,
+        val advice: String? = null,
+        val rules: List<HeaderRule> = emptyList()
+    ) {
+        val valid: Boolean get() = rules.all { it.ok }
+
+        /** Every violated rule, joined - the useful part of a long list. */
+        fun firstViolation(): String =
+            rules.firstOrNull { !it.ok }?.message ?: "model rejected"
+
+        fun describe(): String = if (fields.isEmpty()) {
+            "$bytes bytes"
+        } else {
+            fields.entries.joinToString(" ") { (k, v) ->
+                if (k == "magic") "$k=${hex32(v)}" else "$k=$v"
+            } + " ($bytes bytes)" + (detected?.let { ", detected: $it" } ?: "")
+        }
+    }
+
+    /**
+     * Magics worth naming. "wrong magic 0x46554747" tells nobody that they
+     * just handed the app a llama.cpp model; this does.
+     */
+    private fun describeMagic(magic: Long): Pair<String?, String?> = when {
+        magic == HYDRA_MAGIC -> "HYDRA" to null
+        magic == GGUF_MAGIC -> "GGUF" to getString(R.string.err_magic_gguf)
+        magic == ZIP_MAGIC -> "ZIP archive" to getString(R.string.err_magic_zip)
+        magic == ELF_MAGIC -> "ELF binary" to getString(R.string.err_magic_elf)
+        magic == PNG_MAGIC -> "PNG image" to getString(R.string.err_magic_png)
+        (magic and 0xFFFFL) == GZIP_MAGIC -> "gzip archive" to getString(R.string.err_magic_gzip)
+        else -> null to getString(R.string.err_magic_unknown, hex32(magic))
+    }
+
+    /** 1048576 -> "1.0 MiB". The same phrasing the web console uses. */
+    private fun formatBytes(n: Long): String {
+        val units = arrayOf("B", "KiB", "MiB", "GiB", "TiB")
+        var v = n.toDouble()
+        var i = 0
+        while (v >= 1024 && i < units.size - 1) {
+            v /= 1024
+            i += 1
+        }
+        /* Locale.ROOT: a device set to Turkish would otherwise render the
+         * unit list differently, and Android Lint is right about that. */
+        return if (i == 0) "${v.toLong()} ${units[i]}"
+        else String.format(java.util.Locale.ROOT, "%.1f %s", v, units[i])
+    }
+
+    /**
+     * Checks a .hydra header the same way the C loader and the web console
+     * do, and reports EVERY rule instead of returning on the first failure.
+     *
+     * Rule ids match the server's /api/models/inspect report on purpose:
+     * "dim" here and "dim" there are the same rule, so a user comparing the
+     * two sees one story, not two.
+     */
+    private fun analyseHydraFile(file: File, size: Long): HeaderReport {
+        val rules = mutableListOf<HeaderRule>()
+        if (size < HEADER_BYTES) {
+            rules += HeaderRule("size", false, getString(R.string.err_too_small_human, size))
+            return HeaderReport(size, rules = rules)
+        }
+
         val header = ByteArray(HEADER_BYTES)
         file.inputStream().use { input ->
-            if (input.read(header) != HEADER_BYTES) return getString(R.string.err_unreadable)
+            if (input.read(header) != HEADER_BYTES) {
+                rules += HeaderRule("header_readable", false, getString(R.string.err_unreadable))
+                return HeaderReport(size, rules = rules)
+            }
         }
-        fun u16(off: Int) = (header[off].toInt() and 0xFF) or
-            ((header[off + 1].toInt() and 0xFF) shl 8)
+        rules += HeaderRule("header_readable", true, "$HEADER_BYTES-byte header read")
+
+        fun u16(off: Int): Long = (header[off].toLong() and 0xFF) or
+            ((header[off + 1].toLong() and 0xFF) shl 8)
         fun u32(off: Int): Long =
             (header[off].toLong() and 0xFF) or
                 ((header[off + 1].toLong() and 0xFF) shl 8) or
                 ((header[off + 2].toLong() and 0xFF) shl 16) or
                 ((header[off + 3].toLong() and 0xFF) shl 24)
 
-        if (u32(0) != HYDRA_MAGIC) return getString(R.string.err_magic)
-        if (u16(4) != HYDRA_VERSION) return getString(R.string.err_version)
+        val magic = u32(0)
+        val version = u16(4)
         val vocab = u16(6)
         val dim = u32(8)
         val layers = u32(12)
         val offset = u32(16)
         val len = u32(20)
+        val fields = mapOf(
+            "magic" to magic, "version" to version, "vocab" to vocab,
+            "dim" to dim, "layers" to layers, "weights_offset" to offset,
+            "weights_len" to len
+        )
 
-        if (dim == 0L || dim > MAX_DIM) return getString(R.string.err_dim)
-        if (vocab == 0 || vocab > MAX_VOCAB) return getString(R.string.err_vocab)
-        if (layers == 0L || layers > MAX_LAYERS) return getString(R.string.err_layers)
-        if (offset < HEADER_BYTES) return getString(R.string.err_offset)
-        if (offset + len > size) return getString(R.string.err_weights)
-        if (layers * dim > len) return getString(R.string.err_pair_count)
-        return null
+        val (detected, advice) = describeMagic(magic)
+        if (magic != HYDRA_MAGIC) {
+            rules += HeaderRule(
+                "magic", false,
+                advice ?: getString(R.string.err_magic_unknown, hex32(magic))
+            )
+            return HeaderReport(size, fields, detected, advice, rules)
+        }
+        rules += HeaderRule("magic", true, "magic matches .hydra")
+
+        rules += HeaderRule(
+            "version", version == HYDRA_VERSION,
+            getString(
+                if (version == HYDRA_VERSION) R.string.ok_version
+                else R.string.err_version_human, version, HYDRA_VERSION
+            )
+        )
+        rules += HeaderRule(
+            "dim", dim >= 1 && dim <= MAX_DIM,
+            getString(R.string.err_dim_human, dim, MAX_DIM)
+        )
+        rules += HeaderRule(
+            "vocab", vocab >= 1 && vocab <= MAX_VOCAB,
+            getString(R.string.err_vocab_human, vocab, MAX_VOCAB)
+        )
+        rules += HeaderRule(
+            "layers", layers >= 1 && layers <= MAX_LAYERS,
+            getString(R.string.err_layers_human, layers, MAX_LAYERS)
+        )
+        rules += HeaderRule(
+            "weights_offset", offset >= HEADER_BYTES,
+            getString(R.string.err_offset_human, offset, HEADER_BYTES)
+        )
+        /* Long arithmetic on purpose: offset+len in Int would wrap exactly
+         * like the crafted-header bug the engine test pins. */
+        val weightsEnd = offset + len
+        rules += HeaderRule(
+            "weights_fit", weightsEnd <= size,
+            getString(R.string.err_weights_human, formatBytes(weightsEnd), formatBytes(size))
+        )
+        val pairs = layers * dim
+        rules += HeaderRule(
+            "pairs_covered", pairs <= len,
+            getString(R.string.err_pair_count_human, pairs, len / 4)
+        )
+        /* Informational: how much of the current format's ceiling this model
+         * uses. The format caps at dim x layers pairs, which is far below a
+         * modern LLM - worth saying before somebody wonders. */
+        val shapeBytes = (pairs + 1) / 2
+        val ceiling = (MAX_DIM * MAX_LAYERS + 1) / 2
+        rules += HeaderRule(
+            "shape_within_format_ceiling", shapeBytes <= ceiling,
+            getString(R.string.info_shape_ceiling, formatBytes(shapeBytes), formatBytes(ceiling))
+        )
+
+        return HeaderReport(size, fields, detected, advice, rules)
     }
 
     private fun queryDisplayName(uri: Uri): String? =
@@ -388,7 +525,16 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_CRASH_TEST = "crash_test"
         const val HEADER_BYTES = 24
         const val HYDRA_MAGIC = 0x48594452L
-        const val HYDRA_VERSION = 1
+        const val HYDRA_VERSION = 1L
+
+        /** In the companion so the nested [HeaderReport] can format too. */
+        fun hex32(v: Long): String =
+            "0x" + (v and 0xFFFFFFFFL).toString(16).padStart(8, '0')
+        const val GGUF_MAGIC = 0x46554747L
+        const val ZIP_MAGIC = 0x04034B50L
+        const val ELF_MAGIC = 0x7F454C46L
+        const val PNG_MAGIC = 0x89504E47L
+        const val GZIP_MAGIC = 0x1F8BL
         const val MAX_DIM = 64L
         const val MAX_VOCAB = 1024
         const val MAX_LAYERS = 4096L
