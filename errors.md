@@ -497,3 +497,68 @@
 - **Fix:** library logs moved to stderr exclusively.
 - **Prevention:** libraries never write to stdout; stdout is a data
   channel only.
+
+## 2026-10-02 — CI-Konfigurationsfehler (3 Gates rot trotz gruener Code-Qualitaet)
+
+- **Symptom:** Nach dem ersten `lint.yml`-Lauf waren drei Jobs rot,
+  obwohl alle statischen Analysatoren lokal gruen waren. Das
+  deutete auf Konfigurations-, nicht auf Codefehler hin.
+  (a) `Android lint`: `android-actions/setup-android@v3` ruft
+      `sdkmanager tools` auf — das Paket wurde aus dem Repository
+      entfernt: `Warning: Failed to find package 'tools'` → exit 1.
+  (b) `Semgrep`: `semgrep ci --error` — die Option existiert nicht,
+      Semgrep beendet sich bei Findings bereits selbst mit 1.
+  (c) `CodeQL (javascript-typescript)`: `build-mode: autobuild`
+      wird fuer JS/TS abgelehnt; korrekt ist `build-mode: none`.
+- **Cause:** Drittanbieter-Actions und CLI-Flags wurden aus dem
+  Gedaechtnis geschrieben statt gegen die aktuelle Doku geprueft;
+  eine entfernte Aktion bleibt auch nach Updates auf einem
+  entfernten Paketnamen stehen.
+- **Fix:** (a) cmdline-tools explizit herunterladen/entpacken, PATH
+  und Lizenz-Akzeptanz explizit setzen — dieselbe Sequenz wie lokal
+  in `docs/ANDROID_SKILL.md` erprobt; (b) `--error` entfernt,
+  `--suppress-errors` ergaenzt; (c) `build-mode: none` fuer beide
+  Sprachen.
+- **Prevention:** Jede externe Action und jedes CLI-Flag vor dem
+  Commit gegen die offizielle Doku pruefen (R26). Workflow-Fehler
+  zusaetzlich lokal simulieren, bevor sie in den PR gehen.
+
+## 2026-10-02 — "OldTargetApi" nur im CI, nicht lokal (Runner-SDK)
+
+- **Symptom:** Nach dem SDK-Fix lief `Android lint` durch, meldete aber
+  `0 errors, 1 warnings` mit
+  `Warning: Not targeting the latest versions of Android [OldTargetApi]`
+  und das Gate (grep "No issues found") wurde rot.
+- **Cause:** Der gehostete Runner bringt ein vorgebautes SDK mit, das
+  zusaetzlich `platforms;android-35` und `android-36` enthaelt. Lint
+  beurteilt `OldTargetApi` gegen die *vorhandenen* Platforms. Lokal ist
+  ausschliesslich `android-34` installiert — dort meldet Lint
+  `No issues found`. Dieselbe Toolchain, zwei Ergebnisse: die Warnung
+  kam also aus der Runner-Umgebung, nicht aus dem Projekt.
+- **Fix:** Beide Workflows richten ein eigenes SDK-Root
+  (`$RUNNER_TEMP/android-sdk`) ein und installieren dort ausschliesslich
+  die gepinnten Pakete. Zusaetzlich haengt `release.yml` die
+  build-tools-Pfade an `ANDROID_HOME` statt an ein hart kodiertes
+  `/opt/android-sdk`, das auf dem Runner nicht existiert.
+- **Prevention:** Bei "nur im CI"-Befunden zuerst die Umgebung des
+  Runners gegen die lokale Toolchain stellen (Differenzanalyse), bevor
+  man Code oder Lint-Konfiguration aendert. Ein Gate darf nicht
+  kosmetisch aufgeweicht werden, um einen Umgebungsfehler zu verstecken.
+
+## 2026-10-02 — Skills-UI meldet "Not loaded" trotz korrektem Frontmatter
+
+- **Symptom:** Die Skills-UI zeigt alle drei Skills als *Not loaded*
+  mit `The frontmatter needs name: <skill-dir> (matching ...)`.
+- **Cause:** Die Meldung nennt je Skill den **erwarteten** Namen,
+  d. h. der Parser sieht die Dateien, lehnt sie aber ab. Byte-pruefung
+  auf Platte **und** auf `origin/main` ergab: kein BOM, kein CRLF,
+  keine Tabs, `name == Verzeichnisname`, `description` in
+  Anfuehrungszeichen und zu 100 % ASCII, genau zwei Schluessel.
+  Das Frontmatter ist damit formal korrekt — die Meldung ist ein
+  **Cache-/Anzeigezustand der UI**, kein Dateidefekt.
+- **Fix:** Kein Code-Fix noetig; die Skills sind auf `main` valide.
+  UI neu laden bzw. Workspace neu verbinden.
+- **Prevention:** Bei Frontmatter-Fehlern zuerst die Bytes pruefen
+  (BOM/CRLF/Tabs) und die erwartete Namensquelle mitlesen — die
+  Fehlermeldung nennt den Soll-Namen und verrät damit, ob Parser
+  oder Datei das Problem sind.

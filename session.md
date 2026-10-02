@@ -101,7 +101,29 @@ following the CVE cross-check and linter audit from the previous pass.
 - [x] `errors.md`: 5 neue Einträge; `rules.md`: R25–R30 (Linter-
       Falsifizierbarkeit, Web-Verifikation, Fehler-Leak, Symlink-Pfade)
 - [x] README: Release-/APK-Abschnitt, Linter-Tabelle, Projektstruktur
-- [ ] Commit (kein Checkout) + PR — **kein Merge**
+- [x] Commit (kein Checkout) + PR — **kein Merge**
+- [x] PR #12 und #11 vom User **gemergt** (main: `cfdb34f`) — alle
+      offenen PRs sind damit geschlossen
+
+## Runde 2026-10-02 (CI-Fix-Runde nach Merge)
+
+- [x] Status geklaert: `main` ist gruen bis auf `Android lint`
+      (13/14 Jobs gruen) — Ursache ist **nicht** der Code
+- [x] Fehlerursache im Log verifiziert: `android-actions/setup-android@v3`
+      ruft `sdkmanager tools` auf; das Paket existiert nicht mehr
+      (`Warning: Failed to find package 'tools'` → exit 1)
+- [x] Fix: cmdline-tools explizit herunterladen/entpacken + PATH,
+      Lizenz-Akzeptanz explizit, in **lint.yml und release.yml**
+- [x] Neuer Branch `fix/android-lint-cmdline-tools` direkt auf
+      `origin/main` gebaut (Plumbing, **kein `git checkout`** — R17/R20),
+      PR eroeffnet, **kein Merge** (R14)
+- [x] **PR #13: 13/13 Checks gruen.** Der erste Lauf zeigte noch
+      `OldTargetApi` — Ursache war das vorgebaute Runner-SDK
+      (platforms 35/36), lokal ist nur 34 installiert. Fix: eigenes
+      SDK-Root mit ausschliesslich gepinnten Paketen
+- [x] Nebenbefund dabei korrigiert: `release.yml` nutzte die
+      build-tools ueber das hart kodierte `/opt/android-sdk`, das auf dem
+      GitHub-Runner nicht existiert — jetzt ueber `ANDROID_HOME`
 
 ## Status / Notes
 
