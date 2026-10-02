@@ -44,28 +44,63 @@
 
 ## Current task
 
-Skill `/android-ndk-build` invoked by user — execute it end-to-end,
-verify every step works, then analyze + optimize the skill itself.
+**Bugfix audit for Hydra-Stone** — 14 findings across the C engine, the
+NEON kernel, the CLI, the tests, `server.js` and the JNI bridge.
+Order: correctness-critical (BUG 1–3), semantics/portability (4–9),
+documentation (10–12), audit of unreviewed files (13–14).
 
 ## Plan
 
-- [x] R1: session.md/errors.md/rules.md read; toolchain from the
-      Android session is installed (JDK 17, SDK, NDK r26d, Gradle 8.7)
-- [x] Skill step 1: verify toolchain still present — all OK
-- [x] Skill step 2: gradle assembleDebug → BUILD SUCCESSFUL (17s, 862 KB)
-- [x] APK content check: libhydra.so × 3 ABIs, asset, dex, signature OK,
-      JNI symbols present
-- [x] Skill step 3: emulator booted, APK installed, inference run —
-      logcat `{"ok":true,"steps":32,"dim":64,...}` + UI token stream
-      identical to host (211 388 401 330 ...)
-- [x] Analyze: 6 optimizations identified (portable boot-wait, uiautomator
-      tap, background-start caveat, APK verify step, adb emu kill, daemon tip)
-- [x] Optimize SKILL.md — all 6 folded in, expected outputs documented
-- [x] Frontmatter validator re-run: 3/3 OK
-- [ ] Commit via new branch (NO checkout, R17) + PR (no merge, R14)
+- [x] R1: `session.md` / `errors.md` / `rules.md` read first
+- [x] **PoC before fix (R8):** installed `gcc-12-aarch64-linux-gnu` +
+      `qemu-user-static`; reproduced BUG-1 — x86 gave
+      `211,388,401,330,...`, ARM gave `211,28,137,170,...`. NEON had
+      every ternary weight sign-inverted
+- [x] BUG-1: NEON decode normalised to `0x01`/`0xFF` masks
+- [x] BUG-2: `HYDRA_MAX_LAYERS 4096` (error −11) + `int64_t` accumulator
+      in `step()` and in the NEON kernel
+- [x] BUG-3: documented the algebraic layer-loop redundancy in
+      `docs/ARCHITECTURE.md` + proposed an `HYDRA_AGGREGATE_V2` container.
+      v1 format deliberately unchanged (breaking change not requested)
+- [x] BUG-4: removed `token_in & 0x7F`; old behaviour behind
+      `-DHYDRA_TOKENV_MASK`
+- [x] BUG-5: symmetric modulo instead of `labs()`; the `w=0x02`
+      expectation changed 11 → 1 **with the justification in the comment**
+- [x] BUG-6: `weights_offset >= sizeof(header)` (error −12)
+- [x] BUG-7: single `goto fail` cleanup, `fd = -1`
+- [x] BUG-8: opt-in `-DHYDRA_DROP_CACHE`; Zero-RAM claims rewritten to
+      what is actually provable
+- [x] BUG-9: `isfinite()` guards in the axiom gate
+- [x] BUG-10: explicit `rd_u16le`/`rd_u32le` loader + LE test writers
+- [x] BUG-11: `mkstemp()` + `unlink()` in every test
+- [x] BUG-12: `--help`, unknown-option rejection, surplus-argument
+      rejection, `errno == ERANGE`
+- [x] BUG-13: README density claims corrected to the real 4 bits/weight
+- [x] BUG-14: `server.js` audited with live curl probes; `hydra_jni.c`
+      audited; verified findings only
+- [x] New tests: NEON-vs-scalar same-build comparison (49 total)
+- [x] **Caught a second, latent NEON defect** with the new test: the
+      int64 store offsets were scaled wrong, so lanes 8–15 were never
+      written. Fixed to 0/4/8/12
+- [x] Verification: 47/47 x86, **49/49 ARM/NEON (qemu)**, all lint gates
+      green, `gradle assembleDebug` green, APK installed on the
+      emulator
+- [x] On-device proof: Android UI token stream
+      `211,36,185,410,7,40,197,478` — bit-identical to host x86 **and**
+      ARM/NEON. Three platforms, one sequence
+- [x] `errors.md`: 13 new entries; `rules.md`: R9–R11 + R24 added,
+      renumbered R1–R26
+- [x] Docs: README, ARCHITECTURE, FORMAT
+- [ ] Commit (no checkout) + PR — **no merge** (R17/R20)
 
 ## Status / Notes
 
-- Skills UI confirmed working: user invoked /android-ndk-build (the
-  ASCII frontmatter fix on main did the job).
-- R17 (no checkout) and R14 (no merge without approval) stay active.
+- The two critical bugs (NEON sign inversion, layer overflow) are fixed
+  and each now has a falsifiable regression test.
+- The NEON-vs-scalar test is the structural fix for the class of bug:
+  the documentation had claimed "bit-identical" for a version that was
+  not, because nothing ever compared the two paths to each other.
+- Layer-loop redundancy documented, not "fixed" — collapsing it would
+  be a breaking format change.
+- Open PRs from earlier sessions (#7 CI lint, #10 skill optimisation)
+  are still awaiting the user's merge approval.

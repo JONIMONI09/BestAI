@@ -6,6 +6,200 @@
 
 ---
 
+## 2026-10-02 — NEON kernel inverted the sign of every ternary weight
+
+- **Symptom:** x86 and ARM produced *different* token sequences for the
+  same model. `hydra-run models/demo.hydra 42 8 --json` gave
+  `211,388,401,330,...` on x86 and `211,28,137,170,...` under ARM/NEON
+  (reproduced with `aarch64-linux-gnu-gcc-12 -static` + `qemu-aarch64-static`).
+- **Cause:** in `src/hydra_neon.h` the decode was
+  `vsubq_s8(vreinterpretq_s8_u8(p1), vreinterpretq_s8_u8(n1))`.
+  `vceqq_u8` returns `0xFF` on a match, which reinterpreted as `int8_t`
+  is **-1**, so code `01` (+1) decoded as `0xFF - 0x00 = -1`. Every
+  weight had the opposite sign on ARM.
+- **Fix:** normalise the comparison masks to `0x01` first and subtract in
+  the unsigned domain, so the byte is literally `0x01` (+1) or `0xFF`
+  (-1): `vreinterpretq_s8_u8(vsubq_u8(p1, n1))`.
+- **Prevention:** `test_neon_matches_scalar()` runs a scalar reference
+  `step()` next to the NEON kernel **inside the same ARM build** and
+  demands bit-identical token sequences *and* state vectors. Reviewing
+  each path against fixed expectations is not enough — the two paths
+  must be compared to *each other*. Independently confirmed on three
+  targets: host x86-64, ARM64/NEON, and the Android emulator all emit
+  `211,36,185,410,7,40,197,478`.
+
+## 2026-10-02 — NEON store offsets skipped lanes 8..15
+
+- **Symptom:** the new `test_neon_matches_scalar` failed on ARM:
+  *State-Vektor* mismatch while the token sequence matched. Observed
+  under qemu: ARM state `0,-11,-33,-11,...` vs. expected `0,-11,0,0,-33,...`.
+- **Cause:** when the accumulator was widened to `int64_t`, the store
+  offsets were scaled by 2 (`acc + 0/2/4/6`) even though each call now
+  advances 4 lanes instead of 2. Lanes 8..15 were never written and the
+  second half of `sum_lo` overwrote part of the first half.
+- **Fix:** offsets `0 / 4 / 8 / 12`; `sum_lo` covers lanes 0–7, `sum_hi`
+  covers lanes 8–15.
+- **Prevention:** the same-build comparison test caught this within one
+  run — it would have shipped otherwise, because no cross-platform
+  comparison existed before.
+
+## 2026-10-02 — Signed integer overflow via unbounded `layers` (UB)
+
+- **Symptom/PoC:** `dim=1, vocab=128, layers=16909321, weights_len=16909321,
+  weights_offset=24`, every weight byte `0x01`, token `127`. Each layer
+  adds `+127`; after 16 909 320 layers the accumulator is 2 147 483 640
+  and the next addition crosses `INT32_MAX` — signed overflow, i.e.
+  undefined behaviour. The file is only ~16.9 MB.
+- **Cause:** the loader bounded `dim` but not `layers`.
+- **Fix:** `HYDRA_MAX_LAYERS 4096` enforced at load (error `-11`), plus
+  an `int64_t` accumulator in `step()` and in the NEON kernel as defence
+  in depth. `4096 × 254 = 1 040 384` keeps even an `int32` safe.
+- **Prevention:** the PoC became `test_engine_rejects_layer_overflow()`,
+  which writes the full 16.9 MB of real `0x01` bytes so it also fails if
+  someone merely removes the `layers × dim ≤ weights_len` check.
+  Rule: bound every field that multiplies into an accumulator length.
+
+## 2026-10-02 — `token_in & 0x7F` collapsed the vocabulary
+
+- **Symptom:** with `vocab_size = 1024`, every eighth token ID produced
+  an identical weight contribution — only 128 of 1024 tokens were
+  reachable.
+- **Cause:** an overflow guard for the old `int16` NEON path that was
+  never revisited once the accumulator bounds changed.
+- **Fix:** mask removed. With `vocab ≤ 1024` and `|state| ≤ 127` the
+  per-lane product is ≤ 1150, comfortably inside `int16`. The old
+  behaviour stays available behind `-DHYDRA_TOKENV_MASK`.
+- **Prevention:** `test_token_mask_collisions()` asserts `state[0] == 127`
+  after stepping token 128 — with the mask it would be `0`.
+
+## 2026-10-02 — `labs()` destroyed the sign of the accumulator
+
+- **Symptom:** weights `w = +1` and `w = −1` yielded the *same* output
+  token (`w=0x01, token=5` and `w=0x02, token=5` both gave `11`), i.e.
+  half the ternary alphabet was inert.
+- **Cause:** `labs((long)accumulator[0])` takes the absolute value.
+- **Fix:** symmetric modulo — `raw = acc % vocab; if (raw < 0) raw += vocab;
+  out = (raw + token + 1) % vocab`.
+- **Prevention:** the expected value for `w=0x02` in
+  `test_decoder_known_values` changed from `11` to `1` **on purpose** and
+  carries an explanatory comment. A changed expectation is a decision to
+  review, not something to apply silently.
+
+## 2026-10-02 — `weights_offset` was allowed to point into the header
+
+- **Symptom:** a formally accepted model whose `weights_offset` was `8`
+  would execute header bytes as ternary weights.
+- **Cause:** only `weights_offset + weights_len ≤ file_size` was checked.
+- **Fix:** `weights_offset >= sizeof(HydraModelHeader)` (error `-12`).
+- **Prevention:** `test_engine_rejects_offset_in_header()`.
+
+## 2026-10-02 — Double-close after a failed load
+
+- **Symptom:** a loader failure closed `engine->fd` but left it set, so a
+  caller's subsequent `hydra_engine_unload()` closed the same descriptor
+  again (`EBADF`, or an unrelated fd closed by mistake).
+- **Cause:** repeated `close(engine->fd); return -N;` in every branch.
+- **Fix:** one `goto fail` label that sets `fd = -1`, calls
+  `hydra_engine_unload()` and returns the code.
+- **Prevention:** `test_engine_rejects_garbage()` now asserts `e.fd == -1`
+  after a failed load and that a following `unload()` leaves it at `-1`.
+
+## 2026-10-02 — "Zero-RAM" was an unproven claim
+
+- **Symptom:** README/ARCHITECTURE claimed "inference-time RAM usage is
+  constant regardless of model size" and "Zero-RAM".
+- **Cause:** `madvise(MADV_SEQUENTIAL)` is a *read-ahead* hint, not an
+  eviction hint. Touched pages become resident in the page cache, and
+  because `step()` walks the entire weight region per token, every token
+  re-faults them after eviction.
+- **Fix:** both documents now state precisely what holds (no heap
+  allocation, O(1) engine memory, clean reclaimable pages) and what does
+  not (a zero resident set is impossible). Added opt-in
+  `-DHYDRA_DROP_CACHE` issuing `madvise(MADV_DONTNEED)` after each step.
+- **Prevention:** Rule R6 extended — marketing-style claims must name
+  the mechanism that makes them true.
+
+## 2026-10-02 — NaN bypassed the coexistence axiom
+
+- **Symptom:** `hydra_verify_axiom(NAN, 99.5f, &s)` returned `rc = 1`
+  (allowed) — the safety gate was bypassed.
+- **Cause:** in IEEE-754, `NaN <= 0.0f` is `false`, so the only
+  comparison in the function did not trigger. A non-finite
+  `proposed_score` likewise produced a NaN/Inf result.
+- **Fix:** `!isfinite(...) || ... <= 0.0f` for `humanity_factor`, and a
+  separate `!isfinite(proposed_score)` rejection; both push the score to
+  `-1e9`.
+- **Prevention:** `test_axiom()` covers NaN, `+Inf` humanity and
+  non-finite score. Rule: a safety gate must reject non-finite input
+  explicitly, never rely on comparison operators alone.
+
+## 2026-10-02 — Format was not endian-portable
+
+- **Symptom:** the header was `memcpy`-ed into native integers although
+  `docs/FORMAT.md` defines little-endian; on a big-endian host every
+  field would decode incorrectly and loading would fail.
+- **Cause:** convenience over an explicitly specified byte order.
+- **Fix:** `rd_u16le` / `rd_u32le` in the loader; the tests write with
+  explicit `wr_u16le` / `wr_u32le` so they stay meaningful on any host.
+- **Prevention:** byte-level format docs and the test writers must agree;
+  no struct `memcpy` for on-disk headers.
+
+## 2026-10-02 — Tests wrote to fixed, symlink-vulnerable `/tmp` paths
+
+- **Symptom:** `/tmp/hydra_test_model.hydra` and friends were recreated
+  with `fopen(..., "wb")` on every run.
+- **Cause:** convenience. Parallel runs collide, and in an untrusted
+  `/tmp` the fixed names are a symlink-attack target.
+- **Fix:** `mkstemp()` (unpredictable name, mode 0600) with `unlink()`
+  in the cleanup of every test.
+- **Prevention:** never open a predictable path for writing in a test.
+
+## 2026-10-02 — CLI silently discarded surplus arguments
+
+- **Symptom:** `hydra-run model 1 2 3` ignored the trailing `3` without
+  a word, and `strtol` was used without checking `errno`, so a
+  20-digit number was silently clamped to `LONG_MAX`.
+- **Fix:** `--help` / `-h`, rejection of unknown options, explicit
+  rejection of surplus positional arguments, and an `errno == ERANGE`
+  check in `parse_long_arg()`.
+- **Prevention:** a CLI must fail loudly on input it does not understand.
+
+## 2026-10-02 — Web console: 500 on malformed body, silent model fallback
+
+- **Symptom (verified with curl):** `POST /api/infer` with body `null`
+  answered `500 {"error":"Cannot read properties of null (reading 'token')"}`
+  — an internal TypeError message leaked to the client. A body of
+  `[1,2]` was accepted. An explicitly requested but rejected model path
+  (`../../etc/passwd.hydra`) silently fell back to the default model and
+  returned `200` with results for a *different* model.
+- **Cause:** no body-shape validation, and `safeModelPath(...) || DEFAULT_MODEL`
+  conflates "not supplied" with "supplied and invalid".
+- **Fix:** explicit JSON parse (400), object-shape check (400), finite
+  numeric validation for `token`/`steps` (400), and an explicit 400 for a
+  supplied-but-invalid path.
+- **Not vulnerable (checked, no finding):** command injection — the model
+  path is passed to `execFile` as an argument with `shell: false`, never
+  through a shell; path traversal on the static handler is blocked by
+  `path.normalize` plus a `PUBLIC + path.sep` prefix check (verified:
+  `/../Makefile` and `/%2e%2e%2fMakefile` both return 404).
+
+## 2026-10-02 — JNI: unchecked callback exception, negative `startToken`
+
+- **Symptom:** `emit_token()` called back into Kotlin without checking
+  `ExceptionCheck()`. A throwing callback leaves the exception pending,
+  which makes every subsequent JNI call undefined behaviour. Separately,
+  `startToken = -5` produced `(-5 % 512) = -5` → `(uint16_t)65531`, a
+  valid but semantically wrong seed that was never rejected.
+- **Fix:** `emit_token()` returns `-1` on a pending exception (logged and
+  cleared), and the inference loop aborts with a JSON error. Negative
+  `startToken` is rejected up front.
+- **Prevention:** JNI callbacks must check for pending exceptions, and
+  every numeric crossing the JNI boundary needs an explicit range check.
+  Same class as the "copy data before `*_unload`" bug already logged
+  above: mobile-only defects, invisible to host tests (Rule R20).
+
+---
+
 ## 2026-10-01 — Skills still "Not loaded" after frontmatter fix: non-ASCII in description
 
 - **Symptom:** After adding valid-looking frontmatter, the Skills UI

@@ -22,7 +22,7 @@ jobs:
           gcc -fsyntax-only -std=c99 \
               -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -Wall -Wextra -Werror -Iinclude \
-              src/hydra_engine.c src/main.c
+              src/hydra_engine.c src/main.c tests/test_engine.c
 
       # Gate 1b: same strictness with clang — catches gcc-only
       # diagnostics and validates the code compiles cleanly on a
@@ -32,7 +32,7 @@ jobs:
           clang -fsyntax-only -std=c99 \
               -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -Wall -Wextra -Werror -Iinclude \
-              src/hydra_engine.c src/main.c
+              src/hydra_engine.c src/main.c tests/test_engine.c
 
       # Gate 1c: static analysis (cppcheck), error-exitcode=2 on any
       # warning/error so nothing slips through
@@ -81,10 +81,79 @@ jobs:
           path: lint-report.txt
           if-no-files-found: ignore
 
-  # ---------- Stage 2: Build + tests (double verification) ----------
+  # ---------- Stage 2a: NEON path on ARM64 (explicit) ----------
+  # The NEON kernel shipped with an inverted sign that no existing test
+  # could see, because the SIMD path and the scalar path had only ever
+  # been compared against fixed expectations — never against each other.
+  # This job runs the AArch64 build under qemu so the in-build
+  # NEON-vs-scalar comparison (test_neon_matches_scalar) executes on every
+  # commit, instead of depending on the macOS runner happening to be ARM64.
+  neon-test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install AArch64 cross-compiler and qemu-user
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-12-aarch64-linux-gnu qemu-user-static
+
+      - name: Build + run tests for aarch64 (NEON path active)
+        run: |
+          aarch64-linux-gnu-gcc-12 -O2 -static -Wall -Wextra \
+              -Iinclude \
+              src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm
+          qemu-aarch64-static ./hydra-test-arm
+
+      - name: Cross-arch determinism check (x86 vs ARM/NEON)
+        run: |
+          make all
+          python3 tools/make_dummy_model.py parity.hydra
+          ./hydra-run parity.hydra 42 8 --json 2>/dev/null > /tmp/x86.json
+          aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
+              src/hydra_engine.c src/main.c -o hydra-run-arm
+          qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
+              2>/dev/null > /tmp/arm.json
+          python3 - << 'EOF'
+          import json, sys
+          x = json.load(open('/tmp/x86.json'))
+          a = json.load(open('/tmp/arm.json'))
+          print('x86 tokens:', x['tokens'])
+          print('arm tokens:', a['tokens'])
+          if x['tokens'] != a['tokens'] or x['state'] != a['state']:
+              print('FAIL: scalar and NEON paths disagree', file=sys.stderr)
+              sys.exit(1)
+          print('OK: scalar and NEON paths are bit-identical')
+          EOF
+
+      - name: Upload failure logs
+        if: failure()
+        run: |
+          {
+            echo "=== Hydra-Stone NEON failure (${GITHUB_SHA::7}) ==="
+            echo "Reproduce locally:"
+            echo "  aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \\"
+            echo "      src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm"
+            echo "  qemu-aarch64-static ./hydra-test-arm"
+          } > neon-report.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: neon-errors
+          path: neon-report.txt
+          if-no-files-found: ignore
+
+      - name: Clean up
+        if: always()
+        run: rm -f hydra-run hydra-test hydra-run-arm hydra-test-arm parity.hydra
+
+  # ---------- Stage 2b: Build + tests (double verification) ----------
   # Every commit is built and tested on two independent runners
   # (linux-gcc + macos-clang) AND two code paths are covered:
-  # scalar (x86) and NEON (macOS ARM64).
+  # scalar (x86) and NEON (macOS ARM64 + the dedicated neon-test job).
   build-test:
     needs: lint
     strategy:
