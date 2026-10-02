@@ -200,3 +200,155 @@ Java_dev_hydrastone_HydraBridge_runInference(
     LOGI("inference done: %s", buf);
     return (*env)->NewStringUTF(env, buf);
 }
+
+/*
+ * Phase 0 device benchmark: three costs on the SAME model and the SAME
+ * number of steps, so the numbers are comparable.
+ *
+ *   native_only    : the engine loop in this process, no JNI at all.
+ *   jni_per_token  : one GetMethodID + CallVoidMethod per token (the old
+ *                    callback shape). Kept deliberately, because the point
+ *                    of the measurement is the delta against batching.
+ *   jni_batched    : the shipping path — one callback per 16 tokens plus
+ *                    one final done=true.
+ *
+ * The callbacks here only count; the real UI callback does more work, so
+ * these numbers are a lower bound for the app, which is stated in the
+ * returned JSON rather than glossed over.
+ *
+ * Timing uses clock_gettime(CLOCK_MONOTONIC), not clock(): clock() measures
+ * CPU time and would hide any driver wait time — exactly the time a GPU
+ * comparison needs to see.
+ */
+#define HYDRA_BENCH_STEPS_DEFAULT 2000
+
+static volatile int g_bench_sink = 0;
+
+static int bench_native_only(HydraEngine *e, uint16_t tok, int steps)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < steps; ++i) {
+        uint16_t next = 0;
+        if (hydra_engine_step(e, tok, &next) != 0) return -1;
+        tok = next;
+        g_bench_sink += next;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (int)((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec));
+}
+
+static int bench_jni_per_token(JNIEnv *env, jobject callback, HydraEngine *e,
+                               uint16_t tok, int steps)
+{
+    jclass cls = (*env)->GetObjectClass(env, callback);
+    if (!cls) return -1;
+    /* (II)V is the OLD per-token signature on purpose. */
+    jmethodID mid = (*env)->GetMethodID(env, cls, "onToken", "(II)V");
+    if (!mid) { (*env)->DeleteLocalRef(env, cls); return -2; }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < steps; ++i) {
+        uint16_t next = 0;
+        if (hydra_engine_step(e, tok, &next) != 0) { (*env)->DeleteLocalRef(env, cls); return -3; }
+        (*env)->CallVoidMethod(env, callback, mid, i, next);
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); (*env)->DeleteLocalRef(env, cls); return -4; }
+        tok = next;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    (*env)->DeleteLocalRef(env, cls);
+    return (int)((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec));
+}
+
+static int bench_jni_batched(JNIEnv *env, jobject callback, HydraEngine *e,
+                             uint16_t tok, int steps)
+{
+    struct timespec t0, t1;
+    uint16_t batch[HYDRA_JNI_BATCH];
+    int n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < steps; ++i) {
+        uint16_t next = 0;
+        if (hydra_engine_step(e, tok, &next) != 0) return -3;
+        batch[n++] = next;
+        tok = next;
+        if (n == HYDRA_JNI_BATCH) {
+            if (emit_tokens(env, callback, batch, n, JNI_FALSE) != 0) return -4;
+            n = 0;
+        }
+    }
+    if (emit_tokens(env, callback, batch, n, JNI_TRUE) != 0) return -4;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (int)((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec));
+}
+
+JNIEXPORT jstring JNICALL
+Java_dev_hydrastone_HydraBridge_benchmark(
+        JNIEnv *env, jclass clazz,
+        jstring modelPath, jint steps, jobject callback)
+{
+    (void)clazz;
+    if (steps < 1) steps = HYDRA_BENCH_STEPS_DEFAULT;
+    if (steps > 200000) steps = 200000;
+
+    const char *path = (*env)->GetStringUTFChars(env, modelPath, NULL);
+    if (!path) return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"path null\"}");
+
+    double ns_native = -1, ns_per_token = -1, ns_batched = -1;
+    unsigned dim = 0, layers = 0, vocab = 0;
+    const uint16_t seed = 42;
+    char err[128];
+
+    for (int pass = 0; pass < 3; ++pass) {
+        HydraEngine e;
+        int rc = hydra_engine_load(&e, path);
+        if (rc != 0) {
+            snprintf(err, sizeof(err), "{\"ok\":false,\"error\":\"load rc=%d\"}", rc);
+            (*env)->ReleaseStringUTFChars(env, modelPath, path);
+            return (*env)->NewStringUTF(env, err);
+        }
+        dim = e.header.dim; layers = e.header.layers; vocab = e.header.vocab_size;
+
+        /* Pass 0 warms the mmap pages for every path that follows - the
+         * same warmup discipline as the CLI benchmark. */
+        if (pass == 0) {
+            uint16_t t = seed;
+            for (int i = 0; i < (int)e.header.layers; ++i) {
+                uint16_t n2 = 0;
+                if (hydra_engine_step(&e, t, &n2) != 0) break;
+                t = n2;
+            }
+        } else if (pass == 1) {
+            int ns = bench_native_only(&e, seed, steps);
+            ns_native = ns > 0 ? (double)ns / steps : -1;
+        } else if (pass == 2 && callback) {
+            int ns = bench_jni_per_token(env, callback, &e, seed, steps);
+            ns_per_token = ns > 0 ? (double)ns / steps : -1;
+            hydra_engine_unload(&e);
+            rc = hydra_engine_load(&e, path);
+            if (rc != 0) {
+                snprintf(err, sizeof(err), "{\"ok\":false,\"error\":\"reload failed\"}");
+                (*env)->ReleaseStringUTFChars(env, modelPath, path);
+                return (*env)->NewStringUTF(env, err);
+            }
+            int ns2 = bench_jni_batched(env, callback, &e, seed, steps);
+            ns_batched = ns2 > 0 ? (double)ns2 / steps : -1;
+        }
+        hydra_engine_unload(&e);
+    }
+    (*env)->ReleaseStringUTFChars(env, modelPath, path);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"steps\":%d,\"dim\":%u,\"layers\":%u,\"vocab\":%u,"
+             "\"ns_per_token_native_only\":%.1f,"
+             "\"ns_per_token_jni_per_token\":%.1f,"
+             "\"ns_per_token_jni_batched\":%.1f,"
+             "\"jni_overhead_per_token\":%.1f,"
+             "\"batching_saves_per_token\":%.1f,"
+             "\"callback_does\":\"count only, so the UI cost is additional\"}",
+             (int)steps, dim, layers, vocab,
+             ns_native, ns_per_token, ns_batched,
+             ns_per_token - ns_native, ns_per_token - ns_batched);
+    return (*env)->NewStringUTF(env, buf);
+}

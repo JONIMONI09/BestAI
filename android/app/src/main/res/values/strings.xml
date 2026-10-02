@@ -8,6 +8,12 @@
     <string name="default_steps">32</string>
     <string name="action_run">Run inference</string>
     <string name="action_import_model">Import .hydra model…</string>
+    <string name="action_benchmark">Benchmark (ns/token)</string>
+    <plurals name="log_bench_start">
+        <item quantity="one">[Hydra] benchmark: %1$d step, three passes…</item>
+        <item quantity="other">[Hydra] benchmark: %1$d steps, three passes…</item>
+    </plurals>
+    <string name="log_bench_result">[Hydra] bench %1$s</string>
 
     <string name="log_model">[Hydra] model: %1$s</string>
     <plurals name="log_size">
@@ -23,6 +29,7 @@
         <item quantity="other">[Hydra] %1$d tokens</item>
     </plurals>
     <string name="log_batch_done">[Hydra] stream complete</string>
+    <string name="log_unexpected_per_token">[Hydra] unexpected per-token callback at %1$d = %2$d</string>
     <string name="log_import_start">[Hydra] importing %1$s…</string>
     <string name="log_import_ok">[Hydra] model replaced: %1$s</string>
     <string name="log_import_rejected">[Hydra] import rejected: %1$s — keeping the previous model</string>
@@ -41,6 +48,15 @@
     <string name="err_pair_count">layers × dim is not covered by weights_len</string>
     <string name="err_replace">cannot replace the previous model</string>
     <string name="err_rename">cannot move the imported file into place</string>
+
+    <!-- Crash handler -->
+    <string name="crash_title">Hydra-Stone stopped</string>
+    <string name="crash_explanation">The full report below can be copied and pasted into a bug report. It is also saved inside the app\'s private storage as last-crash.txt.</string>
+    <string name="crash_no_report">No report available.</string>
+    <string name="crash_copy">Copy report</string>
+    <string name="crash_copied">Copied to the clipboard</string>
+    <string name="crash_copy_failed">Clipboard unavailable — select the text instead</string>
+    <string name="crash_close">Close</string>
     <string name="log_result">[Hydra] result: %1$s</string>
     <string name="log_wall">[Hydra] wall time: %1$d ms</string>
     <string name="log_ok">[Hydra] OK — C engine executed on Android.</string>

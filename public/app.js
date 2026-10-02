@@ -134,6 +134,10 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
+    /* Empty state instead of a blank rectangle that looks broken. */
+    $('engine-empty').hidden = tokens.length > 0;
+    $('token-chart').hidden = tokens.length === 0;
+
     if (tokens.length === 0) {
       $('chart-summary').textContent = 'No token stream yet.';
       return;
@@ -357,6 +361,13 @@
         addMessage('sys', textNode(`Engine error: ${e.message}`));
         log(`engine error: ${e.message}`);
         setStatus('error', 'error');
+        recordCrash({
+          what: 'Engine request failed',
+          when: new Date().toISOString(),
+          source: '/api/infer',
+          message: e.message,
+          detail: `model: ${state.model}`,
+        });
       }
     } finally {
       state.inflight = null;
@@ -410,6 +421,13 @@
       out.hidden = false;
       out.textContent = `Training failed: ${e.message}`;
       setStatus('error', 'error');
+      recordCrash({
+        what: 'Training failed',
+        when: new Date().toISOString(),
+        source: '/api/train',
+        message: e.message,
+        detail: `model name: ${$('train-name').value}`,
+      });
     } finally {
       setBusy(false);
     }
@@ -487,9 +505,129 @@
     }
   }
 
+  /* ── Crash handler ────────────────────────────────────────── */
+  /* Every layer reports here: exceptions in this file, unhandled promise
+   * rejections, failed requests, and errors the server pushed into
+   * /api/errors. The report is plain text so it can be pasted into a bug
+   * tracker - which is the whole point of showing it at all. */
+  const crashLog = [];
+
+  function formatCrash(entry) {
+    const lines = [
+      `what: ${entry.what}`,
+      `when: ${entry.when}`,
+      `source: ${entry.source}`,
+      entry.message ? `message: ${entry.message}` : '',
+      entry.detail ? '' : null,
+    ].filter((l) => l !== null);
+    if (entry.detail) lines.push('detail:', entry.detail);
+    return lines.join('\n');
+  }
+
+  function recordCrash(entry) {
+    crashLog.unshift(entry);
+    if (crashLog.length > 20) crashLog.pop();
+    const btn = $('errors-open');
+    btn.hidden = false;
+    btn.textContent = `Errors (${crashLog.length})`;
+    $('error-summary').textContent = `${entry.what}: ${entry.message || 'no message'}`;
+    $('error-detail').textContent = formatCrash(entry);
+    const dialog = $('error-dialog');
+    if (!dialog.open) dialog.showModal();
+    log(`crash: ${entry.what} — ${entry.message}`);
+  }
+
+  /* Clipboard API first, textarea fallback second: the API needs a secure
+   * context, and this console is often opened from a LAN address on plain
+   * http, where navigator.clipboard is undefined. */
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      /* fall through to the manual path */
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', 'readonly');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  function installCrashHandlers() {
+    window.addEventListener('error', (ev) => {
+      recordCrash({
+        what: 'Uncaught error',
+        when: new Date().toISOString(),
+        source: ev.filename ? `${ev.filename}:${ev.lineno}` : 'unknown',
+        message: ev.message || 'unknown error',
+        detail: ev.error && ev.error.stack ? ev.error.stack : '',
+      });
+    });
+    window.addEventListener('unhandledrejection', (ev) => {
+      const reason = ev.reason || {};
+      recordCrash({
+        what: 'Unhandled promise rejection',
+        when: new Date().toISOString(),
+        source: location.href,
+        message: reason.message || String(reason),
+        detail: reason.stack || '',
+      });
+    });
+    $('error-copy').addEventListener('click', async () => {
+      const all = crashLog.map(formatCrash).join('\n\n---\n\n');
+      const ok = await copyText(all);
+      $('error-copy').textContent = ok ? 'Copied' : 'Copy failed — select the text';
+      setTimeout(() => { $('error-copy').textContent = 'Copy details'; }, 2000);
+    });
+    $('errors-open').addEventListener('click', () => {
+      if (crashLog.length === 0) return;
+      $('error-summary').textContent = `${crashLog.length} recorded error(s)`;
+      $('error-detail').textContent = crashLog.map(formatCrash).join('\n\n---\n\n');
+      $('error-dialog').showModal();
+    });
+  }
+
+  async function pollServerErrors() {
+    try {
+      const data = await api('/api/errors');
+      const entries = data.errors || [];
+      for (const e of entries) {
+        const key = `${e.when}|${e.message}`;
+        if (crashLog.some((c) => c.serverKey === key)) continue;
+        crashLog.unshift({
+          what: 'Server error',
+          when: e.when,
+          source: 'server.js',
+          message: e.message,
+          detail: e.detail || '',
+          serverKey: key,
+        });
+      }
+      if (crashLog.length > 20) crashLog.length = 20;
+      const btn = $('errors-open');
+      btn.hidden = crashLog.length === 0;
+      btn.textContent = `Errors (${crashLog.length})`;
+    } catch {
+      /* the server may be down; the startup error already surfaced it */
+    }
+  }
+
   /* ── Wiring ───────────────────────────────────────────────── */
 
   function init() {
+    installCrashHandlers();
     $('composer').addEventListener('submit', (ev) => {
       ev.preventDefault();
       const text = $('input').value.trim();
@@ -554,6 +692,11 @@
     scrim.addEventListener('click', () => openSettings(false));
 
     window.addEventListener('resize', () => drawChart(state.lastTokens));
+
+    /* Server-side errors are polled once a second: a crash in the engine
+     * or in a route must not stay invisible in a log file nobody opens. */
+    setInterval(pollServerErrors, 1000);
+    pollServerErrors();
 
     updateAxiom();
     addMessage('sys', textNode('Every reply is produced by the compiled C engine. Words need a token id in the vocabulary; unknown words are reported, never guessed.'));
