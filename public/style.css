@@ -36,8 +36,22 @@ html, body {
 .app {
   display: grid;
   grid-template-columns: 1fr;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto 1fr;
   height: 100%;
+}
+
+/* Visible to screen readers only. Used for the composer label, the canvas
+ * summary and the state-vector summary - content that must be announced but
+ * must not cost visual space. */
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ── Top bar ─────────────────────────────────────────────────── */
@@ -150,6 +164,30 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; }
 .seg-btn.is-active { background: var(--accent-soft); color: var(--accent); }
 
 /* ── Layout ──────────────────────────────────────────────────── */
+/* ── Tabs ──────────────────────────────────────────────────── */
+/* Chat is the main view; engine internals and training are one click away
+ * instead of competing with the conversation for attention. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 20px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--line-soft);
+}
+.tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--text-faint);
+  padding: 10px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.tab:hover { color: var(--text-dim); }
+.tab.is-active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
@@ -209,11 +247,41 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; }
   display: inline-block;
   font-size: 12px;
 }
+/* A token that has no word: muted and dashed, so "unknown" is visible at a
+ * glance instead of looking like a real word. */
+.tok.unknown {
+  color: var(--text-faint);
+  border-style: dashed;
+  background: transparent;
+}
 
 .composer { border-top: 1px solid var(--line-soft); padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
 .composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .hint { font-size: 12px; color: var(--text-faint); }
 .hint.warn { color: var(--warn); }
+.hint.err { color: var(--err); }
+.composer-buttons { display: flex; gap: 8px; }
+
+/* Upload dialog: <dialog> gives the backdrop, Escape and the focus trap
+ * without hand-rolling them. */
+.dialog {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  color: var(--text);
+  padding: 0 20px 20px;
+  width: min(460px, 92vw);
+  box-shadow: var(--shadow);
+}
+.dialog::backdrop { background: rgba(2, 6, 12, .6); }
+.dialog-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 0 -20px 8px; padding: 12px 20px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.dialog-head h2 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: .09em; color: var(--text-dim); }
+.dialog .train-actions { padding: 12px 0 0; }
+.btn.small { padding: 6px 10px; font-size: 12px; }
 
 /* ── Output ──────────────────────────────────────────────────── */
 .metrics { display: flex; gap: 14px; font-size: 12px; color: var(--text-dim); }
@@ -222,11 +290,30 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; }
 .chart-wrap { padding: 12px 16px 4px; }
 #token-chart { width: 100%; height: 180px; display: block; }
 
-.state-strip { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 16px 8px; }
+/* Collapsible detail sections - the raw internals are opt-in, the chart
+ * stays visible. */
+.fold { border-top: 1px solid var(--line-soft); }
+.fold > summary {
+  cursor: pointer;
+  padding: 10px 16px;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-faint);
+  list-style: none;
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before { content: '▸ '; color: var(--text-faint); }
+.fold[open] > summary::before { content: '▾ '; }
+.fold > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.state-strip { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 16px 12px; }
+/* 11px minimum: at 9.5px the digits were unreadable, and the light end of
+ * the colour scale has to stay dark enough for the text on top of it. */
 .state-cell {
-  width: 22px; height: 22px; border-radius: 5px;
+  width: 26px; height: 26px; border-radius: 5px;
   display: grid; place-items: center;
-  font: 9.5px var(--mono); color: #04222f;
+  font: 11px var(--mono); color: #04222f;
 }
 
 .log {

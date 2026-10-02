@@ -24,40 +24,57 @@
       <select id="model-select" aria-label="Select model"></select>
     </label>
 
+    <button class="btn ghost small" id="upload-open">Upload model</button>
+    <input type="file" id="upload-input" accept=".hydra,application/octet-stream" hidden>
+
     <div class="chips" id="model-chips"></div>
 
     <div class="topbar-actions">
       <span class="status" id="status" data-state="idle">connecting…</span>
-      <button id="toggle-settings" class="btn ghost" aria-expanded="false">Settings</button>
+      <button id="toggle-settings" class="btn ghost">Settings</button>
     </div>
   </header>
 
   <!-- ── Workspace ───────────────────────────────────────────── -->
+  <nav class="tabs" id="tabs" role="tablist" aria-label="Console sections">
+    <button class="tab is-active" id="tab-chat" role="tab" aria-selected="true" aria-controls="view-chat">Chat</button>
+    <button class="tab" id="tab-engine" role="tab" aria-selected="false" aria-controls="view-engine">Engine output</button>
+    <button class="tab" id="tab-train" role="tab" aria-selected="false" aria-controls="view-train">Training</button>
+  </nav>
+
   <main class="workspace">
 
-    <!-- Chat -->
-    <section class="panel chat" aria-label="Chat">
+    <!-- Chat: the primary view. Everything else is one tab away, so the
+         engine internals no longer compete with the conversation. -->
+    <section class="panel chat" id="view-chat" role="tabpanel" aria-labelledby="tab-chat" aria-label="Chat">
       <div class="panel-head">
         <h2>Chat</h2>
         <div class="seg" role="group" aria-label="Reply format">
-          <button class="seg-btn is-active" id="view-words">Words</button>
-          <button class="seg-btn" id="view-tokens">Tokens</button>
+          <button class="seg-btn is-active" id="view-words" aria-pressed="true">Words</button>
+          <button class="seg-btn" id="view-tokens" aria-pressed="false">Tokens</button>
         </div>
       </div>
 
-      <div class="messages" id="messages" role="log" aria-live="polite"></div>
+      <div class="messages" id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
 
       <form class="composer" id="composer">
-        <textarea id="input" rows="2" placeholder="Type text — words are mapped to token IDs via the vocabulary. Empty input uses the start token from Settings."></textarea>
+        <!-- The placeholder is not a label: a screen reader reads it as a
+             hint only. -->
+        <label class="visually-hidden" for="input">Message</label>
+        <textarea id="input" rows="2" placeholder="Type text — every word is mapped to a token id and the whole prompt is fed to the engine. Empty input uses the start token from Settings."></textarea>
         <div class="composer-actions">
           <span class="hint" id="input-hint"></span>
-          <button class="btn primary" id="send" type="submit">Send</button>
+          <span class="composer-buttons">
+            <button class="btn ghost" id="cancel" type="button" hidden>Cancel</button>
+            <button class="btn primary" id="send" type="submit">Send</button>
+          </span>
         </div>
       </form>
     </section>
 
-    <!-- Live output -->
-    <section class="panel output" aria-label="Engine output">
+    <!-- Engine output: chart + metrics stay visible, the raw internals are
+         collapsed by default. -->
+    <section class="panel output" id="view-engine" role="tabpanel" aria-labelledby="tab-engine" aria-label="Engine output" hidden>
       <div class="panel-head">
         <h2>Engine output</h2>
         <div class="metrics">
@@ -68,18 +85,26 @@
       </div>
 
       <div class="chart-wrap">
-        <canvas id="token-chart" height="180" aria-label="Token stream"></canvas>
+        <canvas id="token-chart" height="180" role="img" aria-labelledby="chart-summary"></canvas>
+        <!-- Text alternative for the canvas: the pixels are unreadable to a
+             screen reader, the numbers are not. -->
+        <p class="visually-hidden" id="chart-summary">No token stream yet.</p>
       </div>
 
-      <h3 class="mini-head">State vector (O(1), saturated to ±127)</h3>
-      <div class="state-strip" id="state-strip"></div>
+      <details class="fold">
+        <summary>State vector (O(1), saturated to ±127)</summary>
+        <div class="state-strip" id="state-strip" role="list" aria-label="State vector values"></div>
+        <p class="visually-hidden" id="state-summary">No state vector yet.</p>
+      </details>
 
-      <h3 class="mini-head">Raw engine log</h3>
-      <pre class="log" id="log">waiting for the first run…</pre>
+      <details class="fold">
+        <summary>Raw engine log</summary>
+        <pre class="log" id="log" tabindex="0">waiting for the first run…</pre>
+      </details>
     </section>
 
     <!-- Training -->
-    <section class="panel train" aria-label="Training">
+    <section class="panel train" id="view-train" role="tabpanel" aria-labelledby="tab-train" aria-label="Training" hidden>
       <div class="panel-head">
         <h2>Train a model</h2>
         <span class="badge" id="train-badge">no model trained yet</span>
@@ -100,6 +125,7 @@
         <label class="field"><span>Epochs</span><input id="train-epochs" type="number" min="1" max="50" value="20"></label>
       </div>
 
+      <label class="visually-hidden" for="train-corpus">Training corpus</label>
       <textarea id="train-corpus" rows="7" spellcheck="false">3 3 3 3 -&gt; 7 7 7 7
 1 2 3 4 -&gt; 9 8 7 6
 5 5 5 -&gt; 1 1 1</textarea>
@@ -114,23 +140,23 @@
   </main>
 
   <!-- ── Settings drawer ──────────────────────────────────────── -->
-  <aside class="settings" id="settings" aria-label="Settings" aria-hidden="true">
+  <aside class="settings" id="settings" role="dialog" aria-modal="true" aria-label="Settings" aria-hidden="true">
     <div class="panel-head">
       <h2>Settings</h2>
       <button class="btn ghost" id="settings-close" aria-label="Close settings">✕</button>
     </div>
 
-    <label class="field">
+    <label class="field" for="opt-token">
       <span>Start token (used when the message is empty)</span>
       <input id="opt-token" type="number" min="0" max="65535" value="42">
     </label>
-    <label class="field">
+    <label class="field" for="opt-steps">
       <span>Steps per message</span>
       <input id="opt-steps" type="number" min="1" max="256" value="16">
     </label>
 
     <h3 class="mini-head">Coexistence axiom</h3>
-    <label class="field">
+    <label class="field" for="opt-humanity">
       <span>Humanity factor H(s)</span>
       <input id="opt-humanity" type="range" min="-0.5" max="1" step="0.05" value="1">
     </label>
@@ -141,6 +167,7 @@
 
     <h3 class="mini-head">Vocabulary (token ↔ word)</h3>
     <p class="explain">Stored per model. Used by the chat and by training.</p>
+    <label class="visually-hidden" for="vocab-text">Vocabulary, one "word tokenId" pair per line</label>
     <textarea id="vocab-text" rows="8" spellcheck="false" placeholder="hello 1&#10;world 2"></textarea>
     <div class="train-actions">
       <button class="btn" id="vocab-save">Save vocabulary</button>
@@ -150,6 +177,29 @@
     <h3 class="mini-head">Model</h3>
     <div class="kv" id="model-detail"></div>
   </aside>
+
+  <!-- Upload dialog: a plain <dialog> gives focus trapping, Escape and the
+       backdrop for free, instead of a hand-rolled version that usually
+       gets one of the three wrong. -->
+  <dialog class="dialog" id="upload-dialog" aria-labelledby="upload-title">
+    <form method="dialog" class="dialog-head">
+      <h2 id="upload-title">Upload a .hydra model</h2>
+      <button class="btn ghost" value="cancel" aria-label="Close upload dialog">✕</button>
+    </form>
+    <p class="explain">
+      The file is validated against the same rules the C loader enforces
+      (magic, version, dim/vocab/layers bounds, weights inside the file)
+      and is rejected before it is stored if anything does not match.
+    </p>
+    <label class="field" for="upload-name">
+      <span>Name (letters, digits, dot, dash, underscore)</span>
+      <input id="upload-name" value="my-model" spellcheck="false">
+    </label>
+    <p class="hint err" id="upload-hint" role="status" aria-live="polite"></p>
+    <div class="train-actions">
+      <button class="btn primary" id="upload-confirm" value="default">Upload</button>
+    </div>
+  </dialog>
 
   <div class="scrim" id="scrim" hidden></div>
 </div>

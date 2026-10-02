@@ -47,6 +47,13 @@ typedef struct {
 int hydra_engine_load(HydraEngine *engine, const char *model_path);
 void hydra_engine_unload(HydraEngine *engine);
 int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
+/* Prefill: faedt eine ganze Token-Sequenz durch die Engine, ohne sie
+ * auszugeben. Danach ist der State so weit gelaufen, wie das Prompt ihn
+ * getrieben hat, und hydra_engine_step() erzeugt die Fortsetzung.
+ * Das ist die einzige Moeglichkeit, mehr als ein Token in die Engine zu
+ * geben - hydra_engine_step() nimmt definitionsgemaess genau einen Seed.
+ * n == 0 ist ein gültiges No-Op. */
+int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n);
 int hydra_verify_axiom(float humanity_factor, float proposed_score, float *safe_score);
 
 #endif /* HYDRA_MODEL_H */

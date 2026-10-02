@@ -257,6 +257,82 @@ static void write_seeded_model(const char *path, uint32_t seed,
     fclose(f);
 }
 
+/* Prefill-Tests: der Prompt muss wirklich durch die Engine laufen, und
+ * ein Prompt muss exakt dem Lauf entsprechen, den ein Aufrufer manuell
+ * ausfuehren wuerde. Ohne diese Tests koennte prefill() ein No-op sein
+ * und niemand wuerde es merken - genau das war der urspruengliche Fehler
+ * in der Web-UI, die nur tokens[0] an die Engine gab. */
+static void test_prefill_equivalence(void)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    const uint32_t dim = 16, layers = 2;
+    const uint16_t vocab = 256;
+    const uint16_t prompt[4] = {7, 9, 11, 13};
+    const int steps = 8;
+    uint16_t via_prefill[8], via_manual[8];
+    HydraEngine e;
+
+    write_seeded_model(path, 0xABCDEF01u, dim, layers, vocab);
+
+    /* Weg A: prefill(prompt) + steps Generierung ab dem letzten Prompt-Token */
+    if (hydra_engine_load(&e, path) != 0) { CHECK(0, "Prefill-Modell laedt"); unlink(path); return; }
+    if (hydra_engine_prefill(&e, prompt, 4) != 0) { CHECK(0, "prefill() erfolgreich"); hydra_engine_unload(&e); unlink(path); return; }
+    uint16_t tok = prompt[3];
+    int ok = 1;
+    for (int s = 0; s < steps; ++s) {
+        uint16_t next = 0;
+        if (hydra_engine_step(&e, tok, &next) != 0) { ok = 0; break; }
+        via_prefill[s] = next;
+        tok = next;
+    }
+    hydra_engine_unload(&e);
+    CHECK(ok, "prefill() + step() erzeugt eine vollstaendige Sequenz");
+
+    /* Weg B: von Hand - die ersten drei Prompt-Tokens als Schritte,
+     * deren Ausgaben verworfen, dann ab dem vierten generieren. */
+    if (hydra_engine_load(&e, path) != 0) { CHECK(0, "Prefill-Modell laedt (manuell)"); unlink(path); return; }
+    for (int i = 0; i < 3; ++i) {
+        uint16_t discard = 0;
+        if (hydra_engine_step(&e, prompt[i], &discard) != 0) { ok = 0; break; }
+    }
+    tok = prompt[3];
+    for (int s = 0; s < steps; ++s) {
+        uint16_t next = 0;
+        if (hydra_engine_step(&e, tok, &next) != 0) { ok = 0; break; }
+        via_manual[s] = next;
+        tok = next;
+    }
+    hydra_engine_unload(&e);
+    CHECK(ok && memcmp(via_prefill, via_manual, sizeof(via_prefill)) == 0,
+          "prefill() entspricht exakt dem manuellen Prompt-Lauf");
+
+    /* Ein Prompt muss die Ausgabe wirklich veraendern: ein No-op
+     * prefill() wuerde die Zeile oben bestehen und trotzdem falsch sein. */
+    uint16_t only_last[8];
+    if (hydra_engine_load(&e, path) != 0) { CHECK(0, "Prefill-Modell laedt (Seed only)"); unlink(path); return; }
+    tok = prompt[3];
+    for (int s = 0; s < steps; ++s) {
+        uint16_t next = 0;
+        hydra_engine_step(&e, tok, &next);
+        only_last[s] = next;
+        tok = next;
+    }
+    hydra_engine_unload(&e);
+    CHECK(memcmp(via_prefill, only_last, sizeof(via_prefill)) != 0,
+          "Prompt-Laenge aendert das Ergebnis (prefill() ist kein No-op)");
+
+    /* n == 0 und NULL sind gueltige No-ops, kein Absturz. */
+    if (hydra_engine_load(&e, path) == 0) {
+        CHECK(hydra_engine_prefill(&e, NULL, 0) == 0, "prefill() mit 0 Tokens ist ein No-op");
+        CHECK(hydra_engine_prefill(&e, prompt, 1) == 0, "prefill() mit 1 Token aendert den State nicht");
+        CHECK(hydra_engine_prefill(NULL, prompt, 4) == -1, "prefill() mit NULL-Engine abgelehnt");
+        CHECK(hydra_engine_prefill(&e, NULL, 4) == -1, "prefill() mit NULL-Tokens und n>0 abgelehnt");
+        hydra_engine_unload(&e);
+    }
+    unlink(path);
+}
+
 static void test_seed_roundtrip_variance(void)
 {
     static const uint32_t seeds[VARIANCE_SEEDS] = {
@@ -352,6 +428,140 @@ static void ref_step_scalar(const HydraModelHeader *h, const uint8_t *w,
     int64_t raw = acc[0] % vocab;
     if (raw < 0) raw += vocab;
     *out = (uint16_t)((raw + (int32_t)token_in + 1) % vocab);
+}
+
+/* Alle vier 2-Bit-Codes in EINEM Build: der Dekoder muss 00=0, 01=+1,
+ * 10=-1 und 11=0 korrekt behandeln. Ein Seed-Modell enthaelt 11 mit
+ * verschwindend kleiner Wahrscheinlichkeit, ein zufaelliger Testlauf
+ * haette die reservierte Variante also nie geprueft - und genau an dieser
+ * Stelle saess der urspruengliche Vorzeichenfehler (0xFF-0x00 = -1 fuer
+ * Code 01). Hier ist das Byte-Muster fest vorgegeben, nicht geraten. */
+static void write_code_pattern_model(const char *path, uint32_t dim,
+                                     uint32_t layers, uint16_t vocab)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("fopen"); exit(1); }
+    wr_header(f, vocab, dim, layers, (uint32_t)sizeof(HydraModelHeader), dim * layers);
+    for (uint32_t i = 0; i < dim * layers; ++i) {
+        /* Cycle through the four codes 00/01/10/11 for both weights. */
+        uint8_t c1 = (uint8_t)(i % 4u);
+        uint8_t c2 = (uint8_t)((i / 4u + 1u) % 4u);
+        fputc((int)(c1 | (uint8_t)(c2 << 2)), f);
+    }
+    fclose(f);
+}
+
+static void test_neon_all_ternary_codes(void)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    const uint32_t dim = 64, layers = 4;   /* dim%16==0 erzwingt NEON-Chunks */
+    const uint16_t vocab = 512;
+
+    write_code_pattern_model(path, dim, layers, vocab);
+
+    uint8_t *wbytes = (uint8_t *)malloc(dim * layers);
+    if (!wbytes) { perror("malloc"); exit(1); }
+    FILE *rf = fopen(path, "rb");
+    if (!rf) { perror("fopen"); exit(1); }
+    if (fseek(rf, (long)sizeof(HydraModelHeader), SEEK_SET) != 0 ||
+        fread(wbytes, 1, dim * layers, rf) != dim * layers) {
+        fprintf(stderr, "Gewichte nicht lesbar\n"); exit(1);
+    }
+    fclose(rf);
+
+    /* Beweis, dass der Test wirklich alle vier Codes enthaelt - sonst
+     * waere die Aussage "alle vier Codes" eine Behauptung, keine Messung. */
+    int seen[4] = {0, 0, 0, 0};
+    for (uint32_t i = 0; i < dim * layers; ++i) {
+        seen[wbytes[i] & 0x03u] = 1;
+        seen[(wbytes[i] >> 2) & 0x03u] = 1;
+    }
+    CHECK(seen[0] && seen[1] && seen[2] && seen[3],
+          "Testmodell enthaelt alle vier 2-Bit-Codes 00/01/10/11");
+
+    HydraEngine e;
+    if (hydra_engine_load(&e, path) != 0) {
+        CHECK(0, "Code-Pattern-Modell laedt");
+        free(wbytes); unlink(path); return;
+    }
+    HydraModelHeader h = e.header;
+    int8_t ref_state[HYDRA_EMBED_DIM];
+    memset(ref_state, 0, sizeof(ref_state));
+
+    /* Mehrere Seeds: jedes Token laeuft durch w1 (+/-1 * token) und w2
+     * (+/-1 * state), damit beide Dekoderrichtungen und der 11-Code
+     * tatsaechlich auf die Akkumulation wirken. */
+    int tokens_match = 1, state_match = 1;
+    static const uint16_t seeds[4] = {1u, 64u, 255u, 400u};
+    for (int si = 0; si < 4 && tokens_match && state_match; ++si) {
+        memset(ref_state, 0, sizeof(ref_state));
+        uint16_t tok = seeds[si];
+        for (int t = 0; t < 12; ++t) {
+            uint16_t a = 0, b = 0;
+            if (hydra_engine_step(&e, tok, &a) != 0) { tokens_match = 0; break; }
+            ref_step_scalar(&h, wbytes, ref_state, tok, &b);
+            if (a != b) tokens_match = 0;
+            if (memcmp(e.state_vector, ref_state, sizeof(ref_state)) != 0) state_match = 0;
+            tok = a;
+        }
+    }
+    hydra_engine_unload(&e);
+    free(wbytes);
+    unlink(path);
+
+    CHECK(tokens_match, "NEON == Skalar fuer alle 4 Ternary-Codes (Token-Sequenz)");
+    CHECK(state_match, "NEON == Skalar fuer alle 4 Ternary-Codes (State-Vektor)");
+
+    /* Negativkontrolle auf Decoder-Ebene: ein Dekoder, der 01 als -1
+     * liest (der urspruengliche Fehler), liefert fuer einen reinen
+     * Plus-Modell andere Tokens als einer, der 01 als +1 liest. Wir bauen
+     * beide Modelle und vergleichen sie ueber die Engine: sind sie gleich,
+     * kann der Test einen Vorzeichenfehler nicht sehen - und genau dann
+     * ist er als Beweis wertlos. */
+    {
+        char pp[64], pn[64];
+        tmp_path_new(pp, sizeof(pp));
+        tmp_path_new(pn, sizeof(pn));
+        uint16_t plus[4], minus[4];
+        HydraEngine a, b;
+        memset(&a, 0, sizeof(a)); a.fd = -1; a.mapped_weights = NULL;
+        memset(&b, 0, sizeof(b)); b.fd = -1; b.mapped_weights = NULL;
+        write_code_pattern_model(pp, dim, layers, vocab);
+        write_code_pattern_model(pn, dim, layers, vocab);
+        /* Modell 1: jedes Byte 0x55 (c1=01, c2=01) -> alle Gewichte +1.
+         * Modell 2: jedes Byte 0xAA (c1=10, c2=10) -> alle Gewichte -1. */
+        {
+            FILE *f = fopen(pp, "r+b"); if (!f) { perror("r+b"); exit(1); }
+            fseek(f, (long)sizeof(HydraModelHeader), SEEK_SET);
+            for (uint32_t i = 0; i < dim * layers; ++i) fputc(0x55, f);
+            fclose(f);
+            f = fopen(pn, "r+b"); if (!f) { perror("r+b"); exit(1); }
+            fseek(f, (long)sizeof(HydraModelHeader), SEEK_SET);
+            for (uint32_t i = 0; i < dim * layers; ++i) fputc(0xAA, f);
+            fclose(f);
+        }
+        if (hydra_engine_load(&a, pp) == 0 && hydra_engine_load(&b, pn) == 0) {
+            uint16_t ta = 100, tb = 100;
+            for (int s = 0; s < 4; ++s) {
+                uint16_t na = 0, nb = 0;
+                hydra_engine_step(&a, ta, &na);
+                hydra_engine_step(&b, tb, &nb);
+                plus[s] = na; minus[s] = nb;
+                ta = na; tb = nb;
+            }
+            hydra_engine_unload(&a);
+            hydra_engine_unload(&b);
+            CHECK(memcmp(plus, minus, sizeof(plus)) != 0,
+                  "Negativkontrolle: +1- und -1-Modell liefern verschiedene Tokens");
+        } else {
+            hydra_engine_unload(&a);
+            hydra_engine_unload(&b);
+            CHECK(0, "Negativkontroll-Modelle laden");
+        }
+        unlink(pp);
+        unlink(pn);
+    }
 }
 
 /* Kern-Regression gegen BUG-1: NEON-Pfad und skalare Referenz muessen im
@@ -601,8 +811,10 @@ int main(void)
     test_token_mask_collisions();
     test_engine_step();
     test_seed_roundtrip_variance();
+    test_prefill_equivalence();
 #ifdef __ARM_NEON
     test_neon_matches_scalar();
+    test_neon_all_ternary_codes();
 #else
     printf("SKIP: NEON-Vergleichstest (nur auf ARM builds mit __ARM_NEON)\n");
 #endif
