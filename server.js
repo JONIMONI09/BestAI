@@ -11,7 +11,12 @@
  * Endpoints:
  *  GET  /api/models                -> every model found on disk, with header
  *  GET  /api/model?path=...        -> detail for one model
- *  POST /api/models/upload?name=   -> store an uploaded .hydra (raw body)
+ *  GET  /api/models/inspect?path=  -> full header + EVERY rule the model
+ *                                     violates, with a readable reason
+ *                                     (same analysis the upload route uses)
+ *  POST /api/models/upload?name=   -> store an uploaded .hydra (raw body).
+ *                                     Over the cap: 413 with a body, never a
+ *                                     dropped connection.
  *  POST /api/infer {token,prompt,steps} -> inference via hydra-run --json
  *  POST /api/train {...}           -> train a model from a corpus
  *  GET  /api/vocab?model=...       -> token<->string map for a model
@@ -23,6 +28,9 @@
  *    resolved with realpath + lstat (a symlink must not escape ROOT)
  *  - uploaded bytes are validated against the same header rules the C
  *    loader enforces; an invalid file is never written to a model path
+ *  - /api/models/inspect only accepts paths inside the project, exactly
+ *    like every other model route: a diagnostics endpoint that could read
+ *    arbitrary host files would be a disclosure hole, not a feature
  *  - no shell: execFile only, arguments are passed as an array
  *  - internal error details never reach the client
  */
@@ -47,7 +55,11 @@ const VOCAB_DIR = path.join(ROOT, 'models', 'vocab');
 const DEFAULT_MODEL = path.join(MODELS_DIR, 'demo.hydra');
 
 const MAX_BODY = 2 * 1024 * 1024; /* training corpora are text; 2 MiB is ample */
-const MAX_UPLOAD = 64 * 1024 * 1024; /* .hydra models are small; 64 MiB is generous */
+/* Upload cap, overridable because the model size ceiling is a FORMAT limit,
+ * not a transport one: a future .hydra v2 is allowed to be far bigger than
+ * today's (measured: v1 can describe at most 128 KiB of weights). Bytes can
+ * be set directly, sizes with a suffix: HYDRA_MAX_UPLOAD=2GB. */
+const MAX_UPLOAD = parseByteSize(process.env.HYDRA_MAX_UPLOAD, 64 * 1024 * 1024);
 const MAX_PROMPT = 256; /* must match MAX_PROMPT in src/main.c */
 const ENGINE_TIMEOUT_MS = 20000;
 
@@ -58,6 +70,26 @@ const HOST = process.env.HYDRA_ALLOW_REMOTE === '1' ? '0.0.0.0' : '127.0.0.1';
 
 const HEADER_BYTES = 24;
 const MAX_DIM = 64;
+
+/**
+ * Accepts "1048576", "64MiB", "2GB", "1.5 GiB". Returns fallback for
+ * anything unparseable, because a typo in an environment variable must not
+ * silently remove the limit entirely.
+ */
+function parseByteSize(raw, fallback) {
+  if (raw === undefined || raw === null) return fallback;
+  const s = String(raw).trim().toLowerCase();
+  if (s === '') return fallback;
+  const m = /^(\d+(?:\.\d+)?)\s*(b|kb|kib|mb|mib|gb|gib|tb|tib)?$/.exec(s);
+  if (!m) return fallback;
+  const units = {
+    b: 1, kb: 1000, kib: 1024, mb: 1000 ** 2, mib: 1024 ** 2,
+    gb: 1000 ** 3, gib: 1024 ** 3, tb: 1000 ** 4, tib: 1024 ** 4,
+  };
+  const value = Number(m[1]) * units[m[2] || 'b'];
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -127,12 +159,53 @@ function safeModelPath(p) {
 }
 
 /* Uploaded bytes are streamed straight to disk instead of being buffered:
- * the cap is 64 MiB, and a JSON body parser would have to hold that in RAM
- * before deciding whether the request is acceptable at all. The body is
- * written to a .tmp file first and only renamed after validation, so a
- * failed or oversized upload can never leave a truncated .hydra behind. */
+ * the cap is HYDRA_MAX_UPLOAD (64 MiB by default), and a JSON body parser
+ * would have to hold that in RAM before deciding whether the request is
+ * acceptable at all. The body is written to a .tmp file first and only
+ * renamed after validation, so a failed or oversized upload can never
+ * leave a truncated .hydra behind. */
+class UploadTooLarge extends Error {
+  constructor(limit) {
+    super(`file is larger than the ${formatBytes(limit)} limit`);
+    this.status = 413;
+    this.tooLarge = true;
+    this.limitBytes = limit;
+  }
+}
+
+/** 15728640 -> "15.0 MB"; used so a size limit reads like a human wrote it. */
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return String(n);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
+}
+
+/**
+ * Rejects an over-sized body WITHOUT taking the socket away from the
+ * response.
+ *
+ * The previous version called req.destroy() at the moment the limit was
+ * passed, so the 413 the route wanted to send never reached the client:
+ * curl and fetch both saw an empty reply and a connection error instead of
+ * a number. The client can only learn the refusal from the response, so the
+ * order here is: stop reading, answer, and only then close.
+ */
 function streamToTmpFile(req, tmpPath, limit) {
   return new Promise((resolve, reject) => {
+    /* Content-Length first: a client that declares its size is refused
+     * before a single byte is written, which is the clean path. */
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > limit) {
+      reject(new UploadTooLarge(limit));
+      return;
+    }
+
     const out = fs.createWriteStream(tmpPath, { flags: 'wx' });
     let written = 0;
     let settled = false;
@@ -146,10 +219,12 @@ function streamToTmpFile(req, tmpPath, limit) {
     req.on('data', (chunk) => {
       written += chunk.length;
       if (written > limit) {
-        req.destroy();
-        const e = new Error('file exceeds the 64 MiB limit');
-        e.status = 413;
-        fail(e);
+        /* Unpipe and pause - do NOT destroy. req.pause() keeps the socket
+         * alive so the 413 can still be written; the route closes it once
+         * the answer has been flushed. */
+        req.unpipe(out);
+        req.pause();
+        fail(new UploadTooLarge(limit));
       }
     });
     out.on('error', fail);
@@ -164,43 +239,170 @@ function streamToTmpFile(req, tmpPath, limit) {
 }
 
 /**
- * Header validation for an uploaded model. Mirrors the C loader in
- * src/hydra_engine.c check for check: the point is to reject exactly what
- * the engine would reject, so a model that is listed as valid is loadable.
- * Returns null when the file is fine, otherwise the reason.
+ * Magics worth naming.
+ *
+ * "wrong magic 0x46554747" is useless to somebody who just tried to load
+ * their own model. Naming the format turns that into an action: a GGUF is
+ * a llama.cpp/Ollama model, and this engine reads .hydra.
  */
-function validateHydraHeader(file, size) {
-  if (size < HEADER_BYTES) return 'file is smaller than the 24-byte header';
-  const fd = fs.openSync(file, 'r');
-  try {
-    const buf = Buffer.alloc(HEADER_BYTES);
-    if (fs.readSync(fd, buf, 0, HEADER_BYTES, 0) < HEADER_BYTES) {
-      return 'header could not be read';
-    }
-    const magic = buf.readUInt32LE(0);
-    const version = buf.readUInt16LE(4);
-    const vocab = buf.readUInt16LE(6);
-    const dim = buf.readUInt32LE(8);
-    const layers = buf.readUInt32LE(12);
-    const weightsOffset = buf.readUInt32LE(16);
-    const weightsLen = buf.readUInt32LE(20);
+const KNOWN_MAGICS = [
+  {
+    magic: 0x46554747, mask: 0xffffffff, name: 'GGUF',
+    advice: 'this is a GGUF model (llama.cpp / Ollama). The engine reads .hydra files; '
+      + 'convert it with tools/gguf_to_hydra.py',
+  },
+  { magic: 0x04034b50, mask: 0xffffffff, name: 'ZIP archive', advice: 'this looks like a .zip archive' },
+  { magic: 0x7f454c46, mask: 0xffffffff, name: 'ELF binary', advice: 'this looks like a compiled binary' },
+  { magic: 0x89504e47, mask: 0xffffffff, name: 'PNG image', advice: 'this looks like an image' },
+  { magic: 0x1f8b, mask: 0xffff, name: 'gzip archive', advice: 'this looks gzip-compressed' },
+  { magic: 0x425a68, mask: 0xffff, name: 'bzip2 archive', advice: 'this looks bzip2-compressed' },
+];
 
-    if (magic !== trainer.MAGIC) return 'not a .hydra file (wrong magic)';
-    if (version !== trainer.VERSION) return `unsupported .hydra version ${version}`;
-    if (dim === 0 || dim > MAX_DIM) return `dim out of range (1..${MAX_DIM}): ${dim}`;
-    if (vocab === 0 || vocab > trainer.MAX_VOCAB) {
-      return `vocab out of range (1..${trainer.MAX_VOCAB}): ${vocab}`;
+function describeMagic(magic) {
+  if (magic === trainer.MAGIC) {
+    return { expected: true, name: 'HYDRA', advice: null };
+  }
+  const known = KNOWN_MAGICS.find((k) => (magic & k.mask) === k.magic);
+  return known
+    ? { expected: false, name: known.name, advice: known.advice }
+    : { expected: false, name: null, advice: null };
+}
+
+/**
+ * The complete header analysis, in one place.
+ *
+ * The upload route and GET /api/models/inspect both call this, so the error
+ * message a user gets on upload and the report they get from inspect can
+ * never disagree about why a file was refused. Rules mirror the C loader in
+ * src/hydra_engine.c one for one: a file this accepts is a file the engine
+ * can load.
+ *
+ * @returns a report object; never throws for a merely invalid model.
+ */
+function analyseHydraFile(absPath, sizeArg) {
+  const stat = fs.statSync(absPath);
+  const size = sizeArg === undefined ? stat.size : sizeArg;
+  const report = {
+    path: null,
+    bytes: size,
+    headerBytesRequired: HEADER_BYTES,
+    header: null,
+    detected: null,
+    rules: [],
+    violations: [],
+    valid: false,
+    /* What the current on-disk format can describe at all. Reported even
+     * for a valid file, because "valid" and "can grow to 20 GB" are two
+     * different questions and only one of them has a yes today. */
+    limits: {
+      maxDim: MAX_DIM,
+      maxVocab: trainer.MAX_VOCAB,
+      maxLayers: trainer.MAX_LAYERS,
+      headerFields: 'uint32 (weights_offset, weights_len)',
+      maxWeightsBytesInHeader: 0xffffffff,
+      maxWeightsBytesForShape: Math.floor((MAX_DIM * trainer.MAX_LAYERS) / 2),
+    },
+  };
+  const rule = (id, ok, message) => {
+    report.rules.push({ id, ok, message });
+    if (!ok) report.violations.push(id);
+    return ok;
+  };
+
+  if (size < HEADER_BYTES) {
+    rule('size', false,
+      `file is ${formatBytes(size)}, smaller than the ${HEADER_BYTES}-byte header`);
+    return report;
+  }
+
+  const fd = fs.openSync(absPath, 'r');
+  let buf;
+  try {
+    buf = Buffer.alloc(HEADER_BYTES);
+    if (fs.readSync(fd, buf, 0, HEADER_BYTES, 0) < HEADER_BYTES) {
+      rule('header_readable', false, 'the 24-byte header could not be read');
+      return report;
     }
-    if (layers === 0 || layers > trainer.MAX_LAYERS) {
-      return `layers out of range (1..${trainer.MAX_LAYERS}): ${layers}`;
-    }
-    if (weightsOffset < HEADER_BYTES) return 'weights_offset points into the header';
-    if (weightsOffset + weightsLen > size) return 'weights run past the end of the file';
-    if (layers * dim > weightsLen) return 'layers x dim is not covered by weights_len';
-    return null;
   } finally {
     fs.closeSync(fd);
   }
+  rule('header_readable', true, `the ${HEADER_BYTES}-byte header was read`);
+
+  const header = {
+    magic: buf.readUInt32LE(0),
+    version: buf.readUInt16LE(4),
+    vocab: buf.readUInt16LE(6),
+    dim: buf.readUInt32LE(8),
+    layers: buf.readUInt32LE(12),
+    weightsOffset: buf.readUInt32LE(16),
+    weightsLen: buf.readUInt32LE(20),
+  };
+  report.header = header;
+
+  const magic = describeMagic(header.magic);
+  report.detected = {
+    magic: header.magic,
+    magicHex: '0x' + (header.magic >>> 0).toString(16).padStart(8, '0'),
+    format: magic.name,
+    advice: magic.advice,
+  };
+
+  if (!rule('magic', magic.expected,
+    magic.expected
+      ? 'magic matches .hydra'
+      : (magic.advice || `wrong magic ${report.detected.magicHex}, expected 0x48594452 "HYDR"`))) {
+    return report;
+  }
+  rule('version', header.version === trainer.VERSION,
+    header.version === trainer.VERSION
+      ? `version ${header.version} is supported`
+      : `unsupported .hydra version ${header.version} (this build reads ${trainer.VERSION})`);
+  rule('dim', header.dim >= 1 && header.dim <= MAX_DIM,
+    `dim ${header.dim} in 1..${MAX_DIM}`);
+  rule('vocab', header.vocab >= 1 && header.vocab <= trainer.MAX_VOCAB,
+    `vocab ${header.vocab} in 1..${trainer.MAX_VOCAB}`);
+  rule('layers', header.layers >= 1 && header.layers <= trainer.MAX_LAYERS,
+    `layers ${header.layers} in 1..${trainer.MAX_LAYERS}`);
+  rule('weights_offset', header.weightsOffset >= HEADER_BYTES,
+    `weights_offset ${header.weightsOffset} >= ${HEADER_BYTES} (must not point into the header)`);
+
+  /* Number arithmetic, not 32-bit: this is the exact wrap the C loader has
+   * to avoid (0xFFFFF000 + 0x1000 === 0 in uint32). */
+  const weightsEnd = header.weightsOffset + header.weightsLen;
+  rule('weights_fit', weightsEnd <= size,
+    `weights end at ${formatBytes(weightsEnd)} of a ${formatBytes(size)} file`);
+  rule('pairs_covered', header.layers * header.dim <= header.weightsLen,
+    `layers x dim = ${header.layers * header.dim} pairs, weights_len covers ${Math.floor(header.weightsLen / 4)}`);
+
+  /* Informational: the shape ceiling of the CURRENT format. A valid model
+   * can still be at the ceiling, and knowing that up front is what stops
+   * somebody from waiting for a 20 GB .hydra that the header cannot
+   * describe. */
+  const shapeBytes = Math.ceil((header.layers * header.dim) / 2);
+  rule('shape_within_format_ceiling', shapeBytes <= report.limits.maxWeightsBytesForShape,
+    `weights need ${formatBytes(shapeBytes)}; the current format can describe at most `
+    + `${formatBytes(report.limits.maxWeightsBytesForShape)} (dim ${MAX_DIM} x layers ${trainer.MAX_LAYERS} pairs)`);
+
+  report.valid = report.violations.length === 0;
+  return report;
+}
+
+/**
+ * The single error message for a refused model, derived from the analysis
+ * above. Returns null when the file is fine.
+ */
+function validateHydraHeader(file, size) {
+  let report;
+  try {
+    report = analyseHydraFile(file, size);
+  } catch (e) {
+    return `model could not be read: ${e.message}`;
+  }
+  if (report.valid) return null;
+  /* First violation wins in the message; the full list is what
+   * /api/models/inspect is for. */
+  const first = report.rules.find((r) => !r.ok);
+  return first ? first.message : 'model rejected';
 }
 
 /** Resolve an upload name to a path inside models/uploaded/, or null. */
@@ -647,7 +849,21 @@ const server = http.createServer(async (req, res) => {
       try {
         size = await streamToTmpFile(req, tmp, MAX_UPLOAD);
       } catch (e) {
-        /* The stream already removed the temp file and req is destroyed. */
+        /* The stream already removed the temp file. */
+        if (e.tooLarge) {
+          /* Answer FIRST, close afterwards. Destroying the request here is
+           * what used to make this reply arrive empty. */
+          res.setHeader('Connection', 'close');
+          sendJSON(res, e.status, {
+            error: e.message,
+            rejected: true,
+            limitBytes: e.limitBytes,
+            limitHuman: formatBytes(e.limitBytes),
+            raiseWith: 'HYDRA_MAX_UPLOAD',
+          });
+          res.on('finish', () => { if (!req.destroyed) req.destroy(); });
+          return;
+        }
         return sendJSON(res, e.status || 400, { error: e.message });
       }
       const reason = validateHydraHeader(tmp, size);
@@ -659,6 +875,49 @@ const server = http.createServer(async (req, res) => {
       fs.renameSync(tmp, target);
       const info = inspectHeader(path.relative(ROOT, target));
       return sendJSON(res, 200, { ok: true, model: info });
+    }
+
+    /* Why is this file not loading? One endpoint, one answer, the same
+     * analysis the upload route uses - so the message on upload and the
+     * report here can never contradict each other.
+     *
+     * Only paths inside the model directories are accepted (safeModelPath);
+     * a diagnostics endpoint that can read arbitrary files on the host
+     * would be an information-disclosure hole, not a feature. */
+    if (url.pathname === '/api/models/inspect' && req.method === 'GET') {
+      const rel = url.searchParams.get('path') || '';
+      if (!rel) return sendJSON(res, 400, { error: 'path query parameter is required' });
+      /* Syntactic checks first, so "does not exist" can be a 404 instead of
+       * collapsing into the same 400 a forbidden path gets. safeModelPath()
+       * deliberately conflates the two (realpath fails for a missing file),
+       * which would make "no such model" indistinguishable from "not
+       * allowed". */
+      if (rel.includes('\0') || !rel.endsWith('.hydra')) {
+        return sendJSON(res, 400, { error: 'invalid model path', checked: rel });
+      }
+      const resolved = path.resolve(ROOT, rel);
+      if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) {
+        return sendJSON(res, 400, { error: 'invalid model path', checked: rel });
+      }
+      if (!fs.existsSync(resolved)) {
+        return sendJSON(res, 404, { error: 'no such model file', path: rel });
+      }
+      const abs = safeModelPath(rel);
+      if (!abs) {
+        return sendJSON(res, 400, { error: 'invalid model path', checked: rel });
+      }
+      let report;
+      try {
+        report = analyseHydraFile(abs);
+      } catch (e) {
+        return sendJSON(res, 500, { error: 'model could not be read', detail: e.message });
+      }
+      report.path = rel;
+      report.trained = rel.startsWith('models' + path.sep + 'trained' + path.sep);
+      report.uploaded = rel.startsWith('models' + path.sep + 'uploaded' + path.sep);
+      /* 200 even for an invalid model: the caller asked for a diagnosis,
+       * and "here is why it is broken" is a successful answer. */
+      return sendJSON(res, 200, report);
     }
 
     if (url.pathname === '/api/infer' && req.method === 'POST') {

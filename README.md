@@ -73,6 +73,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/model` | GET | Header info of the model |
+| `/api/models/inspect?path=` | GET | Full header **plus every rule the file violates**, each with a readable reason |
 | `/api/infer` | POST | `{token, steps}` → JSON with tokens, state, timing |
 | `/api/axiom?h=0.5` | GET | Axiom gate simulation |
 
@@ -138,7 +139,8 @@ HYDRA_ALLOW_REMOTE=1 node server.js   # then also reachable from the LAN
 |---|---|
 | **Chat** | Type text, get a real reply from the compiled C engine. Words are mapped to token IDs through the stored vocabulary; a word without an ID is reported as unknown instead of being guessed. Replies can be shown as words or raw token IDs. **The whole prompt is fed to the engine**, not just its first token — `hydra_engine_prefill()` runs every prompt token through the same core step before generation starts. |
 | **Models** | Every `*.hydra` file under `models/` is listed with its real header (dim, vocab, layers, size, validity) and can be selected. Trained and uploaded models are marked. |
-| **Upload** | **Upload model** in the top bar stores a `.hydra` into `models/uploaded/` (`POST /api/models/upload?name=…`). The bytes are streamed to disk (64 MiB cap), then validated against the same rules the C loader enforces — magic, version, dim/vocab/layers bounds, `weights_offset`/`weights_len` inside the file, `layers × dim` covered by `weights_len`. An invalid file is rejected with the reason and never reaches a model path. |
+| **Upload** | **Upload model** in the top bar stores a `.hydra` into `models/uploaded/` (`POST /api/models/upload?name=…`). The bytes are streamed to disk (cap: `HYDRA_MAX_UPLOAD`, 64 MiB by default, `2GB`/`512MiB`/plain bytes all accepted), then validated against the same rules the C loader enforces — magic, version, dim/vocab/layers bounds, `weights_offset`/`weights_len` inside the file, `layers × dim` covered by `weights_len`. An invalid file is rejected with the reason and never reaches a model path. Over the cap the server answers **413 with a body** (never a dropped connection) that names the limit and how to raise it. |
+| **Diagnostics** | `GET /api/models/inspect?path=models/demo.hydra` returns the header values and one entry per rule (`id`, `ok`, `message`) plus a `violations` list. It is the same analysis the upload route uses, so both quote the same reason. Known formats are **named**: a GGUF answers *"this is a GGUF model (llama.cpp / Ollama) — the engine reads .hydra files"* instead of a bare `wrong magic`. The report also states the ceiling of the current format (`limits.maxWeightsBytesForShape`), because "valid" and "can be 20 GB" are two different questions. The console shows the violated rules under any model marked *invalid header*. |
 | **Engine output** | Token chart with metrics; the state vector and the raw log are collapsed by default. |
 | **Training** | Paste a corpus (`3 3 3 3 -> 7 7 7 7`, or `1 2 3` for next-token training), pick vocab/dim/layers/epochs and train. Training writes a real `.hydra` file and is **verified against the compiled engine** before it is reported as successful; accuracy before/after is measured, never estimated. |
 | **Settings** | Start token, steps, coexistence-axiom factor, per-model vocabulary editor. The drawer traps focus, closes on Escape and returns focus to its toggle. |

@@ -172,6 +172,31 @@ jobs:
           node --check tools/server_test.js
           node --check tools/contrast_check.js
 
+      # A 413 that never reaches the client is invisible to every other
+      # check: the request simply fails, without a status code. This
+      # asserts the answer actually arrives (see errors.md, "the 413 that
+      # was never delivered").
+      - name: Over-sized upload gets a readable 413
+        run: |
+          set -euo pipefail
+          make -s all
+          HYDRA_MAX_UPLOAD=1MiB PORT=8999 node server.js &
+          srv=$!
+          trap 'kill $srv 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            curl -sf "http://127.0.0.1:8999/api/models" > /dev/null && break
+            sleep 0.25
+          done
+          head -c 3000000 /dev/zero > /tmp/too-big.bin
+          code=$(curl -s -o /tmp/too-big.json -w '%{http_code}' \
+            -X POST --data-binary @/tmp/too-big.bin \
+            "http://127.0.0.1:8999/api/models/upload?name=too-big.hydra")
+          test "$code" = "413" || { echo "expected 413, got $code"; exit 1; }
+          grep -q "larger than" /tmp/too-big.json \
+            || { echo "the 413 carried no message: $(cat /tmp/too-big.json)"; exit 1; }
+          echo "ok: 413 delivered with a readable body"
+          rm -f /tmp/too-big.bin /tmp/too-big.json
+
       # WCAG 2.2 AA for every text/background pair the stylesheet uses.
       # --text-faint was #64748b (4.04:1 on the page background, below the
       # 4.5:1 required for normal text) and nothing caught it: nobody had

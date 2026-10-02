@@ -53,50 +53,49 @@
 
 ## Current task
 
-**Round 2026-10-02 (closing the remaining verified gaps):** GPU bench compiles
-GLSL at runtime, WCAG AA contrast measured and fixed, cancel made real (web
-server-side kill + Android cooperative flag), crash reports persisted and
-surfaced on next launch, partial-batch flush and `steps <= 0` verified by a
-host test, token-only state semantics documented, large-model loading turned
-into a regression test. Tablet measurements: **blocked, documented as such**
-(no adb, no device, no emulator in this container).
+**Phase P0 of the large-model/GGUF plan: make “why is my model not loading?”
+answerable.** 20 GB support (P1/P2) and the GGUF converter (P3) are still
+open; the full plan is in the P0 handoff (16 items).
 
-### Plan and result
+### Result
 
-- [x] GPU bench: runtime GLSL compilation, SPIR-V path deleted, CPU path
-      built and run by a `gpu-bench` CI job, docs updated
-- [x] Contrast: `tools/contrast_check.js` (17 pairs, WCAG 2.2),
-      `--text-faint` `#64748b` (4.04:1) -> `#7b8da3` (5.66:1), ratios
-      documented in `public/style.css`, gate wired into CI
-- [x] Web cancel (Option A): `ChildProcess` per request, SIGTERM then
-      SIGKILL, `res.on('close')` (NOT `req.on('close')` - see errors.md),
-      `POST /api/cancel`, 409 `cancelled`, distinct `cancelled` UI status
-- [x] Two falsifiable cancel tests (stand-in engine with a pid file), both
-      verified to fail without the kill
-- [x] Bind-address test rewritten against the pid that owns the socket, with
-      a positive control for `HYDRA_ALLOW_REMOTE=1`
-- [x] Android crash handler: write to filesDir, delegate, never start an
-      Activity; next-launch report with copy + delete; debug-only intent
-      extra `crash_test`; `android:process=":crash"` removed
-- [x] Android cancel: `HydraBridge.cancel()` + a `volatile` flag checked per
-      step, UI says *cancelled*, not *error*
-- [x] Batching policy extracted to `hydra_batch.h`, shared with
-      `tests/test_jni_batch.c` (steps 1..69, `steps <= 0` rejected);
-      negative control drops the 17th token
-- [x] `tests/test_large_model.c`: 5 GiB sparse model loads and generates;
-      32-bit offset+length wrap refused (negative control: SIGSEGV)
-- [x] Token-only semantics documented in `include/hydra_model.h` + engine
-      test that `state[1..dim-1]` stays stale; the web console is pinned to
-      the full path so its state strip cannot lie
-- [x] `tools/android_crash_check.sh` (25 checks), `tools/jni_signature_check.sh`
-      fixed to cover `Unit`-returning natives, both in CI
-- [x] `docs/gpu-feasibility.md` §6: "Measured on device" - explicitly empty,
-      with the blocked rows and the exact commands to fill it in
-- [x] `errors.md`: 6 new entries (socat port mirror, `req.on('close')`,
-      cancelled-request hang, fake binary left behind, `Unit` skip in the JNI
-      gate, segfaulting negative control)
-- [ ] **Tablet measurement: BLOCKED** - no device reachable from this
-      container. Documented, not fabricated.
+- [x] **413 actually delivered.** `streamToTmpFile()` called `req.destroy()`
+      before the response, so the client got an empty reply (measured:
+      curl transport error, 0 bytes). Order is now stop reading -> answer ->
+      close, with a `Content-Length` pre-check plus the streaming guard, and
+      the body carries `limitBytes` / `limitHuman` / `raiseWith`.
+      Negative control (re-adding `req.destroy()`) reproduces `ECONNRESET`.
+- [x] **Upload cap configurable**: `HYDRA_MAX_UPLOAD` (`1MiB`, `2GB`,
+      plain bytes), default 64 MiB. A typo falls back to the default
+      instead of removing the limit.
+- [x] **Magic-specific messages**: GGUF, ZIP, ELF, PNG, gzip, bzip2 are
+      named with advice; unknown magics still state both values. The
+      generic "wrong magic" string is gone.
+- [x] **`GET /api/models/inspect?path=`**: header values + one entry per rule
+      (`id`, `ok`, `message`) + `violations` + the current format ceiling.
+      200 even for a broken model (a diagnosis is a successful answer).
+      Paths stay inside the project: 400 outside, 404 when absent.
+- [x] **One analysis, two callers**: upload refusal and inspect report quote
+      the same first violation; a test asserts it.
+- [x] **Android** mirrors the same rule ids, logs the header and *every*
+      violated rule, names GGUF, and sums `offset + len` in `Long`.
+- [x] **Console** shows the violated rules under any model marked
+      *invalid header*, and appends how to raise the upload cap.
+- [x] Tests: 29 in `tools/server_test.js` (7 new), `tools/android_header_check.sh`
+      (22 checks, negative control verified), plus a CI step that proves the
+      413 reaches the client.
+- [x] `errors.md`: 4 new entries (undelivered 413, "wrong magic", inspect as
+      a file-read oracle, `pkill -f` killing its own shell).
+
+### Still open (measured blockers, not guesses)
+
+- **P1** Import cap on Android (64 MiB), free-space check.
+- **P2** 20 GB: v1 can describe at most **128 KiB** of weights
+      (dim ≤ 64 × layers ≤ 4096 × 4 bit) and its offsets are `uint32`.
+      Needs header v2 with 64-bit fields, runtime `dim`, int64 aggregation.
+- **P3** GGUF: the engine is a ternary state machine, not a transformer.
+      A converter is possible as an *initialisation*, never as "the model".
+- **Device**: still blocked (no adb/device/emulator).
 
 ## Plan
 

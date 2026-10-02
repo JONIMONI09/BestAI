@@ -25,6 +25,9 @@ const BASE = `http://127.0.0.1:${PORT}`;
 let child = null;
 let tmpModels = null;
 
+/* Files a test creates inside models/uploaded/; removed in after(). */
+const createdFiles = [];
+
 function request(pathname, options = {}) {
   return fetch(BASE + pathname, options);
 }
@@ -81,6 +84,10 @@ before(async () => {
 after(async () => {
   if (child) child.kill('SIGKILL');
   if (tmpModels) fs.rmSync(tmpModels, { recursive: true, force: true });
+  /* Files the diagnostics tests wrote inside models/ must not survive: a
+   * leftover "kaputt-dim.hydra" would show up in the console's model list
+   * and in the next run's own assertions. */
+  for (const f of createdFiles) fs.rmSync(f, { force: true });
 });
 
 test('/api/models returns JSON with an array of models', async () => {
@@ -213,6 +220,10 @@ test('/api/models/upload stores a valid model and it appears in the list', async
     headers: { 'Content-Type': 'application/octet-stream' },
     body: bytes,
   });
+  /* Registered for cleanup: this test used to leave its upload behind, and
+   * after a few runs models/uploaded/ was full of them - which then showed
+   * up in the console's model list and in every later assertion about it. */
+  createdFiles.push(path.join(ROOT, 'models', 'uploaded', `uploaded-${process.pid}.hydra`));
   assert.strictEqual(res.status, 200);
   const body = await res.json();
   assert.strictEqual(body.ok, true);
@@ -631,6 +642,252 @@ test('the crash dialog and the error button exist and are wired', () => {
   assert.match(js, /addEventListener\('unhandledrejection'/, 'promise rejections must be handled');
   assert.match(js, /clipboard/, 'the copy must use the clipboard API with a fallback');
   assert.match(js, /execCommand\('copy'\)/, 'a non-secure-context fallback must exist');
+});
+
+/* ------------------------------------------------------------------ */
+/* Model diagnostics: why is my file not loading?                       */
+/* ------------------------------------------------------------------ */
+
+/** Writes a .hydra header with chosen values into models/uploaded/. */
+function writeModelFile(name, fields) {
+  const dir = path.join(ROOT, 'models', 'uploaded');
+  fs.mkdirSync(dir, { recursive: true });
+  const b = Buffer.alloc(24);
+  b.writeUInt32LE(fields.magic ?? 0x48594452, 0);
+  b.writeUInt16LE(fields.version ?? 1, 4);
+  b.writeUInt16LE(fields.vocab ?? 512, 6);
+  b.writeUInt32LE(fields.dim ?? 64, 8);
+  b.writeUInt32LE(fields.layers ?? 4, 12);
+  b.writeUInt32LE(fields.weightsOffset ?? 24, 16);
+  b.writeUInt32LE(fields.weightsLen ?? 256, 20);
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, Buffer.concat([b, Buffer.alloc(fields.pad ?? 256)]));
+  createdFiles.push(file);
+  return 'models/uploaded/' + name;
+}
+
+/** Boots an extra server with extra env, e.g. a smaller upload cap. */
+async function bootServer(t, extraEnv) {
+  const port = PORT + 3 + Math.floor(Math.random() * 300);
+  const srv = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env: { ...process.env, PORT: String(port), HYDRA_ALLOW_REMOTE: '', ...extraEnv },
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+  t.after(() => srv.kill('SIGKILL'));
+  const base = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    try {
+      const res = await fetch(`${base}/api/models`);
+      if (res.ok) return base;
+    } catch {
+      /* not up yet */
+    }
+    if (Date.now() > deadline) throw new Error('secondary server did not start');
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+test('an over-sized upload answers 413 with a body the client can read', async (t) => {
+  /* Before the fix the limit path called req.destroy() first, so the client
+   * received an EMPTY reply: a broken connection instead of a status code.
+   * Asserting a non-empty JSON body is therefore the regression test. */
+  const base = await bootServer(t, { HYDRA_MAX_UPLOAD: '1MiB' });
+  const body = Buffer.alloc(3 * 1024 * 1024, 0x41);
+
+  const res = await fetch(`${base}/api/models/upload?name=zu-gross.hydra`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body,
+  });
+  const text = await res.text();
+  assert.strictEqual(res.status, 413, 'an over-sized upload must be refused with 413');
+  assert.ok(text.length > 0, 'the 413 must carry a body - an empty reply is the bug');
+  const json = JSON.parse(text);
+  assert.match(json.error, /larger than the 1\.0 MiB limit/,
+    `the message must name the limit, got: ${json.error}`);
+  assert.strictEqual(json.rejected, true);
+  assert.strictEqual(json.limitBytes, 1024 * 1024);
+  assert.strictEqual(json.raiseWith, 'HYDRA_MAX_UPLOAD',
+    'the error must say how to raise the limit');
+
+  /* Nothing may be left behind: the body was streamed to a temp file. */
+  const uploaded = path.join(ROOT, 'models', 'uploaded');
+  const leftovers = fs.existsSync(uploaded)
+    ? fs.readdirSync(uploaded).filter((f) => f.startsWith('.upload-'))
+    : [];
+  assert.deepStrictEqual(leftovers, [], 'a refused upload must leave no temp file');
+  assert.ok(!fs.existsSync(path.join(uploaded, 'zu-gross.hydra')),
+    'a refused upload must not reach its final name');
+});
+
+test('the same upload succeeds once the cap allows it (negative control)', async (t) => {
+  /* If 413 were returned by an over-eager check, this is the case that
+   * catches it: under a generous cap the identical body must be stored. */
+  const base = await bootServer(t, { HYDRA_MAX_UPLOAD: '16MiB' });
+  const list = await (await fetch(`${base}/api/models`)).json();
+  const demo = fs.readFileSync(path.join(ROOT, list.models[0].path));
+
+  const res = await fetch(`${base}/api/models/upload?name=passt.hydra`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: demo,
+  });
+  const json = await res.json();
+  assert.strictEqual(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(json)}`);
+  assert.strictEqual(json.ok, true);
+  t.after(() => fs.rmSync(path.join(ROOT, 'models', 'uploaded', 'passt.hydra'), { force: true }));
+});
+
+test('an over-sized upload is refused even without a Content-Length header', async (t) => {
+  /* The streaming guard is a different code path from the Content-Length
+   * pre-check, and it is the one that used to kill the socket. */
+  const base = await bootServer(t, { HYDRA_MAX_UPLOAD: '1MiB' });
+  const http = require('node:http');
+  const port = Number(new URL(base).port);
+
+  const result = await new Promise((resolve) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: '/api/models/upload?name=chunked.hydra',
+      method: 'POST',
+      headers: { 'Transfer-Encoding': 'chunked', 'Content-Type': 'application/octet-stream' },
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', (e) => resolve({ status: 0, body: `socket error: ${e.message}` }));
+    const chunk = Buffer.alloc(256 * 1024, 0x41);
+    let sent = 0;
+    const pump = () => {
+      while (sent < 3 * 1024 * 1024) {
+        sent += chunk.length;
+        if (!req.write(chunk)) {
+          req.once('drain', pump);
+          return;
+        }
+      }
+      req.end();
+    };
+    pump();
+  });
+
+  assert.strictEqual(result.status, 413,
+    `a chunked over-sized upload must be refused with 413, got ${result.status}: ${result.body}`);
+  assert.match(result.body, /larger than the 1\.0 MiB limit/,
+    'the streaming refusal must carry the same clear message');
+});
+
+test('a GGUF upload is refused with a GGUF-specific message', async () => {
+  const gguf = Buffer.concat([
+    Buffer.from('GGUF'), Buffer.from([3, 0, 0, 0]), Buffer.alloc(60),
+  ]);
+  const up = await fetch(`${BASE}/api/models/upload?name=mein-llama.hydra`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: gguf,
+  });
+  const json = await up.json();
+  assert.strictEqual(up.status, 400);
+  assert.match(json.error, /GGUF/,
+    `the error must name the format, got: ${json.error}`);
+  assert.match(json.error, /\.hydra/, 'the error must say what IS expected');
+  assert.doesNotMatch(json.error, /wrong magic\)$/,
+    'the generic wrong-magic message must be gone');
+  createdFiles.push(path.join(ROOT, 'models', 'uploaded', 'mein-llama.hydra'));
+});
+
+test('/api/models/inspect returns the header and every violated rule', async () => {
+  /* Valid model: values present, nothing violated. */
+  const { body: list } = await json('/api/models');
+  const demo = list.models.find((m) => m.valid) || list.models[0];
+  const ok = await json(`/api/models/inspect?path=${encodeURIComponent(demo.path)}`);
+  assert.strictEqual(ok.status, 200);
+  assert.strictEqual(ok.body.valid, true, `demo model must be valid: ${JSON.stringify(ok.body.violations)}`);
+  assert.deepStrictEqual(ok.body.violations, []);
+  assert.strictEqual(ok.body.header.dim, demo.dim);
+  assert.strictEqual(ok.body.header.layers, demo.layers);
+  assert.strictEqual(ok.body.header.weightsLen, demo.weightsLen);
+  assert.strictEqual(ok.body.header.magic, 0x48594452);
+  assert.strictEqual(ok.body.detected.format, 'HYDRA');
+  assert.ok(Array.isArray(ok.body.rules) && ok.body.rules.length >= 8,
+    'every rule must be reported, not only the failed ones');
+  for (const r of ok.body.rules) {
+    assert.strictEqual(typeof r.id, 'string');
+    assert.strictEqual(typeof r.ok, 'boolean');
+    assert.ok(r.message && typeof r.message === 'string', `rule ${r.id} needs a message`);
+  }
+
+  /* Broken model: the violated rules are named individually. */
+  const rel = writeModelFile('kaputt-dim.hydra', { dim: 4096, layers: 4, weightsLen: 65536, pad: 65536 });
+  const bad = await json(`/api/models/inspect?path=${encodeURIComponent(rel)}`);
+  assert.strictEqual(bad.status, 200, 'inspect answers 200 even for a broken model');
+  assert.strictEqual(bad.body.valid, false);
+  assert.ok(bad.body.violations.includes('dim'),
+    `dim must be reported as violated: ${JSON.stringify(bad.body.violations)}`);
+  const dimRule = bad.body.rules.find((r) => r.id === 'dim');
+  assert.strictEqual(dimRule.ok, false);
+  assert.match(dimRule.message, /4096/, 'the message must name the offending value');
+  assert.match(dimRule.message, /1\.\.64/, 'the message must name the allowed range');
+  assert.strictEqual(bad.body.header.dim, 4096, 'the raw header value is still reported');
+
+  /* Offset overflow: the 32-bit wrap, reported rather than followed. */
+  const wrap = writeModelFile('kaputt-offset.hydra', {
+    weightsOffset: 0xfffffff0, weightsLen: 0x20, pad: 64,
+  });
+  const wrapped = await json(`/api/models/inspect?path=${encodeURIComponent(wrap)}`);
+  assert.ok(wrapped.body.violations.includes('weights_fit'),
+    `a wrapped offset must be reported: ${JSON.stringify(wrapped.body.violations)}`);
+
+  /* Shape ceiling: valid today, but stated, so nobody waits for 20 GB. */
+  assert.ok(ok.body.limits.maxWeightsBytesForShape < 1024 * 1024,
+    'the report must state how large a model the current format can describe');
+  assert.strictEqual(ok.body.limits.maxWeightsBytesInHeader, 0xffffffff,
+    'the report must state the 32-bit header limit');
+});
+
+test('/api/models/inspect names a GGUF and refuses paths outside the models', async () => {
+  const rel = writeModelFile('llama.hydra', { magic: 0x46554747, version: 3 });
+  const res = await json(`/api/models/inspect?path=${encodeURIComponent(rel)}`);
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.detected.format, 'GGUF');
+  assert.match(res.body.detected.advice, /convert/i,
+    'a GGUF must come with an actionable hint');
+  assert.ok(res.body.violations.includes('magic'));
+
+  /* Diagnostics must not become a file-read oracle for the host. */
+  const escape = await json('/api/models/inspect?path=' + encodeURIComponent('../../etc/hostname'));
+  assert.strictEqual(escape.status, 400, 'a path outside the models must be refused');
+  const missing = await json('/api/models/inspect?path=models/uploadend/fehlt.hydra');
+  assert.strictEqual(missing.status, 404, 'a missing model must be a 404');
+  const noParam = await json('/api/models/inspect');
+  assert.strictEqual(noParam.status, 400, 'path is required');
+});
+
+test('the upload refusal and the inspect report state the same reason', async () => {
+  /* Two code paths reporting on the same file must not drift apart: the
+   * user is told one thing on upload and another in the console. */
+  const rel = writeModelFile('abweichend.hydra', {
+    layers: 99999, weightsLen: 65536, pad: 65536,
+  });
+  const bytes = fs.readFileSync(path.join(ROOT, rel));
+
+  const up = await fetch(`${BASE}/api/models/upload?name=abweichend-upload.hydra`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: bytes,
+  });
+  const upJson = await up.json();
+  createdFiles.push(path.join(ROOT, 'models', 'uploaded', 'abweichend-upload.hydra'));
+
+  const report = await json(`/api/models/inspect?path=${encodeURIComponent(rel)}`);
+  const firstFailed = report.body.rules.find((r) => !r.ok);
+  assert.ok(firstFailed, 'the crafted file must violate a rule');
+  assert.strictEqual(upJson.error, firstFailed.message,
+    'upload and inspect must quote the same first violation');
 });
 
 test('/api/infer returns the real state, not a token-only stand-in', async () => {

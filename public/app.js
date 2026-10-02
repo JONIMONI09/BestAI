@@ -95,7 +95,7 @@
    * and the already-rendered messages kept the old representation. */
   const botMessages = [];
 
-  function renderChips(model) {
+  async function renderChips(model) {
     const box = $('model-chips');
     box.textContent = '';
     if (!model) return;
@@ -120,6 +120,29 @@
     for (const [k, v] of [['path', model.path], ['magic', model.magic === 1213809746 ? 'HYDR' : model.magic]]) {
       detail.appendChild(el('span', null, k));
       detail.appendChild(el('b', null, String(v)));
+    }
+    /* A model in the list with an invalid header gets its violated rules
+     * spelled out. "invalid header" on its own never told anybody what to
+     * fix, which is the whole reason /api/models/inspect exists. */
+    if (model.valid === false) {
+      detail.appendChild(el('span', null, 'checking…'));
+      try {
+        const res = await fetch(`/api/models/inspect?path=${encodeURIComponent(model.path)}`);
+        const report = await res.json();
+        detail.querySelector('span:last-child')?.remove();
+        if (!res.ok) {
+          detail.appendChild(el('span', null, 'inspect'));
+          detail.appendChild(el('b', null, report.error || `HTTP ${res.status}`));
+        } else {
+          for (const r of report.rules.filter((x) => !x.ok)) {
+            detail.appendChild(el('span', null, r.id));
+            detail.appendChild(el('b', null, r.message));
+          }
+        }
+      } catch (e) {
+        const hint = detail.querySelector('span:last-child');
+        if (hint) hint.textContent = `inspect failed: ${e.message}`;
+      }
     }
   }
 
@@ -207,10 +230,10 @@
   async function selectModel(modelPath) {
     state.model = modelPath;
     const meta = state.models.find((m) => m.path === modelPath);
-    renderChips(meta);
+    await renderChips(meta);
     try {
       const info = await api(`/api/model?path=${encodeURIComponent(modelPath)}`);
-      renderChips(Object.assign({}, meta, info));
+      await renderChips(Object.assign({}, meta, info));
     } catch (e) {
       log(`model info failed: ${e.message}`);
     }
@@ -269,7 +292,14 @@
         body: file,
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (!res.ok) {
+        /* A 413 also carries how to raise the cap - the server tells us,
+         * so the console does not have to hardcode a limit of its own. */
+        const howto = data.raiseWith
+          ? ` (raise it with ${data.raiseWith}=…, currently ${data.limitHuman || 'unknown'})`
+          : '';
+        throw new Error((data.error || `HTTP ${res.status}`) + howto);
+      }
       $('upload-hint').textContent = `stored ${data.model.path}`;
       await loadModels(data.model.path);
       return true;

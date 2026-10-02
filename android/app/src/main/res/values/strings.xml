@@ -38,17 +38,27 @@
     <string name="log_import_rejected">[Hydra] import rejected: %1$s — keeping the previous model</string>
     <string name="log_import_failed">[Hydra] import failed: %1$s — keeping the previous model</string>
     <string name="err_no_stream">cannot open the file</string>
-    <string name="err_too_large">file exceeds the 64 MiB limit</string>
-    <string name="err_too_small">file is smaller than the 24-byte header</string>
+    <string name="err_too_large_human">file is larger than the %1$s import limit</string>
+    <string name="err_too_small_human">file is smaller than the 24-byte header (size: %1$d)</string>
     <string name="err_unreadable">header could not be read</string>
-    <string name="err_magic">not a .hydra file (wrong magic)</string>
-    <string name="err_version">unsupported .hydra version</string>
-    <string name="err_dim">dim out of range (1..64)</string>
-    <string name="err_vocab">vocab out of range (1..1024)</string>
-    <string name="err_layers">layers out of range (1..4096)</string>
-    <string name="err_offset">weights_offset points into the header</string>
-    <string name="err_weights">weights run past the end of the file</string>
-    <string name="err_pair_count">layers × dim is not covered by weights_len</string>
+    <!-- Magic-specific messages: the hex value alone never told anybody what
+         they actually picked. -->
+    <string name="err_magic_gguf">this is a GGUF model (llama.cpp / Ollama). The engine reads .hydra files — a GGUF cannot be executed by this ternary engine.</string>
+    <string name="err_magic_zip">this looks like a .zip archive, not a .hydra model</string>
+    <string name="err_magic_elf">this looks like a compiled binary, not a .hydra model</string>
+    <string name="err_magic_png">this looks like an image, not a .hydra model</string>
+    <string name="err_magic_gzip">this looks gzip-compressed, not a raw .hydra model</string>
+    <string name="err_magic_unknown">wrong magic %1$s, expected 0x48594452 \"HYDR\"</string>
+    <string name="err_version_human">version %1$d is not supported (this build reads version %2$d)</string>
+    <string name="ok_version">version %1$d is supported</string>
+    <string name="err_dim_human">dim %1$d is outside 1..%2$d</string>
+    <string name="err_vocab_human">vocab %1$d is outside 1..%2$d</string>
+    <string name="err_layers_human">layers %1$d is outside 1..%2$d</string>
+    <string name="err_offset_human">weights_offset may not point into the header; minimum %1$d, header is %2$d</string>
+    <string name="err_weights_human">weights end at %1$s but the file is only %2$s</string>
+    <string name="err_pair_count_human">layers × dim = %1$d, but weights_len covers only %2$d</string>
+    <string name="info_shape_ceiling">weights use %1$s; the current format can describe at most %2$s</string>
+    <string name="log_import_header">[Hydra] header: %1$s</string>
     <string name="err_replace">cannot replace the previous model</string>
     <string name="err_rename">cannot move the imported file into place</string>
 
