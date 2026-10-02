@@ -678,3 +678,28 @@
 - **Prevention:** every file the packager reads has to be tracked. Ask
   what a clean checkout contains, not what the workstation contains; a
   build that only works locally is not a build.
+
+## 2026-10-02 — First real tag run failed in two jobs
+
+- **Symptom:** `v1.0.0` was pushed and `release.yml` ran for the first
+  time ever. Two jobs failed: `CLI (Linux)` with
+  `cp: cannot create regular file 'dist/hydra-run-linux-x64': No such
+  file or directory` and `Android APK` with
+  `path may not be null or empty string. path=''` from
+  `build.gradle.kts` line 50. No release was published.
+- **Cause:** (a) the Linux job copies into `dist/` but only the macOS
+  job created the directory. (b) A GitHub secret that is not configured
+  is exposed as an EMPTY environment string, not as `null`, so
+  `file(System.getenv("HYDRA_KEYSTORE")!!)` called `file("")` and threw.
+  Every local and CI run had the variable unset (real `null`), which is
+  why the bug survived 20 green runs.
+- **Fix:** `mkdir -p dist` in the Linux job; the Gradle script now
+  resolves the keystore path once via
+  `System.getenv("HYDRA_KEYSTORE")?.takeIf { it.isNotBlank() }` and uses
+  that for both the signing config and the build type; the workflow also
+  only exports `HYDRA_KEYSTORE` when the secret really carries data.
+- **Prevention:** test the *unset* code path the way production
+  presents it. An empty environment string is not the same as an absent
+  variable, and a release-only code path is not exercised by a normal
+  push. Both fixes were replayed locally with `HYDRA_KEYSTORE=""`
+  before pushing.

@@ -102,6 +102,7 @@ jobs:
       - name: Build linux-x64
         run: |
           make clean && make
+          mkdir -p dist
           cp hydra-run dist/hydra-run-linux-x64
           strip dist/hydra-run-linux-x64
 
@@ -208,7 +209,7 @@ jobs:
           HYDRA_KEY_PASSWORD: ${{ secrets.HYDRA_KEY_PASSWORD }}
         run: |
           mkdir -p ../dist
-          if [ -n "$HYDRA_KEYSTORE" ]; then
+          if [ -n "${HYDRA_KEYSTORE//[[:space:]]/}" ]; then
             echo "$HYDRA_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
             echo "HYDRA_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           else

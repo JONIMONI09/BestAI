@@ -11,8 +11,8 @@ android {
         applicationId = "dev.hydrastone"
         minSdk = 24
         targetSdk = 34
-        // Im Release-Workflow aus dem Git-Tag ableiten (v1.2.3 -> 10203),
-        // damit das APK eindeutig einer Version zugeordnet ist.
+        // Derived from the git tag in the release workflow (v1.2.3 -> 10203),
+        // so the APK is unambiguously tied to a version.
         versionCode = (System.getenv("HYDRA_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("HYDRA_VERSION_NAME") ?: "1.0.0"
 
@@ -39,16 +39,21 @@ android {
         }
     }
 
+    // An unconfigured secret arrives as an EMPTY string, not as null, and
+    // file("") throws "path may not be null or empty string" - that killed
+    // the first real release run. takeIf { isNotBlank() } treats "unset"
+    // and "empty" as the same thing.
+    val keystorePath = System.getenv("HYDRA_KEYSTORE")?.takeIf { it.isNotBlank() }
+    val keystoreUsable = keystorePath != null && file(keystorePath).exists()
+
     signingConfigs {
-        // Release-Signierung: bevorzugt ein echtes Keystore aus den
-        // CI-Secrets. Ohne diese Secrets wird auf den Debug-Schluessel
-        // zurueckgefallen, damit das APK trotzdem installierbar bleibt —
-        // es wird dann im Release-Body ausdruecklich als Debug-signiert
-        // gekennzeichnet (KEIN Fake).
+        // Release signing: prefer a real keystore from the CI secrets.
+        // Without them we fall back to the debug key so the APK stays
+        // installable - the release body then states explicitly that it is
+        // debug-signed (no fake).
         create("release") {
-            val storePath = System.getenv("HYDRA_KEYSTORE")
-            if (storePath != null && file(storePath).exists()) {
-                storeFile = file(storePath)
+            if (keystoreUsable) {
+                storeFile = file(keystorePath!!)
                 storePassword = System.getenv("HYDRA_KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("HYDRA_KEY_ALIAS")
                 keyPassword = System.getenv("HYDRA_KEY_PASSWORD")
@@ -59,9 +64,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = if (System.getenv("HYDRA_KEYSTORE") != null &&
-                file(System.getenv("HYDRA_KEYSTORE")!!).exists()
-            ) {
+            signingConfig = if (keystoreUsable) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")
