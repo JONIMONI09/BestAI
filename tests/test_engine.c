@@ -520,10 +520,10 @@ static void test_engine_rejects_offset_in_header(void)
     unlink(path);
 }
 
-/* BUG (Server-Symlink-Audit): ein Symlink im Modellpfad zeigte auf eine
- * Datei ausserhalb des vorgesehenen Verzeichnisses; die Engine oeffnete
- * sie und die Fehlermeldung verriet sogar deren Groesse. O_NOFOLLOW muss
- * das abweisen — auch fuer Aufrufer ausserhalb der Web-Console (JNI). */
+/* BUG (server symlink audit): a symlink in the model path pointed at a
+ * file outside the intended directory; the engine opened it and the
+ * error message even revealed its size. O_NOFOLLOW must reject that —
+ * also for callers outside the web console (JNI). */
 static void test_engine_rejects_symlink(void)
 {
     char real[64], link[64];
@@ -614,6 +614,6 @@ int main(void)
     test_engine_rejects_symlink();
     test_axiom();
 
-    printf("\n=== %d Tests, %d Fehler ===\n", tests_run, tests_failed);
+    printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;
 }

@@ -28,18 +28,18 @@
   arm64-v7a/arm64-v8a/x86_64 via CMake+JNI; verified end-to-end on an
   API-24 x86_64 emulator (no KVM). 7 errors hit and fixed — full log in
   `errors.md`, guide in `docs/ANDROID_SKILL.md`.
-- ✅ **2026-10-01 — CI lint stage (PR #7, OPEN, not merged by request):**
-  Dual-compiler syntax gates (gcc+clang), cppcheck, Python format gate,
+- ✅ **2026-10-01 — CI lint stage (PR #7, merged):** Dual-compiler
+  syntax gates (gcc+clang), cppcheck, Python format gate,
   error-artifact upload. cppcheck caught a real `%u`/signed issue on
   first run.
 
-- ✅ **2026-10-02 — Bugfix audit (PR #11, offen):** NEON-Vorzeicheninversion
-  (PoC: x86 `211,388,...` vs. ARM `211,28,...`) und Layer-Overflow (UB)
-  gefixt, dazu 12 weitere Befunde; `test_neon_matches_scalar` vergleicht
-  NEON und Skalar **im selben Build** und fand sofort einen zweiten,
-  latenten Lane-Offset-Bug. 49 Tests x86 / 51 ARM.
-- ✅ **2026-10-02 — Web-Console, Skills, Android-APK:** siehe
-  "Done (earlier today)" und `docs/ANDROID_SKILL.md`.
+- ✅ **2026-10-02 — Bugfix audit (PR #11, merged by user):** NEON sign
+  inversion (PoC: x86 `211,388,...` vs. ARM `211,28,...`) and layer
+  overflow (UB) fixed, plus 12 further findings; `test_neon_matches_scalar`
+  compares NEON and scalar **in the same build** and immediately found a
+  second, latent lane-offset bug. 49 tests x86 / 51 ARM.
+- ✅ **2026-10-02 — Web console, skills, Android APK:** see
+  "Done (earlier today)" and `docs/ANDROID_SKILL.md`.
 
 ## Done (earlier today)
 
@@ -47,123 +47,147 @@
 - ✅ Frontmatter v1 added (PR branch), then hardening (ASCII + quoted,
   **PR #9, merged by user at 15:46:21Z**) — main now serves valid
   skills; user invoked `/android-ndk-build` successfully → skills work
-- ✅ PR #7 (CI lint) — merged by user as part of #8 line? **No: PR #7
-  is still OPEN** (separate lint PR), awaiting approval
+- ✅ Skill optimization after a verified end-to-end run (PR #10, merged
+  by user)
+- ✅ All PRs from that line are now closed: #7–#14 merged
 
 ## Current task
 
-**Security/lint hardening + GitHub Release with an installable APK**,
-following the CVE cross-check and linter audit from the previous pass.
+**Translate every remaining German `.md` file into English** so the whole
+documentation base is in one language.
 
 ## Plan
 
-- [x] Web-Verifikation aller CVE-IDs aus dem Audit:
-      CVE-2025-2439 und CVE-2025-2445 (Cortex.cpp, bestaetigt ueber
+- [x] Web verification of all CVE IDs from the audit:
+      CVE-2025-2439 and CVE-2025-2445 (Cortex.cpp, confirmed via
       Tenable/Snyk), CVE-2025-53630 (`gguf_init_from_file_impl`,
-      NVD), CVE-2026-27940 (gleiche Funktion, spaetere Korrektur),
+      NVD), CVE-2026-27940 (same function, later fix),
       CVE-2026-33298 (`ggml_nbytes`, CVE.org/Red Hat),
-      CVE-2026-70638 (llama.cpp Android-JNI `new_1batch`, Builds
-      b1886–b7445, NVD) — **alle IDs und Zuordnungen korrekt**
-- [x] Web-Recherche zu den besten Linter 2026 (C / Android / JS)
-- [x] Jedes Werkzeug lokal installiert und **mit Negativkontrolle**
-      geprueft (Fix temporaer zurueckbauen, Gate muss fehlschlagen):
-      - `gcc -fanalyzer`, `clang --analyze`, cppcheck → kein Befund
-      - clang-tidy → 3 echte `bugprone-easily-swappable-parameters`,
-        nach NOLINT mit Begruendung 0
-      - flawfinder `-m 2` → 29 Fehlalarme, `-m 4` → 0
+      CVE-2026-70638 (llama.cpp Android JNI `new_1batch`, builds
+      b1886–b7445, NVD) — **all IDs and assignments correct**
+- [x] Web research on the best linters of 2026 (C / Android / JS)
+- [x] Every tool installed locally and **verified with a negative
+      control** (revert the fix temporarily, the gate must fail):
+      - `gcc -fanalyzer`, `clang --analyze`, cppcheck → no findings
+      - clang-tidy → 3 real `bugprone-easily-swappable-parameters`,
+        0 after NOLINT with a justification
+      - flawfinder `-m 2` → 29 false positives, `-m 4` → 0
       - **ASan+UBSan → `signed integer overflow: 2147483640 + 127`**
-        auf dem ungefixten Code, 0 auf dem gefixten
-      - Android Lint → 5 Warnings, nach Fix „No issues found"
-      - ESLint 10 → 7 Fehler, nach Fix 0
-- [x] **Neue Befunde aus dem Audit reproduziert und gefixt:**
-      - Symlink im Modellpfad umging `safeModelPath()`
-        (verifiziert: Fehler verriet `/etc/hostname`-Groesse)
-      - Server gab interne Engine-Details an den Client
-      - 6 globale Funktionen im Frontend (`no-implicit-globals`)
-- [x] Härtungen: `O_NOFOLLOW` im Loader + `realpath`/`lstat` im Server,
-      generische 500-Antworten, IIFE im Frontend
-- [x] Regressionstests: `test_engine_rejects_symlink()` (schlägt ohne
-      `O_NOFOLLOW` fehl — Negativkontrolle ausgeführt)
-- [x] Android: Vektor-Icon (adaptiv + Fallback + monochrome), alle
-      UI-Texte als Ressourcen, `plurals`, Backup-Regeln, kein
-      Orientierungs-Lock → **Android Lint: keine Befunde**
-- [x] Release: signierte `assembleRelease`-Konfiguration mit
-      Keystore-Secret **und** Debug-Fallback; Version aus Git-Tag
-- [x] `.github/workflows/lint.yml`: 7 Jobs (c-lint, sanitizers, jni-lint,
-      web-lint, android-lint, semgrep, codeql)
-- [x] `.github/workflows/release.yml`: 5 Jobs, parallele Linux-/macOS-/
-      Android-Builds, Paritäts-Gate, APK-Verifikation, SHA256SUMS
-- [x] Release-Kette lokal komplett nachgespielt (Binaries + APK +
-      Checksummen)
-- [x] **Release-APK auf dem Emulator installiert und ausgeführt**:
-      `adb install` → Success, Token-Sequenz
-      `211,36,185,410,7,40,197,478` — identisch zu Host und ARM/NEON
-- [x] `errors.md`: 5 neue Einträge; `rules.md`: R25–R30 (Linter-
-      Falsifizierbarkeit, Web-Verifikation, Fehler-Leak, Symlink-Pfade)
-- [x] README: Release-/APK-Abschnitt, Linter-Tabelle, Projektstruktur
-- [x] Commit (kein Checkout) + PR — **kein Merge**
-- [x] PR #12 und #11 vom User **gemergt** (main: `cfdb34f`) — alle
-      offenen PRs sind damit geschlossen
+        on the unfixed code, 0 on the fixed code
+      - Android Lint → 5 warnings, "No issues found" after the fix
+      - ESLint 10 → 7 errors, 0 after the fix
+- [x] **New findings from the audit reproduced and fixed:**
+      - A symlink in the model path bypassed `safeModelPath()`
+        (verified: the error revealed the size of `/etc/hostname`)
+      - The server leaked internal engine details to the client
+      - 6 global functions in the frontend (`no-implicit-globals`)
+- [x] Hardening: `O_NOFOLLOW` in the loader + `realpath`/`lstat` in the
+      server, generic 500 responses, IIFE in the frontend
+- [x] Regression test: `test_engine_rejects_symlink()` (fails without
+      `O_NOFOLLOW` — negative control executed)
+- [x] Android: vector icon (adaptive + fallback + monochrome), all UI
+      strings as resources, `plurals`, backup rules, no orientation
+      lock → **Android Lint: no findings**
+- [x] Release: signed `assembleRelease` configuration with keystore
+      secret **and** debug fallback; version derived from the Git tag
+- [x] `.github/workflows/lint.yml`: 8 jobs (c-lint, sanitizers, jni-lint,
+      web-lint, release-config, android-lint, semgrep, codeql)
+- [x] `.github/workflows/release.yml`: 5 jobs, parallel Linux/macOS/
+      Android builds, parity gate, APK verification, SHA256SUMS
+- [x] Release chain replayed locally end to end (binaries + APK +
+      checksums)
+- [x] **Release APK installed and executed on the emulator**:
+      `adb install` → Success, token sequence
+      `211,36,185,410,7,40,197,478` — identical to host and ARM/NEON
+- [x] `errors.md`: new entries; `rules.md`: R25–R30 (linter
+      falsifiability, web verification, error leaks, symlink paths)
+- [x] README: release/APK section, linter table, project structure
+- [x] Commit (no checkout) + PR — **no merge**
+- [x] PR #12 and #11 merged by the user (main: `cfdb34f`)
 
-## Runde 2026-10-02 (CI-Fix-Runde nach Merge)
+## Round 2026-10-02 (CI fix round after the merge)
 
-- [x] Status geklaert: `main` ist gruen bis auf `Android lint`
-      (13/14 Jobs gruen) — Ursache ist **nicht** der Code
-- [x] Fehlerursache im Log verifiziert: `android-actions/setup-android@v3`
-      ruft `sdkmanager tools` auf; das Paket existiert nicht mehr
+- [x] Status clarified: `main` was green except for `Android lint`
+      (13 of 14 jobs green) — the cause is **not** the code
+- [x] Root cause verified in the log: `android-actions/setup-android@v3`
+      runs `sdkmanager tools`; that package no longer exists
       (`Warning: Failed to find package 'tools'` → exit 1)
-- [x] Fix: cmdline-tools explizit herunterladen/entpacken + PATH,
-      Lizenz-Akzeptanz explizit, in **lint.yml und release.yml**
-- [x] Neuer Branch `fix/android-lint-cmdline-tools` direkt auf
-      `origin/main` gebaut (Plumbing, **kein `git checkout`** — R17/R20),
-      PR eroeffnet, **kein Merge** (R14)
-- [x] **PR #13: 13/13 Checks gruen.** Der erste Lauf zeigte noch
-      `OldTargetApi` — Ursache war das vorgebaute Runner-SDK
-      (platforms 35/36), lokal ist nur 34 installiert. Fix: eigenes
-      SDK-Root mit ausschliesslich gepinnten Paketen
-- [x] Nebenbefund dabei korrigiert: `release.yml` nutzte die
-      build-tools ueber das hart kodierte `/opt/android-sdk`, das auf dem
-      GitHub-Runner nicht existiert — jetzt ueber `ANDROID_HOME`
-- [x] **PR #13 vom User freigegeben und gemergt** (Merge-Commit auf
-      `main`, head `2fd2223`)
-- [x] **Verifikation auf `main`** (Push-Commit `60a01f6`):
-      Workflow `Lint & Security` 8/8 gruen (Android lint 2m17s,
-      `No issues found.`, NDK-C-Kompilierung erfolgreich),
-      Workflow `CI` 4/4 gruen — beide Runs `conclusion: success`
+- [x] Fix: download/unpack the cmdline-tools explicitly + PATH +
+      explicit license acceptance, in **lint.yml and release.yml**
+- [x] New branch `fix/android-lint-cmdline-tools` built directly on
+      `origin/main` (plumbing, **no `git checkout`** — R17/R20),
+      PR opened, **not merged** (R14)
+- [x] **PR #13: 13 of 13 checks green.** The first run still reported
+      `OldTargetApi` — caused by the runner's prebuilt SDK
+      (platforms 35/36) while only 34 is installed locally. Fix: an own
+      SDK root containing nothing but the pinned packages
+- [x] Incidental fix: `release.yml` addressed the build-tools through
+      the hardcoded `/opt/android-sdk`, which does not exist on the
+      GitHub runner — now derived from `ANDROID_HOME`
+- [x] **PR #13 approved and merged by the user** (head `2fd2223`)
+- [x] **Verified on `main`** (push commit `60a01f6`): workflow
+      `Lint & Security` 8/8 green (Android lint 2m17s,
+      `No issues found.`, NDK C compilation successful), workflow
+      `CI` 4/4 green — both runs `conclusion: success`
 
-## Runde 2026-10-02 (Release-Workflow manuell ausloesbar machen)
+## Round 2026-10-02 (making the release workflow manually triggerable)
 
-- [x] Befund: `workflow_dispatch` existierte, war aber nur mit
-      Pflicht-Tag-Eingabe benutzbar; ohne Eingabe ergaben sich
-      `version=main`, `versionCode=0` — ein Release mit Versionsnamen
-      "main" waere die Folge gewesen
-- [x] `tag` optional, `publish`-Boolean (Default `false`), Dry-Run mit
-      synthetischem Tag `v0.0.0-ci.<run_number>`, `publish`-Job per
-      `if`-Bedingung abgesichert; Tag-Push-Trigger unveraendert
-- [x] Tag-Validierung `vMAJOR.MINOR.PATCH`, `versionCode >= 1`,
-      Eingaben ueber `env:` statt Interpolation (kein Shell-Injection)
-- [x] `tools/ci_release_version_test.sh`: 5 Faelle (Tag-Push, Publish,
-      Dry-Run, Unsinn-Tag, publish ohne Tag) — **Negativkontrolle
-      ausgefuehrt**, Test schlaegt bei kaputter Datei fehl (exit 1)
-- [x] Neuer Job `release-config` in `lint.yml`: YAML-Validierung aller
-      Workflows + Versionslogik-Test — auf PR #14 **gruen** (14/14 Checks)
-- [x] PR #14 eroeffnet; End-to-End-Dispatch versucht, aber von der
-      Umgebung blockiert: `gh workflow run` → **HTTP 403**, die
-      verwaltete GitHub-App darf kein `workflow_dispatch`-Event erzeugen.
-      Der manuelle Weg (Actions-Tab → Run workflow) nutzt die
-      User-Berechtigung und ist der einzige verbleibende Test-Schritt
-- [ ] Merge des PRs — **Freigabe des Users noetig** (R14)
+- [x] Finding: `workflow_dispatch` existed but was only usable with a
+      mandatory tag input; without input it produced
+      `version=main`, `versionCode=0` — a release named "main" would
+      have been published
+- [x] `tag` optional, `publish` boolean (default `false`), dry run with
+      the synthetic tag `v0.0.0-ci.<run_number>`, `publish` job gated
+      via an `if` condition; tag-push trigger unchanged
+- [x] Tag validation `vMAJOR.MINOR.PATCH`, `versionCode >= 1`, inputs
+      passed via `env:` instead of interpolation (no shell injection)
+- [x] `tools/ci_release_version_test.sh`: 5 cases (tag push, publish,
+      dry run, invalid tag, publish without tag) — **negative control
+      executed**, the test fails (exit 1) on a broken file
+- [x] New job `release-config` in `lint.yml`: YAML validation of all
+      workflows + version-logic test — **green** on PR #14 (14 of 14
+      checks)
+- [x] PR #14 opened; end-to-end dispatch attempted but blocked by the
+      environment: `gh workflow run` → **HTTP 403**, the managed GitHub
+      app may not create a `workflow_dispatch` event. The manual route
+      (Actions tab → Run workflow) uses the user's permissions and is
+      the only remaining test step
+- [x] **PR #14 merged by the user** (merge commit `b8a4d97`)
+- [x] **Verified on `main`** (push commit `b8a4d97`): workflow `CI`
+      4/4 green, workflow `Lint & Security` 9/9 green including the new
+      `Release config` job and `Android lint` — both runs
+      `conclusion: success`
+
+## Round 2026-10-02 (documentation language)
+
+- [x] Audit of every tracked `.md` file for German content:
+      `rules.md`, `README.md`, `docs/*.md`, `android/README.md` and the
+      skill files were already English (only a few occurrences of the
+      German word for "failures" in `engine-ci-verify/SKILL.md`
+      remained)
+- [x] `session.md` and `errors.md` translated to English, preserving
+      every entry, cause, fix and verification result
+- [x] Test output string aligned with the documentation: the C test
+      suite prints `Tests, failures` in English, and the regression
+      test expectation in the skill file matches
+- [x] Verification: `make test` → `=== 49 Tests, 0 failures ===`; final
+      grep over all tracked `.md` files finds no German left
+- [ ] Final grep for German leftovers in `.md` files
+- [ ] Commit + PR — **no merge**
 
 ## Status / Notes
 
-- Der wichtigste Erkenntnis dieser Runde: **UBSan ist das einzige Gate,
-  das die echte Arithmetic-UB meldet.** Alle statischen Analyseren waren
-  blind dafür. Deshalb ist der Sanitizer-Job Pflicht und nicht optional.
-- `flawfinder` bleibt auf Schwelle 4 — auf Schwelle 2 meldet es jeden
-  `fopen`/`mkstemp` und jedes char-Array, also nur Rauschen.
-- CVE-2026-70638 (llama.cpp JNI-Multiplikations-Overflow) ist die
-  Fehlerklasse, nach der `hydra_jni.c` durchsucht wurde: die JNI-Brücke
- _allokiert_ nichts aus Headerfeldern, sondern clamped nur, deshalb
-  nicht anwendbar.
-- Offene PRs (#7 CI-Lint, #10 Skill-Optimierung, #11 Bugfix-Audit)
-  warten weiterhin auf die Merge-Freigabe des Users.
+- The most important insight of that round: **UBSan is the only gate
+  that reports real arithmetic UB.** Every static analyzer was blind to
+  it. That is why the sanitizer job is mandatory, not optional.
+- `flawfinder` stays at level 4 — at level 2 it flags every
+  `fopen`/`mkstemp` and every char array, which is only noise.
+- CVE-2026-70638 (llama.cpp JNI multiplication overflow) was the bug
+  class `hydra_jni.c` was searched for: the JNI bridge does not
+  _allocate_ anything from header fields, it only clamps, so the class
+  does not apply.
+- Open PRs: none. #7–#14 are all merged.
+- Remaining manual step: one *Run workflow* execution from the Actions
+  tab on `main` (empty tag = dry run) exercises the release chain
+  end to end. The automated credential cannot dispatch workflows
+  (HTTP 403, no `actions: write`).

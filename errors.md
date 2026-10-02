@@ -6,104 +6,103 @@
 
 ---
 
-## 2026-10-02 — Linter-Audit: Werkzeug auswaehlen heisst Falsifizierbarkeit pruefen
+## 2026-10-02 — Linter audit: choosing a tool means proving it can fail
 
-- **Symptom:** Die Anfrage lautete "die besten Linter 2026". Ohne
-  Gegentest laeuft man Gefahr, ein Werkzeug aufzunehmen, das nichts findet
-  oder nur Rauschen produziert — und es dann als Absicherung zu behaupten.
-- **Vorgehen:** jedes Werkzeug zuerst lokal installiert, laufen gelassen
-  und mit einer **Negativkontrolle** geprueft (bekannten Fix
-  temporaerreueckbauen). Ergebnis:
-  | Werkzeug | Negativkontrolle | Befund am echten Code |
+- **Symptom:** the request was "the best linters of 2026". Without a
+  counter-test you risk adopting a tool that finds nothing or only
+  produces noise — and then claiming it as a safeguard.
+- **Approach:** every tool was installed locally, run, and verified
+  with a **negative control** (temporarily revert a known fix):
+  | Tool | Negative control | Finding on the real code |
   |---|---|---|
-  | `gcc -fanalyzer` | sauber | 0 Befunde |
-  | `clang --analyze` | sauber | 0 Befunde |
-  | clang-tidy `bugprone`/`cert`/`concurrency` | 3 echte Treffer | nach Fix: 0 |
-  | cppcheck | sauber | 0 (fand `%u`/signed in einer frueheren Session) |
-  | flawfinder `-m 2` | 29 Treffer, alle `fopen`/`mkstemp`/char-Array | Fehlalarme; `-m 4` ergibt 0 |
-  | **ASan + UBSan** | **`signed integer overflow: 2147483640 + 127`** in `hydra_engine_step` | 0 Befunde |
-  | Android Lint | 5 Warnings | nach Fix: „No issues found" |
-  | ESLint 10 | 7 Fehler | nach Fix: 0 |
-- **Fix / Erkenntnis:** nur die Werkzeuge uebernommen, deren
-  Falsifizierbarkeit belegt ist. Sanitizer wurde zum wichtigsten Gate,
-  weil es als **einziges** die tatsaechliche Arithmetic-UB meldet statt
-  sie nur strukturell zu vermuten. clang-tidy wurde auf eine kuratierte
-  Checkliste reduziert (Style-Checks erzeugen nur Rauschen,
-  `cert-err33-c` feuert auf jeden `printf`-Return).
-- **Praeventiv:** Regel R27 — jedes neue Lint-Gate muss einmal an einem
-  zurueckgebauten Fix scheitern, bevor es als wirksam gilt. Sonst ist es
-  Dekoration, KEIN Fake in der anderen Richtung.
+  | `gcc -fanalyzer` | clean | 0 findings |
+  | `clang --analyze` | clean | 0 findings |
+  | clang-tidy `bugprone`/`cert`/`concurrency` | 3 real hits | 0 after the fix |
+  | cppcheck | clean | 0 (found a `%u`/signed issue in an earlier session) |
+  | flawfinder `-m 2` | 29 hits, all `fopen`/`mkstemp`/char arrays | false positives; `-m 4` gives 0 |
+  | **ASan + UBSan** | **`signed integer overflow: 2147483640 + 127`** in `hydra_engine_step` | 0 findings |
+  | Android Lint | 5 warnings | "No issues found" after the fix |
+  | ESLint 10 | 7 errors | 0 after the fix |
+- **Fix / insight:** only tools whose falsifiability is demonstrated were
+  adopted. The sanitizers became the most important gate because they
+  are the **only** ones that report actual arithmetic UB instead of
+  merely suspecting it structurally. clang-tidy was reduced to a curated
+  check list (style checks produce only noise, `cert-err33-c` fires on
+  every `printf` return).
+- **Prevention:** rule R27 — every new lint gate must fail once against
+  a reverted fix before it counts as effective. Otherwise it is
+  decoration, i.e. the opposite of a fake.
 
-## 2026-10-02 — Symlink im Modellpfad umging die Pfadpruefung des Web-Servers
+## 2026-10-02 — A symlink in the model path bypassed the web server's path check
 
-- **Symptom (verifiziert mit curl):** `models/evil.hydra` als Symlink auf
-  `/etc/hostname` passierte `safeModelPath()`; die Engine oeffnete die
-  Zieldatei und die HTTP-Antwort verriet deren Groesse:
-  `500 {"error":"Command failed: ... [Hydra] Datei zu klein fuer Header (9 Bytes)"}`.
-- **Cause:** `path.resolve()` ist rein *lexikalisch*. Es folgt Symlinks
-  nicht — der Prefix-Check gegen `ROOT` prueft also nur den Namen, nicht
-  das Ziel. Dazu:getrennte Ursache fuer die Detailausgabe: `server.js`
-  gab `e.message` ungefiltert an den Client.
-- **Fix:** `safeModelPath()` loest den Pfad zusaetzlich ueber
-  `fs.realpathSync()` auf, prueft das **Ergebnis** erneut gegen `ROOT` und
-  verlangt per `lstatSync().isFile()` eine regulaere Datei.
-  `src/hydra_engine.c` oeffnet zusaetzlich mit `O_NOFOLLOW` — die Schranke
-  gehoert in die Engine, weil die API auch aus JNI heraus erreichbar ist.
-  Fehlerantworten geben nur noch `{"error":"internal error"}` aus, Details
-  gehen ins Server-Log.
-- **Verifikation:** Symlink nach draussen -> 400; Symlink innerhalb von
-  `ROOT` -> 200; echte Datei -> 200. Regressionstest
-  `test_engine_rejects_symlink()` schlaegt ohne `O_NOFOLLOW` fehl
-  (Negativkontrolle ausgefuehrt).
-- **Praeventiv:** Pfadpruefung gegen ein Verzeichnis muss *das aufgeloeste
-  Ziel* pruefen, nicht den eingegebenen Namen (CWE-59, Symlink-Following).
+- **Symptom (verified with curl):** `models/evil.hydra` as a symlink to
+  `/etc/hostname` passed `safeModelPath()`; the engine opened the target
+  file and the HTTP response revealed its size:
+  `500 {"error":"Command failed: ... [Hydra] file too small for header (9 bytes)"}`.
+- **Cause:** `path.resolve()` is purely *lexical*. It does not follow
+  symlinks — the prefix check against `ROOT` therefore only inspects the
+  name, not the target. Second, separate cause for the detailed output:
+  `server.js` passed `e.message` to the client unfiltered.
+- **Fix:** `safeModelPath()` additionally resolves the path via
+  `fs.realpathSync()`, checks the **result** against `ROOT` again and
+  requires a regular file via `lstatSync().isFile()`. `src/hydra_engine.c`
+  additionally opens with `O_NOFOLLOW` — that barrier belongs in the
+  engine, because the API is also reachable from JNI. Error responses
+  now emit only `{"error":"internal error"}`; details go to the server
+  log.
+- **Verification:** symlink pointing outside → 400; symlink inside
+  `ROOT` → 200; real file → 200. Regression test
+  `test_engine_rejects_symlink()` fails without `O_NOFOLLOW` (negative
+  control executed).
+- **Prevention:** a path check against a directory must check *the
+  resolved target*, not the supplied name (CWE-59, symlink following).
 
-## 2026-10-02 — Server verriet interne Engine-Details an den Client
+## 2026-10-02 — Server leaked internal engine details to the client
 
-- **Symptom (verifiziert):** `/api/model` auf ein defektes Modell lieferte
-  `500 {"error":"Command failed: /pfad/hydra-run /pfad/modell.hydra 0 1 --json\n[Hydra] ..."}` —
-  Serverpfade, Engine-Argumente und interne Meldungen im Antwort-Body.
-- **Cause:** der generische `catch` gab `e.message` direkt weiter.
-- **Fix:** `console.error` ins Server-Log, Antwort ist ein generisches
-  `internal error`; `execFile`-Fehler tragen Engine-stderr in
-  `e.detail` statt in die Antwort.
-- **Praeventiv:** interne Fehlerdetails gehoeren ins Log, nicht in die
-  Antwort. Jede 5xx-Antwort als Informationsleck-Potential pruefen.
+- **Symptom (verified):** `/api/model` on a broken model returned
+  `500 {"error":"Command failed: /path/hydra-run /path/model.hydra 0 1 --json\n[Hydra] ..."}` —
+  server paths, engine arguments and internal messages in the response
+  body.
+- **Cause:** the generic `catch` passed `e.message` straight through.
+- **Fix:** `console.error` to the server log, the response is a generic
+  `internal error`; `execFile` errors carry the engine stderr in
+  `e.detail` instead of in the response.
+- **Prevention:** internal error details belong in the log, not in the
+  response. Review every 5xx response as a potential information leak.
 
-## 2026-10-02 — Android Lint fand 5 echte Qualitaetsmaengel
+## 2026-10-02 — Android Lint found 5 real quality defects
 
-- **Symptom:** `gradle lintDebug` meldete 0 Errors, aber 5 Warnings.
-- **Befunde:** kein App-Icon (`MissingApplicationIcon`), vier
-  `SetTextI18n` (hart kodierte UI-Texte in Kotlin). Nach dem Icon-Fix
-  kamen weitere hinzu: `LockedOrientationActivity`/`DiscouragedApi`
-  (erzwungene Portrait-Orientierung), `PluralsCandidate`,
+- **Symptom:** `gradle lintDebug` reported 0 errors but 5 warnings.
+- **Findings:** no app icon (`MissingApplicationIcon`), four
+  `SetTextI18n` (hardcoded UI strings in Kotlin). After the icon fix
+  more appeared: `LockedOrientationActivity`/`DiscouragedApi`
+  (forced portrait orientation), `PluralsCandidate`,
   `TypographyEllipsis`, `DataExtractionRules`, `MonochromeLauncherIcon`.
-- **Fix:** Icon als Vektor (adaptiv ab API 26, Fallback-Shape ab API 24,
-  monochrome-Layer fuer Android 13+), alle UI-Texte nach
-  `res/values/strings.xml`, `plurals` fuer Byte-/Iterationszaehle,
-  Orientierungssperre entfernt (die UI ist vertical aufgebaut und
-  funktioniert in beiden Richtungen), `data_extraction_rules.xml` +
-  `backup_rules.xml` schalten Cloud-Backup explizit ab, Ellipsis-Zeichen.
-- **Ergebnis:** Android Lint meldet **„No issues found"**, und das Gate
-  in der CI schlaegt bei jeder Regression fehl (grep auf
-  `errors?, [1-9][0-9]* warnings?`).
-- **Praeventiv:** Lint-Warnungen sind kein Rauschen, wenn sie echte
-  Fehlendeinrichtung melden (kein Icon = App sieht im Launcher defekt aus).
+- **Fix:** icon as vector (adaptive from API 26, fallback shape from
+  API 24, monochrome layer for Android 13+), all UI strings moved to
+  `res/values/strings.xml`, `plurals` for byte/iteration counts,
+  orientation lock removed (the UI is laid out vertically and works in
+  both orientations), `data_extraction_rules.xml` + `backup_rules.xml`
+  disable cloud backup explicitly, ellipsis characters.
+- **Result:** Android Lint reports **"No issues found"**, and the CI gate
+  fails on every regression (grep for `errors?, [1-9][0-9]* warnings?`).
+- **Prevention:** lint warnings are not noise when they report a real
+  omission (no icon = the app looks broken in the launcher).
 
-## 2026-10-02 — ESLint fand sechs leaks in den globalen Scope
+## 2026-10-02 — ESLint found six leaks into the global scope
 
-- **Symptom:** `public/app.js` deklarierte sechs Funktionen und `$()` auf
-  globaler Ebene (`no-implicit-globals`) — Kollisionsrisiko mit jedem
-  anderen Skript auf der Seite.
-- **Cause:** kein Modul-Wrapper; klassisches Skript-Frontend.
-- **Fix:** gesamte Logik in eine IIFE gehüllt. Zusätzlich `catch (e)` in
-  `server.js` zu optionalem Catch-Binding umgestellt (ESLint
+- **Symptom:** `public/app.js` declared six functions and `$()` at
+  global level (`no-implicit-globals`) — collision risk with any other
+  script on the page.
+- **Cause:** no module wrapper; classic script frontend.
+- **Fix:** the whole logic wrapped in an IIFE. Additionally `catch (e)`
+  in `server.js` changed to an optional catch binding (ESLint
   `no-unused-vars`).
-- **Verifikation:** Wiring nach dem Wrapping mit einem minimalen DOM-Shim
-  geprueft (Handler `run`, `humanity`, `keydown` alle registriert);
-  Negativkontrolle mit eingefuegtem `eval`/`var`/`==` liess ESLint
-  korrekt fehlschlagen.
-- **Praeventiv:** Browser-Skripte ohne Modulsystem brauchen eine IIFE.
+- **Verification:** the wiring after wrapping was checked with a minimal
+  DOM shim (handlers `run`, `humanity`, `keydown` all registered); a
+  negative control with injected `eval`/`var`/`==` made ESLint fail
+  correctly.
+- **Prevention:** browser scripts without a module system need an IIFE.
 
 ---
 
@@ -132,7 +131,7 @@
 ## 2026-10-02 — NEON store offsets skipped lanes 8..15
 
 - **Symptom:** the new `test_neon_matches_scalar` failed on ARM:
-  *State-Vektor* mismatch while the token sequence matched. Observed
+  *state vector* mismatch while the token sequence matched. Observed
   under qemu: ARM state `0,-11,-33,-11,...` vs. expected `0,-11,0,0,-33,...`.
 - **Cause:** when the accumulator was widened to `int64_t`, the store
   offsets were scaled by 2 (`acc + 0/2/4/6`) even though each call now
@@ -498,112 +497,110 @@
 - **Prevention:** libraries never write to stdout; stdout is a data
   channel only.
 
-## 2026-10-02 — CI-Konfigurationsfehler (3 Gates rot trotz gruener Code-Qualitaet)
+## 2026-10-02 — CI configuration errors (three red gates despite green code quality)
 
-- **Symptom:** Nach dem ersten `lint.yml`-Lauf waren drei Jobs rot,
-  obwohl alle statischen Analysatoren lokal gruen waren. Das
-  deutete auf Konfigurations-, nicht auf Codefehler hin.
-  (a) `Android lint`: `android-actions/setup-android@v3` ruft
-      `sdkmanager tools` auf — das Paket wurde aus dem Repository
-      entfernt: `Warning: Failed to find package 'tools'` → exit 1.
-  (b) `Semgrep`: `semgrep ci --error` — die Option existiert nicht,
-      Semgrep beendet sich bei Findings bereits selbst mit 1.
-  (c) `CodeQL (javascript-typescript)`: `build-mode: autobuild`
-      wird fuer JS/TS abgelehnt; korrekt ist `build-mode: none`.
-- **Cause:** Drittanbieter-Actions und CLI-Flags wurden aus dem
-  Gedaechtnis geschrieben statt gegen die aktuelle Doku geprueft;
-  eine entfernte Aktion bleibt auch nach Updates auf einem
-  entfernten Paketnamen stehen.
-- **Fix:** (a) cmdline-tools explizit herunterladen/entpacken, PATH
-  und Lizenz-Akzeptanz explizit setzen — dieselbe Sequenz wie lokal
-  in `docs/ANDROID_SKILL.md` erprobt; (b) `--error` entfernt,
-  `--suppress-errors` ergaenzt; (c) `build-mode: none` fuer beide
-  Sprachen.
-- **Prevention:** Jede externe Action und jedes CLI-Flag vor dem
-  Commit gegen die offizielle Doku pruefen (R26). Workflow-Fehler
-  zusaetzlich lokal simulieren, bevor sie in den PR gehen.
+- **Symptom:** after the first `lint.yml` run three jobs were red even
+  though every static analyzer was green locally — a hint at
+  configuration rather than code errors.
+  (a) `Android lint`: `android-actions/setup-android@v3` runs
+      `sdkmanager tools` — the package was removed from the repository:
+      `Warning: Failed to find package 'tools'` → exit 1.
+  (b) `Semgrep`: `semgrep ci --error` — the option does not exist;
+      Semgrep already exits with 1 on findings by itself.
+  (c) `CodeQL (javascript-typescript)`: `build-mode: autobuild` is
+      rejected for JS/TS; the correct value is `build-mode: none`.
+- **Cause:** third-party actions and CLI flags were written from memory
+  instead of checked against the current docs; a deprecated action keeps
+  referencing a retired package name even after updates.
+- **Fix:** (a) download/unpack the cmdline-tools explicitly, set PATH
+  and license acceptance explicitly — the same sequence proven locally
+  in `docs/ANDROID_SKILL.md`; (b) removed `--error`, added
+  `--suppress-errors`; (c) `build-mode: none` for both languages.
+- **Prevention:** check every external action and every CLI flag against
+  the official docs before committing (R26). Additionally simulate
+  workflow steps locally before they go into the PR.
 
-## 2026-10-02 — "OldTargetApi" nur im CI, nicht lokal (Runner-SDK)
+## 2026-10-02 — "OldTargetApi" only in CI, not locally (runner SDK)
 
-- **Symptom:** Nach dem SDK-Fix lief `Android lint` durch, meldete aber
-  `0 errors, 1 warnings` mit
+- **Symptom:** after the SDK fix `Android lint` ran through but reported
+  `0 errors, 1 warnings` with
   `Warning: Not targeting the latest versions of Android [OldTargetApi]`
-  und das Gate (grep "No issues found") wurde rot.
-- **Cause:** Der gehostete Runner bringt ein vorgebautes SDK mit, das
-  zusaetzlich `platforms;android-35` und `android-36` enthaelt. Lint
-  beurteilt `OldTargetApi` gegen die *vorhandenen* Platforms. Lokal ist
-  ausschliesslich `android-34` installiert — dort meldet Lint
-  `No issues found`. Dieselbe Toolchain, zwei Ergebnisse: die Warnung
-  kam also aus der Runner-Umgebung, nicht aus dem Projekt.
-- **Fix:** Beide Workflows richten ein eigenes SDK-Root
-  (`$RUNNER_TEMP/android-sdk`) ein und installieren dort ausschliesslich
-  die gepinnten Pakete. Zusaetzlich haengt `release.yml` die
-  build-tools-Pfade an `ANDROID_HOME` statt an ein hart kodiertes
-  `/opt/android-sdk`, das auf dem Runner nicht existiert.
-- **Prevention:** Bei "nur im CI"-Befunden zuerst die Umgebung des
-  Runners gegen die lokale Toolchain stellen (Differenzanalyse), bevor
-  man Code oder Lint-Konfiguration aendert. Ein Gate darf nicht
-  kosmetisch aufgeweicht werden, um einen Umgebungsfehler zu verstecken.
+  and the gate (grep "No issues found") turned red.
+- **Cause:** the hosted runner ships a prebuilt SDK that additionally
+  contains `platforms;android-35` and `android-36`. Lint judges
+  `OldTargetApi` against the platforms that are *present*. Locally only
+  `android-34` is installed — there lint reports `No issues found`.
+  Same toolchain, two results: the warning therefore came from the
+  runner environment, not from the project.
+- **Fix:** both workflows set up their own SDK root
+  (`$RUNNER_TEMP/android-sdk`) and install nothing but the pinned
+  packages there. Additionally `release.yml` derives the build-tools
+  paths from `ANDROID_HOME` instead of a hardcoded
+  `/opt/android-sdk`, which does not exist on the runner.
+- **Prevention:** for "only in CI" findings, first compare the runner
+  environment against the local toolchain (differential analysis) before
+  changing code or lint configuration. A gate must never be cosmetically
+  weakened to hide an environment problem.
 
-## 2026-10-02 — Manuelles Release war unbrauchbar (Pflicht-Tag-Eingabe, stille Fehlversion)
+## 2026-10-02 — Manual release was unusable (mandatory tag input, silent wrong version)
 
-- **Symptom:** `release.yml` hatte zwar `workflow_dispatch`, aber mit
-  `required: true` fuer das Tag-Input. Ein manueller Lauf war damit nur
-  moeglich, wenn man von Hand ein existierendes Tag eintippt — also ohne
-  neuen Push nicht testbar. Ein Lauf ohne Eingabe (z. B. per API)
-  lieferte zudem `TAG=main`, `version=main`, `versionCode=0`: die
-  Arithmetik `$(( MAJ * 10000 ))` wertet ein unbekanntes Wort als 0 aus,
-  statt einen Fehler zu melden.
-- **Cause:** Das Input war als Pflichtfeld modelliert ("Existing tag to
-  publish a release for"), obwohl der eigentliche Zweck ein *testbarer*
-  Build ist. Zusaetzlich wurde das Tag-Format nie validiert und
-  `versionCode` nie gegen 0 geprueft.
-- **Fix:** `tag` ist optional, `publish` ist ein Boolean (Default
-  `false`). Ohne Tag laeuft ein Dry-Run mit synthetischem Tag
-  `v0.0.0-ci.<run_number>`, der `publish`-Job ist ueber
-  `if: needs.version.outputs.publish == 'true'` deaktiviert. Das Tag
-  wird gegen `vMAJOR.MINOR.PATCH` geprueft (Fehler statt Release mit
-  Versionsnamen "main"), `versionCode` ist mindestens 1, und alle
-  Eingaben kommen ueber `env:` statt per `${{ }}` im Skript (kein
-  Shell-Injection-Risiko). Der Tag-Push-Trigger bleibt unveraendert.
-- **Prevention:** Jeder Dispatch-Pfad braucht eine Negativkontrolle.
-  `tools/ci_release_version_test.sh` spielt die Versionslogik direkt aus
-  der YAML nach (Tag-Push, manueller Publish, Dry-Run, ungueltiges Tag)
-  und laeuft als Job `release-config` in `lint.yml`. Negativkontrolle
-  ausgefuehrt: mit entfernter `publish`-Ausgabe meldet der Test
-  FEHLGESCHLAGEN (exit 1) — das Gate kann also tatsaechlich rot werden.
+- **Symptom:** `release.yml` had a `workflow_dispatch`, but with
+  `required: true` for the tag input. A manual run was therefore only
+  possible after typing an existing tag by hand — i.e. not testable
+  without a new push. A run without input (e.g. via API) additionally
+  produced `TAG=main`, `version=main`, `versionCode=0`: the arithmetic
+  `$(( MAJ * 10000 ))` evaluates an unknown word as 0 instead of
+  reporting an error.
+- **Cause:** the input was modelled as a mandatory field ("Existing tag
+  to publish a release for") although the actual purpose is a
+  *testable* build. In addition the tag format was never validated and
+  `versionCode` was never checked against 0.
+- **Fix:** `tag` is optional, `publish` is a boolean (default
+  `false`). Without a tag a dry run runs under the synthetic tag
+  `v0.0.0-ci.<run_number>`, the `publish` job is disabled via
+  `if: needs.version.outputs.publish == 'true'`. The tag is validated
+  against `vMAJOR.MINOR.PATCH` (an error instead of a release named
+  "main"), `versionCode` is at least 1, and all inputs reach the script
+  via `env:` instead of `${{ }}` (no shell-injection risk). The tag-push
+  trigger remains unchanged.
+- **Prevention:** every dispatch path needs a negative control.
+  `tools/ci_release_version_test.sh` replays the version logic straight
+  from the YAML (tag push, manual publish, dry run, invalid tag) and runs
+  as job `release-config` in `lint.yml`. Negative control executed: with
+  the `publish` output removed the test reports FAILED (exit 1) — the
+  gate can therefore actually turn red.
 
-## 2026-10-02 — Workflow-Dispatch per API nicht moeglich (403, App-Rechte)
+## 2026-10-02 — Workflow dispatch via API impossible (403, app permissions)
 
-- **Symptom:** `gh workflow run release.yml --ref <branch>` antwortet mit
+- **Symptom:** `gh workflow run release.yml --ref <branch>` answered with
   `HTTP 403: Resource not accessible by integration`.
-- **Cause:** Die verwaltete GitHub-App-Credential darf Workflows ausloesen
-  lesen, aber kein `workflow_dispatch`-Event erzeugen — dafuer fehlt die
-  Actions-Schreibberechtigung der App. Das ist keine Eigenschaft des
-  Repositorys und laesst sich im Workflow nicht beheben.
-- **Fix:** Von Hand im Actions-Tab *Run workflow* starten — das nutzt die
-  Berechtigung des angemeldeten Users. Fuer den Fall, dass die App den
-  Dispatch kuenftig selbst testen soll, muss ihre Berechtigung auf
-  `Actions: write` erhoeht werden.
-- **Prevention:** CI-Artefakte, die eine App ohne Schreibrecht auf
-  Actions nicht erzeugen kann (Dispatch, Re-Run, Release-Publish),
-  getrennt verifizieren: Logik lokal, Trigger manuell, Publish-Pfad
-  ausschliesslich nach ausdruecklicher Freigabe.
+- **Cause:** the managed GitHub app credential may read workflows but
+  cannot create a `workflow_dispatch` event — the app lacks the Actions
+  write permission. This is not a property of the repository and cannot
+  be fixed inside the workflow.
+- **Fix:** start *Run workflow* manually in the Actions tab — that uses
+  the permissions of the logged-in user. If the app should be able to
+  test the dispatch itself in future, its permission has to be raised to
+  `Actions: write`.
+- **Prevention:** verify separately those CI artefacts that an app
+  without Actions write permission cannot produce (dispatch, re-run,
+  release publish): logic locally, trigger manually, publish path only
+  after explicit approval.
 
-## 2026-10-02 — Skills-UI meldet "Not loaded" trotz korrektem Frontmatter
+## 2026-10-02 — Skills UI reports "Not loaded" despite correct frontmatter
 
-- **Symptom:** Die Skills-UI zeigt alle drei Skills als *Not loaded*
-  mit `The frontmatter needs name: <skill-dir> (matching ...)`.
-- **Cause:** Die Meldung nennt je Skill den **erwarteten** Namen,
-  d. h. der Parser sieht die Dateien, lehnt sie aber ab. Byte-pruefung
-  auf Platte **und** auf `origin/main` ergab: kein BOM, kein CRLF,
-  keine Tabs, `name == Verzeichnisname`, `description` in
-  Anfuehrungszeichen und zu 100 % ASCII, genau zwei Schluessel.
-  Das Frontmatter ist damit formal korrekt — die Meldung ist ein
-  **Cache-/Anzeigezustand der UI**, kein Dateidefekt.
-- **Fix:** Kein Code-Fix noetig; die Skills sind auf `main` valide.
-  UI neu laden bzw. Workspace neu verbinden.
-- **Prevention:** Bei Frontmatter-Fehlern zuerst die Bytes pruefen
-  (BOM/CRLF/Tabs) und die erwartete Namensquelle mitlesen — die
-  Fehlermeldung nennt den Soll-Namen und verrät damit, ob Parser
-  oder Datei das Problem sind.
+- **Symptom:** the Skills UI shows all three skills as *Not loaded* with
+  `The frontmatter needs name: <skill-dir> (matching ...)`.
+- **Cause:** the message names the **expected** name per skill, i.e. the
+  parser sees the files but rejects them. A byte-level check on disk
+  **and** on `origin/main` showed: no BOM, no CRLF, no tabs,
+  `name == directory name`, `description` in quotation marks and 100 %
+  ASCII, exactly two keys. The frontmatter is therefore formally
+  correct — the message is a **cache/display state of the UI**, not a
+  file defect.
+- **Fix:** no code fix needed; the skills are valid on `main`. Reload
+  the UI or reconnect the workspace.
+- **Prevention:** for frontmatter errors, check the bytes first
+  (BOM/CRLF/tabs) and read the expected-name source — the error message
+  names the target and therefore reveals whether the parser or the file
+  is the problem.
