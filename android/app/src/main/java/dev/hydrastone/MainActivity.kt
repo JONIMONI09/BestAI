@@ -35,26 +35,27 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "Hydra-Stone — Android"
+            // String aus den Ressourcen, nicht hart kodiert (Android Lint SetTextI18n)
+            setText(R.string.app_title)
             textSize = 22f
         }
         root.addView(title)
 
         tokenInput = EditText(this).apply {
-            hint = "start token"
-            setText("42")
+            hint = getString(R.string.hint_start_token)
+            setText(R.string.default_start_token)
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
         root.addView(tokenInput)
 
         stepsInput = EditText(this).apply {
-            hint = "steps (1..256)"
-            setText("32")
+            hint = getString(R.string.hint_steps)
+            setText(R.string.default_steps)
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
         root.addView(stepsInput)
 
-        val run = Button(this).apply { text = "Run inference" }
+        val run = Button(this).apply { setText(R.string.action_run) }
         root.addView(run)
 
         output = TextView(this).apply {
@@ -80,15 +81,15 @@ class MainActivity : Activity() {
             }
         }
 
-        log("[Hydra] model: ${modelFile!!.absolutePath}")
-        log("[Hydra] size: ${modelFile!!.length()} bytes")
+        log(getString(R.string.log_model, modelFile!!.absolutePath))
+        log(resources.getQuantityString(R.plurals.log_size, modelFile!!.length().toInt(), modelFile!!.length()))
 
         run.setOnClickListener {
             val startToken = tokenInput.text.toString().toIntOrNull() ?: 42
             val steps = (stepsInput.text.toString().toIntOrNull() ?: 32)
                 .coerceIn(1, 256)
             lineCount.clear()
-            log("[Hydra] running: startToken=$startToken steps=$steps ...")
+            log(resources.getQuantityString(R.plurals.log_running, steps, startToken, steps))
             val t0 = SystemClock.elapsedRealtime()
             Thread {
                 try {
@@ -96,16 +97,16 @@ class MainActivity : Activity() {
                         modelFile!!.absolutePath, startToken, steps,
                         object : HydraBridge.Callback {
                             override fun onToken(step: Int, token: Int) {
-                                if (step < 8) log("[Hydra] token[$step] = $token")
+                                if (step < 8) log(getString(R.string.log_token, step, token))
                             }
                         }
                     )
                     val wall = SystemClock.elapsedRealtime() - t0
-                    log("[Hydra] result: $json")
-                    log("[Hydra] wall time: $wall ms")
-                    log("[Hydra] OK — C engine executed on Android.")
+                    log(getString(R.string.log_result, json))
+                    log(getString(R.string.log_wall, wall))
+                    log(getString(R.string.log_ok))
                 } catch (e: Throwable) {
-                    log("[Hydra] ERROR: ${e.message}")
+                    log(getString(R.string.log_error, e.message))
                 }
             }.start()
         }

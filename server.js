@@ -58,15 +58,35 @@ function readBody(req) {
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
-}
-
-/* Sicherheit: nur *.hydra-Dateien innerhalb von ROOT erlauben */
+}/* Sicherheit: nur *.hydra-Dateien innerhalb von ROOT erlauben.
+ *
+ * Wichtig: path.resolve() ist rein *lexikalisch* und folgt Symlinks nicht.
+ * Ein Symlink models/x.hydra -> /etc/hostname lag damit frueher in ROOT
+ * und wurde von der Engine geoeffnet (verifiziert: die Fehlermeldung
+ * verriet die Dateigroesse des Ziels). Deshalb wird der Pfad zusaetzlich
+ * ueber realpath aufgeloest und erneut gegen ROOT geprueft. */
 function safeModelPath(p) {
   if (typeof p !== 'string' || !p.endsWith('.hydra')) return null;
   const abs = path.resolve(ROOT, p);
   if (!abs.startsWith(ROOT + path.sep)) return null;
-  if (!fs.existsSync(abs)) return null;
-  return abs;
+
+  let real;
+  try {
+    real = fs.realpathSync(abs);
+  } catch {
+    return null;
+  }
+  /* Auch nach Aufloesung muss das Ziel echte Datei in ROOT sein — kein
+   * Symlink nach draussen, kein Directory, kein Device-Node. */
+  if (real !== ROOT && !real.startsWith(ROOT + path.sep)) return null;
+  let st;
+  try {
+    st = fs.lstatSync(real);
+  } catch {
+    return null;
+  }
+  if (!st.isFile()) return null;
+  return real;
 }
 
 function runInference(modelPath, token, steps) {
@@ -75,12 +95,17 @@ function runInference(modelPath, token, steps) {
       HYDRA_RUN,
       [modelPath, String(token), String(steps), '--json'],
       { timeout: 5000, maxBuffer: 1024 * 1024 },
-      (err, stdout) => {
-        if (err) return reject(err);
+      (err, stdout, stderr) => {
+        if (err) {
+          /* stderr landet im Server-Log, nicht in der HTTP-Antwort. */
+          const e = new Error('engine failed');
+          e.detail = stderr || String(err.message);
+          return reject(e);
+        }
         try {
           resolve(JSON.parse(stdout));
-        } catch (e) {
-          reject(new Error('engine output not JSON: ' + e.message));
+        } catch (parseErr) {
+          reject(new Error('engine output not JSON: ' + parseErr.message));
         }
       }
     );
@@ -93,13 +118,17 @@ function loadModelInfo(modelPath) {
       HYDRA_RUN,
       [modelPath, '0', '1', '--json'],
       { timeout: 5000, maxBuffer: 1024 * 1024 },
-      (err, stdout) => {
-        if (err) return reject(err);
+      (err, stdout, stderr) => {
+        if (err) {
+          const e = new Error('engine failed');
+          e.detail = stderr || String(err.message);
+          return reject(e);
+        }
         try {
           const j = JSON.parse(stdout);
           resolve({ dim: j.dim, vocab: j.vocab, layers: j.layers, path: modelPath });
-        } catch (e) {
-          reject(new Error('engine output not JSON: ' + e.message));
+        } catch (parseErr) {
+          reject(new Error('engine output not JSON: ' + parseErr.message));
         }
       }
     );
@@ -138,7 +167,7 @@ const server = http.createServer(async (req, res) => {
       let body;
       try {
         body = JSON.parse((await readBody(req)) || '{}');
-      } catch (e) {
+      } catch {
         return sendJSON(res, 400, { error: 'invalid JSON body' });
       }
       if (body === null || typeof body !== 'object' || Array.isArray(body)) {
@@ -186,7 +215,10 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, data, MIME[ext] || 'application/octet-stream');
     });
   } catch (e) {
-    sendJSON(res, 500, { error: e.message });
+    /* Interne Details (Pfade, Engine-stderr, Stacktexte) niemals an den
+     * Client geben — sie verraten Dateigroessen und Server-Struktur. */
+    console.error('[Hydra Console] request failed:', e && e.stack ? e.stack : e);
+    sendJSON(res, 500, { error: 'internal error' });
   }
 });
 

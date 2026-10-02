@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hydra-Stone</string>
+    <string name="app_title">Hydra-Stone — Android</string>
+    <string name="hint_start_token">start token</string>
+    <string name="hint_steps">steps (1..256)</string>
+    <string name="default_start_token">42</string>
+    <string name="default_steps">32</string>
+    <string name="action_run">Run inference</string>
+
+    <string name="log_model">[Hydra] model: %1$s</string>
+    <plurals name="log_size">
+        <item quantity="one">[Hydra] size: %1$d byte</item>
+        <item quantity="other">[Hydra] size: %1$d bytes</item>
+    </plurals>
+    <plurals name="log_running">
+        <item quantity="one">[Hydra] running with startToken=%1$d, %2$d iteration…</item>
+        <item quantity="other">[Hydra] running with startToken=%1$d, %2$d iterations…</item>
+    </plurals>
+    <string name="log_token">[Hydra] token[%1$d] = %2$d</string>
+    <string name="log_result">[Hydra] result: %1$s</string>
+    <string name="log_wall">[Hydra] wall time: %1$d ms</string>
+    <string name="log_ok">[Hydra] OK — C engine executed on Android.</string>
+    <string name="log_error">[Hydra] ERROR: %1$s</string>
+</resources>

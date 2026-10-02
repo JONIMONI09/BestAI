@@ -6,6 +6,107 @@
 
 ---
 
+## 2026-10-02 — Linter-Audit: Werkzeug auswaehlen heisst Falsifizierbarkeit pruefen
+
+- **Symptom:** Die Anfrage lautete "die besten Linter 2026". Ohne
+  Gegentest laeuft man Gefahr, ein Werkzeug aufzunehmen, das nichts findet
+  oder nur Rauschen produziert — und es dann als Absicherung zu behaupten.
+- **Vorgehen:** jedes Werkzeug zuerst lokal installiert, laufen gelassen
+  und mit einer **Negativkontrolle** geprueft (bekannten Fix
+  temporaerreueckbauen). Ergebnis:
+  | Werkzeug | Negativkontrolle | Befund am echten Code |
+  |---|---|---|
+  | `gcc -fanalyzer` | sauber | 0 Befunde |
+  | `clang --analyze` | sauber | 0 Befunde |
+  | clang-tidy `bugprone`/`cert`/`concurrency` | 3 echte Treffer | nach Fix: 0 |
+  | cppcheck | sauber | 0 (fand `%u`/signed in einer frueheren Session) |
+  | flawfinder `-m 2` | 29 Treffer, alle `fopen`/`mkstemp`/char-Array | Fehlalarme; `-m 4` ergibt 0 |
+  | **ASan + UBSan** | **`signed integer overflow: 2147483640 + 127`** in `hydra_engine_step` | 0 Befunde |
+  | Android Lint | 5 Warnings | nach Fix: „No issues found" |
+  | ESLint 10 | 7 Fehler | nach Fix: 0 |
+- **Fix / Erkenntnis:** nur die Werkzeuge uebernommen, deren
+  Falsifizierbarkeit belegt ist. Sanitizer wurde zum wichtigsten Gate,
+  weil es als **einziges** die tatsaechliche Arithmetic-UB meldet statt
+  sie nur strukturell zu vermuten. clang-tidy wurde auf eine kuratierte
+  Checkliste reduziert (Style-Checks erzeugen nur Rauschen,
+  `cert-err33-c` feuert auf jeden `printf`-Return).
+- **Praeventiv:** Regel R27 — jedes neue Lint-Gate muss einmal an einem
+  zurueckgebauten Fix scheitern, bevor es als wirksam gilt. Sonst ist es
+  Dekoration, KEIN Fake in der anderen Richtung.
+
+## 2026-10-02 — Symlink im Modellpfad umging die Pfadpruefung des Web-Servers
+
+- **Symptom (verifiziert mit curl):** `models/evil.hydra` als Symlink auf
+  `/etc/hostname` passierte `safeModelPath()`; die Engine oeffnete die
+  Zieldatei und die HTTP-Antwort verriet deren Groesse:
+  `500 {"error":"Command failed: ... [Hydra] Datei zu klein fuer Header (9 Bytes)"}`.
+- **Cause:** `path.resolve()` ist rein *lexikalisch*. Es folgt Symlinks
+  nicht — der Prefix-Check gegen `ROOT` prueft also nur den Namen, nicht
+  das Ziel. Dazu:getrennte Ursache fuer die Detailausgabe: `server.js`
+  gab `e.message` ungefiltert an den Client.
+- **Fix:** `safeModelPath()` loest den Pfad zusaetzlich ueber
+  `fs.realpathSync()` auf, prueft das **Ergebnis** erneut gegen `ROOT` und
+  verlangt per `lstatSync().isFile()` eine regulaere Datei.
+  `src/hydra_engine.c` oeffnet zusaetzlich mit `O_NOFOLLOW` — die Schranke
+  gehoert in die Engine, weil die API auch aus JNI heraus erreichbar ist.
+  Fehlerantworten geben nur noch `{"error":"internal error"}` aus, Details
+  gehen ins Server-Log.
+- **Verifikation:** Symlink nach draussen -> 400; Symlink innerhalb von
+  `ROOT` -> 200; echte Datei -> 200. Regressionstest
+  `test_engine_rejects_symlink()` schlaegt ohne `O_NOFOLLOW` fehl
+  (Negativkontrolle ausgefuehrt).
+- **Praeventiv:** Pfadpruefung gegen ein Verzeichnis muss *das aufgeloeste
+  Ziel* pruefen, nicht den eingegebenen Namen (CWE-59, Symlink-Following).
+
+## 2026-10-02 — Server verriet interne Engine-Details an den Client
+
+- **Symptom (verifiziert):** `/api/model` auf ein defektes Modell lieferte
+  `500 {"error":"Command failed: /pfad/hydra-run /pfad/modell.hydra 0 1 --json\n[Hydra] ..."}` —
+  Serverpfade, Engine-Argumente und interne Meldungen im Antwort-Body.
+- **Cause:** der generische `catch` gab `e.message` direkt weiter.
+- **Fix:** `console.error` ins Server-Log, Antwort ist ein generisches
+  `internal error`; `execFile`-Fehler tragen Engine-stderr in
+  `e.detail` statt in die Antwort.
+- **Praeventiv:** interne Fehlerdetails gehoeren ins Log, nicht in die
+  Antwort. Jede 5xx-Antwort als Informationsleck-Potential pruefen.
+
+## 2026-10-02 — Android Lint fand 5 echte Qualitaetsmaengel
+
+- **Symptom:** `gradle lintDebug` meldete 0 Errors, aber 5 Warnings.
+- **Befunde:** kein App-Icon (`MissingApplicationIcon`), vier
+  `SetTextI18n` (hart kodierte UI-Texte in Kotlin). Nach dem Icon-Fix
+  kamen weitere hinzu: `LockedOrientationActivity`/`DiscouragedApi`
+  (erzwungene Portrait-Orientierung), `PluralsCandidate`,
+  `TypographyEllipsis`, `DataExtractionRules`, `MonochromeLauncherIcon`.
+- **Fix:** Icon als Vektor (adaptiv ab API 26, Fallback-Shape ab API 24,
+  monochrome-Layer fuer Android 13+), alle UI-Texte nach
+  `res/values/strings.xml`, `plurals` fuer Byte-/Iterationszaehle,
+  Orientierungssperre entfernt (die UI ist vertical aufgebaut und
+  funktioniert in beiden Richtungen), `data_extraction_rules.xml` +
+  `backup_rules.xml` schalten Cloud-Backup explizit ab, Ellipsis-Zeichen.
+- **Ergebnis:** Android Lint meldet **„No issues found"**, und das Gate
+  in der CI schlaegt bei jeder Regression fehl (grep auf
+  `errors?, [1-9][0-9]* warnings?`).
+- **Praeventiv:** Lint-Warnungen sind kein Rauschen, wenn sie echte
+  Fehlendeinrichtung melden (kein Icon = App sieht im Launcher defekt aus).
+
+## 2026-10-02 — ESLint fand sechs leaks in den globalen Scope
+
+- **Symptom:** `public/app.js` deklarierte sechs Funktionen und `$()` auf
+  globaler Ebene (`no-implicit-globals`) — Kollisionsrisiko mit jedem
+  anderen Skript auf der Seite.
+- **Cause:** kein Modul-Wrapper; klassisches Skript-Frontend.
+- **Fix:** gesamte Logik in eine IIFE gehüllt. Zusätzlich `catch (e)` in
+  `server.js` zu optionalem Catch-Binding umgestellt (ESLint
+  `no-unused-vars`).
+- **Verifikation:** Wiring nach dem Wrapping mit einem minimalen DOM-Shim
+  geprueft (Handler `run`, `humanity`, `keydown` alle registriert);
+  Negativkontrolle mit eingefuegtem `eval`/`var`/`==` liess ESLint
+  korrekt fehlschlagen.
+- **Praeventiv:** Browser-Skripte ohne Modulsystem brauchen eine IIFE.
+
+---
+
 ## 2026-10-02 — NEON kernel inverted the sign of every ternary weight
 
 - **Symptom:** x86 and ARM produced *different* token sequences for the

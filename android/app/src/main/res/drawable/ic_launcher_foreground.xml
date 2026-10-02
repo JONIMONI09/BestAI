@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Hydra-Stone: three ternary bars (+1, -1, 0) on a dark plate -->
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M32,34 h8 v40 h-8 z" />
+    <path
+        android:fillColor="#F87171"
+        android:pathData="M50,44 h8 v30 h-8 z" />
+    <path
+        android:fillColor="#6B7A8A"
+        android:pathData="M68,39 h8 v35 h-8 z" />
+</vector>

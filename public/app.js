@@ -1,6 +1,11 @@
 /* Hydra-Stone Console — Frontend-Logik */
 'use strict';
 
+/* Alles in einer IIFE: vorher landeten sechs Funktionen und die
+ * Konstante $() im globalen Scope und kollidierten mit jedem anderen
+ * Skript auf der Seite (ESLint no-implicit-globals). */
+(function () {
+
 const $ = (id) => document.getElementById(id);
 const state = { running: false };
 
@@ -150,3 +155,4 @@ document.addEventListener('keydown', (e) => {
 
 loadModelInfo();
 updateAxiom();
+})();

@@ -1,0 +1,19 @@
+{
+  "name": "hydra-stone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hydra-Stone console server — zero runtime dependencies, ESLint is dev-only",
+  "license": "MIT",
+  "scripts": {
+    "lint": "eslint server.js public/app.js",
+    "lint:fix": "eslint --fix server.js public/app.js",
+    "ui": "node server.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
