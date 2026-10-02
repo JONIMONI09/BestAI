@@ -1,8 +1,8 @@
 # Von VibeWorks angelegt: kostenloser Repo-Check ohne KI – Geheimnisse (Gitleaks),
-# Sicherheitslücken (OSV-Scanner), Fehlermuster (Semgrep), je Sprache Bandit, ShellCheck,
+# Security vulnerabilities (OSV scanner), bug patterns (Semgrep), Bandit, ShellCheck,
 # Hadolint, actionlint und fallow (JS/TS) sowie offene Stellen (TODO/FIXME).
 # Das Ergebnis liegt als Artefakt „vibeworks-check“ bereit, VibeWorks holt es selbst ab.
-# Datei löschen = Check aus.
+# Deleting a file disables that check.
 name: VibeWorks Repo-Check
 
 on:
@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          # Die Prüf-Container sehen das Repository – aber nicht das Token in .git/config
+          # The check containers see the repository — but not the token in .git/config
           persist-credentials: false
 
       - name: Geheimnisse (Gitleaks)
@@ -38,7 +38,7 @@ jobs:
           zricethezav/gitleaks:latest detect --source /repo --no-banner --redact
           --report-format json --report-path /repo/.vw-gitleaks.json --exit-code 0
 
-      - name: Sicherheitslücken (OSV-Scanner)
+      - name: Security vulnerabilities (OSV scanner)
         continue-on-error: true
         run: >-
           docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:latest
@@ -52,7 +52,7 @@ jobs:
 
       - name: Offene Stellen (TODO/FIXME)
         continue-on-error: true
-        # Nur Kommentare (// # /* * -- <!--) – nicht jedes Wort „TODO“ im Code
+        # Only comments (// # /* * -- <!--) — not every word "TODO" in the code
         run: |
           git grep -n -I -E '(//|#|/\*|\*|--|<!--)[[:space:]]*(TODO|FIXME|HACK|XXX)\b' -- ':!*.lock' ':!package-lock.json' ':!.github/workflows/vibeworks-check.yml' > .vw-todos.txt || true
 
@@ -75,7 +75,7 @@ jobs:
           if git ls-files '.github/workflows/*.yml' '.github/workflows/*.yaml' | grep -q .; then
             docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -format '{{json .}}' > .vw-actionlint.json || true
           fi
-          # JavaScript/TypeScript: ungenutzter Code, ungenutzte Abhängigkeiten, Zyklen (fallow, kostenlos)
+          # JavaScript/TypeScript: unused code, unused dependencies, cycles (fallow, free)
           if [ -f package.json ] && git ls-files '*.ts' '*.tsx' '*.js' '*.jsx' '*.mjs' | grep -q .; then
             npx -y fallow@3 dead-code --format json > .vw-fallow.json 2> /dev/null || true
           fi
@@ -140,7 +140,7 @@ jobs:
           except Exception:
               out["tools"]["todos"] = False
 
-          # Sprachwerkzeuge: als Befunde mit Werkzeug im Regelnamen, zusammen höchstens 100
+          # Language tools: reported as findings with the tool in the rule name, at most 100 in total
           extra = []
           def add(tool, file, line, rule, severity, message):
               if len(extra) < 100:
