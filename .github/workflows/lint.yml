@@ -168,6 +168,29 @@ jobs:
           node --check server.js
           node --check public/app.js
 
+  # ---------- Release-Konfiguration ----------
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ohne diesen Gate koennte ein Tippfehler im Release-Workflow erst beim
+      # Tag-Push auffallen — dann ist es zu spaet, weil das Tag existiert.
+      - name: Workflow-YAML ist syntaktisch gueltig
+        run: |
+          for f in .github/workflows/*.yml; do
+            python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" \
+              || { echo "::error::$f ist kein gueltiges YAML"; exit 1; }
+          done
+
+      # Der Ausloeser- und Versions-Logik des Release-Workflows wird lokal
+      # nachgespielt: Tag-Push, manueller Publish, Dry-Run ohne Tag und ein
+      # ungueltiges Tag. Der Test liest das Skript direkt aus release.yml
+      # und kann daher nicht von der YAML abweichen.
+      - name: Release-Ausloeser und Versionslogik (Negativkontrolle inklusive)
+        run: bash tools/ci_release_version_test.sh
+
   # ---------- Android ----------
   android-lint:
     name: Android lint

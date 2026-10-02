@@ -8,6 +8,15 @@ name: Release
 # Das APK ist ohne zusaetzliche Secrets sofort installierbar (Debug-Signatur).
 # Sind HYDRA_KEYSTORE*-Secrets gesetzt, wird mit einem echten Release-Key
 # signiert; das steht dann im Release-Body.
+#
+# Zwei Ausloeser:
+#   1. push auf ein Tag v*.*.*  -> baut und veroeffentlicht das Release
+#   2. workflow_dispatch        -> manueller Build ohne Tag-Push moeglich.
+#      Ohne Tag-Eingabe laeuft ein reiner Dry-Run: alle fuenf Jobs bauen
+#      (inkl. APK-Signatur-Pruefung und NDK/JNI-Kompilierung), aber es
+#      wird nichts veroeffentlicht. Mit Tag + publish=true verhaelt sich
+#      der Lauf wie ein Tag-Push. Damit ist die Release-Kette testbar,
+#      ohne jedes Mal ein Tag pushen zu muessen.
 
 on:
   push:
@@ -15,9 +24,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to publish a release for'
-        required: true
+        description: 'Tag to publish (vMAJOR.MINOR.PATCH). Empty = build-only dry run.'
+        required: false
         type: string
+      publish:
+        description: 'Create the GitHub Release (ignored without a tag)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,17 +44,49 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
       version_code: ${{ steps.v.outputs.version_code }}
+      publish: ${{ steps.v.outputs.publish }}
     steps:
+      # Werte kommen ueber env, nicht per ${{ }} im Skript: sonst wuerde ein
+      # frei eingegebener Tag als Shell-Code ausgefuehrt (Script Injection).
       - name: Derive version from tag
         id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          set -euo pipefail
+
+          if [ "$EVENT" = "push" ]; then
+            TAG="$REF_NAME"
+            PUBLISH=true
+          else
+            TAG="${INPUT_TAG:-}"
+            PUBLISH="${INPUT_PUBLISH:-false}"
+            if [ -z "$TAG" ]; then
+              # Dry-Run: synthetisches Tag, kein Push noetig, nichts publiziert.
+              TAG="v0.0.0-ci.${RUN_NUMBER}"
+              PUBLISH=false
+              echo "::notice::Kein Tag angegeben — Dry-Run mit ${TAG}. Es wird kein Release veroeffentlicht."
+            fi
+          fi
+
           V="${TAG#v}"
-          MAJ="${V%%.*}"; REST="${V#*.}"; MIN="${REST%%.*}"; PAT="${V##*.}"
-          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
-          echo "version=$V"      >> "$GITHUB_OUTPUT"
-          echo "version_code=$(( MAJ * 10000 + MIN * 100 + PAT ))" >> "$GITHUB_OUTPUT"
-          echo "Release $TAG -> versionCode $(( MAJ * 10000 + MIN * 100 + PAT ))"
+          if [[ ! "$V" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            echo "::error::Tag '${TAG}' entspricht nicht vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          MAJ="${BASH_REMATCH[1]}"; MIN="${BASH_REMATCH[2]}"; PAT="${BASH_REMATCH[3]}"
+          CODE=$(( MAJ * 10000 + MIN * 100 + PAT ))
+          if [ "$CODE" -lt 1 ]; then CODE=1; fi
+
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "version=$V"    >> "$GITHUB_OUTPUT"
+          echo "version_code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Release ${TAG} -> versionCode ${CODE}, publish=${PUBLISH}"
 
   build-linux:
     name: CLI (Linux)
@@ -212,6 +258,9 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [ version, build-linux, build-macos, build-android ]
+    # Beim manuellen Dry-Run wird nichts veroeffentlicht — die vier Build-Jobs
+    # laufen trotzdem komplett durch.
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write

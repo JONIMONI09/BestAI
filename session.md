@@ -124,6 +124,35 @@ following the CVE cross-check and linter audit from the previous pass.
 - [x] Nebenbefund dabei korrigiert: `release.yml` nutzte die
       build-tools ueber das hart kodierte `/opt/android-sdk`, das auf dem
       GitHub-Runner nicht existiert — jetzt ueber `ANDROID_HOME`
+- [x] **PR #13 vom User freigegeben und gemergt** (Merge-Commit auf
+      `main`, head `2fd2223`)
+- [x] **Verifikation auf `main`** (Push-Commit `60a01f6`):
+      Workflow `Lint & Security` 8/8 gruen (Android lint 2m17s,
+      `No issues found.`, NDK-C-Kompilierung erfolgreich),
+      Workflow `CI` 4/4 gruen — beide Runs `conclusion: success`
+
+## Runde 2026-10-02 (Release-Workflow manuell ausloesbar machen)
+
+- [x] Befund: `workflow_dispatch` existierte, war aber nur mit
+      Pflicht-Tag-Eingabe benutzbar; ohne Eingabe ergaben sich
+      `version=main`, `versionCode=0` — ein Release mit Versionsnamen
+      "main" waere die Folge gewesen
+- [x] `tag` optional, `publish`-Boolean (Default `false`), Dry-Run mit
+      synthetischem Tag `v0.0.0-ci.<run_number>`, `publish`-Job per
+      `if`-Bedingung abgesichert; Tag-Push-Trigger unveraendert
+- [x] Tag-Validierung `vMAJOR.MINOR.PATCH`, `versionCode >= 1`,
+      Eingaben ueber `env:` statt Interpolation (kein Shell-Injection)
+- [x] `tools/ci_release_version_test.sh`: 5 Faelle (Tag-Push, Publish,
+      Dry-Run, Unsinn-Tag, publish ohne Tag) — **Negativkontrolle
+      ausgefuehrt**, Test schlaegt bei kaputter Datei fehl (exit 1)
+- [x] Neuer Job `release-config` in `lint.yml`: YAML-Validierung aller
+      Workflows + Versionslogik-Test — auf PR #14 **gruen** (14/14 Checks)
+- [x] PR #14 eroeffnet; End-to-End-Dispatch versucht, aber von der
+      Umgebung blockiert: `gh workflow run` → **HTTP 403**, die
+      verwaltete GitHub-App darf kein `workflow_dispatch`-Event erzeugen.
+      Der manuelle Weg (Actions-Tab → Run workflow) nutzt die
+      User-Berechtigung und ist der einzige verbleibende Test-Schritt
+- [ ] Merge des PRs — **Freigabe des Users noetig** (R14)
 
 ## Status / Notes
 

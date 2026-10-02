@@ -545,6 +545,51 @@
   man Code oder Lint-Konfiguration aendert. Ein Gate darf nicht
   kosmetisch aufgeweicht werden, um einen Umgebungsfehler zu verstecken.
 
+## 2026-10-02 — Manuelles Release war unbrauchbar (Pflicht-Tag-Eingabe, stille Fehlversion)
+
+- **Symptom:** `release.yml` hatte zwar `workflow_dispatch`, aber mit
+  `required: true` fuer das Tag-Input. Ein manueller Lauf war damit nur
+  moeglich, wenn man von Hand ein existierendes Tag eintippt — also ohne
+  neuen Push nicht testbar. Ein Lauf ohne Eingabe (z. B. per API)
+  lieferte zudem `TAG=main`, `version=main`, `versionCode=0`: die
+  Arithmetik `$(( MAJ * 10000 ))` wertet ein unbekanntes Wort als 0 aus,
+  statt einen Fehler zu melden.
+- **Cause:** Das Input war als Pflichtfeld modelliert ("Existing tag to
+  publish a release for"), obwohl der eigentliche Zweck ein *testbarer*
+  Build ist. Zusaetzlich wurde das Tag-Format nie validiert und
+  `versionCode` nie gegen 0 geprueft.
+- **Fix:** `tag` ist optional, `publish` ist ein Boolean (Default
+  `false`). Ohne Tag laeuft ein Dry-Run mit synthetischem Tag
+  `v0.0.0-ci.<run_number>`, der `publish`-Job ist ueber
+  `if: needs.version.outputs.publish == 'true'` deaktiviert. Das Tag
+  wird gegen `vMAJOR.MINOR.PATCH` geprueft (Fehler statt Release mit
+  Versionsnamen "main"), `versionCode` ist mindestens 1, und alle
+  Eingaben kommen ueber `env:` statt per `${{ }}` im Skript (kein
+  Shell-Injection-Risiko). Der Tag-Push-Trigger bleibt unveraendert.
+- **Prevention:** Jeder Dispatch-Pfad braucht eine Negativkontrolle.
+  `tools/ci_release_version_test.sh` spielt die Versionslogik direkt aus
+  der YAML nach (Tag-Push, manueller Publish, Dry-Run, ungueltiges Tag)
+  und laeuft als Job `release-config` in `lint.yml`. Negativkontrolle
+  ausgefuehrt: mit entfernter `publish`-Ausgabe meldet der Test
+  FEHLGESCHLAGEN (exit 1) — das Gate kann also tatsaechlich rot werden.
+
+## 2026-10-02 — Workflow-Dispatch per API nicht moeglich (403, App-Rechte)
+
+- **Symptom:** `gh workflow run release.yml --ref <branch>` antwortet mit
+  `HTTP 403: Resource not accessible by integration`.
+- **Cause:** Die verwaltete GitHub-App-Credential darf Workflows ausloesen
+  lesen, aber kein `workflow_dispatch`-Event erzeugen — dafuer fehlt die
+  Actions-Schreibberechtigung der App. Das ist keine Eigenschaft des
+  Repositorys und laesst sich im Workflow nicht beheben.
+- **Fix:** Von Hand im Actions-Tab *Run workflow* starten — das nutzt die
+  Berechtigung des angemeldeten Users. Fuer den Fall, dass die App den
+  Dispatch kuenftig selbst testen soll, muss ihre Berechtigung auf
+  `Actions: write` erhoeht werden.
+- **Prevention:** CI-Artefakte, die eine App ohne Schreibrecht auf
+  Actions nicht erzeugen kann (Dispatch, Re-Run, Release-Publish),
+  getrennt verifizieren: Logik lokal, Trigger manuell, Publish-Pfad
+  ausschliesslich nach ausdruecklicher Freigabe.
+
 ## 2026-10-02 — Skills-UI meldet "Not loaded" trotz korrektem Frontmatter
 
 - **Symptom:** Die Skills-UI zeigt alle drei Skills als *Not loaded*
