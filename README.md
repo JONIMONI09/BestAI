@@ -112,6 +112,21 @@ Release artifacts:
 
 **Manual runs.** The release workflow can also be started from the Actions tab (*Run workflow*) without pushing a tag. Leave **tag** empty to get a build-only dry run: all jobs run — CLI binaries, APK build, signature verification, Android Lint, x64/arm64 parity — but **no release is published**. Enter a tag and tick **publish** to behave exactly like a tag push. The trigger and version logic are regression-tested by `tools/ci_release_version_test.sh` (job `release-config`), which replays the script straight out of the workflow file for five input cases.
 
+## Web console
+
+`make ui` (or `node server.js`) serves a dependency-free console on `PORT` (default 8787).
+
+| Area | What it does |
+|---|---|
+| **Chat** | Type text, get a real reply from the compiled C engine. Words are mapped to token IDs through the stored vocabulary; a word without an ID is reported as unknown instead of being guessed. Replies can be shown as words or raw token IDs. |
+| **Models** | Every `*.hydra` file under `models/` is listed with its real header (dim, vocab, layers, size, validity) and can be selected. Trained models are marked. |
+| **Training** | Paste a corpus (`3 3 3 3 -> 7 7 7 7`, or `1 2 3` for next-token training), pick vocab/dim/layers/epochs and train. Training writes a real `.hydra` file and is **verified against the compiled engine** before it is reported as successful; accuracy before/after is measured, never estimated. |
+| **Settings** | Start token, steps, coexistence-axiom factor, per-model vocabulary editor. |
+
+Everything shown comes from the engine. There is no simulated output anywhere in the console.
+
+**How the trainer works.** The engine's update is `acc[i] = Σ (w1·token + w2·state[i])` with the next token decoded from `acc[0]`. Only column 0 influences the decoder, so the trainer searches ternary moves there (`0/±1`), accepts a move only when replaying the **complete** sample afterwards yields more correct steps, and returns the best snapshot over all epochs. Accuracy therefore never drops below the seed weights. The engine has a small capacity by design — the console reports the real number instead of hiding it.
+
 ## Quality Gates
 
 Every push and pull request runs the following. Each gate was verified locally **and** proven to fail on a deliberately reverted fix before being adopted — a linter that cannot fail is worthless.

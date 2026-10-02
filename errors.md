@@ -703,3 +703,36 @@
   variable, and a release-only code path is not exercised by a normal
   push. Both fixes were replayed locally with `HYDRA_KEYSTORE=""`
   before pushing.
+
+## 2026-10-02 — Weight file layout and the "empty secret" class of bug, twice
+
+- **Symptom:** the first version of the console trainer produced models the
+  engine rejected with `layers*dim (64) > weights_len (32)`, and it could
+  not improve accuracy at all.
+- **Cause:** the engine reads **one byte per (layer, dimension)** -
+  `w1` from the low two bits and `w2` from the next two bits of that same
+  byte - not two dimensions per byte. The trainer assumed the latter. That
+  also explains why the first hill-climbing variant failed: it optimised a
+  single step in isolation, which reliably destroys the following steps
+  because the weights are shared along the sequence.
+- **Fix:** the layout is now derived from the engine code (and pinned by a
+  test that runs the compiled binary), and a move is only accepted when
+  replaying the whole sample scores better. The best snapshot over all
+  epochs is returned, so a trained model is never worse than the seed.
+- **Prevention:** when two implementations have to agree on a binary
+  layout, do not infer it from the writer - read the reader, and then prove
+  it with a test that runs the real consumer.
+
+## 2026-10-02 — Unset versus empty is the same bug twice
+
+- **Symptom:** the release job died with
+  `path may not be null or empty string. path=''` (empty secret), and the
+  vocabulary endpoint answered `{}` after a successful `PUT`.
+- **Cause:** (a) same empty-string issue as the release keystore, now fixed
+  with `takeIf { it.isNotBlank() }`. (b) `loadVocab()` only accepted a
+  `{map: ...}` wrapper while the file on disk stores the bare map, so the
+  loader silently returned an empty map for a file it had just written.
+- **Fix:** the loader accepts both shapes.
+- **Prevention:** never let a parser fail *silently* to an empty default -
+  if it cannot parse what it wrote, that is a bug, not a fallback. A GET
+  that returns `{}` after a `PUT` reported success is a lie.
