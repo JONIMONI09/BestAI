@@ -58,6 +58,18 @@ jobs:
           print(f"format check OK: <IHHIIII> = {size} bytes")
           EOF
 
+      # Gate 1e: the packaged model asset must be exactly what the
+      # generator produces. It was untracked for a long time, so every
+      # CI-built APK shipped without it and only a local build had one.
+      - name: Android model asset matches the generator
+        run: |
+          python3 tools/make_dummy_model.py /tmp/demo-check.hydra
+          if ! cmp -s /tmp/demo-check.hydra android/app/src/main/assets/demo.hydra; then
+            echo "::error::android/app/src/main/assets/demo.hydra differs from tools/make_dummy_model.py output"
+            exit 1
+          fi
+          echo "asset matches the generator"
+
       # On any lint failure, upload the captured diagnostics as a
       # workflow artifact so the error text is attached to the run.
       - name: Upload lint error report

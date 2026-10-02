@@ -657,3 +657,24 @@
 - **Prevention:** when switching the documentation language, grep the
   whole repository including workflows — the user-visible text is what
   counts, not only the files with a `.md` suffix.
+
+## 2026-10-02 — Every CI-built APK shipped without the model asset
+
+- **Symptom:** the new `android-apk` job failed on its first run even
+  though all three ABIs were built and packaged. The failure was not an
+  ABI: it was `grep -q 'assets/demo.hydra'`.
+- **Cause:** `android/app/src/main/assets/demo.hydra` existed on the
+  developer machine but was never tracked by git. Every clean checkout —
+  i.e. every CI run and every release run — therefore built an APK
+  without the demo model, and the app would have failed at runtime with
+  "model file not found". The old `release.yml` had the same
+  `grep -q 'assets/demo.hydra'` check, so the first real tag run would
+  have failed the same way.
+- **Fix:** the asset is now tracked, and `tools/make_dummy_model.py` is
+  deterministic (three runs, one sha256), so CI regenerates it and
+  compares it with the committed file — gate 1e in `ci.yml`. The
+  artifact upload also runs on failure so a broken APK can still be
+  inspected.
+- **Prevention:** every file the packager reads has to be tracked. Ask
+  what a clean checkout contains, not what the workstation contains; a
+  build that only works locally is not a build.
