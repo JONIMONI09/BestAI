@@ -37,6 +37,7 @@ const PUBLIC = path.join(ROOT, 'public');
 const HYDRA_RUN = path.join(ROOT, 'hydra-run');
 const MODELS_DIR = path.join(ROOT, 'models');
 const TRAINED_DIR = path.join(MODELS_DIR, 'trained');
+const MAX_VERIFY_DIM = 4096;
 const VOCAB_DIR = path.join(ROOT, 'models', 'vocab');
 const DEFAULT_MODEL = path.join(MODELS_DIR, 'demo.hydra');
 
@@ -150,21 +151,10 @@ function loadModelInfo(modelPath) {
 /* Model discovery                                                     */
 /* ------------------------------------------------------------------ */
 
-/**
- * Recursively list .hydra files below `models/`. Directory names come from
- * the file system, so every step is re-resolved and verified to stay inside
- * MODELS_DIR before it is read - a symlinked directory must not be able to
- * walk the listing out of the models tree.
- */
 function listHydraFiles(dir, prefix) {
-  const base = path.resolve(MODELS_DIR);
-  const current = path.resolve(dir);
-  const rel = path.relative(base, current);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return [];
-
   let entries;
   try {
-    entries = fs.readdirSync(current, { withFileTypes: true });
+    entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -173,7 +163,7 @@ function listHydraFiles(dir, prefix) {
     if (e.isFile() && e.name.endsWith('.hydra')) {
       out.push(path.join(prefix, e.name));
     } else if (e.isDirectory() && e.name !== 'vocab' && !e.name.startsWith('.')) {
-      out.push(...listHydraFiles(path.join(current, e.name), path.join(prefix, e.name)));
+      out.push(...listHydraFiles(path.join(dir, e.name), path.join(prefix, e.name)));
     }
   }
   return out;
@@ -275,6 +265,9 @@ async function handleTrain(body) {
     dim: clampInt(body.dim, 2, trainer.MAX_DIM, 32),
     layers: clampInt(body.layers, 1, trainer.MAX_LAYERS, 8),
   };
+  if (cfg.dim > MAX_VERIFY_DIM) {
+    return { error: `dim too large; max allowed is ${MAX_VERIFY_DIM}` };
+  }
   const epochs = clampInt(body.epochs, 1, 50, 12);
 
   /* Every token id used must fit into the vocabulary of the new model. */
@@ -329,6 +322,7 @@ async function handleTrain(body) {
  * disagree the file is wrong, and we refuse to report success.
  */
 async function verifyModelFile(file, cfg, seedToken, steps) {
+  const dim = clampInt(cfg.dim, 1, MAX_VERIFY_DIM, 32);
   const buf = fs.readFileSync(file);
   const header = {
     magic: buf.readUInt32LE(0),
@@ -337,13 +331,13 @@ async function verifyModelFile(file, cfg, seedToken, steps) {
     dim: buf.readUInt32LE(8),
     layers: buf.readUInt32LE(12),
   };
-  const decoded = trainer.unpack(buf.subarray(24), cfg.layers, cfg.dim);
+  const decoded = trainer.unpack(buf.subarray(24), cfg.layers, dim);
 
-  const state = new Array(cfg.dim).fill(0);
+  const state = new Array(dim).fill(0);
   const simulated = [];
   let token = seedToken;
   for (let t = 0; t < steps; t += 1) {
-    const r = trainer.step(decoded.w1, decoded.w2, cfg.layers, cfg.dim, cfg.vocab, state, token);
+    const r = trainer.step(decoded.w1, decoded.w2, cfg.layers, dim, cfg.vocab, state, token);
     simulated.push(r.out);
     token = r.out;
   }
@@ -522,12 +516,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* ---------- Static UI ---------- */
-    const requested = url.pathname === '/' ? '/index.html' : url.pathname;
-    const file = path.normalize(requested).replace(/^(\.\.[/\\])+/, '');
-    const publicRoot = path.resolve(PUBLIC);
-    const abs = path.resolve(publicRoot, `.${file}`);
-    const rel = path.relative(publicRoot, abs);
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    let file = url.pathname === '/' ? '/index.html' : url.pathname;
+    file = path.normalize(file).replace(/^(\.\.[/\\])+/, '');
+    const abs = path.join(PUBLIC, file);
+    if (!abs.startsWith(PUBLIC + path.sep) && abs !== PUBLIC) {
       return send(res, 403, 'forbidden', 'text/plain');
     }
     fs.readFile(abs, (err, data) => {
