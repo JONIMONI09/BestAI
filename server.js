@@ -250,12 +250,10 @@ function parseCorpus(text, vocabMap) {
 }
 
 async function handleTrain(body) {
-  const name = String(body.name || 'trained-model')
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48);
-  if (!name) return { error: 'invalid name' };
+  const name = modelKey(String(body.name || 'trained-model').toLowerCase());
+  if (name === null) {
+    return { error: 'invalid name: use letters, digits, dot, dash and underscore' };
+  }
 
   const vocabMap = loadVocab(name);
   const { samples, unknown } = parseCorpus(body.corpus || '', vocabMap);
@@ -285,7 +283,11 @@ async function handleTrain(body) {
   );
   const result = trainer.train(cfg, samples, epochs);
   fs.mkdirSync(TRAINED_DIR, { recursive: true });
-  const file = path.join(TRAINED_DIR, `${name}.hydra`);
+  /* `name` passed modelKey(), so this cannot escape TRAINED_DIR. */
+  const file = path.join(TRAINED_DIR, name + '.hydra');
+  if (path.dirname(path.resolve(file)) !== path.resolve(TRAINED_DIR)) {
+    return { error: 'invalid target path' };
+  }
   const bytes = trainer.writeModelFile(file, { ...cfg, ...result });
   const verification = await verifyModelFile(file, cfg, samples[0].input[0], 8);
   if (!verification.match) {
@@ -355,14 +357,30 @@ function clampInt(value, min, max, fallback) {
 /* Vocabulary                                                          */
 /* ------------------------------------------------------------------ */
 
+/** Model names cross from HTTP into file paths, so they are validated once,
+ * here, and rejected rather than rewritten. `replace()` is not a sanitizer:
+ * it still lets `..` and separators through in spirit, and a filter that
+ * silently changes the caller's string hides mistakes. */
+function modelKey(name) {
+  if (typeof name !== 'string') return null;
+  const trimmed = name.trim();
+  if (trimmed.length === 0 || trimmed.length > 64) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(trimmed)) return null;
+  if (trimmed.includes('..')) return null;
+  return trimmed;
+}
+
 function vocabFile(name) {
-  const safe = String(name).replace(/[^A-Za-z0-9._-]/g, '-');
-  return path.join(VOCAB_DIR, `${safe}.json`);
+  const key = modelKey(name);
+  if (key === null) return null;
+  return path.join(VOCAB_DIR, `${key}.json`);
 }
 
 function loadVocab(name) {
+  const file = vocabFile(name);
+  if (file === null) return {};
   try {
-    const raw = JSON.parse(fs.readFileSync(vocabFile(name), 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     /* Accept both shapes: the bare {word: id} map we write and an older
      * {map: {...}} wrapper. */
     if (raw && typeof raw.map === 'object' && raw.map !== null) return raw.map;
@@ -474,8 +492,10 @@ const server = http.createServer(async (req, res) => {
         const id = Number(v);
         if (Number.isInteger(id) && id >= 0 && id < trainer.MAX_VOCAB) clean[k] = id;
       }
+      const file = vocabFile(String(body.model || ''));
+      if (file === null) return sendJSON(res, 400, { error: 'invalid model name' });
       fs.mkdirSync(VOCAB_DIR, { recursive: true });
-      fs.writeFileSync(vocabFile(body.model || ''), JSON.stringify(clean, null, 2));
+      fs.writeFileSync(file, JSON.stringify(clean, null, 2));
       return sendJSON(res, 200, { ok: true, entries: Object.keys(clean).length });
     }
 
