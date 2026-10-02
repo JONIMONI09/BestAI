@@ -182,14 +182,31 @@ function seedWeights(layers, dim) {
   return { w1, w2 };
 }
 
+function clampCfgInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function normalizeCfg(cfg) {
+  const safe = cfg && typeof cfg === 'object' ? cfg : {};
+  return {
+    ...safe,
+    vocab: clampCfgInt(safe.vocab, 2, MAX_VOCAB, 64),
+    dim: clampCfgInt(safe.dim, 2, MAX_DIM, 32),
+    layers: clampCfgInt(safe.layers, 1, MAX_LAYERS, 8),
+  };
+}
+
 /** Token accuracy of the current weights over the dataset. */
 function evaluate(w1, w2, cfg, samples) {
+  const safeCfg = normalizeCfg(cfg);
   let correct = 0;
   let total = 0;
   for (const s of samples) {
-    const state = new Array(cfg.dim).fill(0);
+    const state = new Array(safeCfg.dim).fill(0);
     for (let t = 0; t < s.input.length; t += 1) {
-      const { out } = step(w1, w2, cfg.layers, cfg.dim, cfg.vocab, state, s.input[t]);
+      const { out } = step(w1, w2, safeCfg.layers, safeCfg.dim, safeCfg.vocab, state, s.input[t]);
       total += 1;
       if (out === s.target[t]) correct += 1;
     }
@@ -199,10 +216,11 @@ function evaluate(w1, w2, cfg, samples) {
 
 /** Score a whole sample: how many steps match the target. */
 function scoreSample(w1, w2, cfg, sample) {
-  const state = new Array(cfg.dim).fill(0);
+  const safeCfg = normalizeCfg(cfg);
+  const state = new Array(safeCfg.dim).fill(0);
   let correct = 0;
   for (let t = 0; t < sample.input.length; t += 1) {
-    const { out } = step(w1, w2, cfg.layers, cfg.dim, cfg.vocab, state, sample.input[t]);
+    const { out } = step(w1, w2, safeCfg.layers, safeCfg.dim, safeCfg.vocab, state, sample.input[t]);
     if (out === sample.target[t]) correct += 1;
   }
   return correct;
@@ -238,13 +256,14 @@ function candidateMoves(w1, w2, cfg, token, state0) {
  * seed.
  */
 function train(cfg, samples, epochs) {
-  const seed = seedWeights(cfg.layers, cfg.dim);
+  const safeCfg = normalizeCfg(cfg);
+  const seed = seedWeights(safeCfg.layers, safeCfg.dim);
   const w1 = seed.w1;
   const w2 = seed.w2;
   const snapshot = () => ({ w1: w1.map((r) => r.slice()), w2: w2.map((r) => r.slice()) });
 
   const seedSnapshot = snapshot();
-  const seedEval = evaluate(w1, w2, cfg, samples);
+  const seedEval = evaluate(w1, w2, safeCfg, samples);
   let best = { ...seedSnapshot, accuracy: seedEval.accuracy, epoch: -1 };
   const history = [];
   let flips = 0;
