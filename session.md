@@ -195,12 +195,24 @@ documentation base is in one language.
       SDK bootstrap exists once instead of per workflow
 - [x] CI translated to English: comments, step names, `::error::`/
       `::notice::` messages and the release notes body
-- [x] Verified locally: `assembleDebug` + `assembleRelease` build,
-      `apksigner verify` passes (debug key fallback), `libhydra.so` for
-      arm64-v8a/armeabi-v7a/x86_64 and `assets/demo.hydra` present
+- [x] **The new APK gate immediately caught a real bug:**
+      `android/app/src/main/assets/demo.hydra` was never tracked by git,
+      so every clean checkout — i.e. every CI run and the first tag run —
+      built an APK without the demo model. The asset is now tracked and
+      gate 1e in `ci.yml` compares it byte for byte against
+      `tools/make_dummy_model.py` (deterministic: three runs, one sha256)
+- [x] APK verification hardened: `aapt` **and** `unzip` listings are
+      printed and the archive is checked with `unzip`, artifact upload
+      also runs on failure
+- [x] Verified locally and on CI: `assembleDebug` + `assembleRelease`
+      build, `apksigner verify` passes (debug-key fallback),
+      `libhydra.so` for arm64-v8a/armeabi-v7a/x86_64 and
+      `assets/demo.hydra` present
+- [x] PR #18: **17/17 checks green**, including the two new jobs
+      `Android APK build` and `JNI bridge (javac)`
 - [ ] Merge the PR — **user approval needed** (R14)
-- [ ] Tag `v1.0.0` on `main` afterwards so the release workflow creates
-      the first GitHub Release
+- [ ] Directly afterwards: push tag `v1.0.0` on `main` so
+      `release.yml` creates the first GitHub Release
 
 ## Status / Notes
 
