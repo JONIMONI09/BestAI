@@ -253,17 +253,27 @@ jobs:
           "$BT/apksigner" verify --print-certs "$APK"
           "$BT/aapt" dump badging "$APK" \
             | grep -E "^package:|^sdkVersion:|^application-label:"
+          # Two independent listings: aapt (what the packager thinks it
+          # shipped) and unzip (what is really in the archive). A gate
+          # that only trusts one tool cannot tell a packaging bug from a
+          # listing bug.
           "$BT/aapt" list "$APK" > apk-contents.txt
+          unzip -l "$APK" | awk '{print $NF}' | grep -E '^(lib|assets)/' > apk-unzip.txt
+          echo "--- aapt listing ---";  cat apk-contents.txt | grep -E '^(lib|assets)/' || true
+          echo "--- unzip listing ---"; cat apk-unzip.txt || true
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            grep -q "lib/$abi/libhydra.so" apk-contents.txt || {
-              echo "::error::libhydra.so missing for $abi"; exit 1; }
+            if ! grep -q "lib/$abi/libhydra.so" apk-unzip.txt; then
+              echo "::error::libhydra.so missing for $abi"
+              exit 1
+            fi
           done
-          grep -q 'assets/demo.hydra' apk-contents.txt
+          grep -q 'assets/demo.hydra' apk-unzip.txt
           mkdir -p dist
           cp "$APK" "dist/hydra-stone-ci-${{ github.run_number }}.apk"
           sha256sum "dist/hydra-stone-ci-${{ github.run_number }}.apk" | tee dist/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: hydra-stone-apk-ci
           path: dist/
