@@ -7,6 +7,7 @@
     <string name="default_start_token">42</string>
     <string name="default_steps">32</string>
     <string name="action_run">Run inference</string>
+    <string name="action_import_model">Import .hydra model…</string>
 
     <string name="log_model">[Hydra] model: %1$s</string>
     <plurals name="log_size">
@@ -17,7 +18,29 @@
         <item quantity="one">[Hydra] running with startToken=%1$d, %2$d iteration…</item>
         <item quantity="other">[Hydra] running with startToken=%1$d, %2$d iterations…</item>
     </plurals>
-    <string name="log_token">[Hydra] token[%1$d] = %2$d</string>
+    <plurals name="log_tokens">
+        <item quantity="one">[Hydra] %1$d token</item>
+        <item quantity="other">[Hydra] %1$d tokens</item>
+    </plurals>
+    <string name="log_batch_done">[Hydra] stream complete</string>
+    <string name="log_import_start">[Hydra] importing %1$s…</string>
+    <string name="log_import_ok">[Hydra] model replaced: %1$s</string>
+    <string name="log_import_rejected">[Hydra] import rejected: %1$s — keeping the previous model</string>
+    <string name="log_import_failed">[Hydra] import failed: %1$s — keeping the previous model</string>
+    <string name="err_no_stream">cannot open the file</string>
+    <string name="err_too_large">file exceeds the 64 MiB limit</string>
+    <string name="err_too_small">file is smaller than the 24-byte header</string>
+    <string name="err_unreadable">header could not be read</string>
+    <string name="err_magic">not a .hydra file (wrong magic)</string>
+    <string name="err_version">unsupported .hydra version</string>
+    <string name="err_dim">dim out of range (1..64)</string>
+    <string name="err_vocab">vocab out of range (1..1024)</string>
+    <string name="err_layers">layers out of range (1..4096)</string>
+    <string name="err_offset">weights_offset points into the header</string>
+    <string name="err_weights">weights run past the end of the file</string>
+    <string name="err_pair_count">layers × dim is not covered by weights_len</string>
+    <string name="err_replace">cannot replace the previous model</string>
+    <string name="err_rename">cannot move the imported file into place</string>
     <string name="log_result">[Hydra] result: %1$s</string>
     <string name="log_wall">[Hydra] wall time: %1$d ms</string>
     <string name="log_ok">[Hydra] OK — C engine executed on Android.</string>

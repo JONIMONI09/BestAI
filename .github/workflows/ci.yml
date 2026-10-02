@@ -186,6 +186,39 @@ jobs:
           python3 tools/make_dummy_model.py smoke.hydra
           ./hydra-run smoke.hydra 42
 
+      # The prompt path (--prompt) is what the web console and the Android
+      # app depend on: the whole message has to reach the engine, not just
+      # its first token. A regression there is silent - the console still
+      # answers, just with the wrong prompt - so it is asserted here, with
+      # a negative control that the malformed cases are rejected.
+      - name: Prompt prefill reaches the engine (with negative control)
+        run: |
+          set -euo pipefail
+          python3 tools/make_dummy_model.py prompt.hydra
+          single=$(./hydra-run prompt.hydra 7 4 --json 2>/dev/null)
+          p1=$(./hydra-run prompt.hydra 0 4 --prompt 7 --json 2>/dev/null)
+          p3=$(./hydra-run prompt.hydra 0 4 --prompt 3,5,7 --json 2>/dev/null)
+          python3 - "$single" "$p1" "$p3" <<'EOF'
+          import json, sys
+          bare, one, three = (json.loads(a) for a in sys.argv[1:4])
+          assert one["tokens"] == bare["tokens"], "prompt [7] must equal seed 7"
+          assert three["tokens"] != bare["tokens"], "a longer prompt must change the output"
+          assert three["prompt"] == [3, 5, 7], f"prompt not echoed back: {three['prompt']}"
+          print("ok: prompt [7] == seed 7, prompt [3,5,7] changes the stream")
+          EOF
+          # Negative control: a malformed prompt must be refused, not capped.
+          for bad in "3,abc" "3," ""; do
+            if ./hydra-run prompt.hydra --prompt "$bad" --json >/dev/null 2>&1; then
+              echo "::error::malformed --prompt '$bad' was accepted"
+              exit 1
+            fi
+          done
+          if ./hydra-run prompt.hydra --prompt --json >/dev/null 2>&1; then
+            echo "::error::--prompt without an argument was accepted"
+            exit 1
+          fi
+          echo "ok: malformed prompts are rejected"
+
       - name: Upload failure logs
         if: failure()
         run: |

@@ -11,6 +11,8 @@ node_modules/
 # Models
 *.hydra
 models/
+# Uploaded models are user data, never committed.
+models/uploaded/
 
 # Release staging (produced by .github/workflows/release.yml)
 dist/

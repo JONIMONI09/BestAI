@@ -15,8 +15,10 @@
     model: null,      // path of the selected model
     models: [],       // metadata from /api/models
     vocab: {},        // word -> token id
+    idToWord: {},     // token id -> word (the reverse lookup; see loadVocab)
     view: 'words',    // or 'tokens'
     lastTokens: [],
+    inflight: null,   // AbortController of the running request, if any
   };
 
   /* ── API ──────────────────────────────────────────────────── */
@@ -56,6 +58,10 @@
     return node;
   }
 
+  function textNode(text) {
+    return document.createTextNode(text);
+  }
+
   function addMessage(role, bodyNode, meta) {
     const wrap = el('div', `msg ${role}`);
     wrap.appendChild(bodyNode);
@@ -65,19 +71,29 @@
     return wrap;
   }
 
-  function textNode(text) {
-    return document.createTextNode(text);
-  }
-
+  /**
+   * Render one token per chip into `container`.
+   *
+   * The vocabulary is a word -> id map, so looking a token id up in
+   * Object.values() only ever finds the id itself: "words" mode used to
+   * print numbers. The reverse map is built once in loadVocab().
+   */
   function renderTokens(container, tokens) {
-    const ids = Object.values(state.vocab);
+    const inWords = state.view === 'words';
     for (const tok of tokens) {
-      const word = ids.find((id) => id === tok);
-      const chip = el('span', 'tok', state.view === 'words' && word !== undefined ? word : String(tok));
-      chip.title = word !== undefined ? `token ${tok} → ${word}` : `token ${tok} (not in vocabulary)`;
+      const word = state.idToWord[tok];
+      const known = word !== undefined;
+      /* An unknown token is shown muted, not as if it were a word. */
+      const chip = el('span', inWords && known ? 'tok' : (inWords ? 'tok unknown' : 'tok'), inWords && known ? word : String(tok));
+      chip.title = known ? `token ${tok} → ${word}` : `token ${tok} (not in vocabulary)`;
       container.appendChild(chip);
     }
   }
+
+  /* Every bot message remembers its tokens so the Words/Tokens toggle can
+   * re-render it. Without this the toggle only changed the button state
+   * and the already-rendered messages kept the old representation. */
+  const botMessages = [];
 
   function renderChips(model) {
     const box = $('model-chips');
@@ -96,6 +112,7 @@
       box.appendChild(chip);
     }
     if (model.trained) box.appendChild(el('span', 'chip', 'trained'));
+    if (model.uploaded) box.appendChild(el('span', 'chip', 'uploaded'));
     if (model.valid === false) box.appendChild(el('span', 'chip', 'invalid header'));
 
     const detail = $('model-detail');
@@ -117,11 +134,20 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
-    if (tokens.length === 0) return;
-    const max = Math.max(...tokens, 1);
+    if (tokens.length === 0) {
+      $('chart-summary').textContent = 'No token stream yet.';
+      return;
+    }
+    const max = Math.max(...tokens);
+    const min = Math.min(...tokens);
+    /* Text alternative: the canvas pixels mean nothing to a screen reader,
+     * the three numbers do. */
+    $('chart-summary').textContent =
+      `Token chart: ${tokens.length} tokens, minimum ${min}, maximum ${max}.`;
+
     const barW = w / tokens.length;
     for (let i = 0; i < tokens.length; i += 1) {
-      const bh = (tokens[i] / max) * (h - 20);
+      const bh = (Math.max(tokens[i], 0) / max) * (h - 20);
       const grad = ctx.createLinearGradient(0, h - bh, 0, h);
       grad.addColorStop(0, '#38bdf8');
       grad.addColorStop(1, 'rgba(56,189,248,0.25)');
@@ -139,10 +165,17 @@
     for (const v of stateVector) {
       const t = (v + 127) / 254;
       const cell = el('span', 'state-cell', String(v));
-      cell.style.background = `hsl(${190 - t * 190} 85% ${28 + t * 42}%)`;
+      /* The number sits ON the colour, so the colour has to stay dark
+       * enough for the text to be readable: lightness 28%..46% against
+       * #04222f. */
+      cell.style.background = `hsl(${190 - t * 190} 85% ${28 + t * 18}%)`;
       cell.title = `state value ${v}`;
+      cell.setAttribute('role', 'listitem');
+      cell.setAttribute('aria-label', `state value ${v}`);
       strip.appendChild(cell);
     }
+    $('state-summary').textContent =
+      `State vector: ${stateVector.length} values between ${Math.min(...stateVector)} and ${Math.max(...stateVector)}.`;
   }
 
   /* ── Models ───────────────────────────────────────────────── */
@@ -188,6 +221,11 @@
     } catch {
       state.vocab = {};
     }
+    /* The reverse map is built HERE, once per vocabulary load, not per
+     * rendered token. */
+    state.idToWord = Object.fromEntries(
+      Object.entries(state.vocab).map(([word, id]) => [Number(id), word])
+    );
     const lines = Object.entries(state.vocab).map(([w, id]) => `${w} ${id}`);
     $('vocab-text').value = lines.join('\n');
   }
@@ -202,10 +240,40 @@
     try {
       const res = await api('/api/vocab', { method: 'PUT', body: JSON.stringify({ model: key, map }) });
       state.vocab = map;
+      state.idToWord = Object.fromEntries(Object.entries(map).map(([w, id]) => [Number(id), w]));
       $('vocab-hint').textContent = `${res.entries} entries saved`;
       log(`vocabulary saved for ${key}: ${res.entries} entries`);
     } catch (e) {
       $('vocab-hint').textContent = e.message;
+    }
+  }
+
+  /* ── Model upload ─────────────────────────────────────────── */
+
+  async function uploadModel(file) {
+    const name = $('upload-name').value.trim();
+    if (!name.toLowerCase().endsWith('.hydra')) {
+      $('upload-hint').textContent = 'the name must end in .hydra';
+      return false;
+    }
+    $('upload-hint').textContent = 'validating…';
+    $('upload-open').disabled = true;
+    try {
+      const res = await fetch(`/api/models/upload?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      $('upload-hint').textContent = `stored ${data.model.path}`;
+      await loadModels(data.model.path);
+      return true;
+    } catch (e) {
+      $('upload-hint').textContent = e.message;
+      return false;
+    } finally {
+      $('upload-open').disabled = false;
     }
   }
 
@@ -222,13 +290,24 @@
     return { tokens, unknown };
   }
 
+  /* One request at a time. Two concurrent /api/infer calls could interleave
+   * their responses and the second one would overwrite the first one's
+   * token stream. */
+  function setBusy(busy) {
+    $('send').disabled = busy;
+    $('train-run').disabled = busy;
+    $('cancel').hidden = !busy;
+    $('input').setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+
   async function send(text) {
     const startToken = Number($('opt-token').value) || 0;
     const steps = Number($('opt-steps').value) || 16;
     const { tokens, unknown } = text ? encodeWords(text) : { tokens: [], unknown: [] };
-    const seed = tokens.length > 0 ? tokens[0] : startToken;
+    /* The WHOLE prompt goes to the engine, not just its first token. */
+    const prompt = tokens.length > 0 ? tokens : [startToken];
 
-    addMessage('user', textNode(text || `(empty → start token ${seed})`));
+    addMessage('user', textNode(text || `(empty → prompt ${prompt.join(', ')})`));
     if (unknown.length > 0) {
       $('input-hint').textContent = `not in vocabulary: ${unknown.join(', ')}`;
       $('input-hint').classList.add('warn');
@@ -238,12 +317,16 @@
       $('input-hint').classList.remove('warn');
     }
 
+    const controller = new AbortController();
+    state.inflight = controller;
+    setBusy(true);
     setStatus('running engine…', 'busy');
     try {
       const t0 = performance.now();
       const res = await api('/api/infer', {
         method: 'POST',
-        body: JSON.stringify({ path: state.model, token: seed, steps }),
+        body: JSON.stringify({ path: state.model, prompt, steps }),
+        signal: controller.signal,
       });
       const wall = performance.now() - t0;
       state.lastTokens = res.tokens || [];
@@ -253,19 +336,31 @@
       const engineMs = Number(res.elapsed_ms);
       const shown = Number.isFinite(engineMs) ? engineMs : wall;
       const meta = `${res.tokens.length} tokens · engine ${shown.toFixed(1)} ms · wall ${wall.toFixed(0)} ms · model ${state.model}`;
-      addMessage('bot', body, meta);
+      const wrap = addMessage('bot', body, meta);
+      botMessages.push({ element: body, tokens: state.lastTokens, wrapper: wrap });
 
       $('m-total').textContent = shown.toFixed(1);
       $('m-per-token').textContent = (shown / Math.max(1, res.tokens.length)).toFixed(2);
       $('m-tps').textContent = (res.tokens.length / Math.max(0.001, shown / 1000)).toFixed(1);
       drawChart(state.lastTokens);
       if (Array.isArray(res.state)) renderState(res.state);
-      log(`${state.model} seed=${seed} steps=${steps} → ${JSON.stringify(state.lastTokens)}`);
+      log(`${state.model} prompt=${JSON.stringify(prompt)} steps=${steps} → ${JSON.stringify(state.lastTokens)}`);
       setStatus('ready', 'ready');
     } catch (e) {
-      addMessage('sys', textNode(`Engine error: ${e.message}`));
-      log(`engine error: ${e.message}`);
-      setStatus('error', 'error');
+      if (e.name === 'AbortError') {
+        /* The client stopped waiting. The engine process is left alone:
+         * killing it server-side would also kill any other request. */
+        addMessage('sys', textNode('Request cancelled — the engine kept running, its answer was discarded.'));
+        log('request cancelled by the user');
+        setStatus('ready', 'ready');
+      } else {
+        addMessage('sys', textNode(`Engine error: ${e.message}`));
+        log(`engine error: ${e.message}`);
+        setStatus('error', 'error');
+      }
+    } finally {
+      state.inflight = null;
+      setBusy(false);
     }
   }
 
@@ -286,6 +381,7 @@
     badge.textContent = 'training…';
     $('train-hint').textContent = '';
     out.hidden = true;
+    setBusy(true);
     setStatus('training…', 'busy');
 
     try {
@@ -314,6 +410,8 @@
       out.hidden = false;
       out.textContent = `Training failed: ${e.message}`;
       setStatus('error', 'error');
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -332,6 +430,63 @@
     }
   }
 
+  /* ── Tabs ─────────────────────────────────────────────────── */
+
+  function selectTab(id) {
+    for (const name of ['chat', 'engine', 'train']) {
+      const tab = $(`tab-${name}`);
+      const view = $(`view-${name}`);
+      const active = name === id;
+      tab.classList.toggle('is-active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+      view.hidden = !active;
+    }
+  }
+
+  /* ── Settings drawer ──────────────────────────────────────── */
+
+  const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  function openSettings(open) {
+    const drawer = $('settings');
+    const scrim = $('scrim');
+    drawer.classList.toggle('open', open);
+    drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
+    scrim.hidden = !open;
+    $('toggle-settings').setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) {
+      /* aria-hidden alone hides nothing from a keyboard user: focus could
+       * still walk into the drawer from behind. Focus moves in, and Tab is
+       * trapped while it is open. */
+      $('settings-close').focus();
+      drawer.onkeydown = (ev) => {
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          openSettings(false);
+          return;
+        }
+        if (ev.key !== 'Tab') return;
+        const items = Array.from(drawer.querySelectorAll(FOCUSABLE))
+          .filter((n) => n.offsetParent !== null);
+        if (items.length === 0) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (ev.shiftKey && document.activeElement === first) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && document.activeElement === last) {
+          ev.preventDefault();
+          first.focus();
+        }
+      };
+    } else {
+      drawer.onkeydown = null;
+      /* Focus has to go back where it came from, otherwise it falls to the
+       * document body and the next Tab starts at the top of the page. */
+      $('toggle-settings').focus();
+    }
+  }
+
   /* ── Wiring ───────────────────────────────────────────────── */
 
   function init() {
@@ -342,6 +497,10 @@
       send(text);
     });
 
+    $('cancel').addEventListener('click', () => {
+      if (state.inflight) state.inflight.abort();
+    });
+
     $('model-select').addEventListener('change', (ev) => selectModel(ev.target.value));
     $('opt-humanity').addEventListener('input', updateAxiom);
     $('vocab-save').addEventListener('click', saveVocab);
@@ -350,14 +509,46 @@
     $('view-words').addEventListener('click', () => setView('words'));
     $('view-tokens').addEventListener('click', () => setView('tokens'));
 
+    $('tab-chat').addEventListener('click', () => selectTab('chat'));
+    $('tab-engine').addEventListener('click', () => selectTab('engine'));
+    $('tab-train').addEventListener('click', () => selectTab('train'));
+    $('tabs').addEventListener('keydown', (ev) => {
+      if (ev.key !== 'ArrowRight' && ev.key !== 'ArrowLeft') return;
+      const order = ['chat', 'engine', 'train'];
+      const current = order.indexOf(document.activeElement.id.replace('tab-', ''));
+      if (current < 0) return;
+      ev.preventDefault();
+      const next = order[(current + (ev.key === 'ArrowRight' ? 1 : order.length - 1)) % order.length];
+      $(`tab-${next}`).focus();
+      selectTab(next);
+    });
+
+    /* Upload */
+    $('upload-open').addEventListener('click', () => {
+      $('upload-hint').textContent = '';
+      $('upload-input').value = '';
+      $('upload-dialog').showModal();
+    });
+    $('upload-input').addEventListener('change', (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      $('upload-name').value = file.name.replace(/\.hydra$/i, '');
+      $('upload-hint').textContent = `${file.name} · ${file.size} bytes — press Upload`;
+    });
+    $('upload-confirm').addEventListener('click', async (ev) => {
+      const file = $('upload-input').files && $('upload-input').files[0];
+      if (!file) {
+        $('upload-hint').textContent = 'choose a file first';
+        ev.preventDefault();
+        return;
+      }
+      const ok = await uploadModel(file);
+      if (ok) $('upload-dialog').close();
+      else ev.preventDefault();
+    });
+
     const drawer = $('settings');
     const scrim = $('scrim');
-    const openSettings = (open) => {
-      drawer.classList.toggle('open', open);
-      drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
-      scrim.hidden = !open;
-      $('toggle-settings').setAttribute('aria-expanded', open ? 'true' : 'false');
-    };
     $('toggle-settings').addEventListener('click', () => openSettings(!drawer.classList.contains('open')));
     $('settings-close').addEventListener('click', () => openSettings(false));
     scrim.addEventListener('click', () => openSettings(false));
@@ -379,6 +570,14 @@
     state.view = view;
     $('view-words').classList.toggle('is-active', view === 'words');
     $('view-tokens').classList.toggle('is-active', view === 'tokens');
+    $('view-words').setAttribute('aria-pressed', view === 'words' ? 'true' : 'false');
+    $('view-tokens').setAttribute('aria-pressed', view === 'tokens' ? 'true' : 'false');
+    /* Re-render what is already on screen; before this the toggle only
+     * changed the buttons and the messages kept their old representation. */
+    for (const msg of botMessages) {
+      msg.element.textContent = '';
+      renderTokens(msg.element, msg.tokens);
+    }
   }
 
   if (document.readyState === 'loading') {

@@ -10,6 +10,12 @@
 
 static JavaVM *g_vm = NULL;
 
+/* Wie viele Tokens pro JNI-Aufruf gebuendelt werden. Der pro-Token-Ubergang
+ * (JNI-Aufruf + Kotlin-Objektmethoden-Dispatch) kostet bei winziger Engine
+ * mehr Zeit als die Engine selbst; 16 ist ein Kompromiss aus sichtbarer
+ * Fortschrittsanzeige und geringer Aufrufzahl. */
+#define HYDRA_JNI_BATCH 16
+
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 {
     (void)reserved;
@@ -17,25 +23,51 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
     return JNI_VERSION_1_6;
 }
 
-/* Stream one generated token to Kotlin via a Java callback:
- * callback.onToken(int step, int token)
- * Returns 0 on success, -1 if the callback threw (stream must stop). */
-static int emit_token(JNIEnv *env, jobject callback, int step, int token)
+/* Einen Block erzeugter Tokens an Kotlin uebergeben:
+ *   callback.onTokens(int[] tokens, boolean done)
+ * Ein Aufruf pro HYDRA_JNI_BATCH Tokens und ein letzter mit done=true.
+ * Gibt 0 zurueck, -1 wenn der Kotlin-Callback geworfen hat (dann muss der
+ * Stream abbrechen - eine pending Exception macht jeden weiteren JNI-Call
+ * undefiniert). */
+static int emit_tokens(JNIEnv *env, jobject callback, const uint16_t *tokens,
+                       int n, jboolean done)
 {
     if (!env || !callback) return 0;
     jclass cls = (*env)->GetObjectClass(env, callback);
     if (!cls) return -1;
-    jmethodID mid = (*env)->GetMethodID(env, cls, "onToken", "(II)V");
-    if (mid) {
-        (*env)->CallVoidMethod(env, callback, mid, step, token);
-        /* Wirft der Kotlin-Callback, bleibt die Ausnahme pending und jeder
-         * weitere JNI-Call ist undefiniert. Klar melden und abbrechen. */
-        if ((*env)->ExceptionCheck(env)) {
-            (*env)->ExceptionClear(env);
-            LOGE("onToken callback threw at step %d - aborting token stream", step);
-            (*env)->DeleteLocalRef(env, cls);
-            return -1;
-        }
+    jmethodID mid = (*env)->GetMethodID(env, cls, "onTokens", "([IZ)V");
+    if (!mid) {
+        LOGE("onTokens(int[], boolean) not found on the callback");
+        (*env)->DeleteLocalRef(env, cls);
+        return -1;
+    }
+
+    /* jintArray, nicht jshortArray: Kotlin Int ist immer 32 Bit, und ein
+     * jshort[] wuerde stillschweigend die Haelfte der Token-Werte
+     * zerstoeren (ein Token kann 0..1023 sein, aber der Puffer ist
+     * uint16_t - jeder Wert >= 32768 wuerde negativ). */
+    jintArray arr = (*env)->NewIntArray(env, n);
+    if (!arr) {
+        LOGE("NewIntArray failed for %d tokens", n);
+        (*env)->DeleteLocalRef(env, cls);
+        return -1;
+    }
+    /* Ein lokales jint-Array als Puffer: GetIntArrayRegion kopiert direkt
+     * hinein, kein zweiter malloc. */
+    {
+        static jint staging[HYDRA_JNI_BATCH];
+        int m = n < HYDRA_JNI_BATCH ? n : HYDRA_JNI_BATCH;
+        for (int i = 0; i < m; ++i) staging[i] = (jint)tokens[i];
+        (*env)->SetIntArrayRegion(env, arr, 0, m, staging);
+    }
+    (*env)->CallVoidMethod(env, callback, mid, arr, done);
+    (*env)->DeleteLocalRef(env, arr);
+
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        LOGE("onTokens callback threw - aborting token stream");
+        (*env)->DeleteLocalRef(env, cls);
+        return -1;
     }
     (*env)->DeleteLocalRef(env, cls);
     return 0;
@@ -44,17 +76,21 @@ static int emit_token(JNIEnv *env, jobject callback, int step, int token)
 /*
  * Runs inference against a model file on local storage.
  *
- * @param modelPath  absolute path to a .hydra file (copied from assets)
- * @param startToken seed token
- * @param steps      number of inference steps (1..256, clamped)
+ * @param modelPath  absolute path to a .hydra file (copied from assets or
+ *                   imported via SAF)
+ * @param prompt     int[] of token ids fed through the engine BEFORE the
+ *                   generation (may be null or empty). The last entry is
+ *                   the seed for the first generated token, so a prompt
+ *                   really is context and not just a start value.
+ * @param steps      number of generated inference steps (1..256, clamped)
  * @param callback   instance of dev.hydrastone.HydraBridge.Callback
- * @return JSON-ish summary string: {"ok":true,"steps":N,"ms":X,"model":...}
+ * @return JSON-ish summary string: {"ok":true,"steps":N,"elapsed_us":X,...}
  *         or {"ok":false,"error":"..."}
  */
 JNIEXPORT jstring JNICALL
 Java_dev_hydrastone_HydraBridge_runInference(
         JNIEnv *env, jclass clazz,
-        jstring modelPath, jint startToken, jint steps, jobject callback)
+        jstring modelPath, jintArray prompt, jint steps, jobject callback)
 {
     (void)clazz;
     const char *path = (*env)->GetStringUTFChars(env, modelPath, NULL);
@@ -65,12 +101,30 @@ Java_dev_hydrastone_HydraBridge_runInference(
     if (steps < 1) steps = 1;
     if (steps > 256) steps = 256;
 
-    /* Negative startTokens werden abgewiesen statt stillschweigend
-     * umgewickelt: (-5 % 512) = -5 -> (uint16_t)65531 war ein valider,
-     * aber semantisch falscher Seed. */
-    if (startToken < 0) {
-        LOGE("negative startToken rejected: %d", (int)startToken);
-        return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"negative startToken\"}");
+    /* Prompt-Token vor dem Laden kopieren: nach hydra_engine_load() wird
+     * das jintArray-Handle weiter unten womoeglich als Lokal-Referenz
+     * wegoptimiert. Ausserdem wird jeder Token gegen 0..65535 geprueft -
+     * ein negatives oder zu grosses Token waere ein still falscher Seed. */
+    uint16_t prompt_buf[256];
+    size_t prompt_n = 0;
+    if (prompt != NULL) {
+        jsize plen = (*env)->GetArrayLength(env, prompt);
+        if (plen > (jsize)(sizeof(prompt_buf) / sizeof(prompt_buf[0]))) {
+            LOGE("prompt too long: %d tokens (max %zu)", (int)plen,
+                 sizeof(prompt_buf) / sizeof(prompt_buf[0]));
+            (*env)->ReleaseStringUTFChars(env, modelPath, path);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"prompt too long\"}");
+        }
+        for (jsize i = 0; i < plen; ++i) {
+            jint v = 0;
+            (*env)->GetIntArrayRegion(env, prompt, i, 1, &v);
+            if (v < 0 || v > 65535) {
+                LOGE("prompt token %d out of range: %d", (int)i, (int)v);
+                (*env)->ReleaseStringUTFChars(env, modelPath, path);
+                return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"prompt token out of range\"}");
+            }
+            prompt_buf[prompt_n++] = (uint16_t)v;
+        }
     }
 
     HydraEngine engine;
@@ -89,20 +143,43 @@ Java_dev_hydrastone_HydraBridge_runInference(
     const unsigned vocab = engine.header.vocab_size;
     const unsigned layers = engine.header.layers;
 
-    uint16_t tok = (uint16_t)(startToken % vocab);
+    /* Prompt (alle Token ausser dem letzten) durch die Engine schicken. */
+    if (prompt_n > 0) {
+        if (hydra_engine_prefill(&engine, prompt_buf, prompt_n) != 0) {
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"prefill failed\"}");
+        }
+    }
+
+    /* Seed: letzter Prompt-Token, sonst Token 0. Ein Token ausserhalb des
+     * Vokabulars wird wie in der Engine modularisiert, nicht abgelehnt -
+     * das ist die dokumentierte Semantik von hydra_engine_step(). */
+    uint16_t tok = prompt_n > 0 ? prompt_buf[prompt_n - 1] : 0u;
+    if (tok >= vocab) tok = (uint16_t)(tok % vocab);
+
+    uint16_t batch[HYDRA_JNI_BATCH];
+    int batch_n = 0;
     for (int s = 0; s < steps; ++s) {
         uint16_t next = 0;
         if (hydra_engine_step(&engine, tok, &next) != 0) {
             hydra_engine_unload(&engine);
             return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"step failed\"}");
         }
-        if (emit_token(env, callback, s, next) != 0) {
-            /* Stream abbruecken statt weiter Tokens zu erzeugen. */
-            LOGE("inference aborted at step %d after callback failure", s);
-            hydra_engine_unload(&engine);
-            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"callback failed\"}");
-        }
+        batch[batch_n++] = next;
         tok = next;
+        if (batch_n == HYDRA_JNI_BATCH) {
+            if (emit_tokens(env, callback, batch, batch_n, JNI_FALSE) != 0) {
+                LOGE("inference aborted at step %d after callback failure", s);
+                hydra_engine_unload(&engine);
+                return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"callback failed\"}");
+            }
+            batch_n = 0;
+        }
+    }
+    /* Restlicher Block mit done=true - genau ein Abschluss je Lauf. */
+    if (emit_tokens(env, callback, batch, batch_n, JNI_TRUE) != 0) {
+        hydra_engine_unload(&engine);
+        return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"callback failed\"}");
     }
     long elapsed_us = (clock() - t0) * 1000000L / CLOCKS_PER_SEC;
 
@@ -115,8 +192,10 @@ Java_dev_hydrastone_HydraBridge_runInference(
     char buf[256];
     snprintf(buf, sizeof(buf),
              "{\"ok\":true,\"steps\":%d,\"elapsed_us\":%ld,\"dim\":%u,"
-             "\"vocab\":%u,\"layers\":%u,\"axiom_allowed\":%s}",
-             (int)steps, elapsed_us, dim, vocab, layers,
+             "\"vocab\":%u,\"layers\":%u,\"prompt\":%zu,\"batches\":%d,"
+             "\"axiom_allowed\":%s}",
+             (int)steps, elapsed_us, dim, vocab, layers, prompt_n,
+             (int)((steps + HYDRA_JNI_BATCH - 1) / HYDRA_JNI_BATCH) + 1,
              allowed ? "true" : "false");
     LOGI("inference done: %s", buf);
     return (*env)->NewStringUTF(env, buf);

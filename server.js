@@ -11,7 +11,8 @@
  * Endpoints:
  *  GET  /api/models                -> every model found on disk, with header
  *  GET  /api/model?path=...        -> detail for one model
- *  POST /api/infer {token,steps}   -> inference via hydra-run --json
+ *  POST /api/models/upload?name=   -> store an uploaded .hydra (raw body)
+ *  POST /api/infer {token,prompt,steps} -> inference via hydra-run --json
  *  POST /api/train {...}           -> train a model from a corpus
  *  GET  /api/vocab?model=...       -> token<->string map for a model
  *  PUT  /api/vocab                 -> store/replace that map
@@ -20,6 +21,8 @@
  * Security invariants kept from the audit:
  *  - model paths are restricted to *.hydra inside the project directory and
  *    resolved with realpath + lstat (a symlink must not escape ROOT)
+ *  - uploaded bytes are validated against the same header rules the C
+ *    loader enforces; an invalid file is never written to a model path
  *  - no shell: execFile only, arguments are passed as an array
  *  - internal error details never reach the client
  */
@@ -37,12 +40,23 @@ const PUBLIC = path.join(ROOT, 'public');
 const HYDRA_RUN = path.join(ROOT, 'hydra-run');
 const MODELS_DIR = path.join(ROOT, 'models');
 const TRAINED_DIR = path.join(MODELS_DIR, 'trained');
+const UPLOAD_DIR = path.join(MODELS_DIR, 'uploaded');
 const MAX_VERIFY_DIM = 4096;
 const VOCAB_DIR = path.join(ROOT, 'models', 'vocab');
 const DEFAULT_MODEL = path.join(MODELS_DIR, 'demo.hydra');
 
 const MAX_BODY = 2 * 1024 * 1024; /* training corpora are text; 2 MiB is ample */
+const MAX_UPLOAD = 64 * 1024 * 1024; /* .hydra models are small; 64 MiB is generous */
+const MAX_PROMPT = 256; /* must match MAX_PROMPT in src/main.c */
 const ENGINE_TIMEOUT_MS = 20000;
+
+/* The console talks to a local engine and can run arbitrary uploaded code
+ * paths, so binding it to every interface must be an explicit decision.
+ * Freebuff-style dev hosts set HYDRA_ALLOW_REMOTE=1 when they need it. */
+const HOST = process.env.HYDRA_ALLOW_REMOTE === '1' ? '0.0.0.0' : '127.0.0.1';
+
+const HEADER_BYTES = 24;
+const MAX_DIM = 64;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -111,6 +125,95 @@ function safeModelPath(p) {
   return real;
 }
 
+/* Uploaded bytes are streamed straight to disk instead of being buffered:
+ * the cap is 64 MiB, and a JSON body parser would have to hold that in RAM
+ * before deciding whether the request is acceptable at all. The body is
+ * written to a .tmp file first and only renamed after validation, so a
+ * failed or oversized upload can never leave a truncated .hydra behind. */
+function streamToTmpFile(req, tmpPath, limit) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(tmpPath, { flags: 'wx' });
+    let written = 0;
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      out.destroy();
+      try { fs.unlinkSync(tmpPath); } catch { /* already gone */ }
+      reject(err);
+    };
+    req.on('data', (chunk) => {
+      written += chunk.length;
+      if (written > limit) {
+        req.destroy();
+        const e = new Error('file exceeds the 64 MiB limit');
+        e.status = 413;
+        fail(e);
+      }
+    });
+    out.on('error', fail);
+    req.on('error', fail);
+    out.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      resolve(written);
+    });
+    req.pipe(out);
+  });
+}
+
+/**
+ * Header validation for an uploaded model. Mirrors the C loader in
+ * src/hydra_engine.c check for check: the point is to reject exactly what
+ * the engine would reject, so a model that is listed as valid is loadable.
+ * Returns null when the file is fine, otherwise the reason.
+ */
+function validateHydraHeader(file, size) {
+  if (size < HEADER_BYTES) return 'file is smaller than the 24-byte header';
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(HEADER_BYTES);
+    if (fs.readSync(fd, buf, 0, HEADER_BYTES, 0) < HEADER_BYTES) {
+      return 'header could not be read';
+    }
+    const magic = buf.readUInt32LE(0);
+    const version = buf.readUInt16LE(4);
+    const vocab = buf.readUInt16LE(6);
+    const dim = buf.readUInt32LE(8);
+    const layers = buf.readUInt32LE(12);
+    const weightsOffset = buf.readUInt32LE(16);
+    const weightsLen = buf.readUInt32LE(20);
+
+    if (magic !== trainer.MAGIC) return 'not a .hydra file (wrong magic)';
+    if (version !== trainer.VERSION) return `unsupported .hydra version ${version}`;
+    if (dim === 0 || dim > MAX_DIM) return `dim out of range (1..${MAX_DIM}): ${dim}`;
+    if (vocab === 0 || vocab > trainer.MAX_VOCAB) {
+      return `vocab out of range (1..${trainer.MAX_VOCAB}): ${vocab}`;
+    }
+    if (layers === 0 || layers > trainer.MAX_LAYERS) {
+      return `layers out of range (1..${trainer.MAX_LAYERS}): ${layers}`;
+    }
+    if (weightsOffset < HEADER_BYTES) return 'weights_offset points into the header';
+    if (weightsOffset + weightsLen > size) return 'weights run past the end of the file';
+    if (layers * dim > weightsLen) return 'layers x dim is not covered by weights_len';
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Resolve an upload name to a path inside models/uploaded/, or null. */
+function uploadTarget(name) {
+  if (typeof name !== 'string' || !name.endsWith('.hydra')) return null;
+  const key = modelKey(name.slice(0, -'.hydra'.length));
+  if (key === null) return null;
+  const dir = path.resolve(UPLOAD_DIR);
+  const file = path.resolve(dir, `${key}.hydra`);
+  const rel = path.relative(dir, file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return file;
+}
+
 function engineJson(args) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -134,8 +237,12 @@ function engineJson(args) {
   });
 }
 
-function runInference(modelPath, token, steps) {
-  return engineJson([modelPath, String(token), String(steps), '--json']);
+/* prompt: optional token sequence fed through the engine before generation.
+ * An empty prompt keeps the old single-seed behaviour (token). */
+function runInference(modelPath, token, steps, prompt) {
+  const args = [modelPath, String(token), String(steps), '--json'];
+  if (Array.isArray(prompt) && prompt.length > 0) args.push('--prompt', prompt.join(','));
+  return engineJson(args);
 }
 
 function loadModelInfo(modelPath) {
@@ -192,6 +299,7 @@ function inspectHeader(relPath) {
       weightsLen: buf.readUInt32LE(20),
       valid: buf.readUInt32LE(0) === trainer.MAGIC,
       trained: relPath.startsWith('models' + path.sep + 'trained' + path.sep),
+      uploaded: relPath.startsWith('models' + path.sep + 'uploaded' + path.sep),
     };
   } catch {
     return null;
@@ -430,6 +538,33 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, info);
     }
 
+    if (url.pathname === '/api/models/upload' && req.method === 'POST') {
+      const target = uploadTarget(url.searchParams.get('name') || '');
+      if (!target) {
+        return sendJSON(res, 400, {
+          error: 'invalid file name: use letters, digits, dot, dash, underscore and the .hydra suffix',
+        });
+      }
+      fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+      const tmp = path.join(UPLOAD_DIR, `.upload-${process.pid}-${Date.now()}.tmp`);
+      let size;
+      try {
+        size = await streamToTmpFile(req, tmp, MAX_UPLOAD);
+      } catch (e) {
+        /* The stream already removed the temp file and req is destroyed. */
+        return sendJSON(res, e.status || 400, { error: e.message });
+      }
+      const reason = validateHydraHeader(tmp, size);
+      if (reason !== null) {
+        fs.unlinkSync(tmp);
+        return sendJSON(res, 400, { error: reason, rejected: true });
+      }
+      /* Only a fully validated file reaches its final name. */
+      fs.renameSync(tmp, target);
+      const info = inspectHeader(path.relative(ROOT, target));
+      return sendJSON(res, 200, { ok: true, model: info });
+    }
+
     if (url.pathname === '/api/infer' && req.method === 'POST') {
       /* Audit fix: JSON.parse('null') yields null and '[]' an array, so the
        * body shape is checked explicitly instead of producing a 500 with an
@@ -452,6 +587,28 @@ const server = http.createServer(async (req, res) => {
       const token = Math.max(0, Math.min(0xFFFF, Math.trunc(tokenRaw)));
       const steps = Math.max(1, Math.min(256, Math.trunc(stepsRaw)));
 
+      /* prompt: the whole encoded prompt, not just its first token. It is
+       * validated here as strictly as the seed - a non-array, a NaN or an
+       * out-of-range id would otherwise reach the CLI as a silent cap. */
+      let prompt = null;
+      if (body.prompt !== undefined && body.prompt !== null) {
+        if (!Array.isArray(body.prompt)) {
+          return sendJSON(res, 400, { error: 'prompt must be an array of token ids' });
+        }
+        if (body.prompt.length > MAX_PROMPT) {
+          return sendJSON(res, 400, { error: `prompt too long (max ${MAX_PROMPT} tokens)` });
+        }
+        prompt = [];
+        for (const v of body.prompt) {
+          const n = Number(v);
+          if (!Number.isFinite(n) || n < 0 || n > 0xFFFF) {
+            return sendJSON(res, 400, { error: `prompt token out of range: ${v}` });
+          }
+          prompt.push(Math.trunc(n));
+        }
+        if (prompt.length === 0) prompt = null;
+      }
+
       /* An explicitly requested but forbidden path must not silently fall
        * back to the default model. */
       let p = DEFAULT_MODEL;
@@ -459,7 +616,7 @@ const server = http.createServer(async (req, res) => {
         p = safeModelPath(body.path);
         if (!p) return sendJSON(res, 400, { error: 'invalid model path' });
       }
-      const result = await runInference(p, token, steps);
+      const result = await runInference(p, token, steps, prompt);
       return sendJSON(res, 200, result);
     }
 
@@ -556,6 +713,6 @@ function ensureDefaultModel() {
 
 ensureDefaultModel();
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Hydra Console] http://0.0.0.0:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`[Hydra Console] http://${HOST}:${PORT}`);
 });

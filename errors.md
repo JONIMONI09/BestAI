@@ -737,6 +737,65 @@
   if it cannot parse what it wrote, that is a bug, not a fallback. A GET
   that returns `{}` after a `PUT` reported success is a lie.
 
+## 2026-10-02 — Words mode printed token IDs, the toggle did nothing, and the prompt was thrown away
+
+- **Symptom:** in the web console the "Words" view showed numbers, switching
+  between Words and Tokens changed nothing in the already-rendered messages,
+  and a whole sentence produced the same answer as its first word.
+- **Cause:** three separate bugs in `public/app.js`. (a) `renderTokens()`
+  did `Object.values(state.vocab).find((id) => id === tok)` — the
+  vocabulary is a word -> id map, so the "reverse" lookup always found the
+  id itself and printed it. (b) `setView()` only toggled the button class;
+  the token list of each rendered message was thrown away after painting.
+  (c) `send()` computed a token array from the message and then sent
+  `tokens[0]` as the seed, because the engine API could not accept a
+  sequence at all.
+- **Fix:** a reverse map is built once per vocabulary load
+  (`state.idToWord`); every bot message keeps its tokens so `setView()` can
+  re-render it; and `hydra_engine_prefill()` + the CLI `--prompt` option
+  feed the whole sequence into the engine. The engine core itself is
+  untouched: the prefill runs the same `hydra_engine_step()` for every
+  prompt token.
+- **Prevention:** a UI claim ("this shows words") needs a test that can fail
+  when the lookup is inverted. `tools/server_test.js` now asserts that a
+  one-token prompt equals the bare seed and that a longer prompt *changes*
+  the output — a no-op prefill passes the first check and fails the second.
+
+## 2026-10-02 — The JNI signature gate passed while the callback was unreachable
+
+- **Symptom:** when the callback was changed from `onToken(int,int)` to a
+  batched `onTokens(int[],boolean)`, `tools/jni_signature_check.sh` still
+  reported success.
+- **Cause:** the check verifies the *native method* signatures derived by
+  `javac -h`. The callback is a `jobject` parameter, so its shape was never
+  part of that comparison. At runtime the C bridge looks the method up with
+  `GetMethodID(cls, "onTokens", "([IZ)V")`; with a stale Kotlin declaration
+  the lookup fails and the app silently receives no tokens, while every
+  native-method check stays green.
+- **Fix:** the check now also derives the JVM descriptor of every callback
+  method from the generated stub and requires the C bridge to look up that
+  exact name and descriptor. Proven to fail three ways: a renamed Kotlin
+  callback, a wrong parameter type in the descriptor, and a renamed
+  `GetMethodID` string in C.
+- **Prevention:** `grep` was silently matching a regex while checking a
+  literal descriptor (`Unmatched [`). Descriptors are fixed strings now
+  (`grep -F`), because a check that cannot fail is worse than no check.
+
+## 2026-10-02 — Two dependency-shaped detours that were not the bug
+
+- **Symptom:** `assembleDebug` failed after adding the SAF import.
+- **Cause:** `androidx.activity` 1.13.0 requires `compileSdk 36`, the
+  project compiles against 34; and lint's `GradleDependency` check then
+  reported "a newer version is available" on every build, which breaks the
+  release gate that requires a report without findings.
+- **Fix:** pinned `androidx.activity:activity:1.9.3` (newest line that
+  builds against compileSdk 34) and disabled `GradleDependency` for this
+  module with a comment explaining why. Bumping the compile SDK is a
+  toolchain change and was not smuggled in as a bug fix.
+- **Prevention:** pinning a dependency is a decision that needs a comment
+  stating *why* the newer one is not used, otherwise the next person
+  "fixes" the warning by upgrading and hits the compileSdk error again.
+
 ## 2026-10-02 — "No releases published": the release only ever ran on a tag push
 
 - **Symptom:** the repository page showed "No releases published", 0 tags,
