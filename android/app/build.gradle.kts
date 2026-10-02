@@ -93,8 +93,11 @@ android {
 dependencies {
     // Only the Activity Result API for the SAF model picker. No AppCompat,
     // no Compose, no Material Components - the UI stays programmatic Views.
+    // The -ktx artifact, not the plain one: lint's KtxExtensionAvailable
+    // check flags the plain artifact as an informational finding, and the
+    // release gate requires a report without findings.
     // 1.9.3 is the newest androidx.activity that still builds against
     // compileSdk 34; 1.13.0 requires compileSdk 36. Bumping the compile SDK
     // is a toolchain change, not a bug fix, so it is not smuggled in here.
-    implementation("androidx.activity:activity:1.9.3")
+    implementation("androidx.activity:activity-ktx:1.9.3")
 }
