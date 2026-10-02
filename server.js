@@ -37,6 +37,7 @@ const PUBLIC = path.join(ROOT, 'public');
 const HYDRA_RUN = path.join(ROOT, 'hydra-run');
 const MODELS_DIR = path.join(ROOT, 'models');
 const TRAINED_DIR = path.join(MODELS_DIR, 'trained');
+const MAX_VERIFY_DIM = 4096;
 const VOCAB_DIR = path.join(ROOT, 'models', 'vocab');
 const DEFAULT_MODEL = path.join(MODELS_DIR, 'demo.hydra');
 
@@ -264,6 +265,9 @@ async function handleTrain(body) {
     dim: clampInt(body.dim, 2, trainer.MAX_DIM, 32),
     layers: clampInt(body.layers, 1, trainer.MAX_LAYERS, 8),
   };
+  if (cfg.dim > MAX_VERIFY_DIM) {
+    return { error: `dim too large; max allowed is ${MAX_VERIFY_DIM}` };
+  }
   const epochs = clampInt(body.epochs, 1, 50, 12);
 
   /* Every token id used must fit into the vocabulary of the new model. */
@@ -318,6 +322,7 @@ async function handleTrain(body) {
  * disagree the file is wrong, and we refuse to report success.
  */
 async function verifyModelFile(file, cfg, seedToken, steps) {
+  const dim = clampInt(cfg.dim, 1, MAX_VERIFY_DIM, 32);
   const buf = fs.readFileSync(file);
   const header = {
     magic: buf.readUInt32LE(0),
@@ -326,13 +331,13 @@ async function verifyModelFile(file, cfg, seedToken, steps) {
     dim: buf.readUInt32LE(8),
     layers: buf.readUInt32LE(12),
   };
-  const decoded = trainer.unpack(buf.subarray(24), cfg.layers, cfg.dim);
+  const decoded = trainer.unpack(buf.subarray(24), cfg.layers, dim);
 
-  const state = new Array(cfg.dim).fill(0);
+  const state = new Array(dim).fill(0);
   const simulated = [];
   let token = seedToken;
   for (let t = 0; t < steps; t += 1) {
-    const r = trainer.step(decoded.w1, decoded.w2, cfg.layers, cfg.dim, cfg.vocab, state, token);
+    const r = trainer.step(decoded.w1, decoded.w2, cfg.layers, dim, cfg.vocab, state, token);
     simulated.push(r.out);
     token = r.out;
   }
