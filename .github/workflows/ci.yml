@@ -22,7 +22,8 @@ jobs:
           gcc -fsyntax-only -std=c99 \
               -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -Wall -Wextra -Werror -Iinclude \
-              src/hydra_engine.c src/main.c tests/test_engine.c
+              src/hydra_engine.c src/main.c tests/test_engine.c \
+              tests/test_jni_batch.c tests/test_large_model.c
 
       # Gate 1b: same strictness with clang — catches gcc-only
       # diagnostics and validates the code compiles cleanly on a
@@ -32,7 +33,8 @@ jobs:
           clang -fsyntax-only -std=c99 \
               -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -Wall -Wextra -Werror -Iinclude \
-              src/hydra_engine.c src/main.c tests/test_engine.c
+              src/hydra_engine.c src/main.c tests/test_engine.c \
+              tests/test_jni_batch.c tests/test_large_model.c
 
       # Gate 1c: static analysis (cppcheck), error-exitcode=2 on any
       # warning/error so nothing slips through
@@ -181,6 +183,19 @@ jobs:
       - name: Run unit tests
         run: ./hydra-test
 
+      # The JNI batching policy and the large-model/32-bit arithmetic run
+      # on the host, with no device involved. Both are part of `make test`,
+      # but they are listed separately here so a failure names the file that
+      # broke instead of hiding inside a combined exit code.
+      - name: JNI batching policy (partial final block, steps <= 0)
+        run: ./jni-batch-test
+
+      # Loads a 5 GiB SPARSE model: the point is that a model bigger than
+      # RAM still loads, which is only possible because the mapping is
+      # lazy. Sparse keeps it at a few KiB of real disk.
+      - name: Large models and 32-bit offset arithmetic
+        run: ./large-model-test
+
       - name: Runtime smoke test
         run: |
           python3 tools/make_dummy_model.py smoke.hydra
@@ -238,6 +253,47 @@ jobs:
       - name: Clean up
         run: make clean
 
+  # ---------- Stage 2c: GPU benchmark still builds and still measures ----
+  # tools/gpu_bench/ used to depend on a precompiled SPIR-V blob that
+  # nothing in the build produced, so it could not run anywhere. It now
+  # compiles its GLSL at runtime, and this job keeps the CPU reference
+  # path honest on every push: it must build with -Werror and emit valid
+  # JSON for both the CPU line and the explicit "no GPU here" line.
+  gpu-bench:
+    name: GPU bench (CPU reference)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run the CPU reference
+        run: make -s gpu-bench
+
+      - name: The JSON contract must hold
+        run: |
+          set -euo pipefail
+          out="$(./gpu_bench_cpu --dim 64 --layers 4 --k 1,16,64 --steps 500)"
+          echo "$out"
+          echo "$out" | python3 -c '
+          import json, sys
+          lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+          objs = [json.loads(l) for l in lines]
+          cpu = [o for o in objs if o.get("device") == "cpu"]
+          gpu = [o for o in objs if o.get("device") == "gpu"]
+          assert cpu, "no CPU measurement"
+          assert cpu[0]["measured"] is True, "the CPU line must claim to be measured"
+          assert cpu[0]["ns_per_step"] > 0, "a measurement must be positive"
+          assert gpu, "there must be an explicit GPU line"
+          # No GPU on a CI runner: the line must SAY so instead of
+          # pretending or crashing.
+          assert gpu[0]["measured"] is False
+          assert "reason" in gpu[0]
+          print("ok: cpu measured, gpu explicitly skipped with a reason")
+          '
+
+      - name: Clean up
+        run: make -s clean
+
   # ---------- Stage 3a: JNI bridge verified by javac ----------
   # The Kotlin bridge declares `external fun` methods; the C file must
   # export the matching JNI symbols. `javac -h` derives the symbol names
@@ -257,6 +313,14 @@ jobs:
 
       - name: Every native method must exist in the C bridge
         run: bash tools/jni_signature_check.sh
+
+      # The crash-reporting contract cannot be executed without a device,
+      # but the properties that were the bugs can be: the handler writes
+      # the file BEFORE delegating, never starts an Activity, the report is
+      # surfaced on the next launch, and steps <= 0 is rejected instead of
+      # clamped. Each check fails when the property is removed.
+      - name: Crash reporting and cancel contract
+        run: bash tools/android_crash_check.sh
 
   # ---------- Stage 3b: the APK is built on every push ----------
   # Previously the APK was only built by the release workflow, i.e. only

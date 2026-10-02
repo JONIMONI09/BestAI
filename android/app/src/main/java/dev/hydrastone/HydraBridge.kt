@@ -31,8 +31,11 @@ object HydraBridge {
      * @param modelPath absolute path of a .hydra file on local storage
      * @param prompt    token ids fed through the engine before generation;
      *                  the last entry is the seed. Empty = start at token 0.
-     * @param steps     number of generated steps (clamped to 1..256)
-     * @return a JSON summary string, never null
+     * @param steps     number of generated steps (1..256). A value below 1
+     *                  is rejected by the native side - not clamped - and
+     *                  answers {"ok":false,"error":"steps must be >= 1"}.
+     * @return a JSON summary string, never null. A cancelled run answers
+     *         {"ok":false,"cancelled":true,...}, which is not an error.
      */
     external fun runInference(
         modelPath: String,
@@ -40,6 +43,19 @@ object HydraBridge {
         steps: Int,
         callback: Callback
     ): String
+
+    /**
+     * Asks the run in progress to stop.
+     *
+     * This is a real, cooperative cancel, not a UI detach: the native loop
+     * checks the flag once per step, returns within one step, and reports
+     * `cancelled: true`. It is called from the UI thread and returns
+     * immediately; it does not wait for the run to finish.
+     *
+     * The flag is cleared at the start of every run, so a cancel that
+     * arrives between two runs cannot kill the next one.
+     */
+    external fun cancel()
 
     /**
      * Phase 0 measurement on the real device. Runs the same model three

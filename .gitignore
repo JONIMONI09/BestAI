@@ -3,6 +3,9 @@ hydra-run
 hydra-test
 hydra-run-*
 hydra-test-*
+jni-batch-test
+large-model-test
+gpu_bench_cpu
 *.o
 node_modules/
 # package-lock.json wird bewusst MIT committed: `npm ci` in der CI

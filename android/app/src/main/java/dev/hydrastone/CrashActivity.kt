@@ -9,19 +9,25 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * Shows a crash report with a copy button.
+ * Shows a crash report: copy it, or delete it.
  *
- * A separate activity (rather than an AlertDialog inside MainActivity)
- * because the crash may have killed MainActivity itself — this one starts
- * from a plain Context with FLAG_ACTIVITY_NEW_TASK and does not depend on
- * anything that was already initialised.
+ * This activity is NOT started by [CrashHandler]. It is started by
+ * MainActivity on the next launch when a report file exists - starting an
+ * activity from an uncaught-exception handler is unreliable, because the
+ * process is already dying and the request usually never lands.
+ *
+ * The report text comes either from [EXTRA_REPORT] or, when that is absent,
+ * from the stored file, so the same screen serves both the "here is the
+ * report you just asked for" and the "here is what happened last time"
+ * case.
  */
 class CrashActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val report = intent.getStringExtra(EXTRA_REPORT).orEmpty()
+        val fromIntent = intent.getStringExtra(EXTRA_REPORT)
+        val report = fromIntent ?: CrashHandler.pendingReport(filesDir).orEmpty()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -57,13 +63,23 @@ class CrashActivity : Activity() {
         }
         val copy = Button(this).apply { setText(R.string.crash_copy) }
         copy.tag = "crash-copy-button"
+        val delete = Button(this).apply { setText(R.string.crash_delete) }
+        delete.tag = "crash-delete-button"
         val close = Button(this).apply { setText(R.string.crash_close) }
         actions.addView(copy)
+        actions.addView(delete)
         actions.addView(close)
 
         copy.setOnClickListener {
             val ok = CrashHandler.copyToClipboard(this, report)
             copy.text = getString(if (ok) R.string.crash_copied else R.string.crash_copy_failed)
+        }
+        /* Deleting is destructive and irreversible, so it is labelled as
+         * such and does not happen by closing the screen. */
+        delete.setOnClickListener {
+            CrashHandler.clearReport(filesDir)
+            delete.text = getString(R.string.crash_deleted)
+            delete.isEnabled = false
         }
         close.setOnClickListener { finish() }
 

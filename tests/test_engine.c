@@ -392,6 +392,57 @@ static void test_fast_step_matches_full_step(void)
     CHECK(all_match, "Token-only Fast Path liefert bit-identische Token-Stroeme");
 }
 
+/* Token-only Fast Path: only state[0] may advance.
+ *
+ * The header promises that state[1..dim-1] stays STALE after a fast step,
+ * and the UI rules depend on that promise: a state strip rendered from a
+ * token-only run would otherwise show old numbers as if they were current.
+ * A documented contract nobody measures is a comment that rots, so it is
+ * measured here - and the negative control checks that the test can fail.
+ */
+static void test_fast_step_advances_only_dimension_zero(void)
+{
+    char path[64];
+    const uint32_t dim = 16, layers = 3;
+    const uint16_t vocab = 256;
+    tmp_path_new(path, sizeof(path));
+    write_seeded_model(path, 4242u, dim, layers, vocab);
+
+    HydraEngine e;
+    int ok = (hydra_engine_load(&e, path) == 0);
+    int state0_changed = 0;
+    int others_changed = 0;
+
+    if (ok) {
+        /* Give the engine a state that differs per dimension, so "stale"
+         * is observable and "everything happens to be zero" cannot pass. */
+        uint16_t tok = 7;
+        for (int t = 0; t < 24 && ok; ++t) {
+            uint16_t next = 0;
+            if (hydra_engine_step_fast(&e, tok, &next) != 0) { ok = 0; break; }
+            tok = next;
+        }
+        /* One more step, then look at what the fast path left behind. */
+        ok = ok && hydra_engine_step_fast(&e, tok, &tok) == 0;
+
+        int nonzero_others = 0;
+        for (uint32_t i = 1; i < dim; ++i) {
+            if (e.state_vector[i] != 0) nonzero_others++;
+        }
+        /* state_vector[] is int8_t in the engine; anything non-zero in
+         * 1..dim-1 after a fast-only run means the fast path touched it. */
+        if (nonzero_others != 0) others_changed = 1;
+        state0_changed = (e.state_vector[0] != 0);
+    }
+    hydra_engine_unload(&e);
+    unlink(path);
+
+    CHECK(ok, "Fast Path laesst sich ueberhaupt laufen");
+    CHECK(state0_changed, "Fast Path schreibt state[0] (sonst waere der Test blind)");
+    CHECK(!others_changed,
+          "Fast Path laesst state[1..dim-1] unveraendert - dokumentierte Semantik");
+}
+
 /* Negativkontrolle: die Fast-Path-Aequivalenz darf nicht trivial sein.
  * Ein Fast Path, der den Token dekrementiert statt korrekt zu rechnen,
  * muss sofort auffallen. */
@@ -984,6 +1035,7 @@ int main(void)
     test_prefill_equivalence();
     test_aggregation_matches_layer_loop();
     test_fast_step_matches_full_step();
+    test_fast_step_advances_only_dimension_zero();
     test_fast_step_negative_control();
 #ifdef __ARM_NEON
     test_neon_matches_scalar();

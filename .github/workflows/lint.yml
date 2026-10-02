@@ -170,6 +170,15 @@ jobs:
           node --check tools/hydra_train.js
           node --check tools/console_train_test.js
           node --check tools/server_test.js
+          node --check tools/contrast_check.js
+
+      # WCAG 2.2 AA for every text/background pair the stylesheet uses.
+      # --text-faint was #64748b (4.04:1 on the page background, below the
+      # 4.5:1 required for normal text) and nothing caught it: nobody had
+      # the numbers. The ratios now live in public/style.css as a comment,
+      # and this gate recomputes them on every push.
+      - name: WCAG AA contrast (documented ratios still hold)
+        run: node tools/contrast_check.js
 
       # The console can TRAIN a model. That is only believable if the
       # compiled C engine is shown to reproduce the trained token stream,

@@ -322,14 +322,20 @@
     }
 
     const controller = new AbortController();
+    /* The server kills the engine process for this id, so Cancel really
+     * stops the work instead of only hiding the answer. */
+    const callId = (window.crypto && typeof window.crypto.randomUUID === 'function')
+      ? window.crypto.randomUUID()
+      : `c${Date.now()}${Math.random().toString(16).slice(2)}`;
     state.inflight = controller;
+    state.inflightId = callId;
     setBusy(true);
     setStatus('running engine…', 'busy');
     try {
       const t0 = performance.now();
       const res = await api('/api/infer', {
         method: 'POST',
-        body: JSON.stringify({ path: state.model, prompt, steps }),
+        body: JSON.stringify({ path: state.model, prompt, steps, request_id: callId }),
         signal: controller.signal,
       });
       const wall = performance.now() - t0;
@@ -352,11 +358,14 @@
       setStatus('ready', 'ready');
     } catch (e) {
       if (e.name === 'AbortError') {
-        /* The client stopped waiting. The engine process is left alone:
-         * killing it server-side would also kill any other request. */
-        addMessage('sys', textNode('Request cancelled — the engine kept running, its answer was discarded.'));
+        /* The fetch is gone, so the answer cannot arrive through it. Tell
+         * the server to kill the engine process explicitly — a dropped
+         * socket alone is racy, and "cancelled" must mean the work
+         * stopped, not that the answer was merely hidden. */
+        await cancelCall(callId);
+        addMessage('sys', textNode('Cancelled — the engine process was stopped, not just ignored.'));
         log('request cancelled by the user');
-        setStatus('ready', 'ready');
+        setStatus('cancelled', 'cancelled');
       } else {
         addMessage('sys', textNode(`Engine error: ${e.message}`));
         log(`engine error: ${e.message}`);
@@ -371,7 +380,21 @@
       }
     } finally {
       state.inflight = null;
+      state.inflightId = null;
       setBusy(false);
+    }
+  }
+
+  /** Best-effort server-side kill; the socket may already be closed. */
+  async function cancelCall(id) {
+    try {
+      await fetch('/api/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+    } catch {
+      /* the server may have closed the connection already */
     }
   }
 

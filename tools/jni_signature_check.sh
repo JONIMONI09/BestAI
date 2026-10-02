@@ -38,7 +38,11 @@ if not m:
     sys.exit("no Kotlin object found in " + kt_path)
 cls = m.group(1)
 
-fns = re.findall(r"external\s+fun\s+(\w+)\s*\(([^)]*)\)\s*:\s*([\w.<>]+)", src, re.S)
+# The return type is OPTIONAL: Kotlin writes `external fun cancel()` for a
+# Unit-returning method. A pattern that required ": Type" would skip every
+# such method, and a native method that nothing checks is a native method
+# that can drift away from its C implementation unnoticed.
+fns = re.findall(r"external\s+fun\s+(\w+)\s*\(([^)]*)\)\s*(?::\s*([\w.<>]+))?", src, re.S)
 if not fns:
     sys.exit("no external fun declarations found in " + kt_path)
 
@@ -49,6 +53,7 @@ JMAP = {
     "Boolean": "boolean",
     "Long": "long",
     "Double": "double",
+    "Unit": "void",
     "Callback": "dev.hydrastone.%s.Callback" % cls,
 }
 
@@ -84,7 +89,7 @@ out = ["package dev.hydrastone;", "",
        "public final class %s {" % cls,
        "    public interface Callback { %s }" % " ".join(cb_methods)]
 for name, params, ret in fns:
-    ret_j = JMAP.get(ret.strip())
+    ret_j = JMAP.get((ret or "Unit").strip())
     if ret_j is None:
         sys.exit("unsupported return type: " + ret)
     ps = []

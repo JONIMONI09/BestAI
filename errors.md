@@ -6,6 +6,113 @@
 
 ---
 
+## 2026-10-02 — A reachability probe is not a bind-address test (sandbox published the console)
+
+- **Symptom:** the existing test `the server does not listen on a public
+  interface by default` started failing after the cancel work: it connected
+  to the workspace address and got a **200 with the console's own JSON**,
+  while `ss` showed the server bound to `127.0.0.1` only.
+- **Cause:** the development host mirrors every port the console listens on
+  onto the workspace address with `socat` (a leftover `169.254.0.21:<port>
+  LISTEN` row appears right after the first probe to that port). The test
+  therefore measured the sandbox's port publishing, not the server's bind
+  address. The original version of the test passed only because nothing had
+  yet probed that port in that session.
+- **Fix:** the test now reads the bind address from the kernel (`ss -Hltnp`)
+  and matches the socket by **the pid that owns it**, so a mirror cannot be
+  mistaken for the server. Both directions are asserted: no `HYDRA_ALLOW_REMOTE`
+  -> only `127.0.0.1`; `HYDRA_ALLOW_REMOTE=1` -> `0.0.0.0`. Negative control:
+  pinning `HOST = "0.0.0.0"` makes it fail with `0.0.0.0 !== 127.0.0.1`.
+- **Prevention:** a test must assert the property that matters through a
+  channel the environment cannot fake. "Can I reach it?" is a property of the
+  network path; "which address is it bound to?" is a property of the server.
+  Where a probe is unavoidable, check the peer socket with `ss`, never the
+  response body.
+
+## 2026-10-02 — `req.on('close')` never fires for an aborted fetch, so Cancel did nothing
+
+- **Symptom:** the new test `a client that hangs up kills its engine process`
+  failed: after `AbortController.abort()` the `hydra-run` child was still
+  alive 6 seconds later. The explicit `POST /api/cancel` path worked; the
+  button in the UI did not — and the UI button is the one users press.
+- **Cause:** `req.on('close')` on the `IncomingMessage` does not fire when
+  the peer disconnects mid-response in this Node version (verified with a
+  standalone probe: no `close` and no `aborted` event at all, while the
+  engine kept running). The response stream emits `close` immediately.
+- **Fix:** both `/api/infer` and `/api/train` now use
+  `res.on('close', …)` guarded by a `finished` flag set in
+  `res.on('finish')`, which always fires first for a request that completed.
+  Measured with the probe: the engine dies within 250 ms of the abort.
+- **Prevention:** the first version of this feature was written, "looked
+  right", and shipped into a passing test — because the test counted
+  processes after a 256-step run that had already finished on its own. A
+  test that can pass with the feature removed is not a test. The replacement
+  installs a stand-in engine that sleeps, records its own pid, and only
+  answers at the end; the pid disappearing can then only mean the server
+  signalled it.
+
+## 2026-10-02 — An explicitly cancelled request hung forever
+
+- **Symptom:** after a successful `POST /api/cancel`, the client's own
+  `fetch` for `/api/infer` never resolved — the test waited for a response
+  that was never sent.
+- **Cause:** the cancelled branch returned without answering. That is
+  correct for a client that hung up (its socket is gone) and wrong for one
+  that only pressed Cancel and is still waiting.
+- **Fix:** the branch answers `409 {"error":"cancelled","cancelled":true,id}`
+  when the response is still writable, and stays silent when the socket is
+  already gone. A cancelled run can no longer be confused with an engine
+  failure, and it is no longer written into the crash log.
+- **Prevention:** every early return in a request handler needs the question
+  "who is still listening?" answered explicitly. And a delete-timeout in a
+  test is a bug in the *server* until proven otherwise.
+
+## 2026-10-02 — A test that replaced the engine binary left the repository broken
+
+- **Symptom:** two test runs later, every engine test failed with 10-second
+  timeouts, and `hydra-run` was a 99-byte bash script.
+- **Cause:** the new cancel tests swap in a sleeping stand-in engine and
+  restore the real binary in a `finally`. A run killed by an external
+  timeout (`timeout 120 node --test`) never reaches `finally`, so the
+  stand-in survived; the next run swapped the *stand-in* for a *stand-in*.
+  The real binary was not in git (it is a build artifact) and `make`
+  considered it up to date.
+- **Fix:** an `exit` hook restores the file as well, and `make` is forced
+  with a rebuild. `hydra-run` was rebuilt from source.
+- **Prevention:** any test that mutates a tracked-by-convention file
+  registers a `process.on('exit')` restore, not only a `finally`; and a
+  swapped binary is never left to `make`'s timestamp heuristics.
+
+## 2026-10-02 — The JNI gate silently skipped every `Unit`-returning native method
+
+- **Symptom:** after adding `external fun cancel()` the signature gate still
+  reported "2 native method(s) verified" instead of three.
+- **Cause:** the extraction regex in `tools/jni_signature_check.sh` required
+  a return type (`external fun name(...): Type`). Kotlin writes
+  `external fun cancel()` for a method that returns `Unit`, so the new
+  method was never compared against the C bridge at all.
+- **Fix:** the return type is optional in the pattern and `Unit` maps to
+  `void`. The gate now reports 3 methods, including
+  `Java_dev_hydrastone_HydraBridge_cancel`.
+- **Prevention:** a gate that silently ignores a class of declarations is
+  worse than no gate, because it reports green. When a parser is widened,
+  the expected count in the output has to move with it.
+
+## 2026-10-02 — A negative control that killed the test process proved more than it should
+
+- **Symptom:** with the bounds sum temporarily narrowed to 32 bits,
+  `./large-model-test` died with SIGSEGV and printed nothing useful.
+- **Cause:** the crafted-header cases loaded the model in-process, and the
+  broken loader follows the wrapped offset straight off the mapping.
+- **Fix:** those loads run in a forked child; the parent turns "killed by
+  signal 11" into a named failure. With the 32-bit sum the suite now reports
+  `the loader followed offset 0xFFFFF000 and the child died with signal 11`.
+- **Prevention:** when the negative control's failure mode is a crash, run
+  it out of process. A test harness that dies with the bug cannot report on
+  the bug.
+
+---
+
 ## 2026-10-02 — Linter audit: choosing a tool means proving it can fail
 
 - **Symptom:** the request was "the best linters of 2026". Without a

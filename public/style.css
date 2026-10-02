@@ -9,7 +9,25 @@
   --line-soft: #1b2531;
   --text: #e8eef5;
   --text-dim: #94a3b4;
-  --text-faint: #64748b;
+  /* --text-faint was #64748b, which measures 4.04:1 on --bg, 3.74:1 on
+     --bg-elev and 3.45:1 on --bg-elev-2 - below the WCAG 2.2 AA minimum
+     of 4.5:1 for normal text. #7b8da3 measures 5.66 / 5.25 / 4.83 and
+     is the smallest step that clears all three surfaces.
+
+     Measured ratios (tools/contrast_check.js recomputes these and fails
+     the build if any of them drops below the threshold):
+
+       --text        on --bg       16.45:1   --text-dim    on --bg-elev-2  6.37:1
+       --text        on --bg-elev  15.26:1   --text-faint  on --bg       5.66:1
+       --text        on --bg-elev-2 14.04:1  --text-faint  on --bg-elev  5.25:1
+       --accent      on --bg-elev   8.32:1   --text-faint  on --bg-elev-2 4.83:1
+       --ok/--warn/--err on --bg-elev  9.27 / 10.68 / 6.44:1
+       --text on #04222f (state cell, primary button)  14.10:1
+
+     Only --text-faint was changed. The others already passed and are left
+     alone on purpose: "fix" a colour that is not failing is how a palette
+     silently drifts. */
+  --text-faint: #7b8da3;
   --accent: #38bdf8;
   --accent-strong: #0ea5e9;
   --accent-soft: rgba(56, 189, 248, 0.14);
@@ -130,6 +148,9 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; }
 .status[data-state="ready"] { color: var(--ok); border-color: rgba(52, 211, 153, .4); }
 .status[data-state="busy"] { color: var(--accent); border-color: rgba(56, 189, 248, .4); }
 .status[data-state="error"] { color: var(--err); border-color: rgba(248, 113, 113, .4); }
+/* "cancelled" is neither ready nor broken — it gets its own state so a
+   user-triggered cancel never looks like an engine failure. */
+.status[data-state="cancelled"] { color: var(--warn); border-color: rgba(251, 191, 36, .45); }
 
 /* ── Buttons ─────────────────────────────────────────────────── */
 .btn {

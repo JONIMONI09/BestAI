@@ -75,7 +75,9 @@ dispatch/read-back latency on the Adreno 830 — is still missing.
 
 ## 4. Phase 2 status: built, not run
 
-`tools/gpu_bench/` contains a standalone GLES 3.1 compute benchmark:
+`tools/gpu_bench/` contains a standalone GLES 3.1 compute benchmark
+(the shader is compiled **at runtime** from GLSL ES 3.10 source — the
+earlier SPIR-V-blob path could not run anywhere and is gone):
 
 * the CPU reference uses the identical arithmetic to the engine,
 * the GPU path keeps `A`, `B` and `state` in SSBOs and reads the
@@ -85,17 +87,16 @@ dispatch/read-back latency on the Adreno 830 — is still missing.
   one.
 
 It **compiles for arm64** with the NDK 26.3.11579264 toolchain
-(`aarch64-linux-android24-clang -O2 -c tools/gpu_bench/gpu_bench.c` exits 0)
-and has **never been executed**. The GLSL shader
-(`tools/gpu_bench/ternary.comp`) still has to be compiled to SPIR-V with
-`glslangValidator`, which is not installed here; shipping an unverified
-binary blob would be worse than shipping the source.
+(`aarch64-linux-android24-clang -DHYDRA_WITH_GLES -O2 -c
+tools/gpu_bench/gpu_bench.c` exits 0), it **compiles and runs its CPU
+reference path on the host** (`make -s gpu-bench`, covered by the `gpu-bench`
+job in `ci.yml`), and the GPU path has **never been executed**.
 
 To get the table (5 minutes on the tablet):
 
 ```bash
-glslangValidator -V --target-env opengl tools/gpu_bench/ternary.comp -o ternary.comp.spv
-adb push gpu_bench ternary.comp.spv /data/local/tmp/
+make -s gpu-bench    # verifies the CPU half compiles and runs, no device
+adb push gpu_bench ternary.comp /data/local/tmp/
 adb shell "cd /data/local/tmp && ./gpu_bench --dim 64   --layers 4  --k 1,16,64,256 --steps 1000"
 adb shell "cd /data/local/tmp && ./gpu_bench --dim 1024 --layers 64 --k 1,16,64,256 --steps 1000"
 ```
@@ -130,7 +131,56 @@ What *is* worth doing, in order:
 3. Only if the table shows a crossover at a model size the project would
    actually ship, design v2.
 
-## 6. Corrections to the task brief
+## 6. Measured on device
+
+**Status: NOT MEASURED. No device was available.**
+
+This section exists so the gap is visible instead of quietly absent. It is
+intentionally empty of numbers.
+
+| What | Needed for | Status |
+|---|---|---|
+| `ns_per_token_native_only` | decides whether batching mattered | **blocked** — no device |
+| `ns_per_token_jni_per_token` | the cost of the old per-token shape | **blocked** — no device |
+| `ns_per_token_jni_batched` | the shipping JNI path | **blocked** — no device |
+| GPU `ns_per_step` + `checksum_matches_cpu` | the Phase 2 crossover table | **blocked** — no GPU, no shader execution |
+
+Why it is blocked, measured rather than assumed:
+
+* `adb` is not installed in the development container,
+* no device is attached and no emulator image is available,
+* the container has no GLES/EGL headers and no `glslangValidator`, so the
+  GPU path can be compile-verified only (`-DHYDRA_WITH_GLES` against the
+  NDK clang) and never executed.
+
+When a Snapdragon 8 Elite tablet is available, fill in the table above with
+the device name, the date and the raw output of:
+
+```bash
+# 1. the APK's own three-pass benchmark (Benchmark button, or via UI)
+# 2. the GPU bench, now compiling its shader at runtime
+adb push gpu_bench ternary.comp /data/local/tmp/
+adb shell "cd /data/local/tmp && ./gpu_bench --dim 64 --layers 4 --k 1,16,64 --steps 1000"
+```
+
+Until then, every number in this document comes from an x86-64 container
+and is labelled as such. No number in this document was produced by a
+phone, and none is presented as if it were.
+
+## 7. What *was* verified on the host in this round
+
+To be explicit about what the device gap does and does not block, these
+are executable and were run:
+
+| Claim | Gate |
+|---|---|
+| A 5 GiB model loads and generates, i.e. model size is not RAM size | `tests/test_large_model.c` (sparse file, 5 GiB, 7 checks) |
+| `weights_offset + weights_len` is summed in 64 bits, so a wrapping header is refused instead of followed | same file, negative control: a 32-bit sum kills the child with SIGSEGV |
+| The JNI token stream emits its last partial block with `done=true` for any step count | `tests/test_jni_batch.c` (steps 1…69, negative control drops the 17th token) |
+| `steps <= 0` is rejected before the engine runs | same file + `tools/android_crash_check.sh` |
+| The crash handler writes before it delegates and never starts an Activity | `tools/android_crash_check.sh` (25 checks) |
+
+## 8. Corrections to the task brief
 
 Two items in the brief were already done in `main` before this work
 started, and are recorded here so nobody re-does them:

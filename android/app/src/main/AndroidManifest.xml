@@ -12,14 +12,15 @@
              Letterboxing auf Chromebooks/Tablets (Android-Lint
              LockedOrientationActivity/DiscouragedApi). Die UI ist vertikal
              aufgebaut und funktioniert in beiden Orientierungen. -->
-        <!-- Started by CrashHandler from a plain Context after an
-             uncaught exception: it must be launchable without
-             MainActivity being alive, and it is not user-facing, so it is
-             not exported. -->
+        <!-- Started by MainActivity on the next launch when a crash report
+             file exists. It is deliberately NOT started from the
+             UncaughtExceptionHandler any more: the handler only writes the
+             report and delegates to the platform, because a dying process
+             cannot be relied on to bring up an Activity. Not exported and
+             not in the recents - it is not user-facing navigation. -->
         <activity
             android:name=".CrashActivity"
             android:exported="false"
-            android:process=":crash"
             android:launchMode="singleTop"
             android:excludeFromRecents="true" />
 

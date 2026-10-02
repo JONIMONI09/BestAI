@@ -27,17 +27,21 @@ are not comparable and the timing is meaningless.
 
 ## Build
 
-The shader needs `glslangValidator`; there was none on the build host, so
-the `.spv` is deliberately **not** committed (an unverified binary blob in
-a repository is worse than a missing one):
+The shader is **compiled at runtime** from the GLSL ES 3.10 source. The
+earlier version loaded a precompiled `.spv`, which had two problems: no
+build step anywhere produced that blob, and SPIR-V loading via
+`glShaderBinary` is an OpenGL ES *extension*, not core 3.1 — so it could
+not run even where a blob existed.
 
 ```bash
-glslangValidator -V --target-env opengl ternary.comp -o ternary.comp.spv
+# CPU reference only (no GLES headers needed) — this is what CI runs:
+make -s gpu-bench
 
+# Full device build:
 NDK=~/Android/Sdk/ndk/26.3.11579264
 $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang \
-    -O2 gpu_bench.c -lEGL -lGLESv2 -o gpu_bench
-adb push gpu_bench ternary.comp.spv /data/local/tmp/
+    -DHYDRA_WITH_GLES -O2 gpu_bench.c -lEGL -lGLESv2 -o gpu_bench
+adb push gpu_bench ternary.comp /data/local/tmp/
 ```
 
 ## Run

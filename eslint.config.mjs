@@ -105,7 +105,6 @@ export default [
       'no-var': 'error',
       'prefer-const': 'error',
       eqeqeq: ['error', 'smart'],
-      'no-var': 'error',
       'no-implicit-globals': 'error',
       'no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     },

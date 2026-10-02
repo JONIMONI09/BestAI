@@ -53,8 +53,50 @@
 
 ## Current task
 
-**Translate every remaining German `.md` file into English** so the whole
-documentation base is in one language.
+**Round 2026-10-02 (closing the remaining verified gaps):** GPU bench compiles
+GLSL at runtime, WCAG AA contrast measured and fixed, cancel made real (web
+server-side kill + Android cooperative flag), crash reports persisted and
+surfaced on next launch, partial-batch flush and `steps <= 0` verified by a
+host test, token-only state semantics documented, large-model loading turned
+into a regression test. Tablet measurements: **blocked, documented as such**
+(no adb, no device, no emulator in this container).
+
+### Plan and result
+
+- [x] GPU bench: runtime GLSL compilation, SPIR-V path deleted, CPU path
+      built and run by a `gpu-bench` CI job, docs updated
+- [x] Contrast: `tools/contrast_check.js` (17 pairs, WCAG 2.2),
+      `--text-faint` `#64748b` (4.04:1) -> `#7b8da3` (5.66:1), ratios
+      documented in `public/style.css`, gate wired into CI
+- [x] Web cancel (Option A): `ChildProcess` per request, SIGTERM then
+      SIGKILL, `res.on('close')` (NOT `req.on('close')` - see errors.md),
+      `POST /api/cancel`, 409 `cancelled`, distinct `cancelled` UI status
+- [x] Two falsifiable cancel tests (stand-in engine with a pid file), both
+      verified to fail without the kill
+- [x] Bind-address test rewritten against the pid that owns the socket, with
+      a positive control for `HYDRA_ALLOW_REMOTE=1`
+- [x] Android crash handler: write to filesDir, delegate, never start an
+      Activity; next-launch report with copy + delete; debug-only intent
+      extra `crash_test`; `android:process=":crash"` removed
+- [x] Android cancel: `HydraBridge.cancel()` + a `volatile` flag checked per
+      step, UI says *cancelled*, not *error*
+- [x] Batching policy extracted to `hydra_batch.h`, shared with
+      `tests/test_jni_batch.c` (steps 1..69, `steps <= 0` rejected);
+      negative control drops the 17th token
+- [x] `tests/test_large_model.c`: 5 GiB sparse model loads and generates;
+      32-bit offset+length wrap refused (negative control: SIGSEGV)
+- [x] Token-only semantics documented in `include/hydra_model.h` + engine
+      test that `state[1..dim-1]` stays stale; the web console is pinned to
+      the full path so its state strip cannot lie
+- [x] `tools/android_crash_check.sh` (25 checks), `tools/jni_signature_check.sh`
+      fixed to cover `Unit`-returning natives, both in CI
+- [x] `docs/gpu-feasibility.md` §6: "Measured on device" - explicitly empty,
+      with the blocked rows and the exact commands to fill it in
+- [x] `errors.md`: 6 new entries (socat port mirror, `req.on('close')`,
+      cancelled-request hang, fake binary left behind, `Unit` skip in the JNI
+      gate, segfaulting negative control)
+- [ ] **Tablet measurement: BLOCKED** - no device reachable from this
+      container. Documented, not fabricated.
 
 ## Plan
 

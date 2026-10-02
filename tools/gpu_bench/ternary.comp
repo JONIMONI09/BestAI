@@ -12,8 +12,10 @@
  * purpose: it happens once, not per token, and repeating it per token would
  * make the GPU look better than the engine it is supposed to replace.
  *
- * Compile with:
- *   glslangValidator -V --target-env opengl ternary.comp -o ternary.comp.spv
+ * gpu_bench.c reads this file and compiles it AT RUNTIME with
+ * glShaderSource/glCompileShader. No SPIR-V, no glslangValidator, no
+ * prebuilt blob: SPIR-V loading is an OpenGL ES extension, not core 3.1,
+ * so a .spv would have made this benchmark unrunnable on a stock device.
  */
 
 layout(local_size_x = 128) in;
