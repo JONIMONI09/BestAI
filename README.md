@@ -20,15 +20,15 @@ Hydra-Stone is a C99 engine that streams ternary weights ({-1, 0, +1}) directly 
 
 ## Why It's Fast
 
-| Approach | Multiply-adds/Token | RAM Growth | Typical Bottleneck |
+| Approach | Multiplications/Token | RAM Growth | Typical Bottleneck |
 |---|---|---|---|
 | FP32 Transformer | O(N² · d) | KV cache grows unbounded | HBM bandwidth |
 | INT8 quantization | O(N² · d) | KV cache grows unbounded | Dequantization overhead |
-| **Hydra-Stone (ternary + mmap)** | **`2·d`, independent of depth** | **none (O(1) state)** | disk/cache bandwidth only |
+| **Hydra-Stone (ternary + mmap)** | **0** (addition only) | **none (O(1) state)** | disk/cache bandwidth only |
 
 Three levers:
 
-1. **Ternary weights** — in the inner loop the weight is one of `{-1, 0, +1}`, so no FP multiply is needed: `y = Σ_{w=+1} x − Σ_{w=−1} x`. Layer aggregation then collapses this to exactly `2·d` integer multiply-adds per token (128 at `d = 64`) — **constant in the number of layers**, which is the claim that matters. Saying "0 multiplications" would be false: the aggregated form does multiply, just not by depth.
+1. **Ternary weights** — no multiplication needed: `y = Σ_{w=+1} x − Σ_{w=−1} x`
 2. **mmap paging** — the kernel faults in only the 4-KiB pages the compute cursor actually touches; clean pages are reclaimable under memory pressure (no swap traffic).
 3. **O(1) recurrent state** — instead of a growing KV cache, a fixed `int8_t[64]` vector carries the state.
 
@@ -84,7 +84,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 ## Features
 
 - ✅ **Zero-heap inference** — weights are never copied, only mapped; no `malloc` in the inference path
-- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 2 bits per weight on disk** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The planned v2 packs 4 weights per byte, which doubles *file size* at the same 2 bits/weight — see `docs/FORMAT.md`.
+- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores 2 weights per byte, i.e. **4 bits per weight on disk** (true 2-bit packing via 4 weights/byte is planned for v2) — see `docs/FORMAT.md`.
 - ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
@@ -147,7 +147,7 @@ HYDRA_ALLOW_REMOTE=1 node server.js   # then also reachable from the LAN
 | **Chat** | Type text, get a real reply from the compiled C engine. Words are mapped to token IDs through the stored vocabulary; a word without an ID is reported as unknown instead of being guessed. Replies can be shown as words or raw token IDs. **The whole prompt is fed to the engine**, not just its first token — `hydra_engine_prefill()` runs every prompt token through the same core step before generation starts. |
 | **Models** | Every `*.hydra` file under `models/` is listed with its real header (dim, vocab, layers, size, validity) and can be selected. Trained and uploaded models are marked. |
 | **Upload** | **Upload model** in the top bar stores a `.hydra` into `models/uploaded/` (`POST /api/models/upload?name=…`). The bytes are streamed to disk (cap: `HYDRA_MAX_UPLOAD`, 64 MiB by default, `2GB`/`512MiB`/plain bytes all accepted), then validated against the same rules the C loader enforces — magic, version, dim/vocab/layers bounds, `weights_offset`/`weights_len` inside the file, `layers × dim` covered by `weights_len`. An invalid file is rejected with the reason and never reaches a model path. Over the cap the server answers **413 with a body** (never a dropped connection) that names the limit and how to raise it. |
-| **GGUF import** | **Import .gguf** converts a llama.cpp/Ollama checkpoint into `.hydra` (`POST /api/models/import?name=…`) with absmean scaling, and returns a conversion report: which source tensor fed each plane, its shape, rows read vs. rows sampled, the **absmean scale `gamma`** (the reciprocal of the mean absolute weight), how many weights ternarised to zero, the resulting density, the rescale factor, the resulting peak and the vocabulary size — plus the reason if it refused. The converted model appears in the chat model selector marked as converted, and the source vocabulary is carried over so chat words map to real token ids. |
+| **GGUF import** | **Import .gguf** converts a llama.cpp/Ollama checkpoint into `.hydra` (`POST /api/models/import?name=…`) with absmean scaling, and returns a conversion report: which source tensor fed each plane, its shape, rows read vs. rows sampled, the **absmean scale `gamma` and `mean|w|`**, how many weights ternarised to zero, the resulting density, the rescale factor, the resulting peak and the vocabulary size — plus the reason if it refused. The converted model appears in the chat model selector marked as converted, and the source vocabulary is carried over so chat words map to real token ids. |
 | **Diagnostics** | `GET /api/models/inspect?path=models/starter.hydra` returns the header values and one entry per rule (`id`, `ok`, `message`) plus a `violations` list. It is the same analysis the upload route uses, so both quote the same reason. Known formats are **named**: a GGUF answers *"this is a GGUF model (llama.cpp / Ollama) — the engine reads .hydra files"* instead of a bare `wrong magic`. The report also states the ceiling of the current format (`limits.maxWeightsBytesForShape`), because "valid" and "can be 20 GB" are two different questions. The console shows the violated rules under any model marked *invalid header*. |
 | **Engine output** | Token chart with metrics; the state vector and the raw log are collapsed by default. |
 | **Training** | Paste a corpus (`3 3 3 3 -> 7 7 7 7`, or `1 2 3` for next-token training), pick vocab/dim/layers/epochs and train. Training writes a real `.hydra` file and is **verified against the compiled engine** before it is reported as successful; accuracy before/after is measured, never estimated. |
@@ -175,8 +175,6 @@ python3 tools/make_model.py models/starter.hydra
 ```
 
 `load_ms` and `rss_delta_kb` are measured, not asserted: the loader reports how long the map took and how much resident memory the run added. For this model `rss_delta_kb` is **0**, because the 256 weight bytes are mmap'd and never copied — the kernel owns those pages.
-
-The `ns_per_token_*` figures are from one run on the host and move by a few percent between runs (a fresh `--bench 20000` on the same machine gave `141.43` / `17.27`); they are a sample, not a specification. `load_ms` and `rss_delta_kb` are the stable results — sub-millisecond mapping and zero RSS growth regardless of timing noise.
 
 * **Layer aggregation** — `A[i] = sum_l w1[l][i]` and `B[i] = sum_l w2[l][i]`
   are computed once at load time, because the token and the state vector
@@ -276,24 +274,15 @@ acc_i += (+1) · x_j   for every w_ij = +1
 acc_i += (−1) · x_j   for every w_ij = −1
 ```
 
-**On-disk footprint per weight (v1): 2 bits** — two ternary weights per byte
-(`w1` in bits 0–1, `w2` in bits 2–3), upper 4 bits reserved. Compared with a
-naive FP16 checkpoint:
+**On-disk footprint per parameter (v1): 4 bits** — two ternary weights per byte, upper 4 bits reserved. Measured against a naive FP16 checkpoint:
 
-| Parameters | FP16 | INT4 (4 bits) | Hydra v1 (2 bits) | Hydra v2 (2 bits, packed) |
+| Parameters | FP16 | INT4 (4 bits) | Hydra v1 (4 bits) | Hydra v2 (2 bits, planned) |
 |---|---|---|---|---|
-| 0.5 B | 1000 MiB | 250 MiB | **125 MiB** | 62.5 MiB |
-| 1.0 B | 2000 MiB | 500 MiB | **250 MiB** | 125 MiB |
-| 1.5 B | 3000 MiB (OOM) | 750 MiB | **375 MiB** | 187.5 MiB |
+| 0.5 B | 1000 MiB | 250 MiB | 250 MiB | 125 MiB |
+| 1.0 B | 2000 MiB | 500 MiB | 500 MiB | 250 MiB |
+| 1.5 B | 3000 MiB (OOM) | 750 MiB | 750 MiB | 375 MiB |
 
-The honest framing: **v1 is INT2 on disk — it halves INT4, and beats it in
-compute too** (additions only, no dequantization, no FP unit). Two honest
-caveats. First, v1 wastes half of every byte: the reserved codes mean a byte
-carries `log₂9 ≈ 3.17` bits of information, i.e. **1.58 bits per weight** — so
-the real figure is *better* than the allocated 2. Second, v2's
-4-weights-per-byte packing does **not** change the 2 bits/weight of weight data;
-it only removes the wasted half of each byte, halving the file. See
-`docs/FORMAT.md`.
+The honest framing: **v1's win over FP16 is compression, not density parity.** It matches INT4 on disk and beats it in *compute* (additions only, no dequantization, no FP unit). The 2× edge over INT4 arrives with 4-weights-per-byte packing in v2 — see `docs/FORMAT.md`.
 
 ## Testing Strategy
 
@@ -322,7 +311,7 @@ make ui       # builds hydra-run + the starter model and serves on :8787
 - [ ] Min-P sampling & repetition penalty
 - [ ] safetensors import with automatic absmean ternarization (GGUF is done — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md))
 - [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
-- [ ] 4-weights-per-byte packing (same 2 bits/weight, but no wasted byte) and an aggregated `A[i]/B[i]` model format — see the redundancy analysis in `docs/ARCHITECTURE.md`
+- [ ] 4-weights-per-byte packing (true 2 bits/weight) and an aggregated `A[i]/B[i]` model format — see the redundancy analysis in `docs/ARCHITECTURE.md`
 - [ ] Streaming ring-buffer KV with attention sinks
 
 Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.
