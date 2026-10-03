@@ -53,8 +53,9 @@ def inspect(path):
         return report
 
     dense = gguf.dense_candidates()
+    decodable = gguf.decodable_candidates()
     quantised = gguf.quantised_names()
-    convertible = bool(dense) and min(t.shape()[1] for t in dense) > 0
+    convertible = bool(decodable) and min(t.shape()[1] for t in decodable) > 0
 
     report['ok'] = True
     report['version'] = gguf.version
@@ -63,6 +64,7 @@ def inspect(path):
     report['tensorCount'] = len(gguf.tensors)
     report['tokens'] = len(gguf.tokens())
     report['denseFloatTensors'] = len(dense)
+    report['blockDequantisedTensors'] = len(decodable) - len(dense)
     report['quantisedTensors'] = quantised
     report['convertible'] = convertible
     report['metadata'] = {
@@ -72,9 +74,10 @@ def inspect(path):
     report['tensors'] = [t.as_dict() for t in gguf.tensors]
     if not convertible:
         report['convertibleWhy'] = (
-            'every 1-D/2-D tensor is block-quantised (%s). Hydra reads dense '
-            'floats only: re-export with llama.cpp --convert-f16.'
-            % ', '.join(quantised[:6] if quantised else ['no float tensor']))
+            'every 1-D/2-D tensor uses a block layout this reader does not '
+            'implement (%s). Hydra decodes F32, F16, BF16 and Q8_0: '
+            're-export with llama.cpp --convert-f16.'
+            % ', '.join(quantised[:6] if quantised else ['no readable tensor']))
     return report
 
 
@@ -103,16 +106,18 @@ def main(argv=None):
     print('%s  GGUF v%d  %d bytes' % (report['path'], report['version'],
                                       report['bytes']))
     print('  architecture : %s' % (report['architecture'] or 'unknown'))
-    print('  tensors      : %d total, %d dense float, %d quantised'
-          % (report['tensorCount'], report['denseFloatTensors'],
-             len(report['quantisedTensors'])))
+    print('  tensors      : %d total, %d dense float, %d Q8_0 dequantised, '
+          '%d unsupported' % (report['tensorCount'],
+                              report['denseFloatTensors'],
+                              report['blockDequantisedTensors'],
+                              len(report['quantisedTensors'])))
     print('  vocabulary   : %d tokens' % report['tokens'])
     for key, value in report['metadata'].items():
         if isinstance(value, list):
             value = '[%d entries]' % len(value)
         print('  %-28s %s' % (key, value))
     if report['quantisedTensors']:
-        print('  quantised    : %s' % ', '.join(report['quantisedTensors'][:8]))
+        print('  not read     : %s' % ', '.join(report['quantisedTensors'][:8]))
     print('  convertible  : %s' % ('yes' if report['convertible'] else
                                    'NO - ' + report.get('convertibleWhy', '')))
     if args.tensors:

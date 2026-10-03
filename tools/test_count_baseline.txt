@@ -1,0 +1,18 @@
+# Baseline assertion counts for tools/test_count_check.sh.
+#
+# ONE reviewed number per architecture. This file is the only place a test
+# count is written down; the gate parses the real count from the test binary
+# and fails when it drifts (rules.md R21, R25).
+#
+# Measured on 2026-10-03 by running the binaries, not by counting call sites:
+#   x86-64 : ./hydra-test                                        -> 71
+#   ARM64  : aarch64-linux-gnu-gcc-12 -static -D__ARM_NEON + qemu -> 77
+#
+# ARM is deliberately larger: the NEON-vs-scalar comparison tests exist only in
+# an NEON build. Do not "fix" this by lowering the ARM number.
+#
+# When tests are deliberately added or removed, update the matching line in the
+# SAME commit, so the drift is reviewable rather than silent.
+
+x86: 71
+arm: 77

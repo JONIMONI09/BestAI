@@ -72,6 +72,15 @@ jobs:
           fi
           echo "asset matches the generator"
 
+      # Gate 1f: documentation claim lint. An external audit found the
+      # project's own prose contradicting its code ("Zero-RAM" in the
+      # README title while errors.md recorded it as an unproven claim; a
+      # size table implying v1 holds 1.5 B parameters when the format
+      # caps at 256 KiB of weights). Prose decays silently - nothing fails
+      # when a doc drifts, so these specific claims now fail CI.
+      - name: Docs claim lint (banned claims)
+        run: bash tools/docs_claim_check.sh
+
       # On any lint failure, upload the captured diagnostics as a
       # workflow artifact so the error text is attached to the run.
       - name: Upload lint error report
@@ -119,6 +128,19 @@ jobs:
               -Iinclude \
               src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm
           qemu-aarch64-static ./hydra-test-arm
+
+      # Drift gate. The count is PARSED from the binary's own output and
+      # compared against the reviewed baseline for this architecture - no
+      # number is hard-coded here (rules.md R21/R25). The ARM count is
+      # legitimately higher than x86 because the NEON-vs-scalar comparison
+      # tests only exist in an NEON build.
+      #
+      # qemu-aarch64-static is passed as the command prefix rather than
+      # relying on binfmt_misc: this runner is x86-64, and executing the
+      # AArch64 binary directly would depend on host binfmt registration
+      # that a GitHub runner does not guarantee.
+      - name: Test-count drift gate (ARM64/NEON)
+        run: bash tools/test_count_check.sh ./hydra-test-arm arm qemu-aarch64-static
 
       - name: Cross-arch determinism check (x86 vs ARM/NEON)
         run: |
@@ -182,6 +204,13 @@ jobs:
 
       - name: Run unit tests
         run: ./hydra-test
+
+      # Drift gate. The count is PARSED from the binary's own output and
+      # compared against the reviewed baseline - no number is hard-coded
+      # here. A silent test deletion now fails CI instead of shrinking the
+      # suite unnoticed (rules.md R21/R25).
+      - name: Test-count drift gate (x86-64)
+        run: bash tools/test_count_check.sh ./hydra-test x86
 
       # The JNI batching policy and the large-model/32-bit arithmetic run
       # on the host, with no device involved. Both are part of `make test`,

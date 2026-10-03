@@ -15,6 +15,10 @@ const fs = require('fs');
 const path = require('path');
 
 const GGUF_MAGIC = 0x46554747;
+const GGML_F32 = 0;
+const GGML_Q8_0 = 8;
+const QK8_0 = 32;
+const Q8_0_BLOCK_BYTES = 34;
 const KV_UINT64 = 10;
 const KV_FLOAT32 = 6;
 const KV_STRING = 8;
@@ -74,13 +78,149 @@ function referenceMatrix(rows, cols, seed) {
   return out;
 }
 
+/**
+ * Packs int8 codes as Q8_0: one F16 scale per 32 values, then the codes.
+ *
+ * The scales are powers of two, so scale * code is exactly representable in
+ * binary16 - that is what lets the test compare a Q8_0 import against an F16
+ * import of the same numbers with equality instead of a tolerance.
+ */
+/**
+ * IEEE binary16 encoder (round to nearest, ties to even).
+ *
+ * Node's Buffer has no writeFloat16LE, and DataView.setFloat16 only landed
+ * recently, so the Q8_0 scale has to be encoded here. Only the fixture uses
+ * this - the production reader uses an exhaustive 65536-entry table.
+ */
+const _f32 = new Float32Array(1);
+const _i32 = new Int32Array(_f32.buffer);
+
+function toHalf(value) {
+  _f32[0] = value;
+  const bits = _i32[0];
+  const sign = (bits >>> 16) & 0x8000;
+  const rawExp = (bits >>> 23) & 0xff;
+  const mant = bits & 0x7fffff;
+
+  if (rawExp === 0xff) return sign | 0x7c00 | (mant ? 0x200 : 0);   // inf / NaN
+  if (rawExp === 0 && mant === 0) return sign;                     // +/-0
+
+  const exp = rawExp - 127 + 15;
+  if (exp <= 0) {
+    if (exp < -10) return sign;                                     // underflow to zero
+    /* Subnormal half: value = m_half * 2^-24, and the F32 is
+     * (2^23 + mant) * 2^(exp-38), so m_half = (2^23 + mant) >> (14 - exp).
+     * The shift is 14 - exp, NOT 1 - exp: getting that wrong zeroes every
+     * subnormal instead of encoding it. A differential run against
+     * struct.pack('<e') over 5000+ random values is what proved it. */
+    const wide = mant | 0x800000;
+    const shift = 14 - exp;                       // 14..24, always < 32
+    let m = wide >>> shift;
+    const rem = wide & ((1 << shift) - 1);
+    const halfway = 1 << (shift - 1);
+    if (rem > halfway || (rem === halfway && (m & 1))) m += 1;   // round to nearest, ties to even
+    return sign | m;                                // m may reach 0x400: that is the smallest normal
+  }
+  if (exp >= 31) return sign | 0x7c00;                              // overflow
+
+  let m = mant >>> 13;
+  const rem = mant & 0x1fff;
+  if (rem > 0x1000 || (rem === 0x1000 && (m & 1))) m += 1;          // round
+  if (m === 0x400) {                                                // carry into exponent
+    if (exp + 1 >= 31) return sign | 0x7c00;
+    return sign | ((exp + 1) << 10);
+  }
+  return sign | (exp << 10) | m;
+}
+
+function q8_0Pack(codes, scales) {
+  const nBlocks = codes.length / QK8_0;
+  if (!Number.isInteger(nBlocks)) {
+    throw new Error(`Q8_0 needs a multiple of ${QK8_0} values, got ${codes.length}`);
+  }
+  const out = Buffer.alloc(nBlocks * Q8_0_BLOCK_BYTES);
+  for (let b = 0; b < nBlocks; b += 1) {
+    out.writeUInt16LE(toHalf(scales[b % scales.length]), b * Q8_0_BLOCK_BYTES);
+    for (let i = 0; i < QK8_0; i += 1) {
+      const q = codes[b * QK8_0 + i];
+      if (q < -128 || q > 127) throw new Error(`Q8_0 needs int8, got ${q}`);
+      out.writeInt8(q, b * Q8_0_BLOCK_BYTES + 2 + i);
+    }
+  }
+  return out;
+}
+
+/** The dequantised values a Q8_0 tensor holds, for an F32/F16 twin file.
+ *
+ * The scale is round-tripped through toHalf first, because that is what the
+ * reader will see: encoding the scale as the exact double the test wrote
+ * would compare against a number the file does not contain. */
+function q8_0Values(codes, scales) {
+  const out = new Float64Array(codes.length);
+  for (let b = 0; b * QK8_0 < codes.length; b += 1) {
+    const d = halfToFloat(toHalf(scales[b % scales.length]));
+    for (let i = 0; i < QK8_0; i += 1) {
+      out[b * QK8_0 + i] = d * codes[b * QK8_0 + i];
+    }
+  }
+  return out;
+}
+
+function halfToFloat(h) {
+  const sign = (h & 0x8000) ? -1 : 1;
+  const exp = (h >>> 10) & 0x1f;
+  const mant = h & 0x3ff;
+  if (exp === 0) return sign * mant * 2 ** -24;
+  if (exp === 31) return mant ? NaN : sign * Infinity;
+  return sign * (1 + mant / 1024) * 2 ** (exp - 15);
+}
+
+function float32Buffer(values) {
+  const out = Buffer.alloc(values.length * 4);
+  for (let i = 0; i < values.length; i += 1) out.writeFloatLE(values[i], i * 4);
+  return out;
+}
+
 function buildGgufBytes({
   rows = 64, cols = 32, tokens = ['a', 'b', '▁c', 'd'], alignment = ALIGNMENT,
+  type = GGML_F32, q8_0Twin = false,
 } = {}) {
-  const tensors = [
-    { name: 'token_embd.weight', dims: [rows, cols], data: referenceMatrix(rows, cols, 7) },
-    { name: 'blk.0.attn_q.weight', dims: [cols, cols], data: referenceMatrix(cols, cols, 99) },
-  ];
+  let tensors;
+  if (type === GGML_Q8_0 || q8_0Twin) {
+    /* cols must tile whole 32-value blocks for a Q8_0 tensor. */
+    if ((rows * cols) % QK8_0 !== 0) {
+      throw new Error(`Q8_0 fixture needs rows*cols to be a multiple of ${QK8_0}`);
+    }
+    const codes = [];
+    let x = 12345 >>> 0;
+    for (let i = 0; i < rows * cols; i += 1) {
+      x = (Math.imul(x, 1103516245) + 12345) >>> 0;
+      codes.push(((x >>> 9) & 0xff) - 128);
+    }
+    /* Six different scales, all powers of two, so each block decodes exactly
+     * and a decoder that reads the wrong block's scale produces a different
+     * model rather than the same one by accident. */
+    const scales = [1.0, 0.5, 0.25, -2.0, 0.125, 4.0];
+    const codesB = codes.slice(0, cols * cols);
+    if (q8_0Twin) {
+      /* The same numbers, already dequantised, stored as F32. Converting both
+       * files must give the identical model; that is the equivalence test. */
+      tensors = [
+        { name: 'token_embd.weight', dims: [rows, cols], data: float32Buffer(q8_0Values(codes, scales)), type: GGML_F32 },
+        { name: 'blk.0.attn_q.weight', dims: [cols, cols], data: float32Buffer(q8_0Values(codesB, scales)), type: GGML_F32 },
+      ];
+    } else {
+      tensors = [
+        { name: 'token_embd.weight', dims: [rows, cols], data: q8_0Pack(codes, scales), type: GGML_Q8_0 },
+        { name: 'blk.0.attn_q.weight', dims: [cols, cols], data: q8_0Pack(codesB, scales), type: GGML_Q8_0 },
+      ];
+    }
+  } else {
+    tensors = [
+      { name: 'token_embd.weight', dims: [rows, cols], data: referenceMatrix(rows, cols, 7), type: GGML_F32 },
+      { name: 'blk.0.attn_q.weight', dims: [cols, cols], data: referenceMatrix(cols, cols, 99), type: GGML_F32 },
+    ];
+  }
   const metadata = {
     'general.architecture': 'llama',
     'general.name': 'server-fixture',
@@ -105,7 +245,7 @@ function buildGgufBytes({
     let p = 0;
     buf.writeUInt32LE(t.dims.length, p); p += 4;
     for (const d of t.dims) { buf.writeBigUInt64LE(BigInt(d), p); p += 8; }
-    buf.writeUInt32LE(0, p); p += 4;          // ggml_type F32
+    buf.writeUInt32LE(t.type, p); p += 4;
     buf.writeBigUInt64LE(BigInt(offset), p);
     infos.push(Buffer.concat([ggufString(t.name), buf]));
     offset += t.data.length;
@@ -130,4 +270,7 @@ function writeGgufFile(dir, name, options) {
   return file;
 }
 
-module.exports = { buildGgufBytes, writeGgufFile, referenceMatrix };
+module.exports = {
+  buildGgufBytes, writeGgufFile, referenceMatrix, q8_0Pack, q8_0Values, toHalf,
+  float32Buffer, GGML_F32, GGML_Q8_0,
+};

@@ -249,18 +249,20 @@ def pick_tensors(gguf, a_name, b_name):
     """Choose the A and B source tensors.
 
     A defaults to the embedding, then the output projection, then the first
-    dense 2-D tensor. B defaults to the next dense 2-D tensor after A, so
-    the two recurrent planes come from two different real matrices; with
+    readable 2-D tensor. B defaults to the next readable 2-D tensor after A,
+    so the two recurrent planes come from two different real matrices; with
     only one candidate, B is A's column sums rolled by one dimension, which
     is arbitrary but deterministic and stated in the report.
+
+    Readable means F32, F16, BF16 or Q8_0 (dequantised at read time).
     """
-    candidates = gguf.dense_candidates()
+    candidates = gguf.decodable_candidates()
     if not candidates:
         quantised = gguf.quantised_names()
         detail = ', '.join(quantised[:6]) if quantised else 'none'
         raise gguf_reader.GgufError(
-            'no dense F32/F16/BF16 1-D or 2-D tensor in this file. '
-            'Quantised or unsupported tensors: %s. Re-export with '
+            'no F32/F16/BF16/Q8_0 1-D or 2-D tensor in this file. '
+            'Unsupported quantised tensors: %s. Re-export with '
             'llama.cpp --convert-f16 and import again.' % detail)
 
     a_t = None
@@ -268,9 +270,10 @@ def pick_tensors(gguf, a_name, b_name):
         a_t = gguf.find(a_name)
         if a_t is None:
             raise gguf_reader.GgufError('no tensor named %r in this file' % a_name)
-        if not a_t.is_dense_float:
+        if not a_t.is_decodable:
             raise gguf_reader.GgufError(
-                'tensor %r is %s, not a dense float tensor'
+                'tensor %r is %s, which this converter cannot read '
+                '(supported: F32, F16, BF16, Q8_0)'
                 % (a_name, a_t.type_name))
         if a_t.shape() is None:
             raise gguf_reader.GgufError(
@@ -279,7 +282,7 @@ def pick_tensors(gguf, a_name, b_name):
     else:
         for name in A_PREFERENCE:
             cand = gguf.find(name)
-            if cand is not None and cand.is_dense_float and cand.shape() is not None:
+            if cand is not None and cand.is_decodable and cand.shape() is not None:
                 a_t = cand
                 break
         if a_t is None:
@@ -291,9 +294,10 @@ def pick_tensors(gguf, a_name, b_name):
         b_t = gguf.find(b_name)
         if b_t is None:
             raise gguf_reader.GgufError('no tensor named %r in this file' % b_name)
-        if not b_t.is_dense_float:
+        if not b_t.is_decodable:
             raise gguf_reader.GgufError(
-                'tensor %r is %s, not a dense float tensor' % (b_name, b_t.type_name))
+                'tensor %r is %s, which this converter cannot read '
+                '(supported: F32, F16, BF16, Q8_0)' % (b_name, b_t.type_name))
         if b_t.shape() is None:
             raise gguf_reader.GgufError(
                 'tensor %r has %d dimensions; only 1-D and 2-D tensors can '
@@ -393,14 +397,14 @@ def _convert(args, gguf):
     if b_tensor is not None:
         report_b, b_raw = plane_from_tensor(gguf, b_tensor, args.max_rows, dim, 'B')
     else:
-        # One dense tensor in the file: the recurrent plane is A's column
+        # One readable tensor in the file: the recurrent plane is A's column
         # sums rolled by one dimension. Arbitrary, deterministic, and named
         # as such in the report instead of being passed off as a second
         # real matrix.
         b_raw = a_raw[1:] + a_raw[:1]
         report_b = {
             'plane': 'B',
-            'tensor': '%s (columns rolled by 1 - no second dense tensor)' % a_tensor.name,
+            'tensor': '%s (columns rolled by 1 - no second readable tensor)' % a_tensor.name,
             'shape': report_a['shape'],
             'rowsRead': report_a['rowsRead'],
             'rowsTotal': report_a['rowsTotal'],
@@ -503,7 +507,7 @@ def main(argv=None):
                     help='rows per source tensor; 0 reads every row (default %d)'
                          % DEFAULT_MAX_ROWS)
     ap.add_argument('--a-tensor', help='tensor for the A plane (default: the embedding)')
-    ap.add_argument('--b-tensor', help='tensor for the B plane (default: the next dense tensor)')
+    ap.add_argument('--b-tensor', help='tensor for the B plane (default: the next readable tensor)')
     ap.add_argument('--vocab', type=int, help='force the header vocab size')
     ap.add_argument('--vocab-out', help='write the token list here as a word -> id JSON map')
     ap.add_argument('--expect', help='also write the header and A/B here, for the test gate')

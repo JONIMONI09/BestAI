@@ -1,6 +1,6 @@
 ---
 name: engine-ci-verify
-description: "Run all local Hydra-Stone quality gates in CI-identical order: compilers, analyzers, sanitizers, cppcheck, flawfinder, ESLint, build, 49 unit tests, ARM/NEON cross-path parity check via qemu, runtime smoke test."
+description: "Run all local Hydra-Stone quality gates in CI-identical order: compilers, analyzers, sanitizers, cppcheck, flawfinder, ESLint, build, the unit tests, ARM/NEON cross-path parity check via qemu, runtime smoke test."
 ---
 
 # Engine CI Verification — Hydra-Stone
@@ -44,7 +44,7 @@ make all && make test && ./hydra-test
 #    sudo apt-get install -y gcc-12-aarch64-linux-gnu qemu-user-static
 aarch64-linux-gnu-gcc-12 -O2 -static -Wall -Wextra -Iinclude \
     src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm
-qemu-aarch64-static ./hydra-test-arm          # expect: 49 Tests, 0 failures
+qemu-aarch64-static ./hydra-test-arm          # expect: "N Tests, 0 failures" (N parsed from the output)
 
 aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
     src/hydra_engine.c src/main.c -o hydra-run-arm
@@ -63,10 +63,10 @@ python3 tools/make_model.py smoke.hydra && ./hydra-run smoke.hydra 42
 
 # 8. Optional build-flag variants (both must stay green)
 gcc -O2 -DHYDRA_TOKENV_MASK -Iinclude src/hydra_engine.c tests/test_engine.c \
-    -lm -o /tmp/t-mask && /tmp/t-mask          # expect: 46 Tests, 0 failures
+    -lm -o /tmp/t-mask && /tmp/t-mask          # expect "N Tests, 0 failures" (parse N)
 aarch64-linux-gnu-gcc-12 -O2 -static -DHYDRA_DROP_CACHE -Iinclude \
     src/hydra_engine.c tests/test_engine.c -lm -o /tmp/t-drop
-qemu-aarch64-static /tmp/t-drop                # expect: 51 Tests, 0 failures
+qemu-aarch64-static /tmp/t-drop                # expect "M Tests, 0 failures" (parse M)
 
 rm -f smoke.hydra parity.hydra hydra-run hydra-test hydra-run-arm hydra-test-arm
 ```
@@ -119,14 +119,15 @@ Toolchain install for L1–L5 (once per machine):
 ## Expected result
 
 - Gates 1-4: silent, exit 0
-- Gate 5: `49 Tests, 0 failures` (x86 scalar path; the 2 NEON comparison
-  tests are compiled out there)
-- Gate 6: `51 Tests, 0 failures` on ARM (the 2 extra tests are the
-  NEON-vs-scalar comparison), then `x86: [...]` / `arm: [...]` with
+- Gate 5: `<N> Tests, 0 failures` (x86 scalar path). **Do not hard-code N.**
+  Parse it from the binary's output; the count differs per architecture
+  because the NEON comparison tests are compiled out on x86.
+- Gate 6: `<M> Tests, 0 failures` on ARM, where `M > N` because of the
+  NEON-vs-scalar comparison tests, then `x86: [...]` / `arm: [...]` with
   **identical** token and state arrays
 - Gate 7: 16 tokens printed + axiom check allows at 1.0, blocks at 0.0
 - L1–L4, L6: no output, exit 0
-- L5: `49 Tests, 0 failures` and no sanitizer diagnostics
+- L5: `<N> Tests, 0 failures` (parse N from the output) and no sanitizer diagnostics
 - L7: Android Lint "No issues found"
 
 ## Notes
@@ -148,6 +149,7 @@ Toolchain install for L1–L5 (once per machine):
   red is decoration (rule R25).
 - `-DHYDRA_TOKENV_MASK` re-introduces the 0x7F token mask (only 128 of up
   to 1024 token IDs stay distinguishable) and flips one test assertion
-  accordingly, hence 46 instead of 47 tests.
+  accordingly, so that build legitimately reports a **different** count.
+  Parse it; do not compare it to a stored number.
 - macOS: cppcheck gate runs on ubuntu only in CI; the clang-ARM64 build
   covers the NEON path there as well.

@@ -1,6 +1,6 @@
 # Hydra-Stone
 
-**Zero-RAM, ternary O(1) inference engine — drop in any `.hydra` model and go.**
+**Ternary inference engine with no heap allocation for weights — drop in a `.hydra` model and go.**
 
 ```bash
 ./hydra-run my_model.hydra 123
@@ -50,7 +50,7 @@ python3 tools/make_model.py test.hydra
 # 3. Feed the model to the engine
 ./hydra-run test.hydra 123
 
-# 4. Unit tests (71 on x86-64, 77 on ARM with NEON)
+# 4. Unit tests (count is architecture-dependent - ARM runs the extra NEON-vs-scalar tests)
 make test-run
 
 # 5. Start the web console (desktop-optimized)
@@ -78,7 +78,7 @@ Android builds need JDK 17, the Android SDK, CMake and the NDK; set
 ### Test
 
 ```bash
-make test-run                       # 71 tests x86-64, 77 on ARM (NEON)
+make test-run                       # count is architecture-dependent; see tools/test_count_baseline.txt
 python3 tools/gguf_test.py          # GGUF -> .hydra, checked against the real engine
 node --test tools/server_test.js    # web console API and diagnostics
 npm ci && npm run lint              # ESLint (the only dev dependency)
@@ -146,12 +146,12 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 ## Features
 
 - ✅ **Zero-heap inference** — weights are never copied, only mapped; no `malloc` in the inference path
-- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 2 bits per weight on disk** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The planned v2 packs 4 weights per byte, which doubles *file size* at the same 2 bits/weight — see `docs/FORMAT.md`.
-- ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
+- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 2 bits per weight on disk** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The planned v2 packs 4 weights per byte at the same 2 bits per weight, which **halves the file** by removing the wasted half of each byte — see `docs/FORMAT.md`.
+- ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
   - *Honesty note:* the NEON path is active on ARM builds only. It is **not** merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the NEON kernel **in the same ARM build** and requires bit-identical token sequences *and* state vectors. The x86 path is purely scalar; AVX2 is on the roadmap.
-- ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation, 71 unit tests (77 on ARM with NEON)
+- ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation; unit-test count is parsed from the binary and drift-gated in CI (`tools/test_count_check.sh`, baselines in `tools/test_count_baseline.txt`)
 - ✅ **Web console** — desktop UI with live visualization (`make ui`)
 - ✅ **Android** — NDK/JNI build of the same C source. Verified end to end on an API-24 x86_64 emulator with the **signed release APK**: the installed package is byte-identical to the built artifact, `lib/x86_64/libhydra.so` is genuinely mapped into the running process (ELF header `7f 45 4c 46`, `e_machine = EM_X86_64`), and the 32-token output is **bit-identical** to the host C engine. *Not yet verified on physical ARM hardware — no device was available.*
 - ✅ **C99, zero dependencies** — runs on 32-bit ARMv7, x86-64, and everything in between
@@ -223,6 +223,12 @@ Everything shown comes from the engine. There is no simulated output anywhere in
 
 ## Performance
 
+**Measurement provenance for every number below (rule R32).** These were taken
+on a **shared x86-64 Linux container**, Intel Xeon @ 2.60 GHz, 2 vCPU, 3.9 GB
+RAM — *not* on a phone or tablet, and not on the target Snapdragon 8 Elite. No
+Android device measurement exists for this project; where one is needed the
+text says "not measured". Re-run on your own hardware before quoting them.
+
 The inference step is now two multiply-adds per dimension, not two per
 (layer x dimension):
 
@@ -236,7 +242,7 @@ python3 tools/make_model.py models/starter.hydra
  "note":"JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device"}
 ```
 
-`load_ms` and `rss_delta_kb` are measured, not asserted: the loader reports how long the map took and how much resident memory the run added. For this model `rss_delta_kb` is **0**, because the 256 weight bytes are mmap'd and never copied — the kernel owns those pages.
+`load_ms` and `rss_delta_kb` are measured, not asserted: the loader reports how long the map took and how much resident memory the run added. **The `rss_delta_kb: 0` above holds for the 256-byte starter model shown**, whose entire weight region fits inside the existing mapping — it is not a general statement about larger models, whose weight pages are real physical memory until the kernel reclaims them.
 
 The `ns_per_token_*` figures are from one warm run on an idle host and move noticeably when the machine is busy (repeat runs on the same box gave 141.90 / 15.96 and 160.41 / 26.44). They are a sample, not a specification; take the median of a few runs. `load_ms` and `rss_delta_kb` are the stable results — sub-millisecond mapping and zero RSS growth regardless of timing noise.
 
@@ -310,13 +316,14 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── tools/gguf_inspect.py      Read-only GGUF report (no numpy, no torch)
 ├── tools/gguf_to_hydra.py     GGUF → .hydra converter, absmean ternarisation
 ├── tools/gguf_test.py         Converter gate: synthetic GGUF in, real C engine out
-├── tests/test_engine.c        71 unit tests (x86) / 77 on ARM (incl. NEON-vs-scalar, OOB + overflow PoC regressions)
+├── tests/test_engine.c        unit tests (NEON-vs-scalar, OOB + overflow PoC regressions); count is architecture-dependent and drift-gated
 ├── android/                   NDK/JNI app wrapping the same C source
 ├── server.js                  UI server (Node, 0 runtime dependencies; ESLint is dev-only)
 ├── public/                    Hydra-Stone Console (HTML/CSS/JS)
 ├── docs/ARCHITECTURE.md       Architecture & math
 ├── docs/FORMAT.md             .hydra binary format specification
 ├── docs/GGUF-IMPORT.md        GGUF import, absmean ternarisation, limits
+├── docs/FORMAT-V2.md          .hydra2 sparse-expert format — SPEC ONLY, no loader yet
 ├── docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
 ├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
 ├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
@@ -341,14 +348,23 @@ acc_i += (−1) · x_j   for every w_ij = −1
 ```
 
 **On-disk footprint per weight (v1): 2 bits** — two ternary weights per byte
-(`w1` in bits 0–1, `w2` in bits 2–3), upper 4 bits reserved. Compared with a
-naive FP16 checkpoint:
+(`w1` in bits 0–1, `w2` in bits 2–3), upper 4 bits reserved.
 
-| Parameters | FP16 | INT4 (4 bits) | Hydra v1 (2 bits) | Hydra v2 (2 bits, packed) |
+The table below is a **bits-per-parameter density comparison only**. It is
+*not* a statement that Hydra-Stone can store models of that size:
+
+| Parameters | FP16 | INT4 (4 bits) | v1 density (2 bits) | v2 packing (same 2 bits) |
 |---|---|---|---|---|
 | 0.5 B | 1000 MiB | 250 MiB | **125 MiB** | 62.5 MiB |
 | 1.0 B | 2000 MiB | 500 MiB | **250 MiB** | 125 MiB |
 | 1.5 B | 3000 MiB (OOM) | 750 MiB | **375 MiB** | 187.5 MiB |
+
+**What v1 can actually hold:** `dim <= 64`, `layers <= 4096`, `vocab <= 1024`,
+which caps the weight region at **256 KiB** (`64 x 4096` bytes). A parameter
+count far beyond a few million is not expressible in v1 at all — that is a
+format ceiling, not a memory problem (a 5 GiB sparse `.hydra` maps and
+generates fine; `tests/test_large_model.c`). Lifting the ceiling is the job of
+the v2 container, specified in `docs/FORMAT-V2.md`.
 
 The honest framing: **v1 is INT2 on disk — it halves INT4, and beats it in
 compute too** (additions only, no dequantization, no FP unit). Two honest

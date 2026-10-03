@@ -342,10 +342,10 @@
     const lines = [
       `source      ${c.source}`,
       `format      GGUF v${g.version}, ${g.architecture || 'unknown architecture'}, ${g.bytes} bytes`,
-      `tensors     ${g.tensorCount} total, ${(g.denseFloatTensors || []).length} dense float`,
+      `tensors     ${g.tensorCount} total, ${(g.decodableTensors || g.denseFloatTensors || []).length} readable (F32/F16/BF16/Q8_0)`,
     ];
     if (g.quantisedTensors && g.quantisedTensors.length) {
-      lines.push(`not read    ${g.quantisedTensors.length} quantised tensors: ${g.quantisedTensors.slice(0, 6).join(', ')}`);
+      lines.push(`not read    ${g.quantisedTensors.length} tensors in unsupported block layouts: ${g.quantisedTensors.slice(0, 6).join(', ')}`);
     }
     for (const p of c.planes || []) {
       lines.push(`plane ${p.plane}      ${p.tensor} ${JSON.stringify(p.shape)} ${p.type}`);
