@@ -50,9 +50,17 @@ const HYDRA_RUN = path.join(ROOT, 'hydra-run');
 const MODELS_DIR = path.join(ROOT, 'models');
 const TRAINED_DIR = path.join(MODELS_DIR, 'trained');
 const UPLOAD_DIR = path.join(MODELS_DIR, 'uploaded');
+const CONVERTED_DIR = path.join(MODELS_DIR, 'converted');
+const GGUF_CONVERTER = path.join(ROOT, 'tools', 'gguf_to_hydra.py');
+/* Conversion is CPU work in a second process. The cap is a wall-clock
+ * limit on the SUBPROCESS, not a client timeout: it stops a 4 GB F32 file
+ * from parking a request forever, and it is deliberately much larger than
+ * the 20 s an inference gets. Measured throughput is in
+ * docs/GGUF-IMPORT.md; raise it if a bigger model has to go through. */
+const CONVERT_TIMEOUT_MS = parseInt(process.env.HYDRA_CONVERT_TIMEOUT_MS || '600000', 10);
 const MAX_VERIFY_DIM = 4096;
 const VOCAB_DIR = path.join(ROOT, 'models', 'vocab');
-const DEFAULT_MODEL = path.join(MODELS_DIR, 'demo.hydra');
+const DEFAULT_MODEL = path.join(MODELS_DIR, 'starter.hydra');
 
 const MAX_BODY = 2 * 1024 * 1024; /* training corpora are text; 2 MiB is ample */
 /* Upload cap, overridable because the model size ceiling is a FORMAT limit,
@@ -248,8 +256,9 @@ function streamToTmpFile(req, tmpPath, limit) {
 const KNOWN_MAGICS = [
   {
     magic: 0x46554747, mask: 0xffffffff, name: 'GGUF',
-    advice: 'this is a GGUF model (llama.cpp / Ollama). The engine reads .hydra files; '
-      + 'convert it with tools/gguf_to_hydra.py',
+    advice: 'this is a GGUF model (llama.cpp / Ollama). Import it with '
+      + 'POST /api/models/import (or the "Import .gguf" button) and it is '
+      + 'converted with tools/gguf_to_hydra.py; a .hydra file can be used directly',
   },
   { magic: 0x04034b50, mask: 0xffffffff, name: 'ZIP archive', advice: 'this looks like a .zip archive' },
   { magic: 0x7f454c46, mask: 0xffffffff, name: 'ELF binary', advice: 'this looks like a compiled binary' },
@@ -503,8 +512,76 @@ function loadModelInfo(modelPath) {
     dim: j.dim,
     vocab: j.vocab,
     layers: j.layers,
+    /* Gemessen vom Loader im selben Aufruf, nicht geschaetzt: das Modell
+     * wird fuer diese Antwort ohnehin einmal geladen. */
+    load_ms: j.load_ms,
+    weights_bytes: j.weights_bytes,
     path: path.relative(ROOT, modelPath),
   }));
+}
+
+/* ------------------------------------------------------------------ */
+/* GGUF import                                                        */
+/* ------------------------------------------------------------------ */
+
+/** Resolve an import name to a .hydra path inside models/converted/. */
+function convertedTarget(name) {
+  if (typeof name !== 'string' || !name.endsWith('.hydra')) return null;
+  const key = modelKey(name.slice(0, -'.hydra'.length));
+  if (key === null) return null;
+  const dir = path.resolve(CONVERTED_DIR);
+  const file = path.resolve(dir, `${key}.hydra`);
+  const rel = path.relative(dir, file);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return file;
+}
+
+/**
+ * Run tools/gguf_to_hydra.py and return its report.
+ *
+ * The converter is a separate process on purpose: it is a few hundred
+ * lines of pure-Python decoding that can take seconds on a real model, and
+ * running it inline would block every other request in the single-threaded
+ * event loop. Its stderr is captured because the message there is written
+ * for the user - it names the quantised type and the flag that fixes it.
+ */
+function runGgufConverter(ggufPath, outPath) {
+  const vocabOut = path.join(VOCAB_DIR, `${path.basename(outPath, '.hydra')}.json`);
+  const args = [
+    GGUF_CONVERTER, ggufPath,
+    '--out', outPath,
+    '--vocab-out', vocabOut,
+    '--json',
+  ];
+  return new Promise((resolve) => {
+    execFile('python3', args, {
+      cwd: ROOT,
+      timeout: CONVERT_TIMEOUT_MS,
+      maxBuffer: 8 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      let report = null;
+      try {
+        report = JSON.parse(stdout);
+      } catch {
+        /* stdout was not JSON: the converter crashed or printed usage. The
+         * stderr message below is what the user needs. */
+      }
+      /* stdout is the converter's JSON report; stderr carries the message it
+       * wrote for the user. Both are bounded by maxBuffer above. */
+      if (err && !report) {
+        resolve({
+          ok: false,
+          error: (stderr || '').trim() || `converter failed: ${err.message}`,
+        });
+        return;
+      }
+      if (!report || report.ok !== true) {
+        resolve({ ok: false, error: (report && report.error) || 'conversion failed' });
+        return;
+      }
+      resolve(report);
+    });
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -553,6 +630,9 @@ function inspectHeader(relPath) {
       valid: buf.readUInt32LE(0) === trainer.MAGIC,
       trained: relPath.startsWith('models' + path.sep + 'trained' + path.sep),
       uploaded: relPath.startsWith('models' + path.sep + 'uploaded' + path.sep),
+      /* A model that came out of the GGUF converter says so in the chat's
+       * model list, so it is never mistaken for a trained model. */
+      converted: relPath.startsWith('models' + path.sep + 'converted' + path.sep),
     };
   } catch {
     return null;
@@ -877,6 +957,74 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true, model: info });
     }
 
+    /* GGUF -> .hydra. One POST, one model: the bytes are streamed to disk,
+     * recognised, converted by tools/gguf_to_hydra.py and validated by the
+     * SAME analysis every other path uses - so a converted model that came
+     * out of here is a model the engine can load, or the request fails.
+     *
+     * The report comes back verbatim: which tensors were read, how many rows
+     * of each, what the absmean scale was, how dense the ternary result is.
+     * A conversion that quietly produced something different from what was
+     * asked for is worse than one that is refused. */
+    if (url.pathname === '/api/models/import' && req.method === 'POST') {
+      const name = url.searchParams.get('name') || '';
+      if (!name.toLowerCase().endsWith('.gguf')) {
+        return sendJSON(res, 400, {
+          error: 'invalid file name: the import expects a .gguf suffix '
+            + '(a .hydra model goes to /api/models/upload)',
+        });
+      }
+      const target = convertedTarget(`${name.slice(0, -'.gguf'.length)}.hydra`);
+      if (!target) {
+        return sendJSON(res, 400, {
+          error: 'invalid file name: use letters, digits, dot, dash and underscore before the suffix',
+        });
+      }
+      fs.mkdirSync(CONVERTED_DIR, { recursive: true });
+      const tmp = path.join(CONVERTED_DIR, `.import-${process.pid}-${Date.now()}.gguf`);
+      try {
+        await streamToTmpFile(req, tmp, MAX_UPLOAD);
+      } catch (e) {
+        if (e.tooLarge) {
+          res.setHeader('Connection', 'close');
+          sendJSON(res, e.status, {
+            error: e.message,
+            rejected: true,
+            limitBytes: e.limitBytes,
+            limitHuman: formatBytes(e.limitBytes),
+            raiseWith: 'HYDRA_MAX_UPLOAD',
+          });
+          res.on('finish', () => { if (!req.destroyed) req.destroy(); });
+          return;
+        }
+        return sendJSON(res, e.status || 400, { error: e.message });
+      }
+
+      const report = await runGgufConverter(tmp, target);
+      /* The source GGUF never reaches a model path: only the converted
+       * .hydra is offered, and only after the header check below. */
+      fs.unlinkSync(tmp);
+
+      if (!report.ok) {
+        if (fs.existsSync(target)) fs.unlinkSync(target);
+        return sendJSON(res, 400, { error: report.error, rejected: true });
+      }
+
+      const reason = validateHydraHeader(target);
+      if (reason !== null) {
+        fs.unlinkSync(target);
+        return sendJSON(res, 500, {
+          error: `the converter produced a model the engine refuses: ${reason}`,
+          rejected: true,
+        });
+      }
+
+      const info = inspectHeader(path.relative(ROOT, target));
+      /* The conversion report is the answer, not a log line: it is the only
+       * place that says what the new model actually is. */
+      return sendJSON(res, 200, { ok: true, model: info, conversion: report });
+    }
+
     /* Why is this file not loading? One endpoint, one answer, the same
      * analysis the upload route uses - so the message on upload and the
      * report here can never contradict each other.
@@ -915,6 +1063,7 @@ const server = http.createServer(async (req, res) => {
       report.path = rel;
       report.trained = rel.startsWith('models' + path.sep + 'trained' + path.sep);
       report.uploaded = rel.startsWith('models' + path.sep + 'uploaded' + path.sep);
+      report.converted = rel.startsWith('models' + path.sep + 'converted' + path.sep);
       /* 200 even for an invalid model: the caller asked for a diagnosis,
        * and "here is why it is broken" is a successful answer. */
       return sendJSON(res, 200, report);
@@ -1121,7 +1270,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 /**
- * The demo model is generated output, not a checked-in binary. A clean
+ * The starter model is generated output, not a checked-in binary. A clean
  * checkout therefore has no models/ directory at all, so we create it from
  * the repository's own writer instead of shipping a stale blob.
  */
@@ -1130,12 +1279,12 @@ function ensureDefaultModel() {
   if (fs.existsSync(DEFAULT_MODEL)) return;
   try {
     execFileSync('python3', [
-      path.join(ROOT, 'tools', 'make_dummy_model.py'),
+      path.join(ROOT, 'tools', 'make_model.py'),
       DEFAULT_MODEL,
     ]);
-    console.log('[Hydra Console] generated the default demo model');
+    console.log('[Hydra Console] generated the default starter model');
   } catch (e) {
-    console.error('[Hydra Console] could not generate the demo model:', e.message);
+    console.error('[Hydra Console] could not generate the starter model:', e.message);
   }
 }
 

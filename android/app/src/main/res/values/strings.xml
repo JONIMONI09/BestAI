@@ -8,8 +8,10 @@
     <string name="default_steps">32</string>
     <string name="action_run">Run inference</string>
     <string name="action_cancel">Cancel run</string>
-    <string name="action_import_model">Import .hydra model…</string>
+    <string name="action_import_model">Import model…</string>
     <string name="action_benchmark">Benchmark (ns/token)</string>
+    <string name="action_auto_run">Run automatically on start</string>
+    <string name="label_model">model</string>
     <plurals name="log_bench_start">
         <item quantity="one">[Hydra] benchmark: %1$d step, three passes…</item>
         <item quantity="other">[Hydra] benchmark: %1$d steps, three passes…</item>
@@ -17,6 +19,12 @@
     <string name="log_bench_result">[Hydra] bench %1$s</string>
 
     <string name="log_model">[Hydra] model: %1$s</string>
+    <string name="log_model_starter">[Hydra] starter model ready: %1$s</string>
+    <string name="log_model_imported">[Hydra] imported model active: %1$s</string>
+    <string name="log_starter_failed">[Hydra] the bundled starter model could not be prepared: %1$s</string>
+    <string name="log_auto_run">[Hydra] starting automatically — press Run inference to repeat, or switch the app off to skip this</string>
+    <string name="err_no_model">No model available. Import a .hydra model to run the engine.</string>
+    <string name="err_import_invalid">the imported file does not pass the header rules</string>
     <plurals name="log_size">
         <item quantity="one">[Hydra] size: %1$d byte</item>
         <item quantity="other">[Hydra] size: %1$d bytes</item>
@@ -26,8 +34,8 @@
         <item quantity="other">[Hydra] running with startToken=%1$d, %2$d iterations…</item>
     </plurals>
     <plurals name="log_tokens">
-        <item quantity="one">[Hydra] %1$d token</item>
-        <item quantity="other">[Hydra] %1$d tokens</item>
+        <item quantity="one">[Hydra] %1$d token:</item>
+        <item quantity="other">[Hydra] %1$d tokens:</item>
     </plurals>
     <string name="log_batch_done">[Hydra] stream complete</string>
     <string name="log_cancelled">[Hydra] cancelled — the native loop stopped at the next step; the result is discarded.</string>
@@ -43,7 +51,7 @@
     <string name="err_unreadable">header could not be read</string>
     <!-- Magic-specific messages: the hex value alone never told anybody what
          they actually picked. -->
-    <string name="err_magic_gguf">this is a GGUF model (llama.cpp / Ollama). The engine reads .hydra files — a GGUF cannot be executed by this ternary engine.</string>
+    <string name="err_magic_gguf">this is a GGUF model (llama.cpp / Ollama). The engine reads .hydra files. Convert it on the desktop with tools/gguf_to_hydra.py (or POST /api/models/import in the web console) and import the resulting .hydra here.</string>
     <string name="err_magic_zip">this looks like a .zip archive, not a .hydra model</string>
     <string name="err_magic_elf">this looks like a compiled binary, not a .hydra model</string>
     <string name="err_magic_png">this looks like an image, not a .hydra model</string>

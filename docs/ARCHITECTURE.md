@@ -23,8 +23,8 @@
 | `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate |
 | `src/main.c` | CLI entry point (`--json` mode for machine-readable output) |
 | `src/hydra_neon.h` | NEON SIMD kernel — **actively integrated**: `step()` uses it on ARM in 16-lane chunks; bit-identical scalar fallback for remainders and x86 (proven by a same-build comparison test) |
-| `tools/make_dummy_model.py` | Test model generator (reference implementation of the format) |
-| `tests/test_engine.c` | 49 unit tests (hand-computed cases, NEON-vs-scalar, seeded roundtrips, security regressions) |
+| `tools/make_model.py` | Test model generator (reference implementation of the format) |
+| `tests/test_engine.c` | 71 unit tests on x86-64, 77 on ARM (hand-computed cases, NEON-vs-scalar, seeded roundtrips, security regressions) |
 | `server.js` | Web console server (Node, zero npm dependencies) |
 | `public/` | Hydra-Stone Console frontend (plain HTML/CSS/JS) |
 
@@ -66,7 +66,7 @@ No FP32/FP16 multiplication in the inner loop → maximum ALU throughput even wi
 | ARM, `dim % 16 != 0` | NEON for multiples of 16, scalar for the remainder | active |
 | x86 / x86-64 | purely **scalar** | no SIMD — AVX2 on the roadmap |
 
-Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Empirically confirmed on three targets — host x86-64, ARM64 under NEON, and the Android emulator — which all emit the token sequence `211, 36, 185, 410, 7, 40, 197, 478` for `models/demo.hydra` with `start_token=42`.
+Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Empirically confirmed on three targets — host x86-64, ARM64 under NEON, and the Android emulator — which all emit the token sequence `211, 36, 185, 410, 7, 40, 197, 478` for `models/starter.hydra` with `start_token=42`.
 
 NEON overflow analysis: `|w| ≤ 1`, `|token| ≤ 1023`, `|state| ≤ 127` → per-lane product ≤ 1150, safely within int16; accumulation happens in an `int64_t` array, which cannot overflow for any layer count the loader accepts.
 

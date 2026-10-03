@@ -284,7 +284,7 @@ Java_dev_hydrastone_HydraBridge_runInference(
     }
     long elapsed_us = (clock() - t0) * 1000000L / CLOCKS_PER_SEC;
 
-    /* Axiom gate demo (mirrors the CLI smoke test) */
+    /* Axiom gate starter (mirrors the CLI smoke test) */
     float safe = 0.0f;
     int allowed = hydra_verify_axiom(1.0f, 99.5f, &safe);
 

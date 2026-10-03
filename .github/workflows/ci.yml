@@ -49,7 +49,7 @@ jobs:
       # reference writer
       - name: Python lint (py_compile + format reference check)
         run: |
-          python3 -m py_compile tools/make_dummy_model.py
+          python3 -m py_compile tools/make_model.py
           python3 - << 'EOF'
           import struct, sys
           sys.path.insert(0, 'tools')
@@ -65,9 +65,9 @@ jobs:
       # CI-built APK shipped without it and only a local build had one.
       - name: Android model asset matches the generator
         run: |
-          python3 tools/make_dummy_model.py /tmp/demo-check.hydra
-          if ! cmp -s /tmp/demo-check.hydra android/app/src/main/assets/demo.hydra; then
-            echo "::error::android/app/src/main/assets/demo.hydra differs from tools/make_dummy_model.py output"
+          python3 tools/make_model.py /tmp/demo-check.hydra
+          if ! cmp -s /tmp/demo-check.hydra android/app/src/main/assets/starter.hydra; then
+            echo "::error::android/app/src/main/assets/starter.hydra differs from tools/make_model.py output"
             exit 1
           fi
           echo "asset matches the generator"
@@ -123,7 +123,7 @@ jobs:
       - name: Cross-arch determinism check (x86 vs ARM/NEON)
         run: |
           make all
-          python3 tools/make_dummy_model.py parity.hydra
+          python3 tools/make_model.py parity.hydra
           ./hydra-run parity.hydra 42 8 --json 2>/dev/null > /tmp/x86.json
           aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
               src/hydra_engine.c src/main.c -o hydra-run-arm
@@ -198,7 +198,7 @@ jobs:
 
       - name: Runtime smoke test
         run: |
-          python3 tools/make_dummy_model.py smoke.hydra
+          python3 tools/make_model.py smoke.hydra
           ./hydra-run smoke.hydra 42
 
       # The prompt path (--prompt) is what the web console and the Android
@@ -209,7 +209,7 @@ jobs:
       - name: Prompt prefill reaches the engine (with negative control)
         run: |
           set -euo pipefail
-          python3 tools/make_dummy_model.py prompt.hydra
+          python3 tools/make_model.py prompt.hydra
           single=$(./hydra-run prompt.hydra 7 4 --json 2>/dev/null)
           p1=$(./hydra-run prompt.hydra 0 4 --prompt 7 --json 2>/dev/null)
           p3=$(./hydra-run prompt.hydra 0 4 --prompt 3,5,7 --json 2>/dev/null)
@@ -382,7 +382,7 @@ jobs:
               exit 1
             fi
           done
-          grep -q 'assets/demo.hydra' apk-unzip.txt
+          grep -q 'assets/starter.hydra' apk-unzip.txt
 
           # Permission gate: the app opens files through the Storage
           # Access Framework, which needs NO permission at all. Any

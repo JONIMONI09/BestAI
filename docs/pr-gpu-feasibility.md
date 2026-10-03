@@ -7,8 +7,8 @@ Three items in the brief were **already merged** before this work (PR #24/#26) a
 ## Measured here (x86-64 container, not a Snapdragon)
 
 ```
-make -s all && python3 tools/make_dummy_model.py models/demo.hydra
-./hydra-run models/demo.hydra 0 --bench 50000
+make -s all && python3 tools/make_model.py models/starter.hydra
+./hydra-run models/starter.hydra 0 --bench 50000
 ```
 
 | Run | full | token-only | speedup |

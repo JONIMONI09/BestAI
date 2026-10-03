@@ -992,6 +992,49 @@ static void test_engine_rejects_symlink(void)
     unlink(link);
 }
 
+/* Lademessung: die Aussage "Modelle laden schnell" ist eine Zahl, und
+ * eine Zahl veraltet. Dieser Test pinnt die Felder fest, damit niemand
+ * load_ms entfernen kann, ohne dass es auffaellt - und meldet den Wert,
+ * damit eine Aenderung sichtbar wird.
+ *
+ * Er behauptet NICHT, dass das Laden schnell ist: eine Zeitgrenze waere auf
+ * einer ausgelasteten CI-Maschine flaky. Er behauptet, dass gemessen wird. */
+static void test_load_metrics_are_measured(void)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    const uint32_t dim = 64, layers = 512;
+    write_seeded_model(path, 31337u, dim, layers, 512);
+
+    long warm = hydra_engine_resident_kb();
+    (void)warm;   /* erster Aufruf kann den stdio-/locale-Zustand aufsetzen */
+
+    HydraEngine e;
+    CHECK(hydra_engine_load(&e, path) == 0, "Modell laedt fuer die Lademessung");
+    HydraModelHeader h = e.header;
+    size_t expect = (size_t)h.layers * (size_t)h.dim;
+
+    CHECK(e.weights_bytes >= expect,
+          "weights_bytes deckt layers x dim ab");
+    CHECK(e.load_ms >= 0.0, "load_ms wurde gesetzt (nicht -1, nicht uninitialisiert)");
+    CHECK(e.load_ms < 10000.0,
+          "load_ms ist eine Zeit in Millisekunden und keine Overflow-Summe");
+
+    /* RSS ist nur auf Linux messbar. Wo er messbar ist, muss er eine
+     * plausible Groesse sein - ein 0 oder ein Rauschen waere ein Messfehler,
+     * kein Messergebnis, und wird als solcher gemeldet. */
+    CHECK(e.rss_kb_before_load == -1 || e.rss_kb_before_load > 0,
+          "rss_kb_before_load ist entweder -1 (nicht messbar) oder positiv");
+    CHECK(e.resident_kb_after_load == -1 || e.resident_kb_after_load > 0,
+          "resident_kb_after_load ist entweder -1 oder positiv");
+
+    uint16_t tok = 5, out = 0;
+    CHECK(hydra_engine_step(&e, tok, &out) == 0,
+          "nach der Lademessung ist das Modell weiter benutzbar");
+    hydra_engine_unload(&e);
+    unlink(path);
+}
+
 static void test_axiom(void)
 {
     float score = 0.0f;
@@ -1049,6 +1092,7 @@ int main(void)
     test_engine_rejects_layer_overflow();
     test_engine_rejects_offset_in_header();
     test_engine_rejects_symlink();
+    test_load_metrics_are_measured();
     test_axiom();
 
     printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);

@@ -48,8 +48,8 @@ cold). Keep `--no-daemon` in CI (clean, no leftover JVM).
 
 ```bash
 APK=app/build/outputs/apk/debug/app-debug.apk
-unzip -l $APK | grep -E "libhydra|demo.hydra|classes.dex"
-# expect: lib/{arm64-v8a,armeabi-v7a,x86_64}/libhydra.so + assets/demo.hydra
+unzip -l $APK | grep -E "libhydra|starter.hydra|classes.dex"
+# expect: lib/{arm64-v8a,armeabi-v7a,x86_64}/libhydra.so + assets/starter.hydra
 /opt/android-sdk/build-tools/34.0.0/apksigner verify $APK && echo "signature: OK"
 unzip -o $APK lib/arm64-v8a/libhydra.so -d /tmp/apkchk >/dev/null
 /opt/android-sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm -D \
@@ -142,6 +142,6 @@ $SDK/cmake/3.22.1/bin/cmake --build /tmp/cmake_test
 ## Expected end-to-end result (verified 2x on API-24 x86_64)
 
 - logcat `HydraJNI`: `{"ok":true,"steps":32,...,"dim":64,"vocab":512,"layers":4,"axiom_allowed":true}`
-- UI token stream identical to host CLI (`./hydra-run models/demo.hydra 42 8 --json`):
+- UI token stream identical to host CLI (`./hydra-run models/starter.hydra 42 8 --json`):
   `211 388 401 330 111 176 113 170` — the engine is deterministic
   across host and Android on the same code path.

@@ -42,9 +42,9 @@ static void usage(const char *argv0, FILE *out)
     fprintf(out, "  --fast           Token-only Fast Path, nur Dimension 0\n");
     fprintf(out, "  --help           Diese Hilfe anzeigen\n");
     fprintf(out, "\n");
-    fprintf(out, "Beispiel: %s models/demo.hydra 123 32 --json\n", argv0);
-    fprintf(out, "Beispiel: %s models/demo.hydra 0 8 --prompt 7,9,11 --json\n", argv0);
-    fprintf(out, "Tipp: Modell erzeugen mit: python3 tools/make_dummy_model.py <ziel>\n");
+    fprintf(out, "Beispiel: %s models/starter.hydra 123 32 --json\n", argv0);
+    fprintf(out, "Beispiel: %s models/starter.hydra 0 8 --prompt 7,9,11 --json\n", argv0);
+    fprintf(out, "Tipp: Modell erzeugen mit: python3 tools/make_model.py <ziel>\n");
 }
 
 /* strtol mit strengem Zahlencheck: kein Unsinn, kein Overflow, kein
@@ -111,6 +111,11 @@ static void print_json(const HydraEngine *e, const uint16_t *tokens,
            "\"steps\":%d,\"elapsed_ms\":%.3f",
            e->header.dim, e->header.vocab_size, e->header.layers,
            (unsigned)start, n, elapsed_ms);
+    /* Ladezeit und Gewichtsgroesse mitgeben: die Konsole zeigt sie als
+     * Modell-Chip an, und eine Behauptung ueber Ladezeiten braucht einen
+     * Wert, der im selben Aufruf gemessen wurde. */
+    printf(",\"load_ms\":%.3f,\"weights_bytes\":%zu",
+           e->load_ms, e->weights_bytes);
     /* Das Prompt wird mit ausgegeben: die Web-UI muss nachweisen koennen,
      * dass wirklich die ganze Sequenz in die Engine gegangen ist und
      * nicht nur ihr erstes Token. */
@@ -142,10 +147,11 @@ static void print_json(const HydraEngine *e, const uint16_t *tokens,
  * mmap-Seiten im Page-Cache liegen. Ohne Warmup misst man in erster
  * Linie den Page-Cache, nicht den Kernel. */
 static double bench_run(const char *model_path, uint16_t start_token, long steps,
-                        int fast_mode, uint16_t *first_out)
+                        int fast_mode, uint16_t *first_out, HydraEngine *stats)
 {
     HydraEngine e;
     if (hydra_engine_load(&e, model_path) != 0) return -1.0;
+    if (stats) *stats = e;
 
     /* Warmup: ein voller Durchlauf, damit die mmap-Seiten im Page-Cache
      * liegen. Ohne das misst man den Page-Cache, nicht den Kernel. */
@@ -190,23 +196,45 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
      * Zustand, und ein zweiter Lauf auf einem gesättigten Vektor ist ein
      * anderes Experiment als ein frischer Start. */
     uint16_t sink = 0;
-    double ns_full = bench_run(model_path, start_token, steps, 0, &sink);
+    HydraEngine full_stats;
+    double ns_full = bench_run(model_path, start_token, steps, 0, &sink, &full_stats);
     if (ns_full < 0) { fprintf(stderr, "[Hydra] Bench: Modell konnte nicht geladen werden\n"); return 1; }
     uint16_t sink_fast = 0;
-    double ns_fast = bench_run(model_path, start_token, steps, 1, &sink_fast);
+    double ns_fast = bench_run(model_path, start_token, steps, 1, &sink_fast, NULL);
     if (ns_fast < 0) { fprintf(stderr, "[Hydra] Bench: Fast Path fehlgeschlagen\n"); return 1; }
 
     /* Beide Ströme muessen identisch sein - sonst vergleicht der Benchmark
-     * zwei verschiedene Algorithmen und die Zahlen sind Muell. */
+     * zwei verschiedene Algorithmen und die Zahlen sind Muell.
+     *
+     * Die Ladezahlen stehen mit drin, weil "Modelle laden schnell" eine
+     * Behauptung ist und eine Behauptung braucht eine Messung:
+     *   load_ms                 gemessene Ladezeit inkl. Aggregation
+     *   weights_bytes            Bytes, die die Aggregation liest
+     *   rss_delta_kb             RSS Aenderung ueber das Laden hinweg
+     * Ein rss_delta_kb von 0 heisst: nach dem Laden ist keine einzige
+     * Gewichtsseite mehr im Prozess - MADV_SEQUENTIAL gibt sie hinter dem
+     * Lesezeiger frei. Genau das ist die Messung hinter der O(1)-Aussage;
+     * ein MADV_DONTNEED zusaetzlich wurde gebaut, gemessen und verworfen
+     * (Kommentar in src/hydra_engine.c). */
+    long rss_delta = -1;
+    if (full_stats.rss_kb_before_load >= 0 && full_stats.resident_kb_after_load >= 0) {
+        rss_delta = full_stats.resident_kb_after_load - full_stats.rss_kb_before_load;
+    }
     printf("{\"mode\":\"bench\",\"engine\":\"cpu\",\"model\":\"%s\","
            "\"dim\":%u,\"layers\":%u,\"vocab\":%u,\"steps\":%ld,"
            "\"warmup_layers\":%u,"
            "\"ns_per_token_full\":%.2f,\"ns_per_token_fast\":%.2f,"
            "\"speedup\":%.3f,\"tokens_equal\":%s,"
+           "\"load_ms\":%.3f,\"weights_bytes\":%zu,"
+           "\"rss_before_kb\":%ld,"
+           "\"rss_after_kb\":%ld,\"rss_delta_kb\":%ld,"
            "\"note\":\"JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device\"}",
            model_path, h->dim, h->layers, h->vocab_size, steps,
            h->layers, ns_full, ns_fast, ns_fast > 0 ? ns_full / ns_fast : 0.0,
-           sink == sink_fast ? "true" : "false");
+           sink == sink_fast ? "true" : "false",
+           full_stats.load_ms, full_stats.weights_bytes,
+           full_stats.rss_kb_before_load,
+           full_stats.resident_kb_after_load, rss_delta);
     printf("\n");
     return sink == sink_fast ? 0 : 1;
 }

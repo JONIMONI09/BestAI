@@ -9,6 +9,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <time.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/time.h>
+#endif
 
 /* Explizite Little-Endian-Dekodierung: docs/FORMAT.md definiert das
  * Headerlayout als little-endian, memcpy in native Integer wuerde auf
@@ -32,6 +37,77 @@ static int hydra_decode_ternary_2bit(uint8_t code)
     default:                return 0; /* 0 und 11(reserved) -> 0 */
     }
 }
+
+/* Millisekunden seit einem beliebigen Referenzpunkt (CLOCK_MONOTONIC,
+ * damit ein NTP-Sprung die Ladezeitmessung nicht verschluckt). */
+static double hydra_now_ms(void)
+{
+#ifdef CLOCK_MONOTONIC
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    }
+#endif
+    return 0.0;
+}
+
+/* Residenter Speicher in KiB, oder -1 wenn die Plattform ihn nicht sagt.
+ * /proc ist billiger und genauer als getrusage(ru_maxrss), das nur den
+ * HOECHSTWERT seit Prozessstart kennt - nach dem Freigeben der
+ * Gewichtsseiten waere genau das die Zahl, die man nicht mehr sehen kann.
+ *
+ * Bewusst open()/read() statt fopen(): ein stdio-Puffer wird beim ersten
+ * fopen alloziert und taucht danach mit ~512 KiB in JEDER weiteren Messung
+ * auf. Genau dieser Sprung hat eine A/B-Messung der Gewichtsseiten zuerst
+ * unlesbar gemacht, bevor die Ursache gefunden war. */
+static long hydra_resident_kb(void)
+{
+#ifdef __linux__
+    int fd = open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char buf[128];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            /* size resident shared text lib data dt, in pages */
+            unsigned long total = 0, resident = 0;
+            if (sscanf(buf, "%lu %lu", &total, &resident) == 2) {
+                long page_kb = sysconf(_SC_PAGESIZE) / 1024;
+                if (page_kb < 1) page_kb = 4;
+                return (long)(resident * (unsigned long)page_kb);
+            }
+        }
+    }
+#endif
+    return -1;
+}
+
+/* Gewichtsseiten nach dem Aufbau der Aggregation freizugeben: GEMESSEN,
+ * UND ES GIBT NICHTS ZU TUN.
+ *
+ * Die naheliegende Optimierung waere MADV_DONTNEED auf den Gewichtsblock,
+ * weil hydra_engine_step() mapped_weights nie wieder liest. Sie wurde
+ * gebaut, per mincore() und per RSS verglichen - und wieder verworfen:
+ *
+ *   - MADV_SEQUENTIAL (das der Loader schon setzt) gibt die Seiten hinter
+ *     dem Lesezeiger frei. Gemessen: 256 KiB sequentiell gelesen, RSS +0 KiB.
+ *     Der Gewichtsblock ist nach der Aggregation also ohnehin nicht mehr
+ *     im Prozess.
+ *   - Ein zusaetzliches MADV_DONTNEED danach aenderte nichts messbar - und
+ *     in einem Durchlauf 444 KiB schlechter (936 -> 1380 kB), weil die
+ *     Seiten zu diesem Zeitpunkt schon weg waren und das Mapping nur noch
+ *     Buchhaltung verschob.
+ *   - mincore() ist das falsche Instrument: es meldet fuer ein
+ *     MAP_SHARED-Dateimapping die Page-Cache-Anwesenheit, nicht die
+ *     Seiteentabelle. Es meldete 65 von 65 Seiten "resident", waehrend der
+ *     RSS 512 MiB niedriger lag.
+ *
+ * Ausserdem ist die Frage bei diesem Format fast gegenstandslos: v1 kann
+ * hoechstens dim 64 x layers 4096 = 262144 Gewichtsbytes beschreiben, und
+ * das Laden dieser maximalen Datei dauert gemessen 0.33 ms (--bench
+ * load_ms). Der Rueckgabewert bleibt fuer den v2-Fall, wo ein echtes
+ * Modell existiert und die Frage wieder eine wird. */
 
 /* Layer-Aggregation beim Laden: A[i] = sum_l w1[l][i],
  * B[i] = sum_l w2[l][i]. Ein einziger Durchlauf ueber die gemappten
@@ -75,6 +151,11 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
     if (!engine || !model_path) return -1;
     memset(engine, 0, sizeof(HydraEngine));
     engine->fd = -1;
+    engine->resident_kb_after_load = -1;
+    engine->rss_kb_before_load = -1;
+
+    double started_ms = hydra_now_ms();
+    long rss_before = hydra_resident_kb();
 
     int rc;
     /* O_NOFOLLOW: ein Symlink im Modellpfad wuerde auf eine Datei ausserhalb
@@ -179,7 +260,21 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * maschinenlesbare Ausgaben (z.B. --json) sauber bleibt. */
     fprintf(stderr, "[Hydra] Modell erfolgreich gemappt! Layers: %u, Dim: %u, Vocab: %u\n",
             engine->header.layers, engine->header.dim, engine->header.vocab_size);
+
+    /* Read-ahead fuer den Gewichtsblock anstossen wurde ebenfalls gebaut und
+     * verworfen: posix_fadvise(POSIX_FADV_WILLNEED) zieht die Seiten vorher
+     * in den Cache, obwohl die Aggregation sie unmittelbar danach ohnehin
+     * sequentiell liest - es gibt nichts zu ueberholen, weil es keinen
+     * zweiten Konsumenten gibt. Siehe die Notiz ueber
+     * hydra_release_weight_pages fuer die Messung. */
+
+    engine->weights_bytes = (size_t)engine->header.weights_len;
     hydra_build_aggregation(engine);
+
+    engine->rss_kb_before_load = rss_before;
+    engine->resident_kb_after_load = hydra_resident_kb();
+    double elapsed = hydra_now_ms() - started_ms;
+    engine->load_ms = (elapsed > 0.0) ? elapsed : 0.0;
     return 0;
 
 fail:
@@ -271,8 +366,11 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
     }
 
 #ifdef HYDRA_DROP_CACHE
-    /* Optionales Flag: nach jedem Step die zustaendigen Seiten verwerfen,
-     * damit die Gewichte nicht im Page-Cache resident bleiben. */
+    /* Optionales Flag: nach jedem Step die zustaendigen Seiten verwerfen.
+     * Seit dem Laden liest step() mapped_weights ohnehin nicht mehr - das
+     * Flag betrifft also faktisch nur den Header-Bereich und kostet pro
+     * Token einen Systemaufruf. Bleibt fuer Builds, die ein strengeres
+     * Verhalten wollen, ist aber kein Default. */
     madvise((void *)engine->mapped_weights, engine->mapped_size, MADV_DONTNEED);
 #endif
 
@@ -337,6 +435,12 @@ int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)
         if (hydra_engine_step(engine, tokens[i], &discarded) != 0) return -3;
     }
     return 0;
+}
+
+/* Wie gross ist der Prozess gerade wirklich resident? */
+long hydra_engine_resident_kb(void)
+{
+    return hydra_resident_kb();
 }
 
 int hydra_verify_axiom(float humanity_factor, float proposed_score, float *safe_score)

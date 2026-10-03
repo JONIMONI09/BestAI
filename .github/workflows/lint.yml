@@ -107,7 +107,7 @@ jobs:
           gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -fsanitize=address,undefined -fno-sanitize-recover=all -Iinclude \
               src/hydra_engine.c src/main.c -lm -o hydra-run-san
-          python3 tools/make_dummy_model.py san.hydra
+          python3 tools/make_model.py san.hydra
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
             ./hydra-run-san san.hydra 42 32 --json
           # CLI-Fehlerpfade unter Sanitizern (OOB-/Symlink-PoCs)

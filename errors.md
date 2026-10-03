@@ -1064,3 +1064,75 @@
   version. Two dedicated cases in `tools/ci_release_version_test.sh`
   (multi-line tag list, non-lexicographic comparison `v1.0.9` vs
   `v1.2.0`) now pin this.
+
+## The app ran and showed nothing (Android, 320x640)
+
+- **Symptom:** "it does not run automatically". The engine did run — a fresh
+  logcat shows the model loading and `inference done: {"ok":true}` — but the
+  UI looked dead, and a `uiautomator dump` ended at "Cancel run" with no log
+  view in the hierarchy at all.
+- **Cause:** the root layout was a bare vertical `LinearLayout`. On a 320x640
+  device the controls (title, import, two inputs, Run, Cancel, Benchmark,
+  model label, auto-run box) do not fit, and a vertical `LinearLayout` lays
+  the remaining children out **below the bottom edge** instead of making them
+  reachable. The token log went with them. "Ran but invisible" is
+  indistinguishable from "did not run".
+- **Fix:** one `ScrollView` around the whole screen
+  (`setContentView(ScrollView(this).apply { addView(root) })`), with the log
+  `TextView` given `minLines = 8`.
+- **Prevention:** a layout is not verified until it is rendered on the size it
+  will actually run on. Note that `uiautomator dump` reported the ScrollView
+  clipped at y=394 while the real content reached y=623 — the decisive
+  measurement was decoding raw `screencap` pixels, not the accessibility tree.
+- **Gate:** `tools/android_autostart_check.sh` (29 checks).
+
+## The emulator refused to boot, blamed on hardware
+
+- **Symptom:** every launch ended the same way —
+  `ERROR | x86_64 emulation currently requires hardware acceleration!`, or a
+  boot that died with `detected a hanging thread 'QEMU2 main loop'. No
+  response for 15847 ms`. `adb devices` showed nothing.
+- **Cause 1 (the real one):** two Gradle daemons were holding **2.4 GB of the
+  3.9 GB** host RAM. QEMU's threads could not be scheduled inside its own
+  watchdog window, so the emulator aborted itself. No amount of emulator
+  flags fixes a host that has no memory left.
+- **Cause 2:** `-accel off` is required — there is no `/dev/kvm`, and the
+  emulator treats that as fatal without it.
+- **Fix:** `gradle --stop` before starting the emulator; `-accel off`,
+  `-memory 1536`, `-cores 2`, snapshots off. Boot time then ~90 s with **zero**
+  hang errors.
+- **Prevention:** free host memory before starting a software-emulated
+  device, and read the *last* lines of the emulator log rather than the
+  first — the acceleration message is printed early and looks like the cause.
+- **Also:** `-wipe-data` forces a from-scratch guest init, which under TCG is
+  slow enough to trip the same watchdog. Wipe once, then boot the userdata.
+
+## A conversion report that claimed fields it does not have
+
+- **Symptom:** a README sentence advertised the import report as containing
+  "peak memory, conversion time". The report has neither — it carries
+  `source`, `out`, `bytes`, `gguf`, `header`, `planes[]`, `aggregation`,
+  `vocabulary`, `sampling`, `whatThisIs`.
+- **Cause:** the description was written from the shape of the feature rather
+  than from the dict the converter builds.
+- **Fix:** the README now names the fields that exist (`gamma`, `meanAbs`,
+  `ternaryZeros`, `density`, `rowsRead`/`rowsTotal`, `rescale`, `peakAbs`,
+  vocabulary size) — and the numbers were re-derived from the code, not from
+  memory.
+- **Prevention:** a documentation claim about a payload is a claim about code.
+  Read the keys the code writes; if you cannot name them, you have not
+  verified anything.
+
+## A "speedup" that made the thing slower
+
+- **Symptom:** an explicit `madvise(MADV_DONTNEED)` over the weight pages,
+  added to return memory after loading, made measured RSS **worse** rather
+  than better.
+- **Cause:** the mapping already uses `MADV_SEQUENTIAL`, which drops the
+  pages behind its read-ahead automatically. The extra `DONTNEED` evicted
+  pages the loader was about to touch again.
+- **Fix:** reverted the optimisation, kept the instrumentation (`load_ms`,
+  `rss_before_kb`, `rss_after_kb`, `rss_delta_kb`) so the claim stays
+  checkable.
+- **Prevention:** measure the optimisation before shipping it. "It frees
+  memory" is a hypothesis; `rss_delta_kb` is the measurement, and it said no.

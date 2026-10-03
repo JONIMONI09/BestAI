@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -17,8 +18,22 @@ import java.io.File
  * Hydra-Stone Android front end (programmatic Views, no Compose).
  *
  * Model selection has two paths:
- *  1. the demo model copied out of the APK assets (always present), and
- *  2. a user model imported through the Storage Access Framework.
+ *  1. the starter model shipped in the APK assets (always present, a real
+ *     working .hydra so the engine has something to run), and
+ *  2. a user model imported through the Storage Access Framework, which
+ *     takes precedence on every launch after the first import.
+ *
+ * The app RUNS BY ITSELF. On every launch it prepares a model and starts a
+ * generation run without waiting for a button press; "Run inference" re-runs
+ * it, and the auto-run switch turns the automatic run off. Two things made
+ * that fail before, and both are fixed here rather than papered over:
+ *
+ *  - the asset copy used to sit in onCreate() unguarded, so a missing or
+ *    unreadable asset threw on the main thread, killed the activity and
+ *    left nothing on screen at all. Model preparation is now a function
+ *    that returns false and says why.
+ *  - nothing started a run until the user pressed the button, which read
+ *    as "the app does nothing" on a phone.
  *
  * The import is a COPY into filesDir, streamed, written to a .tmp file and
  * then renamed. A copy is required because hydra_engine_load() mmaps a real
@@ -34,7 +49,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var stepsInput: EditText
     private lateinit var runButton: Button
     private lateinit var cancelButton: Button
+    private lateinit var modelLabel: TextView
     private var modelFile: File? = null
+
+    /** Run automatically on launch. Off = the app waits for Run inference. */
+    @Volatile
+    private var autoRun = true
 
     /** True while an inference thread is alive. Gates Run/Cancel. */
     @Volatile
@@ -49,6 +69,14 @@ class MainActivity : ComponentActivity() {
         }
 
     private fun log(line: String) {
+        /* Mirrored to logcat under the tag "Hydra".
+         *
+         * The TextView is the user-facing view, but it is also the only place
+         * this output used to live, and reading it back on a headless
+         * emulator needs uiautomator - which under TCG software emulation is
+         * heavy enough to starve the guest and kill it. logcat is the
+         * surface a CI machine can actually read cheaply. */
+        android.util.Log.i(LOG_TAG, line)
         runOnUiThread {
             lineCount.append(line).append('\n')
             if (lineCount.length > MAX_LOG_CHARS) {
@@ -66,9 +94,23 @@ class MainActivity : ComponentActivity() {
         CrashHandler.appContext = applicationContext
         CrashHandler.install()
 
+        /* The whole screen scrolls.
+         *
+         * The root used to be a bare LinearLayout. On a 320x640 device the
+         * controls (title, import, two inputs, run, cancel, benchmark,
+         * model label, auto-run box) do not fit, and a vertical LinearLayout
+         * lays the remaining children out BELOW the bottom edge instead of
+         * making them reachable. The token log went with them, so the app
+         * ran the engine and showed nothing - indistinguishable from "it
+         * does not run". Confirmed on the emulator: a UI dump of the
+         * running app ended at "Cancel run", with no log view at all.
+         *
+         * One ScrollView around everything, and the log gets a guaranteed
+         * minimum height so it is readable even on a short screen. */
+        val pad = (16 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 48, 48, 48)
+            setPadding(pad, pad, pad, pad)
         }
 
         val title = TextView(this).apply {
@@ -111,30 +153,29 @@ class MainActivity : ComponentActivity() {
         val bench = Button(this).apply { setText(R.string.action_benchmark) }
         root.addView(bench)
 
+        /* Which model is actually loaded, stated in the UI. "Something runs"
+         * is not the same as "you can see what ran". */
+        modelLabel = TextView(this).apply { textSize = 12f }
+        root.addView(modelLabel)
+
+        val auto = CheckBox(this).apply {
+            setText(R.string.action_auto_run)
+            isChecked = true
+        }
+        root.addView(auto)
+
         output = TextView(this).apply {
             typeface = android.graphics.Typeface.MONOSPACE
             textSize = 13f
+            /* Enough rows for a real run even when the screen is short;
+             * the outer ScrollView handles the rest. */
+            minLines = 8
+            setBackgroundColor(0x11000000)
+            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
         }
-        root.addView(
-            ScrollView(this).apply { addView(output) },
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-        )
+        root.addView(output)
 
-        setContentView(root)
-
-        // Copy the packed demo model out of assets to internal storage,
-        // so the C loader can mmap it from a real filesystem path.
-        modelFile = File(filesDir, "demo.hydra")
-        if (!modelFile!!.exists()) {
-            assets.open("demo.hydra").use { input ->
-                modelFile!!.outputStream().use { output -> input.copyTo(output) }
-            }
-        }
-
-        log(getString(R.string.log_model, modelFile!!.absolutePath))
-        log(resources.getQuantityString(R.plurals.log_size, modelFile!!.length().toInt(), modelFile!!.length()))
+        setContentView(ScrollView(this).apply { addView(root) })
 
         pick.setOnClickListener {
             // */* rather than a MIME filter: .hydra has no reliable MIME
@@ -150,6 +191,24 @@ class MainActivity : ComponentActivity() {
             log(getString(R.string.log_cancel_armed))
         }
         bench.setOnClickListener { runBenchmark() }
+        auto.setOnCheckedChangeListener { _, checked -> autoRun = checked }
+
+        /* Model preparation FIRST, and guarded. An exception here used to
+         * escape onCreate() and kill the activity before anything was drawn
+         * - the app simply did not come up. */
+        if (!prepareModel()) {
+            log(getString(R.string.err_no_model))
+            runButton.isEnabled = false
+            cancelButton.isEnabled = false
+            modelLabel.setText(R.string.err_no_model)
+            return
+        }
+
+        /* Und dann laeuft es von selbst. */
+        if (autoRun) {
+            log(getString(R.string.log_auto_run))
+            root.post { startInference() }
+        }
 
         /* A report written during the previous session surfaces here, not
          * in the middle of the crash: the handler only writes the file and
@@ -166,11 +225,90 @@ class MainActivity : ComponentActivity() {
         maybeRunCrashTest()
     }
 
+    /**
+     * Put a usable model in place, or say why there is none.
+     *
+     * A previously imported model wins over the bundled starter model, so a
+     * relaunch keeps the model the user actually chose. The starter model is
+     * copied out of the assets because hydra_engine_load() mmaps a real path
+     * and assets live inside the APK zip.
+     *
+     * @return true when [modelFile] points at a usable .hydra.
+     */
+    private fun prepareModel(): Boolean {
+        val imported = File(filesDir, IMPORTED_NAME)
+        if (imported.isFile && imported.length() > HEADER_BYTES) {
+            modelFile = imported
+            return reportModel(imported, getString(R.string.log_model_imported))
+        }
+
+        val starter = File(filesDir, STARTER_NAME)
+        try {
+            if (!starter.isFile || starter.length() <= HEADER_BYTES) {
+                assets.open(STARTER_ASSET).use { input ->
+                    starter.outputStream().use { out ->
+                        input.copyTo(out)
+                        /* Sync before the loader may mmap it: a buffered
+                         * write that has not reached storage shows up as a
+                         * header the C loader cannot read. */
+                        out.fd.sync()
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            /* Never throw out of here: this runs inside onCreate, and an
+             * exception there means no window at all - which is exactly the
+             * "the app does nothing" symptom this function exists to remove. */
+            log(getString(R.string.log_starter_failed, e.message ?: "unknown"))
+            return false
+        }
+
+        if (!starter.isFile || starter.length() <= HEADER_BYTES) {
+            log(getString(R.string.log_starter_failed, starter.length().toString()))
+            return false
+        }
+        modelFile = starter
+        return reportModel(starter, getString(R.string.log_model_starter))
+    }
+
+    /**
+     * Log what is loaded and mirror it into the UI label.
+     *
+     * @param message a format template with one %s, e.g. the value of
+     *   R.string.log_model_starter - a resolved template, not a resource id,
+     *   because the caller picks between "starter" and "imported".
+     */
+    private fun reportModel(file: File, message: String): Boolean {
+        val report = analyseHydraFile(file, file.length())
+        if (!report.valid) {
+            log(getString(R.string.log_model, file.name))
+            log(getString(R.string.log_import_header, report.describe()))
+            for (rule in report.rules.filter { !it.ok }) {
+                log("  - ${rule.id}: ${rule.message}")
+            }
+            return false
+        }
+        log(String.format(java.util.Locale.ROOT, message, file.name))
+        log(resources.getQuantityString(R.plurals.log_size, file.length().toInt(), file.length()))
+        log(getString(R.string.log_import_header, report.describe()))
+        modelLabel.text = buildString {
+            append(getString(R.string.label_model))
+            append(' ').append(file.name)
+            append(" · dim ").append(report.fields["dim"])
+            append(" · layers ").append(report.fields["layers"])
+        }
+        return true
+    }
+
     private fun startInference() {
         if (running) return
         val startToken = tokenInput.text.toString().toIntOrNull() ?: 42
         val steps = (stepsInput.text.toString().toIntOrNull() ?: 32).coerceIn(1, 256)
-        val file = modelFile ?: return
+        val file = modelFile ?: run {
+            log(getString(R.string.err_no_model))
+            modelLabel.setText(R.string.err_no_model)
+            return
+        }
         lineCount.clear()
         setRunning(true)
         log(resources.getQuantityString(R.plurals.log_running, steps, startToken, steps))
@@ -327,7 +465,7 @@ class MainActivity : ComponentActivity() {
                     return@Thread
                 }
 
-                val target = File(filesDir, "imported.hydra")
+                val target = File(filesDir, IMPORTED_NAME)
                 // Atomic within the same directory: readers see either the
                 // old file or the complete new one, never a partial write.
                 if (target.exists() && !target.delete()) {
@@ -342,8 +480,16 @@ class MainActivity : ComponentActivity() {
                 }
 
                 modelFile = target
-                log(getString(R.string.log_import_ok, target.name))
-                log(resources.getQuantityString(R.plurals.log_size, bytes.toInt(), bytes))
+                if (reportModel(target, getString(R.string.log_model_imported))) {
+                    log(getString(R.string.log_import_ok, target.name))
+                    /* An import is an explicit "use this model now", so it
+                     * runs straight away - otherwise the new model sits
+                     * there until the next launch and looks like it was
+                     * ignored. */
+                    startInference()
+                } else {
+                    log(getString(R.string.log_import_rejected, getString(R.string.err_import_invalid)))
+                }
             } catch (e: Throwable) {
                 log(getString(R.string.log_import_failed, e.message ?: "unknown"))
             }
@@ -523,7 +669,13 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         const val EXTRA_CRASH_TEST = "crash_test"
+        /** logcat tag for the app's own log lines, next to the JNI tag. */
+        const val LOG_TAG = "Hydra"
         const val HEADER_BYTES = 24
+        /** Asset shipped in the APK; a real, working .hydra, not a stub. */
+        const val STARTER_ASSET = "starter.hydra"
+        const val STARTER_NAME = "starter.hydra"
+        const val IMPORTED_NAME = "imported.hydra"
         const val HYDRA_MAGIC = 0x48594452L
         const val HYDRA_VERSION = 1L
 

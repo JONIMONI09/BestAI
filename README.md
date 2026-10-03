@@ -44,13 +44,13 @@ It survived because *no test compared the two paths to each other* — every tes
 # 1. Compile
 make
 
-# 2. Generate a test model
-python3 tools/make_dummy_model.py test.hydra
+# 2. Generate a starter model
+python3 tools/make_model.py test.hydra
 
 # 3. Feed the model to the engine
 ./hydra-run test.hydra 123
 
-# 4. Unit tests (32)
+# 4. Unit tests (71 on x86-64, 77 on ARM with NEON)
 make test-run
 
 # 5. Start the web console (desktop-optimized)
@@ -73,20 +73,25 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/model` | GET | Header info of the model |
+| `/api/models` | GET | Every `.hydra` under `models/`, with a real header; drives the chat model selector |
 | `/api/models/inspect?path=` | GET | Full header **plus every rule the file violates**, each with a readable reason |
+| `/api/models/upload?name=` | POST | Store a `.hydra` (`HYDRA_MAX_UPLOAD`, 64 MiB default) |
+| `/api/models/import?name=` | POST | Convert a **`.gguf`** to `.hydra` and store both |
 | `/api/infer` | POST | `{token, steps}` → JSON with tokens, state, timing |
+| `/api/cancel` | POST | Abort the running inference (409 `cancelled`) |
 | `/api/axiom?h=0.5` | GET | Axiom gate simulation |
 
 ## Features
 
 - ✅ **Zero-heap inference** — weights are never copied, only mapped; no `malloc` in the inference path
 - ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores 2 weights per byte, i.e. **4 bits per weight on disk** (true 2-bit packing via 4 weights/byte is planned for v2) — see `docs/FORMAT.md`.
+- ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
   - *Honesty note:* the NEON path is active on ARM builds only. It is **not** merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the NEON kernel **in the same ARM build** and requires bit-identical token sequences *and* state vectors. The x86 path is purely scalar; AVX2 is on the roadmap.
-- ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation, 56 unit tests (62 on ARM with NEON)
+- ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation, 71 unit tests (77 on ARM with NEON)
 - ✅ **Web console** — desktop UI with live visualization (`make ui`)
-- ✅ **Android** — NDK/JNI build of the same C source, verified on-device
+- ✅ **Android** — NDK/JNI build of the same C source; launches, loads its bundled model and completes inference on an emulator (x86-64, API 24). *Not yet verified on physical ARM hardware — no device was available.*
 - ✅ **C99, zero dependencies** — runs on 32-bit ARMv7, x86-64, and everything in between
 
 ## Releases & the Android APK
@@ -98,9 +103,11 @@ Every `v*.*.*` tag produces a GitHub Release containing a **directly installable
 adb install -r hydra-stone-<version>-android-arm64v8a-armeabiv7a-x86_64.apk
 ```
 
-The APK bundles the same C engine (`libhydra.so` for arm64-v8a, armeabi-v7a and x86_64 — NEON active on ARM), the packed demo model, and a launcher icon. Tapping **Run inference** executes the engine and streams the tokens live.
+The APK bundles the same C engine (`libhydra.so` for arm64-v8a, armeabi-v7a and x86_64 — NEON active on ARM), the packed starter model (`assets/starter.hydra`, 280 bytes), and a launcher icon. The app **runs by itself** on launch — it copies the starter model into private storage and starts an inference run; untick *Run automatically on start* to skip that. Tapping **Run inference** executes the engine again and streams the tokens live.
 
-**Importing your own model.** *Import .hydra model…* opens the system file picker (Storage Access Framework, `*/*` because `.hydra` has no reliable MIME mapping). The chosen file is streamed into the app's private storage, validated against the same header rules the C loader enforces, and only then renamed into place and used — the demo model stays as the fallback when nothing valid has been imported. Tokens are delivered from the JNI layer in blocks of 16 instead of one call per token; the per-token JNI transition cost more than the engine step itself at this model size.
+**Importing your own model.** *Import model…* opens the system file picker (Storage Access Framework, `*/*` because `.hydra` has no reliable MIME mapping). The chosen file is streamed into the app's private storage, validated against the same header rules the C loader enforces, and only then renamed into place and used — the starter model stays as the fallback when nothing valid has been imported. Tokens are delivered from the JNI layer in blocks of 16 instead of one call per token; the per-token JNI transition cost more than the engine step itself at this model size.
+
+The whole screen scrolls. A 320x640 device cannot fit the controls and the token log at once, and a root layout that does not scroll pushes the log below the visible area — the engine then runs while showing nothing, which is indistinguishable from "it does not start". *The starter model is never demo content: it is the shipped default, and any valid import replaces it.*
 
 Release artifacts:
 
@@ -140,12 +147,13 @@ HYDRA_ALLOW_REMOTE=1 node server.js   # then also reachable from the LAN
 | **Chat** | Type text, get a real reply from the compiled C engine. Words are mapped to token IDs through the stored vocabulary; a word without an ID is reported as unknown instead of being guessed. Replies can be shown as words or raw token IDs. **The whole prompt is fed to the engine**, not just its first token — `hydra_engine_prefill()` runs every prompt token through the same core step before generation starts. |
 | **Models** | Every `*.hydra` file under `models/` is listed with its real header (dim, vocab, layers, size, validity) and can be selected. Trained and uploaded models are marked. |
 | **Upload** | **Upload model** in the top bar stores a `.hydra` into `models/uploaded/` (`POST /api/models/upload?name=…`). The bytes are streamed to disk (cap: `HYDRA_MAX_UPLOAD`, 64 MiB by default, `2GB`/`512MiB`/plain bytes all accepted), then validated against the same rules the C loader enforces — magic, version, dim/vocab/layers bounds, `weights_offset`/`weights_len` inside the file, `layers × dim` covered by `weights_len`. An invalid file is rejected with the reason and never reaches a model path. Over the cap the server answers **413 with a body** (never a dropped connection) that names the limit and how to raise it. |
-| **Diagnostics** | `GET /api/models/inspect?path=models/demo.hydra` returns the header values and one entry per rule (`id`, `ok`, `message`) plus a `violations` list. It is the same analysis the upload route uses, so both quote the same reason. Known formats are **named**: a GGUF answers *"this is a GGUF model (llama.cpp / Ollama) — the engine reads .hydra files"* instead of a bare `wrong magic`. The report also states the ceiling of the current format (`limits.maxWeightsBytesForShape`), because "valid" and "can be 20 GB" are two different questions. The console shows the violated rules under any model marked *invalid header*. |
+| **GGUF import** | **Import .gguf** converts a llama.cpp/Ollama checkpoint into `.hydra` (`POST /api/models/import?name=…`) with absmean scaling, and returns a conversion report: which source tensor fed each plane, its shape, rows read vs. rows sampled, the **absmean scale `gamma` and `mean|w|`**, how many weights ternarised to zero, the resulting density, the rescale factor, the resulting peak and the vocabulary size — plus the reason if it refused. The converted model appears in the chat model selector marked as converted, and the source vocabulary is carried over so chat words map to real token ids. |
+| **Diagnostics** | `GET /api/models/inspect?path=models/starter.hydra` returns the header values and one entry per rule (`id`, `ok`, `message`) plus a `violations` list. It is the same analysis the upload route uses, so both quote the same reason. Known formats are **named**: a GGUF answers *"this is a GGUF model (llama.cpp / Ollama) — the engine reads .hydra files"* instead of a bare `wrong magic`. The report also states the ceiling of the current format (`limits.maxWeightsBytesForShape`), because "valid" and "can be 20 GB" are two different questions. The console shows the violated rules under any model marked *invalid header*. |
 | **Engine output** | Token chart with metrics; the state vector and the raw log are collapsed by default. |
 | **Training** | Paste a corpus (`3 3 3 3 -> 7 7 7 7`, or `1 2 3` for next-token training), pick vocab/dim/layers/epochs and train. Training writes a real `.hydra` file and is **verified against the compiled engine** before it is reported as successful; accuracy before/after is measured, never estimated. |
 | **Settings** | Start token, steps, coexistence-axiom factor, per-model vocabulary editor. The drawer traps focus, closes on Escape and returns focus to its toggle. |
 
-Only one inference runs at a time: **Send** and **Train** are disabled while a request is in flight and a **Cancel** button aborts it client-side (the engine process is deliberately left running — killing it would also kill any other request).
+Only one inference runs at a time: **Send** and **Train** are disabled while a request is in flight and a **Cancel** button aborts the request. Cancel is real, not cosmetic — the server kills the engine process it started (`SIGTERM`, then `SIGKILL` after a grace period) and answers **409 `cancelled`**. Because each request owns its own child process, killing it cannot disturb another request. A client that simply disconnects is treated the same way.
 
 Everything shown comes from the engine. There is no simulated output anywhere in the console.
 
@@ -157,11 +165,16 @@ The inference step is now two multiply-adds per dimension, not two per
 (layer x dimension):
 
 ```
-python3 tools/make_dummy_model.py models/demo.hydra
-./hydra-run models/demo.hydra 0 --bench 50000
-{"mode":"bench","engine":"cpu","dim":64,"layers":4,"ns_per_token_full":135.44,
- "ns_per_token_fast":19.22,"speedup":7.05,"tokens_equal":true}
+python3 tools/make_model.py models/starter.hydra
+./hydra-run models/starter.hydra 0 --bench 20000
+{"mode":"bench","engine":"cpu","model":"models/starter.hydra","dim":64,"layers":4,
+ "vocab":512,"steps":20000,"warmup_layers":4,"ns_per_token_full":140.60,
+ "ns_per_token_fast":15.75,"speedup":8.929,"tokens_equal":true,"load_ms":0.037,
+ "weights_bytes":256,"rss_before_kb":948,"rss_after_kb":948,"rss_delta_kb":0,
+ "note":"JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device"}
 ```
+
+`load_ms` and `rss_delta_kb` are measured, not asserted: the loader reports how long the map took and how much resident memory the run added. For this model `rss_delta_kb` is **0**, because the 256 weight bytes are mmap'd and never copied — the kernel owns those pages.
 
 * **Layer aggregation** — `A[i] = sum_l w1[l][i]` and `B[i] = sum_l w2[l][i]`
   are computed once at load time, because the token and the state vector
@@ -209,6 +222,10 @@ Every push and pull request runs the following. Each gate was verified locally *
 | Web | ESLint 10 (`server.js`, `public/app.js`) | undefined vars, `eval`, sloppy globals |
 | Android | Android Lint (must report **no issues**) | missing icon, hardcoded strings, API misuse, orientation locks |
 | Android | APK permission gate (`aapt dump permissions`) | the app opens files through SAF, which needs **no** permission — any dangerous permission must be a decision, not a surprise |
+| Android | Android autostart gate (`tools/android_autostart_check.sh`) | the app must actually run on its own: starter model in assets, wired to the load path, no `demo.hydra` reference left behind, log mirrored to logcat |
+| Android | Android header-diagnostics gate (`tools/android_header_check.sh`) | the app and the server must apply the **same** header rules and quote the **same** reason |
+| Node | `node --test tools/server_test.js` | upload cap, diagnostics, GGUF import, cancel — each with a negative control |
+| Python | `python3 tools/gguf_test.py` | a synthetic GGUF goes in, a **real C engine run** comes out — the converter is checked against the engine, not against itself |
 | Android | NDK clang build (stricter than host gcc) | JNI/Android header issues |
 | Security | CodeQL (`c-cpp`, `javascript-typescript`, `security-extended`) | taint flows from HTTP input into `open()`/`execFile` |
 | Security | Semgrep | pattern-based security rules |
@@ -222,13 +239,18 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── src/hydra_engine.c         mmap loader, ternary inference, axiom gate
 ├── src/main.c                 CLI
 ├── src/hydra_neon.h           ARM NEON kernel (actively integrated; scalar fallback on x86)
-├── tools/make_dummy_model.py  Test model generator (format reference)
-├── tests/test_engine.c        49 unit tests (x86) / 51 on ARM (incl. NEON-vs-scalar, OOB + overflow PoC regressions)
+├── tools/make_model.py        Starter-model generator (format reference)
+├── tools/gguf_reader.py       GGUF header/tensor reader (Python stdlib only)
+├── tools/gguf_inspect.py      Read-only GGUF report (no numpy, no torch)
+├── tools/gguf_to_hydra.py     GGUF → .hydra converter, absmean ternarisation
+├── tools/gguf_test.py         Converter gate: synthetic GGUF in, real C engine out
+├── tests/test_engine.c        71 unit tests (x86) / 77 on ARM (incl. NEON-vs-scalar, OOB + overflow PoC regressions)
 ├── android/                   NDK/JNI app wrapping the same C source
 ├── server.js                  UI server (Node, 0 runtime dependencies; ESLint is dev-only)
 ├── public/                    Hydra-Stone Console (HTML/CSS/JS)
 ├── docs/ARCHITECTURE.md       Architecture & math
 ├── docs/FORMAT.md             .hydra binary format specification
+├── docs/GGUF-IMPORT.md        GGUF import, absmean ternarisation, limits
 ├── docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
 ├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
 ├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
@@ -280,14 +302,14 @@ The server itself has **zero runtime npm dependencies**. ESLint is a dev-only de
 ```bash
 npm ci        # only needed to run the linter
 npm run lint
-make ui       # builds hydra-run + the demo model and serves on :8787
+make ui       # builds hydra-run + the starter model and serves on :8787
 ```
 
 ## Roadmap
 
 - [ ] Full transformer forward pass (RMSNorm, RoPE, SwiGLU) on top of the ternary core
 - [ ] Min-P sampling & repetition penalty
-- [ ] GGUF/safetensors import with automatic absmean ternarization
+- [ ] safetensors import with automatic absmean ternarization (GGUF is done — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md))
 - [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
 - [ ] 4-weights-per-byte packing (true 2 bits/weight) and an aggregated `A[i]/B[i]` model format — see the redundancy analysis in `docs/ARCHITECTURE.md`
 - [ ] Streaming ring-buffer KV with attention sinks

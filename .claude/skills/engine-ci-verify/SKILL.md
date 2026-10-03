@@ -33,7 +33,7 @@ cppcheck --enable=warning,portability --inline-suppr --std=c99 \
     --platform=unix64 -Iinclude --error-exitcode=2 src/ tests/
 
 # 4. Python gate (CI gate 1d)
-python3 -m py_compile tools/make_dummy_model.py
+python3 -m py_compile tools/make_model.py
 python3 -c "import struct; assert struct.calcsize('<IHHIIII') == 24"
 
 # 5. Build + full test suite (scalar path)
@@ -48,7 +48,7 @@ qemu-aarch64-static ./hydra-test-arm          # expect: 49 Tests, 0 failures
 
 aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
     src/hydra_engine.c src/main.c -o hydra-run-arm
-python3 tools/make_dummy_model.py parity.hydra
+python3 tools/make_model.py parity.hydra
 ./hydra-run parity.hydra 42 8 --json 2>/dev/null > /tmp/x86.json
 qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
     2>/dev/null > /tmp/arm.json
@@ -59,7 +59,7 @@ print('x86:',x['tokens']); print('arm:',a['tokens'])
 sys.exit(0 if x['tokens']==a['tokens'] and x['state']==a['state'] else 1)"
 
 # 7. Runtime smoke test
-python3 tools/make_dummy_model.py smoke.hydra && ./hydra-run smoke.hydra 42
+python3 tools/make_model.py smoke.hydra && ./hydra-run smoke.hydra 42
 
 # 8. Optional build-flag variants (both must stay green)
 gcc -O2 -DHYDRA_TOKENV_MASK -Iinclude src/hydra_engine.c tests/test_engine.c \

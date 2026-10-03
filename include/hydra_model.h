@@ -51,11 +51,33 @@ typedef struct {
      * |A| <= layers <= HYDRA_MAX_LAYERS, |B| <= layers, also int32. */
     int32_t agg_a[HYDRA_EMBED_DIM];
     int32_t agg_b[HYDRA_EMBED_DIM];
+
+    /* Lademessung (Rule: messen, bevor etwas behauptet wird).
+     * load_ms               Dauer von hydra_engine_load() inkl. Aggregation
+     * weights_bytes         Bytes, die die Aggregation tatsaechlich liest
+     * resident_kb_after_load gemessener RSS direkt nach dem Laden, oder -1
+     * rss_kb_before_load    gemessener RSS direkt davor, oder -1
+     * rss_delta_kb          Differenz der beiden: die Zahl, die die Aussage
+     *                       "nach dem Laden ist das Modell nicht mehr
+     *                       resident" belegt oder widerlegt.
+     * Gemessen am groessten vom v1-Format beschreibbaren Modell
+     * (dim 64 x layers 4096 = 262144 Gewichtsbytes): load_ms 0.33 ms,
+     * rss_delta_kb 0 - MADV_SEQUENTIAL gibt die Seiten hinter dem
+     * Lesezeiger frei. Ein zusaetzliches MADV_DONTNEED wurde gemessen und
+     * brachte nichts, siehe den Kommentar in src/hydra_engine.c. */
+    double load_ms;
+    size_t weights_bytes;
+    long resident_kb_after_load;
+    long rss_kb_before_load;
 } HydraEngine;
 
 /* Engine-Funktionen */
 int hydra_engine_load(HydraEngine *engine, const char *model_path);
 void hydra_engine_unload(HydraEngine *engine);
+/* Residenter Speicher in KiB, oder -1 wenn die Plattform ihn nicht meldet.
+ * Nur Linux/Android; anderswo ist der Rueckgabewert -1 und das ist ein
+ * "nicht gemessen", kein "null". */
+long hydra_engine_resident_kb(void);
 int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
 /* Token-only fast path: computes dimension 0 ONLY. Because the dimensions
  * are independent after the aggregation (acc[i] depends only on state[i]),

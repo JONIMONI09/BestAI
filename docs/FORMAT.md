@@ -43,7 +43,7 @@ Iteration order is **row-major over layers × dim**: first all `dim` pairs of la
 
 ## Reference Writer
 
-`tools/make_dummy_model.py` is the canonical Python reference:
+`tools/make_model.py` is the canonical Python reference:
 
 ```python
 header = struct.pack("<IHHIIII", MAGIC, VERSION, VOCAB, DIM, LAYERS,
