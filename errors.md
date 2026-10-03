@@ -1136,3 +1136,42 @@
   checkable.
 - **Prevention:** measure the optimisation before shipping it. "It frees
   memory" is a hypothesis; `rss_delta_kb` is the measurement, and it said no.
+
+## A shipped asset that was in .gitignore the whole time
+
+- **Symptom:** CI failed with
+  `::error::android/app/src/main/assets/starter.hydra differs from tools/make_model.py output`
+  while the same check passed on every developer machine.
+- **Cause:** `.gitignore` ignores `*.hydra` (correctly — models are user data).
+  The old `assets/demo.hydra` had been force-added (`git add -f`), so it was
+  tracked *despite* the rule. When it was renamed to `starter.hydra`, the new
+  name was no longer an exception and was therefore **never staged** — the
+  rename silently deleted the asset from the repository. Every local build
+  still had one (it sat in the working tree); a fresh checkout had none, so
+  `cmp` had no file to compare and failed.
+- **Fix:** a negation rule in `.gitignore`:
+  `!android/app/src/main/assets/starter.hydra`, plus the file actually staged.
+  `models/` and stray `*.hydra` stay ignored.
+- **Prevention:** the byte-comparison gate is checked **locally**, so it cannot
+  catch this class of bug by construction — the file exists locally either way.
+  Added a check that asks the real question instead: `git check-ignore
+  --no-index` on the asset. `--no-index` is load-bearing: plain
+  `git check-ignore` skips already-tracked paths, so the check would report
+  "ok" forever the moment the fix landed. Negative control verified (rule
+  removed -> gate exits 1).
+- **Also affected, now fixed by the same change:** `ci.yml` asserts the APK
+  contains `assets/starter.hydra`, and `release.yml` does the same. Both would
+  have failed on the packaged output.
+
+## A negative control that passed when it should have failed
+
+- **Symptom:** the new "not git-ignored" check reported `ok` even after the
+  `.gitignore` negation rule was deleted.
+- **Cause:** `git check-ignore` does not report paths that are already tracked,
+  and the asset had been staged. The check was measuring the index, not the
+  rules.
+- **Fix:** `--no-index`, so the check evaluates the ignore rules against a path
+  as if it were being added fresh.
+- **Prevention:** every new gate gets a negative control *before* it is
+  trusted. The first version of this one passed every run, which is exactly
+  what a worthless gate looks like.

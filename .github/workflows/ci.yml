@@ -328,6 +328,14 @@ jobs:
       - name: Android model header diagnostics
         run: bash tools/android_header_check.sh
 
+      # The app must actually start by itself, and the starter model it
+      # ships must be a real file that git is willing to track. That second
+      # half is the reason this runs in CI and not only locally: the asset
+      # was once renamed while .gitignore still ignored *.hydra, so every
+      # developer build had it and no fresh checkout did.
+      - name: Android autostart and packaged starter model
+        run: bash tools/android_autostart_check.sh
+
   # ---------- Stage 3b: the APK is built on every push ----------
   # Previously the APK was only built by the release workflow, i.e. only
   # on a tag. main therefore never proved that the app still builds.
