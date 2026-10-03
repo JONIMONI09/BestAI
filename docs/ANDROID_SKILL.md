@@ -164,15 +164,36 @@ externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
 
 ### Error 6: no `/dev/kvm`
 
-- **Symptom:** nested virtualization unavailable in the container.
-- **Fix:** run the emulator with `-no-accel -gpu swiftshader_indirect`.
-  x86_64 image + software rendering boots in ~1–2 min on a modern
-  container CPU. Avoid ARM system images here — they would emulate on
-  QEMU TCG and take many minutes.
-- **Lesson:** KVM is a nice-to-have; x86_64 + `-no-accel` is a working
-  fallback for CI containers.
+- **Symptom:** nested virtualization unavailable in the container. With no
+  acceleration flag at all the emulator 37.x refuses to start and exits with
+  `ERROR | x86_64 emulation currently requires hardware acceleration!`.
+- **Fix:** run the emulator with `-accel off -gpu swiftshader_indirect`.
+  (`-accel off` is the valid form; `-no-accel` is not a recognised flag on
+  current emulator builds.) An x86_64 image + software rendering boots in
+  ~1–2 min on a modern container CPU. Avoid ARM system images here — they
+  would emulate on QEMU TCG and take many minutes.
+- **Lesson:** KVM is a nice-to-have; x86_64 + `-accel off` is a working
+  fallback for CI containers. Do **not** add `-wipe-data` on a slow host: it
+  forces a from-scratch guest init that can trip the emulator's own watchdog.
 
-### Error 7: dim/vocab/layers printed as 0 in the JSON summary
+### Error 7: the emulator dies at boot and blames the hypervisor
+
+- **Symptom:** the guest aborts during startup with
+  `ERROR | detected a hanging thread 'QEMU2 main loop'. No response for 15847 ms`,
+  and `adb devices` lists nothing. The log's *last* lines matter; the
+  acceleration warning is printed early and looks like the cause.
+- **Cause:** not the emulator. Two Gradle daemons were holding ~2.4 GB of a
+  3.9 GB container. QEMU's threads could not be scheduled inside its own
+  watchdog window, so the emulator aborted *itself*. No emulator flag fixes a
+  host with no free memory.
+- **Fix:** `gradle --stop` before starting the emulator, and give the AVD
+  enough RAM (`hw.ramSize`, or `-memory 1536`). It then boots in ~90 s with
+  zero hang errors.
+- **Lesson:** before blaming a sandboxed hypervisor, check host memory.
+  `free -m` during the failure showed 3.5 GB *available* once the daemons were
+  stopped, versus ~1.2 GB before — that single number identified the cause.
+
+### Error 8: dim/vocab/layers printed as 0 in the JSON summary
 
 - **Symptom:** on-device logcat showed
   `{"ok":true,"steps":32,"dim":0,"vocab":0,"layers":0,…}`.

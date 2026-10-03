@@ -96,15 +96,23 @@ Supporting a single model whose weights start at or above 4 GiB needs v2 (64-bit
 a split mapping with `mmap64`/`off64_t`. It does **not** need more RAM, which is the point:
 the requirement "complete loading regardless of RAM" is already met on 64-bit platforms.
 
-## Known Density Limitation (Honest Note)
+## Density, stated exactly (Honest Note)
 
-The format stores **2 weights per byte, i.e. 4 bits per weight on disk**; the upper 4 bits are reserved. Because the reserved code `11` is treated as `0`, a byte carries only `log₂(9) ≈ 3.17` bits of information — so the honest figure is "4 bits/weight allocated, ~3.17 bits of information". Moving to 4 weights per byte is planned for v2 and would reach the advertised 2 bits/weight; until then, the "2-bit" label describes the *target* density, not the current one.
+The format stores **2 ternary weights per byte, i.e. 2 bits per weight on disk**: `w1` in bits 0–1, `w2` in bits 2–3, with the upper 4 bits reserved. One byte therefore covers one `(layer, dim)` pair, and `weights_len = layers × dim` **bytes** (verified: a 4-layer, dim-64 model declares `weights_len = 256`).
+
+The reserved code `11` is decoded as `0`, so a byte carries `3 × 3 = 9` distinct states, i.e. `log₂9 ≈ 3.17` bits of information **per byte** — `log₂3 ≈ 1.58` bits **per weight**. The honest figures are therefore:
+
+- **allocated:** 2 bits per weight,
+- **informational:** ~1.58 bits per weight,
+- **used:** half of each byte (4 of 8 bits).
+
+Packing 4 weights per byte in v2 does not change the weight data density — it stays 2 bits per weight. What it removes is the wasted half of every byte, which halves the file size.
 
 ## Planned Extensions (v2)
 
 - 64-bit offset fields, so weights may start at or above 4 GiB (see "Model Size vs RAM" —
   this is the only size limit that RAM does not solve)
 - Per-layer scale factors (γ from absmean quantization)
-- 4-weights-per-byte packing (true 2 bits/weight)
+- 4-weights-per-byte packing (same 2 bits/weight, but no wasted byte — roughly halves file size)
 - Checksum (xxHash) over the weight region
 - **Aggregated container** holding only `A[i] = Σ_l w1[l][i]` and `B[i] = Σ_l w2[l][i]`, signalled by a `HYDRA_AGGREGATE_V2` flag. The layer loop in v1 is algebraically redundant (see "Known Structural Redundancy" in `docs/ARCHITECTURE.md`), so v1 models compress losslessly into this form. v1 files keep loading unchanged.
