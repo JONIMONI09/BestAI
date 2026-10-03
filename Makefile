@@ -3,7 +3,7 @@ CFLAGS ?= -O3 -Wall -Wextra -Iinclude
 LDFLAGS ?= -lm
 NODE ?= node
 
-.PHONY: all test test-run jni-batch-test large-model-test gpu-bench ui clean
+.PHONY: all test test-run jni-batch-test large-model-test gguf-test gpu-bench ui clean
 
 all: hydra-run
 
@@ -27,7 +27,14 @@ jni-batch-test: tests/test_jni_batch.c android/app/src/main/cpp/hydra_batch.h
 large-model-test: src/hydra_engine.c tests/test_large_model.c include/hydra_model.h
 	$(CC) $(CFLAGS) -o large-model-test src/hydra_engine.c tests/test_large_model.c $(LDFLAGS)
 
-test-run: hydra-test jni-batch-test large-model-test
+# GGUF -> .hydra conversion. The gate builds a real GGUF, converts it, and
+# cross-checks the packed bytes and the C engine's token stream against
+# independent reference implementations. It needs ./hydra-run for the
+# engine half and says so when it is missing rather than passing quietly.
+gguf-test: hydra-run tools/gguf_test.py tools/gguf_to_hydra.py tools/gguf_reader.py
+	python3 tools/gguf_test.py --engine ./hydra-run
+
+test-run: hydra-test jni-batch-test large-model-test gguf-test
 	./hydra-test
 	./jni-batch-test
 	./large-model-test
@@ -43,11 +50,11 @@ gpu-bench: gpu_bench_cpu
 gpu_bench_cpu: tools/gpu_bench/gpu_bench.c
 	$(CC) -O2 -Wall -Wextra -Werror -o gpu_bench_cpu tools/gpu_bench/gpu_bench.c
 
-# Weboberflaeche: Demo-Modell bauen und Server starten (Port via PORT, Default 8787)
+# Weboberflaeche: Starter-Modell bauen und Server starten (Port via PORT, Default 8787)
 ui: hydra-run
 	mkdir -p models
-	python3 tools/make_dummy_model.py models/demo.hydra
+	python3 tools/make_model.py models/starter.hydra
 	$(NODE) server.js
 
 clean:
-	rm -f hydra-run hydra-test jni-batch-test large-model-test gpu_bench_cpu *.hydra
+	rm -f hydra-run hydra-test jni-batch-test large-model-test gpu_bench_cpu *.hydra .speed.gguf .speed.hydra

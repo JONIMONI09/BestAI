@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Android 12+ (API 31) Datenextraktionsregeln.
-     Die App haelt nur das gepackte Demo-Modell; Sicherung und
+     Die App haelt nur das gepackte Starter-Modell; Sicherung und
      Geraete-Transfer werden bewusst deaktiviert, damit keine lokalen
      Modell-/Statusdaten den Geraet verlassen. -->
 <data-extraction-rules>

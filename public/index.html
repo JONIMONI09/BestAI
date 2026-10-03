@@ -24,8 +24,8 @@
       <select id="model-select" aria-label="Select model"></select>
     </label>
 
-    <button class="btn ghost small" id="upload-open">Upload model</button>
-    <input type="file" id="upload-input" accept=".hydra,application/octet-stream" hidden>
+    <button class="btn ghost small" id="upload-open">Import model</button>
+    <input type="file" id="upload-input" accept=".hydra,.gguf,application/octet-stream" hidden>
 
     <div class="chips" id="model-chips"></div>
 
@@ -121,7 +121,7 @@
       </p>
 
       <div class="train-grid">
-        <label class="field"><span>Name</span><input id="train-name" value="chat-model"></label>
+        <label class="field"><span>Name</span><input id="train-name" spellcheck="false"></label>
         <label class="field"><span>Vocab</span><input id="train-vocab" type="number" min="2" max="1024" value="64"></label>
         <label class="field"><span>Dim</span><input id="train-dim" type="number" min="2" max="64" value="16"></label>
         <label class="field"><span>Layers</span><input id="train-layers" type="number" min="1" max="4096" value="12"></label>
@@ -129,9 +129,7 @@
       </div>
 
       <label class="visually-hidden" for="train-corpus">Training corpus</label>
-      <textarea id="train-corpus" rows="7" spellcheck="false">3 3 3 3 -&gt; 7 7 7 7
-1 2 3 4 -&gt; 9 8 7 6
-5 5 5 -&gt; 1 1 1</textarea>
+      <textarea id="train-corpus" rows="7" spellcheck="false" placeholder="one sample per line&#10;7 7 7 7 -&gt; 3 3 3 3&#10;1 2 3&#10;…"></textarea>
 
       <div class="train-actions">
         <button class="btn primary" id="train-run">Train</button>
@@ -171,7 +169,7 @@
     <h3 class="mini-head">Vocabulary (token ↔ word)</h3>
     <p class="explain">Stored per model. Used by the chat and by training.</p>
     <label class="visually-hidden" for="vocab-text">Vocabulary, one "word tokenId" pair per line</label>
-    <textarea id="vocab-text" rows="8" spellcheck="false" placeholder="hello 1&#10;world 2"></textarea>
+    <textarea id="vocab-text" rows="8" spellcheck="false" placeholder="one word and its token id per line"></textarea>
     <div class="train-actions">
       <button class="btn" id="vocab-save">Save vocabulary</button>
       <span class="hint" id="vocab-hint"></span>
@@ -179,28 +177,34 @@
 
     <h3 class="mini-head">Model</h3>
     <div class="kv" id="model-detail"></div>
-  </aside>
-
-  <!-- Upload dialog: a plain <dialog> gives focus trapping, Escape and the
-       backdrop for free, instead of a hand-rolled version that usually
-       gets one of the three wrong. -->
+  </aside><!-- Import dialog: a plain <dialog> gives focus trapping, Escape and
+       the backdrop for free, instead of a hand-rolled version that usually
+       gets one of the three wrong. One dialog, two formats: a .hydra is
+       validated and stored, a .gguf is converted first. -->
   <dialog class="dialog" id="upload-dialog" aria-labelledby="upload-title">
     <form method="dialog" class="dialog-head">
-      <h2 id="upload-title">Upload a .hydra model</h2>
-      <button class="btn ghost" value="cancel" aria-label="Close upload dialog">✕</button>
+      <h2 id="upload-title">Import a model</h2>
+      <button class="btn ghost" value="cancel" aria-label="Close import dialog">✕</button>
     </form>
     <p class="explain">
-      The file is validated against the same rules the C loader enforces
+      <b>.hydra</b> is checked against the same rules the C loader enforces
       (magic, version, dim/vocab/layers bounds, weights inside the file)
       and is rejected before it is stored if anything does not match.
+      <b>.gguf</b> is a llama.cpp/Ollama model: it is converted to a
+      <code>.hydra</code> first — the real float weights are read, ternarised
+      with the b1.58 absmean rule and folded into the 64-dimensional
+      recurrent core. The full conversion report is shown below, because a
+      conversion that quietly produces something else is worse than one that
+      fails.
     </p>
     <label class="field" for="upload-name">
       <span>Name (letters, digits, dot, dash, underscore)</span>
-      <input id="upload-name" value="my-model" spellcheck="false">
+      <input id="upload-name" spellcheck="false">
     </label>
     <p class="hint err" id="upload-hint" role="status" aria-live="polite"></p>
+    <pre class="log" id="upload-report" tabindex="0" hidden></pre>
     <div class="train-actions">
-      <button class="btn primary" id="upload-confirm" value="default">Upload</button>
+      <button class="btn primary" id="upload-confirm" value="default">Import</button>
     </div>
   </dialog>
 

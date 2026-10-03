@@ -234,7 +234,7 @@ jobs:
       # Host — sonst waere die NEON-Gleichheitsaussage wieder unbelegt.
       - name: Verify x64 vs arm64 parity
         run: |
-          python3 tools/make_dummy_model.py parity.hydra
+          python3 tools/make_model.py parity.hydra
           ./dist/hydra-run-linux-x64 parity.hydra 42 8 --json 2>/dev/null > /tmp/x64.json
           qemu-aarch64-static ./dist/hydra-run-linux-arm64 parity.hydra 42 8 --json \
               2>/dev/null > /tmp/arm.json
@@ -270,7 +270,7 @@ jobs:
               src/hydra_engine.c src/main.c -lm -o dist/hydra-run-macos-arm64
       - name: Smoke test on the release binary
         run: |
-          python3 tools/make_dummy_model.py smoke.hydra
+          python3 tools/make_model.py smoke.hydra
           ./dist/hydra-run-macos-arm64 smoke.hydra 42 8 --json 2>/dev/null | head -c 160
           echo
       - name: Checksums
@@ -357,7 +357,7 @@ jobs:
             grep -q "lib/$abi/libhydra.so" apk-contents.txt || {
               echo "::error::libhydra.so missing for $abi"; exit 1; }
           done
-          grep -q 'assets/demo.hydra' apk-contents.txt
+          grep -q 'assets/starter.hydra' apk-contents.txt
           "$BT/aapt" dump badging "$APK" \
             | grep -E "^package:|^sdkVersion:|^application-label:"
       - name: Android Lint must be error-free
@@ -429,7 +429,7 @@ jobs:
             ```
 
             Contains `libhydra.so` for all three ABIs (the C engine itself,
-            NEON path on ARM), `assets/demo.hydra` and the launcher icon. The
+            NEON path on ARM), `assets/starter.hydra` and the launcher icon. The
             app runs an inference on startup and shows the token stream live.
 
             ### CLI
@@ -441,8 +441,8 @@ jobs:
             | `hydra-run-macos-arm64` | macOS Apple Silicon (clang, NEON enabled) |
 
             ```bash
-            python3 tools/make_dummy_model.py demo.hydra
-            ./hydra-run-linux-x64 demo.hydra 42 8 --json
+            python3 tools/make_model.py starter.hydra
+            ./hydra-run-linux-x64 starter.hydra 42 8 --json
             ```
 
             The x64 and arm64 binaries are checked against each other before

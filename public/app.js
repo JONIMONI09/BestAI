@@ -105,6 +105,12 @@
       ['layers', model.layers],
       ['size', `${(model.bytes / 1024).toFixed(1)} kB`],
     ];
+    /* The measured load time of this very model, not an estimate. The
+     * server got it from the same engine run that produced the header
+     * numbers, so there is no second load to compare against. */
+    if (Number.isFinite(model.load_ms)) {
+      facts.push(['load', `${model.load_ms.toFixed(2)} ms`]);
+    }
     for (const [k, v] of facts) {
       const chip = el('span', 'chip');
       chip.appendChild(textNode(`${k} `));
@@ -113,6 +119,7 @@
     }
     if (model.trained) box.appendChild(el('span', 'chip', 'trained'));
     if (model.uploaded) box.appendChild(el('span', 'chip', 'uploaded'));
+    if (model.converted) box.appendChild(el('span', 'chip', 'from .gguf'));
     if (model.valid === false) box.appendChild(el('span', 'chip', 'invalid header'));
 
     const detail = $('model-detail');
@@ -215,7 +222,12 @@
     for (const m of state.models) {
       const opt = document.createElement('option');
       opt.value = m.path;
-      opt.textContent = `${m.path}${m.valid ? '' : ' (invalid header)'}`;
+      /* The selector IS the model list of the chat, so it carries what
+       * decides a choice: where it comes from, how big it is, and whether
+       * it would load at all. */
+      const origin = m.trained ? 'trained' : (m.uploaded ? 'uploaded' : (m.converted ? 'converted' : 'models'));
+      opt.textContent = `${m.path} · ${(m.bytes / 1024).toFixed(1)} kB · ${origin}`
+        + (m.valid ? '' : ' · invalid header');
       select.appendChild(opt);
     }
     const wanted = selectPath || state.model || data.default;
@@ -277,16 +289,26 @@
 
   /* ── Model upload ─────────────────────────────────────────── */
 
+  /* One entry point, two formats. The suffix picks the route, and the
+   * answer is never just "ok": a .gguf import renders the conversion
+   * report, because the user has to see which tensors were read and what
+   * came out before they trust the model. */
   async function uploadModel(file) {
-    const name = $('upload-name').value.trim();
-    if (!name.toLowerCase().endsWith('.hydra')) {
-      $('upload-hint').textContent = 'the name must end in .hydra';
+    const raw = $('upload-name').value.trim();
+    const report = $('upload-report');
+    const isGguf = /\.gguf$/i.test(file.name);
+    const name = raw || file.name.replace(/\.(hydra|gguf)$/i, '');
+    const suffix = isGguf ? '.gguf' : '.hydra';
+    if (!name.toLowerCase().endsWith(suffix)) {
+      $('upload-hint').textContent = `the name must end in ${suffix}`;
       return false;
     }
-    $('upload-hint').textContent = 'validating…';
+    const route = isGguf ? '/api/models/import' : '/api/models/upload';
+    $('upload-hint').textContent = isGguf ? 'reading and converting…' : 'validating…';
     $('upload-open').disabled = true;
+    report.hidden = true;
     try {
-      const res = await fetch(`/api/models/upload?name=${encodeURIComponent(name)}`, {
+      const res = await fetch(`${route}?name=${encodeURIComponent(name)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: file,
@@ -300,15 +322,42 @@
           : '';
         throw new Error((data.error || `HTTP ${res.status}`) + howto);
       }
-      $('upload-hint').textContent = `stored ${data.model.path}`;
+      $('upload-hint').textContent = `imported ${data.model.path}`;
+      report.hidden = !data.conversion;
+      if (data.conversion) report.textContent = describeConversion(data.conversion);
       await loadModels(data.model.path);
       return true;
     } catch (e) {
       $('upload-hint').textContent = e.message;
+      log(`import failed: ${e.message}`);
       return false;
     } finally {
       $('upload-open').disabled = false;
     }
+  }
+
+  /** The converter's own report, rendered as plain lines. Nothing invented. */
+  function describeConversion(c) {
+    const g = c.gguf || {};
+    const lines = [
+      `source      ${c.source}`,
+      `format      GGUF v${g.version}, ${g.architecture || 'unknown architecture'}, ${g.bytes} bytes`,
+      `tensors     ${g.tensorCount} total, ${(g.denseFloatTensors || []).length} dense float`,
+    ];
+    if (g.quantisedTensors && g.quantisedTensors.length) {
+      lines.push(`not read    ${g.quantisedTensors.length} quantised tensors: ${g.quantisedTensors.slice(0, 6).join(', ')}`);
+    }
+    for (const p of c.planes || []) {
+      lines.push(`plane ${p.plane}      ${p.tensor} ${JSON.stringify(p.shape)} ${p.type}`);
+      lines.push(`             ${p.rowsRead}/${p.rowsTotal} rows read, gamma ${p.gamma}, ternary density ${p.density}`
+        + (p.zeroPaddedDims ? `, ${p.zeroPaddedDims} dims zero-padded` : ''));
+    }
+    const h = c.header || {};
+    lines.push(`result      vocab ${h.vocab}, dim ${h.dim}, layers ${h.layers}, ${c.bytes} bytes`);
+    lines.push(`vocabulary  ${c.vocabulary ? `${c.vocabulary.entries} words` : 'none in the source'}`);
+    lines.push('');
+    lines.push(c.whatThisIs || '');
+    return lines.join('\n');
   }
 
   /* ── Chat ─────────────────────────────────────────────────── */
@@ -718,13 +767,14 @@
     $('upload-open').addEventListener('click', () => {
       $('upload-hint').textContent = '';
       $('upload-input').value = '';
+      $('upload-report').hidden = true;
       $('upload-dialog').showModal();
     });
     $('upload-input').addEventListener('change', (ev) => {
       const file = ev.target.files && ev.target.files[0];
       if (!file) return;
-      $('upload-name').value = file.name.replace(/\.hydra$/i, '');
-      $('upload-hint').textContent = `${file.name} · ${file.size} bytes — press Upload`;
+      $('upload-name').value = file.name.replace(/\.(hydra|gguf)$/i, '');
+      $('upload-hint').textContent = `${file.name} · ${file.size} bytes — press Import`;
     });
     $('upload-confirm').addEventListener('click', async (ev) => {
       const file = $('upload-input').files && $('upload-input').files[0];

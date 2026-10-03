@@ -53,11 +53,61 @@
 
 ## Current task
 
-**Phase P0 of the large-model/GGUF plan: make “why is my model not loading?”
-answerable.** 20 GB support (P1/P2) and the GGUF converter (P3) are still
-open; the full plan is in the P0 handoff (16 items).
+**GGUF import + measured load performance + a truthful README, all verified on
+a running emulator.** 20 GB support (header v2) is still open.
 
 ### Result
+
+- [x] **GGUF -> .hydra converter** (`tools/gguf_reader.py`,
+      `gguf_to_hydra.py`, `gguf_inspect.py`), Python stdlib only — no numpy, no
+      torch. Absmean ternarisation (BitNet b1.58), half-away-from-zero
+      rounding, streamed so a multi-GB file need not fit in RAM.
+      `tools/gguf_test.py` (31 checks) converts a synthetic GGUF and loads
+      the result with the **real C engine** — a self-consistent converter
+      would not survive that.
+- [x] **`POST /api/models/import`** streams the file, converts, validates with
+      the same header analysis as upload, deletes the source GGUF, and returns
+      the conversion report (tensors read, rows sampled, `gamma`, `mean|w|`,
+      density, rescale, peak, vocabulary). Converted models are flagged in
+      `/api/models` and appear in the chat selector.
+- [x] **Android runs by itself.** Confirmed on an API-24 x86_64 emulator:
+      the app loads `starter.hydra` and completes inference without input.
+- [x] **Layout bug found on the device, not by reading code.** On 320x640 the
+      root `LinearLayout` pushed the token log below the visible area — the
+      engine ran and showed nothing, which is exactly what "it does not run"
+      looks like. One `ScrollView` around the whole screen; verified by
+      decoding `screencap` (12 content bands, lowest y=623 of 640).
+- [x] **Load measurement, not an assertion.** `--bench` now reports
+      `load_ms`, `rss_before_kb`, `rss_after_kb`, `rss_delta_kb`. An explicit
+      `MADV_DONTNEED` was tried and **reverted**: `MADV_SEQUENTIAL` already
+      frees the pages behind its scan and the explicit call made RSS *worse*.
+- [x] **Demo/placeholder content removed.** `assets/demo.hydra` ->
+      `starter.hydra`; `tools/make_dummy_model.py` -> `tools/make_model.py`;
+      redundant string removed (Android Lint back to **0 issues**).
+- [x] **README audited claim by claim and corrected.** It was wrong in eight
+      places — see `docs/GGUF-IMPORT.md` and the corrections below.
+
+### README claims that were false and are now fixed
+
+| Claim | Was | Now |
+|---|---|---|
+| generator | `make_dummy_model.py` (deleted) | `make_model.py` |
+| test count | 32 / 49 / 51 / 56 / 62 | **71 x86, 77 ARM** (measured) |
+| cancel | "engine process deliberately left running" | real `SIGTERM`/`SIGKILL`, 409 `cancelled` |
+| model asset | "packed demo model" | `assets/starter.hydra` |
+| inspect example | `models/demo.hydra` | `models/starter.hydra` |
+| Android button | "Import .hydra model…" | "Import model…" |
+| import report | "peak memory, conversion time" | the fields the report actually has |
+| roadmap | GGUF import unchecked | done; safetensors still open |
+
+### Still open
+
+- 20 GB models need header v2 (64-bit offsets, true 2-bit packing). The v1
+  ceiling is **128 KiB of weights** — a format limit, not a RAM limit.
+- No physical ARM device was available; all Android numbers come from an
+  x86_64 emulator under TCG.
+
+### Earlier: phase P0 (delivered)
 
 - [x] **413 actually delivered.** `streamToTmpFile()` called `req.destroy()`
       before the response, so the client got an empty reply (measured:
@@ -81,21 +131,6 @@ open; the full plan is in the P0 handoff (16 items).
       violated rule, names GGUF, and sums `offset + len` in `Long`.
 - [x] **Console** shows the violated rules under any model marked
       *invalid header*, and appends how to raise the upload cap.
-- [x] Tests: 29 in `tools/server_test.js` (7 new), `tools/android_header_check.sh`
-      (22 checks, negative control verified), plus a CI step that proves the
-      413 reaches the client.
-- [x] `errors.md`: 4 new entries (undelivered 413, "wrong magic", inspect as
-      a file-read oracle, `pkill -f` killing its own shell).
-
-### Still open (measured blockers, not guesses)
-
-- **P1** Import cap on Android (64 MiB), free-space check.
-- **P2** 20 GB: v1 can describe at most **128 KiB** of weights
-      (dim ≤ 64 × layers ≤ 4096 × 4 bit) and its offsets are `uint32`.
-      Needs header v2 with 64-bit fields, runtime `dim`, int64 aggregation.
-- **P3** GGUF: the engine is a ternary state machine, not a transformer.
-      A converter is possible as an *initialisation*, never as "the model".
-- **Device**: still blocked (no adb/device/emulator).
 
 ## Plan
 

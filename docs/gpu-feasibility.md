@@ -23,8 +23,8 @@ and presented as a result (rule R32 in `rules.md`).
 
 ```bash
 make -s all
-python3 tools/make_dummy_model.py models/demo.hydra
-./hydra-run models/demo.hydra 0 --bench 50000
+python3 tools/make_model.py models/starter.hydra
+./hydra-run models/starter.hydra 0 --bench 50000
 ```
 
 ## 2. Measured CPU results

@@ -49,7 +49,7 @@ android/
 ├── app/src/main/java/dev/hydrastone/
 │   ├── HydraBridge.kt                ← object + external fun + Callback interface
 │   └── MainActivity.kt               ← minimal UI, token log
-├── app/src/main/assets/demo.hydra    ← packed demo model (from tools/make_dummy_model.py)
+├── app/src/main/assets/starter.hydra    ← packed starter model (from tools/make_model.py)
 ├── app/build.gradle.kts              ← externalNativeBuild + ndkVersion pinned
 └── build.gradle.kts / settings.gradle.kts / gradle.properties
 ```
@@ -224,7 +224,7 @@ $SDK/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -h /tmp/cmake_
 Similarly, verify APK contents without a device:
 
 ```bash
-unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E "libhydra|demo.hydra|classes.dex"
+unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E "libhydra|starter.hydra|classes.dex"
 $SDK/ndk/*/…/llvm-nm -D libhydra.so | grep runInference
 $SDK/build-tools/34.0.0/apksigner verify --print-certs app-debug.apk
 ```

@@ -17,6 +17,7 @@ const { spawn, execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { writeGgufFile } = require('./gguf_fixture');
 
 const ROOT = path.resolve(__dirname, '..');
 const PORT = 8000 + Math.floor(process.pid % 1000);
@@ -94,7 +95,7 @@ test('/api/models returns JSON with an array of models', async () => {
   const { status, body } = await json('/api/models');
   assert.strictEqual(status, 200);
   assert.ok(Array.isArray(body.models), 'models must be an array');
-  assert.ok(body.models.length > 0, 'the demo model must be listed');
+  assert.ok(body.models.length > 0, 'the starter model must be listed');
   for (const m of body.models) {
     assert.ok(m.path.endsWith('.hydra'), `bad path: ${m.path}`);
     assert.strictEqual(typeof m.dim, 'number');
@@ -132,7 +133,7 @@ test('safeModelPath rejects path escapes and non-.hydra names', async () => {
     'models/../../etc/hostname',
     '../../../etc/hostname.hydra',
     'server.js',
-    'models/demo.hydra/../../../../etc/hostname',
+    'models/starter.hydra/../../../../etc/hostname',
   ];
   for (const p of escapes) {
     const { status, body } = await postJSON('/api/infer', { path: p, token: 1, steps: 1 });
@@ -209,7 +210,7 @@ test('/api/infer rejects a malformed prompt', async () => {
 
 test('/api/models/upload stores a valid model and it appears in the list', async () => {
   const modelPath = path.join(os.tmpdir(), `hydra-upload-${process.pid}.hydra`);
-  execFileSync('python3', [path.join(ROOT, 'tools', 'make_dummy_model.py'), modelPath], {
+  execFileSync('python3', [path.join(ROOT, 'tools', 'make_model.py'), modelPath], {
     stdio: 'ignore',
   });
   const bytes = fs.readFileSync(modelPath);
@@ -420,7 +421,7 @@ test('public/app.js initialises against the real markup without throwing', async
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (p) => {
     if (String(p).startsWith('/api/models')) {
-      return { ok: true, json: async () => ({ models: [{ path: 'models/demo.hydra', dim: 16, vocab: 512, layers: 2, bytes: 280, magic: 1213809746, valid: true }], default: 'models/demo.hydra' }) };
+      return { ok: true, json: async () => ({ models: [{ path: 'models/starter.hydra', dim: 16, vocab: 512, layers: 2, bytes: 280, magic: 1213809746, valid: true }], default: 'models/starter.hydra' }) };
     }
     return { ok: true, json: async () => ({}) };
   };
@@ -727,12 +728,12 @@ test('the same upload succeeds once the cap allows it (negative control)', async
    * catches it: under a generous cap the identical body must be stored. */
   const base = await bootServer(t, { HYDRA_MAX_UPLOAD: '16MiB' });
   const list = await (await fetch(`${base}/api/models`)).json();
-  const demo = fs.readFileSync(path.join(ROOT, list.models[0].path));
+  const starter = fs.readFileSync(path.join(ROOT, list.models[0].path));
 
   const res = await fetch(`${base}/api/models/upload?name=passt.hydra`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
-    body: demo,
+    body: starter,
   });
   const json = await res.json();
   assert.strictEqual(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(json)}`);
@@ -803,14 +804,14 @@ test('a GGUF upload is refused with a GGUF-specific message', async () => {
 test('/api/models/inspect returns the header and every violated rule', async () => {
   /* Valid model: values present, nothing violated. */
   const { body: list } = await json('/api/models');
-  const demo = list.models.find((m) => m.valid) || list.models[0];
-  const ok = await json(`/api/models/inspect?path=${encodeURIComponent(demo.path)}`);
+  const starter = list.models.find((m) => m.valid) || list.models[0];
+  const ok = await json(`/api/models/inspect?path=${encodeURIComponent(starter.path)}`);
   assert.strictEqual(ok.status, 200);
-  assert.strictEqual(ok.body.valid, true, `demo model must be valid: ${JSON.stringify(ok.body.violations)}`);
+  assert.strictEqual(ok.body.valid, true, `starter model must be valid: ${JSON.stringify(ok.body.violations)}`);
   assert.deepStrictEqual(ok.body.violations, []);
-  assert.strictEqual(ok.body.header.dim, demo.dim);
-  assert.strictEqual(ok.body.header.layers, demo.layers);
-  assert.strictEqual(ok.body.header.weightsLen, demo.weightsLen);
+  assert.strictEqual(ok.body.header.dim, starter.dim);
+  assert.strictEqual(ok.body.header.layers, starter.layers);
+  assert.strictEqual(ok.body.header.weightsLen, starter.weightsLen);
   assert.strictEqual(ok.body.header.magic, 0x48594452);
   assert.strictEqual(ok.body.detected.format, 'HYDRA');
   assert.ok(Array.isArray(ok.body.rules) && ok.body.rules.length >= 8,
@@ -888,6 +889,106 @@ test('the upload refusal and the inspect report state the same reason', async ()
   assert.ok(firstFailed, 'the crafted file must violate a rule');
   assert.strictEqual(upJson.error, firstFailed.message,
     'upload and inspect must quote the same first violation');
+});
+
+/* ------------------------------------------------------------------ */
+/* GGUF import: recognise it, convert it, and prove the result is real  */
+/* ------------------------------------------------------------------ */
+
+/** Writes a syntactically valid GGUF with two dense F32 tensors. */
+function writeGguf(name, { rows = 64, cols = 32, tokens = ['a', 'b', '▁c', 'd'] } = {}) {
+  const dir = path.join(ROOT, 'models', 'converted');
+  return writeGgufFile(dir, name, { rows, cols, tokens });
+}
+
+test('a GGUF upload is converted into a loadable .hydra with a full report', async () => {
+  const src = writeGguf('server-fixture.gguf');
+  createdFiles.push(src);
+  const bytes = fs.readFileSync(src);
+
+  const res = await fetch(`${BASE}/api/models/import?name=server-fixture.gguf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: bytes,
+  });
+  const json = await res.json();
+  assert.strictEqual(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(json)}`);
+  assert.strictEqual(json.ok, true);
+  assert.strictEqual(json.model.path, 'models/converted/server-fixture.hydra');
+  assert.strictEqual(json.model.valid, true, 'the converted model must pass the header rules');
+  assert.strictEqual(json.model.dim, 64);
+  assert.strictEqual(json.model.converted, true, 'it must be marked as converted, not trained');
+  createdFiles.push(path.join(ROOT, json.model.path));
+
+  /* The conversion report is the answer, not a log line: without the
+   * tensors and the scale, the user cannot tell what they just got. */
+  const c = json.conversion;
+  assert.strictEqual(c.ok, true);
+  assert.strictEqual(c.gguf.magic, 'GGUF');
+  assert.strictEqual(c.gguf.architecture, 'llama');
+  assert.strictEqual(c.planes.length, 2, 'two planes: A and B');
+  assert.ok(c.planes[0].gamma > 0, 'the absmean gamma must be reported');
+  assert.strictEqual(c.aggregation.exact, true);
+  assert.strictEqual(c.planes[0].rowsRead, 64);
+
+  /* And the converted model has to actually run - a file the engine
+   * refuses is worse than a refused import. */
+  const run = await postJSON('/api/infer', { path: json.model.path, token: 1, steps: 8 });
+  assert.strictEqual(run.status, 200, `the converted model must run: ${JSON.stringify(run.body)}`);
+  assert.strictEqual(run.body.tokens.length, 8);
+  assert.ok(run.body.tokens.every((t) => t >= 0 && t < run.body.vocab),
+    'every token must be inside the vocabulary');
+
+  /* The vocabulary sidecar is what makes the chat usable with the model. */
+  const vocab = JSON.parse(fs.readFileSync(
+    path.join(ROOT, 'models', 'vocab', 'server-fixture.json'), 'utf8'));
+  assert.strictEqual(vocab.c, 2, 'the U+2581 space mark must be stripped from "▁c"');
+  assert.strictEqual(Object.keys(vocab).length, 4);
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'server-fixture.json'));
+});
+
+test('the import refuses a file that is not a GGUF and leaves nothing behind', async () => {
+  const junk = Buffer.alloc(512, 0x41);
+  const res = await fetch(`${BASE}/api/models/import?name=not-a-model.gguf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: junk,
+  });
+  const json = await res.json();
+  assert.strictEqual(res.status, 400);
+  assert.match(json.error, /not a GGUF/i,
+    `the message must say what the file is not, got: ${json.error}`);
+  assert.ok(!fs.existsSync(path.join(ROOT, 'models', 'converted', 'not-a-model.hydra')),
+    'a refused import must not leave a model behind');
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'not-a-model.hydra'));
+});
+
+test('the import route only accepts .gguf and points .hydra at the other one', async () => {
+  const wrong = await fetch(`${BASE}/api/models/import?name=model.hydra`, { method: 'POST' });
+  assert.strictEqual(wrong.status, 400);
+  assert.match((await wrong.json()).error, /api\/models\/upload/,
+    'the refusal must name the route that does take a .hydra');
+});
+
+test('a converted model shows up in the chat model list as converted', async () => {
+  await json('/api/models');
+  const src = writeGguf('listed.gguf');
+  createdFiles.push(src);
+  const up = await fetch(`${BASE}/api/models/import?name=listed.gguf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: fs.readFileSync(src),
+  });
+  assert.strictEqual(up.status, 200);
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'listed.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'listed.json'));
+
+  const after = await json('/api/models');
+  const entry = after.body.models.find((m) => m.path === 'models/converted/listed.hydra');
+  assert.ok(entry, 'the converted model must be listed');
+  assert.strictEqual(entry.converted, true);
+  assert.strictEqual(entry.trained, false, 'it must not claim to be trained');
+  assert.strictEqual(entry.uploaded, false, 'it must not claim to be uploaded');
 });
 
 test('/api/infer returns the real state, not a token-only stand-in', async () => {
