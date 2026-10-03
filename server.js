@@ -65,7 +65,7 @@ const DEFAULT_MODEL = path.join(MODELS_DIR, 'starter.hydra');
 const MAX_BODY = 2 * 1024 * 1024; /* training corpora are text; 2 MiB is ample */
 /* Upload cap, overridable because the model size ceiling is a FORMAT limit,
  * not a transport one: a future .hydra v2 is allowed to be far bigger than
- * today's (measured: v1 can describe at most 128 KiB of weights). Bytes can
+ * today's (measured: v1 can describe at most 256 KiB of weights). Bytes can
  * be set directly, sizes with a suffix: HYDRA_MAX_UPLOAD=2GB. */
 const MAX_UPLOAD = parseByteSize(process.env.HYDRA_MAX_UPLOAD, 64 * 1024 * 1024);
 const MAX_PROMPT = 256; /* must match MAX_PROMPT in src/main.c */
@@ -309,7 +309,11 @@ function analyseHydraFile(absPath, sizeArg) {
       maxLayers: trainer.MAX_LAYERS,
       headerFields: 'uint32 (weights_offset, weights_len)',
       maxWeightsBytesInHeader: 0xffffffff,
-      maxWeightsBytesForShape: Math.floor((MAX_DIM * trainer.MAX_LAYERS) / 2),
+      /* One byte per (layer, dim) pair, holding w1 in bits 0-1 and w2 in
+       * bits 2-3: 4 used bits = 2 ternary weights = 2 bits per weight.
+       * So a shape of dim x layers occupies dim * layers BYTES, with the
+       * upper 4 bits of each byte reserved. */
+      maxWeightsBytesForShape: MAX_DIM * trainer.MAX_LAYERS,
     },
   };
   const rule = (id, ok, message) => {
@@ -387,10 +391,10 @@ function analyseHydraFile(absPath, sizeArg) {
    * can still be at the ceiling, and knowing that up front is what stops
    * somebody from waiting for a 20 GB .hydra that the header cannot
    * describe. */
-  const shapeBytes = Math.ceil((header.layers * header.dim) / 2);
+  const shapeBytes = header.layers * header.dim;
   rule('shape_within_format_ceiling', shapeBytes <= report.limits.maxWeightsBytesForShape,
     `weights need ${formatBytes(shapeBytes)}; the current format can describe at most `
-    + `${formatBytes(report.limits.maxWeightsBytesForShape)} (dim ${MAX_DIM} x layers ${trainer.MAX_LAYERS} pairs)`);
+    + `${formatBytes(report.limits.maxWeightsBytesForShape)} (dim ${MAX_DIM} x layers ${trainer.MAX_LAYERS} bytes)`);
 
   report.valid = report.violations.length === 0;
   return report;
