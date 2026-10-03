@@ -4,18 +4,25 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import dev.hydrastone.ui.HydraApp
+import dev.hydrastone.ui.MainActions
+import dev.hydrastone.ui.MainUiState
+import dev.hydrastone.ui.Tab
+import dev.hydrastone.ui.theme.HydraTheme
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.io.File
 
 /**
- * Hydra-Stone Android front end (programmatic Views, no Compose).
+ * Hydra-Stone Android front end (Jetpack Compose, Material 3).
  *
  * Model selection has two paths:
  *  1. the starter model shipped in the APK assets (always present, a real
@@ -44,19 +51,26 @@ import java.io.File
  */
 class MainActivity : ComponentActivity() {
 
-    private lateinit var output: TextView
-    private lateinit var tokenInput: EditText
-    private lateinit var stepsInput: EditText
-    private lateinit var runButton: Button
-    private lateinit var cancelButton: Button
-    private lateinit var modelLabel: TextView
     private var modelFile: File? = null
 
-    /** Run automatically on launch. Off = the app waits for Run inference. */
+    /**
+     * The engine the chat talks to. This phase ships only the Hydra engine;
+     * the llama.cpp engine arrives behind the same [EngineInterface], and
+     * nothing above this line will have to change when it does.
+     */
+    private val engine: EngineInterface = HydraEngine()
+
+    /** Conversation state, kept outside composition so rotation cannot lose it. */
+    private val chat = ChatStateHolder()
+
+    private val _ui = MutableStateFlow(MainUiState())
+    private val ui: StateFlow<MainUiState> = _ui.asStateFlow()
+
+    /** Run automatically on launch. Off = the app waits for Send. */
     @Volatile
     private var autoRun = true
 
-    /** True while an inference thread is alive. Gates Run/Cancel. */
+    /** True while an inference thread is alive. Gates Send/Stop. */
     @Volatile
     private var running = false
 
@@ -82,7 +96,7 @@ class MainActivity : ComponentActivity() {
             if (lineCount.length > MAX_LOG_CHARS) {
                 lineCount.delete(0, lineCount.length - MAX_LOG_CHARS)
             }
-            output.text = lineCount.toString()
+            _ui.update { it.copy(log = lineCount.toString()) }
         }
     }
 
@@ -94,120 +108,71 @@ class MainActivity : ComponentActivity() {
         CrashHandler.appContext = applicationContext
         CrashHandler.install()
 
-        /* The whole screen scrolls.
+        /* Compose owns the layout now.
          *
-         * The root used to be a bare LinearLayout. On a 320x640 device the
-         * controls (title, import, two inputs, run, cancel, benchmark,
-         * model label, auto-run box) do not fit, and a vertical LinearLayout
-         * lays the remaining children out BELOW the bottom edge instead of
-         * making them reachable. The token log went with them, so the app
-         * ran the engine and showed nothing - indistinguishable from "it
-         * does not run". Confirmed on the emulator: a UI dump of the
-         * running app ended at "Cancel run", with no log view at all.
-         *
-         * One ScrollView around everything, and the log gets a guaranteed
-         * minimum height so it is readable even on a short screen. */
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
+         * The programmatic-Views version had one ScrollView around a vertical
+         * LinearLayout, because a bare LinearLayout on a 320x640 device lays
+         * its remaining children out BELOW the bottom edge instead of making
+         * them reachable - the token log went with them, so the app ran the
+         * engine and showed nothing, which is indistinguishable from "it does
+         * not run". The Scaffold below keeps the property that matters: every
+         * control stays reachable, and the conversation keeps a guaranteed
+         * minimum height so it is readable on a short screen. */
+        setContent {
+            HydraTheme {
+                val state by ui.collectAsState()
+
+                /* Runs once per composition, which is what root.post { … }
+                 * did before. It reads ui.value rather than the captured
+                 * `state`: prepareModel() runs after setContent returns, so
+                 * the value from the first composition is stale and would
+                 * see hasModel = false and silently never auto-run. */
+                LaunchedEffect(Unit) {
+                    if (autoRun && ui.value.hasModel) startInference()
+                }
+
+                HydraApp(
+                    state = state,
+                    actions = MainActions(
+                        onTabSelected = { tab -> _ui.update { it.copy(selectedTab = tab) } },
+                        onInputChanged = { text -> _ui.update { it.copy(input = text) } },
+                        onSend = { sendMessage() },
+                        onStop = {
+                            chat.onCancelRequested()
+                            syncChat()
+                            log(getString(R.string.log_cancel_armed))
+                            engine.cancel()
+                        },
+                        onNewConversation = { chat.clear(); syncChat() },
+                        onImportModel = {
+                            // */* rather than a MIME filter: .hydra has no
+                            // reliable MIME mapping, and a filter would hide
+                            // the file on most providers.
+                            openModel.launch(arrayOf("*/*"))
+                        },
+                        onAutoRunChanged = { checked -> autoRun = checked },
+                        onBenchmark = { runBenchmark() }
+                    )
+                )
+            }
         }
-
-        val title = TextView(this).apply {
-            // String aus den Ressourcen, nicht hart kodiert (Android Lint SetTextI18n)
-            setText(R.string.app_title)
-            textSize = 22f
-        }
-        root.addView(title)
-
-        val pick = Button(this).apply { setText(R.string.action_import_model) }
-        root.addView(pick)
-
-        tokenInput = EditText(this).apply {
-            hint = getString(R.string.hint_start_token)
-            setText(R.string.default_start_token)
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(tokenInput)
-
-        stepsInput = EditText(this).apply {
-            hint = getString(R.string.hint_steps)
-            setText(R.string.default_steps)
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(stepsInput)
-
-        val run = Button(this).apply { setText(R.string.action_run) }
-        runButton = run
-        root.addView(run)
-
-        /* Cancel is a real, cooperative cancel: it sets a flag the native
-         * loop checks once per step (HydraBridge.cancel). It is disabled
-         * while nothing runs, so it can never look like it does something
-         * it does not. */
-        val cancel = Button(this).apply { setText(R.string.action_cancel) }
-        cancelButton = cancel
-        cancel.isEnabled = false
-        root.addView(cancel)
-
-        val bench = Button(this).apply { setText(R.string.action_benchmark) }
-        root.addView(bench)
-
-        /* Which model is actually loaded, stated in the UI. "Something runs"
-         * is not the same as "you can see what ran". */
-        modelLabel = TextView(this).apply { textSize = 12f }
-        root.addView(modelLabel)
-
-        val auto = CheckBox(this).apply {
-            setText(R.string.action_auto_run)
-            isChecked = true
-        }
-        root.addView(auto)
-
-        output = TextView(this).apply {
-            typeface = android.graphics.Typeface.MONOSPACE
-            textSize = 13f
-            /* Enough rows for a real run even when the screen is short;
-             * the outer ScrollView handles the rest. */
-            minLines = 8
-            setBackgroundColor(0x11000000)
-            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
-        }
-        root.addView(output)
-
-        setContentView(ScrollView(this).apply { addView(root) })
-
-        pick.setOnClickListener {
-            // */* rather than a MIME filter: .hydra has no reliable MIME
-            // mapping, and a filter would hide the file on most providers.
-            openModel.launch(arrayOf("*/*"))
-        }
-
-        run.setOnClickListener { startInference() }
-        cancel.setOnClickListener {
-            /* Cooperative and asynchronous: the flag is set here, the
-             * inference thread returns within one step. */
-            HydraBridge.cancel()
-            log(getString(R.string.log_cancel_armed))
-        }
-        bench.setOnClickListener { runBenchmark() }
-        auto.setOnCheckedChangeListener { _, checked -> autoRun = checked }
 
         /* Model preparation FIRST, and guarded. An exception here used to
          * escape onCreate() and kill the activity before anything was drawn
          * - the app simply did not come up. */
         if (!prepareModel()) {
             log(getString(R.string.err_no_model))
-            runButton.isEnabled = false
-            cancelButton.isEnabled = false
-            modelLabel.setText(R.string.err_no_model)
+            // The composer stays disabled and the reason is shown, instead of
+            // a Send button that silently does nothing.
+            _ui.update {
+                it.copy(hasModel = false, modelLabel = getString(R.string.err_no_model))
+            }
             return
         }
 
         /* Und dann laeuft es von selbst. */
         if (autoRun) {
             log(getString(R.string.log_auto_run))
-            root.post { startInference() }
         }
 
         /* A report written during the previous session surfaces here, not
@@ -291,77 +256,120 @@ class MainActivity : ComponentActivity() {
         log(String.format(java.util.Locale.ROOT, message, file.name))
         log(resources.getQuantityString(R.plurals.log_size, file.length().toInt(), file.length()))
         log(getString(R.string.log_import_header, report.describe()))
-        modelLabel.text = buildString {
-            append(getString(R.string.label_model))
-            append(' ').append(file.name)
-            append(" · dim ").append(report.fields["dim"])
-            append(" · layers ").append(report.fields["layers"])
+        _ui.update {
+            it.copy(
+                hasModel = true,
+                modelLabel = buildString {
+                    append(file.name)
+                    append(" · dim ").append(report.fields["dim"])
+                    append(" · layers ").append(report.fields["layers"])
+                }
+            )
         }
+        engine.load(file.absolutePath)
         return true
     }
 
-    private fun startInference() {
+    /** Sends whatever is in the composer. The engine, not the UI, is paged. */
+    private fun sendMessage() {
+        val text = ui.value.input
+        if (text.isBlank()) return
+        _ui.update { it.copy(input = "") }
+        chat.onUserMessage(text)
+        syncChat()
+        startInference(text)
+    }
+
+    /**
+     * Mirrors [ChatStateHolder] into the state the shell renders.
+     *
+     * Called after every chat mutation rather than collected in a coroutine:
+     * the holder's streams are the source of truth and this is a plain copy,
+     * so there is no second writer and nothing to keep in step in a lifecycle.
+     * Safe to call from the engine's background thread - StateFlow.update is
+     * atomic and the Compose runtime observes it from the main thread.
+     */
+    private fun syncChat() {
+        _ui.update {
+            it.copy(
+                chatMessages = chat.messages.value,
+                chatState = chat.state.value,
+                lastTurnCancelled = chat.lastTurnCancelled.value
+            )
+        }
+    }
+
+    /**
+     * Starts a run through [EngineInterface], never through a concrete engine.
+     *
+     * The steps default is the Settings token limit; the start token the old
+     * single-screen UI took from a text field is gone, because a chat screen
+     * has no field for it. The Hydra engine derives its token sequence from
+     * the prompt itself.
+     */
+    private fun startInference(prompt: String = DEFAULT_PROMPT) {
         if (running) return
-        val startToken = tokenInput.text.toString().toIntOrNull() ?: 42
-        val steps = (stepsInput.text.toString().toIntOrNull() ?: 32).coerceIn(1, 256)
         val file = modelFile ?: run {
             log(getString(R.string.err_no_model))
-            modelLabel.setText(R.string.err_no_model)
+            _ui.update { it.copy(hasModel = false, modelLabel = getString(R.string.err_no_model)) }
             return
         }
         lineCount.clear()
+        _ui.update { it.copy(log = "") }
         setRunning(true)
-        log(resources.getQuantityString(R.plurals.log_running, steps, startToken, steps))
+        chat.onGenerationStarted()
+        syncChat()
+        log(resources.getQuantityString(R.plurals.log_running, MAX_STEPS, MAX_STEPS))
 
         val t0 = SystemClock.elapsedRealtime()
         Thread {
-            try {
-                val json = HydraBridge.runInference(
-                    file.absolutePath, intArrayOf(startToken), steps,
-                    object : HydraBridge.Callback {
-                        override fun onTokens(tokens: IntArray, done: Boolean) {
-                            // One UI update per block, not per token: the old
-                            // per-token callback rebuilt the whole TextView
-                            // for every single token.
-                            log(resources.getQuantityString(
-                                R.plurals.log_tokens, tokens.size, tokens.size
-                            ) + tokens.joinToString(", "))
-                            if (done) log(getString(R.string.log_batch_done))
-                        }
-
-                        /* Only benchmark() still uses the per-token shape.
-                         * A normal run must never take this path — if it
-                         * did, the batching would be silently undone. */
-                        override fun onToken(step: Int, token: Int) {
-                            log(getString(R.string.log_unexpected_per_token, step, token))
-                        }
+            engine.generate(
+                prompt,
+                MAX_STEPS,
+                object : GenerationCallbacks {
+                    override fun onFirstToken() {
+                        chat.onFirstToken()
+                        syncChat()
                     }
-                )
-                val wall = SystemClock.elapsedRealtime() - t0
-                /* A cancelled run is reported as cancelled, never as a
-                 * failure: the user asked for it. */
-                if (json.contains("\"cancelled\":true")) {
-                    log(getString(R.string.log_cancelled))
-                } else {
-                    log(getString(R.string.log_result, json))
-                    log(getString(R.string.log_wall, wall))
-                    log(getString(R.string.log_ok))
+
+                    override fun onToken(tokenId: Int, text: String) {
+                        // The chat state holder owns the accumulated message,
+                        // so a token arriving during a rotation updates the
+                        // model rather than a composable that is going away.
+                        chat.onToken(tokenId, text)
+                        syncChat()
+                    }
+
+                    override fun onComplete(summary: GenerationSummary) {
+                        val wall = SystemClock.elapsedRealtime() - t0
+                        if (summary.cancelled) {
+                            // A cancelled run is reported as cancelled, never
+                            // as a failure: the user asked for it, and the
+                            // partial output stays on screen.
+                            log(getString(R.string.log_cancelled))
+                        } else if (summary.error != null) {
+                            log(getString(R.string.log_error, summary.error))
+                        } else {
+                            log(getString(R.string.log_wall, wall))
+                            log(getString(R.string.log_ok))
+                        }
+                        chat.onComplete(summary.cancelled)
+                        syncChat()
+                        setRunning(false)
+                    }
                 }
-            } catch (e: Throwable) {
-                log(getString(R.string.log_error, e.message))
-            } finally {
-                setRunning(false)
-            }
+            )
         }.start()
     }
 
-    /** Run and Cancel are mutually exclusive; only Cancel is live mid-run. */
+    /**
+     * Send and Stop are mutually exclusive: the composer renders one button
+     * that becomes Stop while a run is live, so there is never a second control
+     * on screen that does nothing.
+     */
     private fun setRunning(value: Boolean) {
         running = value
-        runOnUiThread {
-            runButton.isEnabled = !value
-            cancelButton.isEnabled = value
-        }
+        _ui.update { it.copy(chatState = if (value) ChatState.GENERATING else ChatState.IDLE) }
     }
 
     /**
@@ -390,7 +398,9 @@ class MainActivity : ComponentActivity() {
      */
     private fun runBenchmark() {
         val file = modelFile ?: return
-        val steps = (stepsInput.text.toString().toIntOrNull() ?: 32).coerceIn(1, 200000)
+        // The old screen took this from a text field. The chat screen has no
+        // such field, so it uses the same bound the engine runs with.
+        val steps = MAX_STEPS
         lineCount.clear()
         log(resources.getQuantityString(R.plurals.log_bench_start, steps, steps))
 
@@ -402,7 +412,7 @@ class MainActivity : ComponentActivity() {
                         override fun onTokens(tokens: IntArray, done: Boolean) = Unit
                         // Deliberately does nothing: the benchmark measures
                         // the CALLING CONVENTION, not the UI work. A real
-                        // run updates a TextView per token, which is more
+                        // run updates the chat state per token, which is more
                         // expensive still - so these numbers are a floor.
                         override fun onToken(step: Int, token: Int) = Unit
                     }
@@ -669,6 +679,16 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         const val EXTRA_CRASH_TEST = "crash_test"
+
+        /**
+         * Token budget for one run. The native side accepts 1..256 steps and
+         * rejects anything below 1 rather than clamping, so the bound is the
+         * same one the engine advertises.
+         */
+        const val MAX_STEPS = 32
+
+        /** Prompt used by the automatic run on launch, which has no input yet. */
+        const val DEFAULT_PROMPT = "hydra demo"
         /** logcat tag for the app's own log lines, next to the JNI tag. */
         const val LOG_TAG = "Hydra"
         const val HEADER_BYTES = 24

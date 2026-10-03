@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -81,6 +82,10 @@ android {
         }
     }
 
+    buildFeatures {
+        compose = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -91,13 +96,30 @@ android {
 }
 
 dependencies {
-    // Only the Activity Result API for the SAF model picker. No AppCompat,
-    // no Compose, no Material Components - the UI stays programmatic Views.
-    // The -ktx artifact, not the plain one: lint's KtxExtensionAvailable
-    // check flags the plain artifact as an informational finding, and the
-    // release gate requires a report without findings.
-    // 1.9.3 is the newest androidx.activity that still builds against
-    // compileSdk 34; 1.13.0 requires compileSdk 36. Bumping the compile SDK
-    // is a toolchain change, not a bug fix, so it is not smuggled in here.
+    // SAF model picker. The -ktx artifact, not the plain one: lint's
+    // KtxExtensionAvailable check flags the plain artifact as an
+    // informational finding, and the release gate requires a report without
+    // findings. 1.9.3 is the newest androidx.activity that still builds
+    // against compileSdk 34; 1.13.0 requires compileSdk 36. Bumping the
+    // compile SDK is a toolchain change, not a bug fix, so it is not smuggled
+    // in here.
     implementation("androidx.activity:activity-ktx:1.9.3")
+
+    // Compose / Material 3. Every version is pinned and the versions are not
+    // written out individually: the BOM is the single place that decides
+    // which ui/material3/runtime versions are used together, which is the
+    // only way to keep a Compose set mutually compatible (rules.md R15).
+    //
+    // 2024.09.03 is the newest BOM whose ui/material3 artifacts still build
+    // against compileSdk 34. Newer BOMs (2024.12+) require compileSdk 35,
+    // and raising the compile SDK is a toolchain decision, not a UI change.
+    implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    // Basic icon set for the bottom navigation. The -extended set is ~10x
+    // larger and is not needed for four tabs.
+    implementation("androidx.compose.material:material-icons-core")
 }

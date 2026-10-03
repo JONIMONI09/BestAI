@@ -381,6 +381,14 @@ jobs:
       - name: Android autostart and packaged starter model
         run: bash tools/android_autostart_check.sh
 
+      # rules.md R25: a gate that cannot fail is decoration. The Compose
+      # rewrite changed what nine of the autostart checks assert, so every
+      # check is proved here by removing its behaviour and requiring the
+      # gate to go red. It is a separate step from the gate itself so a
+      # weakened check cannot hide inside a passing run.
+      - name: Negative control for the Android autostart gate
+        run: bash tools/android_autostart_negative_test.sh
+
   # ---------- Stage 3b: the APK is built on every push ----------
   # Previously the APK was only built by the release workflow, i.e. only
   # on a tag. main therefore never proved that the app still builds.

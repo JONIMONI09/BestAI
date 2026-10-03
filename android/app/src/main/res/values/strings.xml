@@ -2,12 +2,6 @@
 <resources>
     <string name="app_name">Hydra-Stone</string>
     <string name="app_title">Hydra-Stone — Android</string>
-    <string name="hint_start_token">start token</string>
-    <string name="hint_steps">steps (1..256)</string>
-    <string name="default_start_token">42</string>
-    <string name="default_steps">32</string>
-    <string name="action_run">Run inference</string>
-    <string name="action_cancel">Cancel run</string>
     <string name="action_import_model">Import model…</string>
     <string name="action_benchmark">Benchmark (ns/token)</string>
     <string name="action_auto_run">Run automatically on start</string>
@@ -30,17 +24,11 @@
         <item quantity="other">[Hydra] size: %1$d bytes</item>
     </plurals>
     <plurals name="log_running">
-        <item quantity="one">[Hydra] running with startToken=%1$d, %2$d iteration…</item>
-        <item quantity="other">[Hydra] running with startToken=%1$d, %2$d iterations…</item>
+        <item quantity="one">[Hydra] running %2$d iteration…</item>
+        <item quantity="other">[Hydra] running %2$d iterations…</item>
     </plurals>
-    <plurals name="log_tokens">
-        <item quantity="one">[Hydra] %1$d token:</item>
-        <item quantity="other">[Hydra] %1$d tokens:</item>
-    </plurals>
-    <string name="log_batch_done">[Hydra] stream complete</string>
     <string name="log_cancelled">[Hydra] cancelled — the native loop stopped at the next step; the result is discarded.</string>
     <string name="log_cancel_armed">[Hydra] cancel requested — the run stops within one step.</string>
-    <string name="log_unexpected_per_token">[Hydra] unexpected per-token callback at %1$d = %2$d</string>
     <string name="log_import_start">[Hydra] importing %1$s…</string>
     <string name="log_import_ok">[Hydra] model replaced: %1$s</string>
     <string name="log_import_rejected">[Hydra] import rejected: %1$s — keeping the previous model</string>
@@ -81,8 +69,32 @@
     <string name="crash_deleted">Report deleted</string>
     <string name="crash_close">Close</string>
     <string name="crash_previous">The app stopped unexpectedly last time. Tap to read the saved report.</string>
-    <string name="log_result">[Hydra] result: %1$s</string>
     <string name="log_wall">[Hydra] wall time: %1$d ms</string>
     <string name="log_ok">[Hydra] OK — C engine executed on Android.</string>
     <string name="log_error">[Hydra] ERROR: %1$s</string>
+
+    <!-- Bottom navigation -->
+    <string name="tab_chat">Chat</string>
+    <string name="tab_models">Models</string>
+    <string name="tab_data">Data</string>
+    <string name="tab_settings">Settings</string>
+
+    <!-- Chat -->
+    <string name="banner_experimental_engine">Experimental engine — token demo, not an LLM chat</string>
+    <string name="chat_input_hint">Message</string>
+    <string name="action_send">Send</string>
+    <string name="action_stop">Stop</string>
+    <string name="chat_empty_title">No messages yet</string>
+    <string name="chat_empty_body">Import a model, then send a message.</string>
+    <string name="chat_cancelled">Cancelled</string>
+    <string name="chat_new_conversation">New conversation</string>
+
+    <!-- Models / Data placeholders for this phase -->
+    <string name="models_empty_title">No models yet</string>
+    <string name="models_empty_body">Import a .hydra model to run the experimental engine.</string>
+    <string name="data_empty_title">No datasets yet</string>
+    <string name="data_empty_body">Datasets appear here once imported.</string>
+    <string name="coming_soon">Not available in this build yet</string>
+    <string name="section_diagnostics">Diagnostics</string>
+    <string name="section_engine_info">Engine information</string>
 </resources>
