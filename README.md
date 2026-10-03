@@ -57,6 +57,68 @@ make test-run
 make ui    # → http://localhost:8787
 ```
 
+## Build, Test, Deploy
+
+Everything below runs from the repository root unless stated otherwise.
+
+### Build
+
+| Target | Command | Produces |
+|---|---|---|
+| C engine + CLI | `make` | `hydra-run` |
+| Unit tests | `make test-run` | `hydra-test`, `jni-batch-test`, `large-model-test` |
+| Web console | `make ui` | serves `http://localhost:8787` (also `node server.js`) |
+| Android debug APK | `cd android && gradle assembleDebug` | `app/build/outputs/apk/debug/app-debug.apk` |
+| Android release APK | `cd android && gradle assembleRelease` | `app/build/outputs/apk/release/app-release.apk` |
+| Starter model | `python3 tools/make_model.py <out.hydra>` | a valid `.hydra` |
+
+Android builds need JDK 17, the Android SDK, CMake and the NDK; set
+`ANDROID_HOME` (see `android/README.md` for the exact versions).
+
+### Test
+
+```bash
+make test-run                       # 71 tests x86-64, 77 on ARM (NEON)
+python3 tools/gguf_test.py          # GGUF -> .hydra, checked against the real engine
+node --test tools/server_test.js    # web console API and diagnostics
+npm ci && npm run lint              # ESLint (the only dev dependency)
+```
+
+Static gates, all reproducible locally: `gcc -fanalyzer`, `clang-tidy`,
+`cppcheck`, `flawfinder`, ASan + UBSan. The shell gates are
+`tools/android_autostart_check.sh`, `tools/android_header_check.sh`,
+`tools/android_crash_check.sh` and `tools/jni_signature_check.sh`.
+
+**Cross-platform note:** the same 32-token sequence must come out on x86-64
+(scalar), on ARM64 with the NEON kernel, and on the Android emulator. The
+starter model is generated so that this is a real test and not a tautology —
+see “Cross-platform determinism” below.
+
+### Deploy
+
+There are two deployment paths.
+
+**The web console** is a single Node process with zero runtime dependencies:
+
+```bash
+node server.js                      # binds 127.0.0.1 only
+HYDRA_ALLOW_REMOTE=1 node server.js # opt in to LAN access explicitly
+```
+
+**Releases** are published automatically by `.github/workflows/release.yml`
+whenever `main` is pushed: it resolves the next version, creates the tag if
+needed, and attaches the CLI binaries, the signed APK and `SHA256SUMS.txt`.
+A merge to `main` therefore *does* publish a release — see the versioning rules
+below. `workflow_dispatch` gives a build-only dry run when **tag** is left
+empty and **publish** is unticked.
+
+**APK signing.** Without repository secrets the release APK is signed with the
+**debug key**: installable by sideloading, not Play-Store-ready. The build
+never fabricates a release key. To sign for real, configure
+`HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS` and
+`HYDRA_KEY_PASSWORD`; the workflow decodes the keystore only when the value is
+non-blank.
+
 ## Web Console (Desktop)
 
 The **Hydra-Stone Console** is a dark terminal-style desktop UI featuring:
@@ -91,7 +153,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
   - *Honesty note:* the NEON path is active on ARM builds only. It is **not** merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the NEON kernel **in the same ARM build** and requires bit-identical token sequences *and* state vectors. The x86 path is purely scalar; AVX2 is on the roadmap.
 - ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation, 71 unit tests (77 on ARM with NEON)
 - ✅ **Web console** — desktop UI with live visualization (`make ui`)
-- ✅ **Android** — NDK/JNI build of the same C source; launches, loads its bundled model and completes inference on an emulator (x86-64, API 24). *Not yet verified on physical ARM hardware — no device was available.*
+- ✅ **Android** — NDK/JNI build of the same C source. Verified end to end on an API-24 x86_64 emulator with the **signed release APK**: the installed package is byte-identical to the built artifact, `lib/x86_64/libhydra.so` is genuinely mapped into the running process (ELF header `7f 45 4c 46`, `e_machine = EM_X86_64`), and the 32-token output is **bit-identical** to the host C engine. *Not yet verified on physical ARM hardware — no device was available.*
 - ✅ **C99, zero dependencies** — runs on 32-bit ARMv7, x86-64, and everything in between
 
 ## Releases & the Android APK
@@ -105,7 +167,7 @@ adb install -r hydra-stone-<version>-android-arm64v8a-armeabiv7a-x86_64.apk
 
 The APK bundles the same C engine (`libhydra.so` for arm64-v8a, armeabi-v7a and x86_64 — NEON active on ARM), the packed starter model (`assets/starter.hydra`, 280 bytes), and a launcher icon. The app **runs by itself** on launch — it copies the starter model into private storage and starts an inference run; untick *Run automatically on start* to skip that. Tapping **Run inference** executes the engine again and streams the tokens live.
 
-**Importing your own model.** *Import model…* opens the system file picker (Storage Access Framework, `*/*` because `.hydra` has no reliable MIME mapping). The chosen file is streamed into the app's private storage, validated against the same header rules the C loader enforces, and only then renamed into place and used — the starter model stays as the fallback when nothing valid has been imported. Tokens are delivered from the JNI layer in blocks of 16 instead of one call per token; the per-token JNI transition cost more than the engine step itself at this model size.
+**Importing your own model.** *Import model…* opens the system file picker (Storage Access Framework, `*/*` because `.hydra` has no reliable MIME mapping). The chosen file is streamed into the app's private storage, validated against the same header rules the C loader enforces, and only then renamed into place and used — the starter model stays as the fallback when nothing valid has been imported. Tokens are delivered from the JNI layer in blocks of 16 instead of one call per token. *Measured caveat:* on a software-emulated (TCG) emulator the in-app benchmark reported `batching_saves_per_token` as **negative** — under emulation the engine work dominates and the JNI transition is proportionally cheap. The batching policy itself is verified deterministically by `tests/test_jni_batch.c`; whether batching is a net win is a device question, not yet settled on real hardware.
 
 The whole screen scrolls. A 320x640 device cannot fit the controls and the token log at once, and a root layout that does not scroll pushes the log below the visible area — the engine then runs while showing nothing, which is indistinguishable from "it does not start". *The starter model is never demo content: it is the shipped default, and any valid import replaces it.*
 
@@ -124,7 +186,7 @@ Release artifacts:
 
 **Signing.** Without repository secrets the APK is signed with the debug key — fully installable by sideloading, but not Play-Store-ready. Supplying `HYDRA_KEYSTORE_BASE64`, `HYDRA_KEYSTORE_PASSWORD`, `HYDRA_KEY_ALIAS` and `HYDRA_KEY_PASSWORD` switches the build to a real release key, and the release body states which one was used.
 
-**Every push builds the APK.** A dedicated `android-apk` job in `ci.yml` runs on every push and pull request: it builds `assembleDebug` and `assembleRelease`, verifies the signature with `apksigner`, checks that `libhydra.so` is packaged for arm64-v8a, armeabi-v7a and x86_64 together with the model asset, and uploads the APK as a workflow artifact. A release is published only for a `v*.*.*` tag — but a broken app build can therefore never reach release day unnoticed. The JNI bridge is checked separately by `jni-signatures`: `javac -h` derives the JNI header from the Kotlin declarations and `tools/jni_signature_check.sh` proves every native method exists in the C bridge with a matching parameter list.
+**Every push builds the APK.** A dedicated `android-apk` job in `ci.yml` runs on every push and pull request: it builds `assembleDebug` and `assembleRelease`, verifies the signature with `apksigner`, checks that `libhydra.so` is packaged for arm64-v8a, armeabi-v7a and x86_64 together with the model asset, and uploads the APK as a workflow artifact. A release is published for a `v*.*.*` tag **and** automatically on every push to `main` (see below) — but a broken app build can therefore never reach release day unnoticed. The JNI bridge is checked separately by `jni-signatures`: `javac -h` derives the JNI header from the Kotlin declarations and `tools/jni_signature_check.sh` proves every native method exists in the C bridge with a matching parameter list.
 
 **Manual runs.** The release workflow can also be started from the Actions tab (*Run workflow*) without pushing a tag. Leave **tag** empty to get a build-only dry run: all jobs run — CLI binaries, APK build, signature verification, Android Lint, x64/arm64 parity — but **no release is published**. Enter a tag and tick **publish** to behave exactly like a tag push. The trigger and version logic are regression-tested by `tools/ci_release_version_test.sh` (job `release-config`), which replays the script straight out of the workflow file for five input cases.
 
@@ -220,7 +282,9 @@ Every push and pull request runs the following. Each gate was verified locally *
 | C | cppcheck | dead code, resource misuse |
 | C | flawfinder (level ≥ 4) | known-dangerous C functions |
 | C | **ASan + UBSan** on the full test suite | out-of-bounds, signed overflow, UB — *this is the gate that flagged the layer-overflow bug as `signed integer overflow: 2147483640 + 127`* |
-| NEON | AArch64 build under qemu + scalar/NEON parity check | platform-divergent SIMD |
+| NEON | AArch64 cross-build under qemu + scalar/NEON parity check | platform-divergent SIMD |
+| Portability | full build + engine tests on native x86-64 (`ubuntu-latest`) **and native ARM64** (`macos-latest`, an Apple Silicon runner) | a bug that only appears on 64-bit ARM |
+| Release | signed release APK + x86-64/ARM64/macOS binaries, `apksigner` verification, `SHA256SUMS.txt` | shipping an unsigned or truncated artifact |
 | Web | ESLint 10 (`server.js`, `public/app.js`) | undefined vars, `eval`, sloppy globals |
 | Android | Android Lint (must report **no issues**) | missing icon, hardcoded strings, API misuse, orientation locks |
 | Android | APK permission gate (`aapt dump permissions`) | the app opens files through SAF, which needs **no** permission — any dangerous permission must be a decision, not a surprise |
@@ -304,7 +368,18 @@ The test suite goes beyond smoke checks — every test can fail:
 - **Seeded roundtrip & variance** — 5 deterministic LCG seeds generate random ternary weight patterns; per seed, all 32 outputs must stay within vocab and a second run with a *fresh engine instance* must reproduce the bit-identical sequence. Sequences must differ across seeds (detects a no-op engine).
 - **Security regressions** — crafted headers (bad magic, out-of-bounds weights, `layers × dim > weights_len`, `weights_offset` pointing into the header, `layers = 16 909 321` signed-overflow PoC) must be rejected at load. Every one of these was a real, reproduced bug first.
 - **Axiom edge cases** — `NaN`, `±Inf` and negative `humanity_factor` must all block (`NaN ≤ 0` is false in IEEE-754, so the finiteness check is load-bearing).
-- **Cross-platform determinism** — verified empirically: host x86-64 (scalar), ARM64 under NEON, and the Android emulator all produce the identical token sequence for the same model.
+- **Cross-platform determinism** — verified empirically and pinned to a
+  concrete sequence: host x86-64 (scalar), ARM64/NEON, and the Android emulator
+  all emit `[471, 386, 385, 386, 385, 386, 385, 386]` for the starter model with
+  `start_token=42` and 8 steps. CI enforces the x86-64/ARM64 half of this on every
+  push (`neon-test` compares a scalar reference against the NEON kernel *inside
+  the same ARM binary*); the Android half is covered by the emulator evidence
+  recorded in `android/README.md`.
+  *This is a real test, not a tautology:* the starter model is generated so that
+  its column-0 sums are non-zero (`A[0] != 0` and `B[0] != 0`). An earlier
+  version had `B[0] == 0`, which made it **state-blind** — it looped
+  `471, 42, 471, 42` forever, and `--prompt` provably could not change the
+  output. `tools/make_model.py` now guarantees and asserts the invariant.
 
 ## Running the Web Console
 

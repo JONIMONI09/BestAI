@@ -63,9 +63,50 @@ adb shell am start -n dev.hydrastone/.MainActivity
 adb logcat -d | grep Hydra
 ```
 
-Verified on the Android emulator (API 24, x86_64): inference completed
-with identical token sequences to the host CLI — the engine is
-deterministic across architectures on the same ABI's code path.
+Verified on an API-24 x86_64 emulator with the signed **release** APK: the
+installed package is byte-identical to the built artifact (md5), and inference
+produces token sequences identical to the host CLI on the same ABI. See the next
+section for how that was established rather than assumed.
+
+## How the JNI bridge was verified
+
+The app's own logs are not proof that native code ran, so the bridge was checked
+from the outside. Reproduce with a rooted emulator:
+
+```bash
+cd android && gradle assembleRelease
+adb install -r app/build/outputs/apk/release/app-release.apk
+adb shell am start -n dev.hydrastone/.MainActivity
+adb logcat -d | grep -E 'Hydra|HydraJNI'
+adb root
+
+# 1. the native library is really mapped into the process
+PID=$(adb shell pidof dev.hydrastone)
+adb shell "grep base.apk /proc/$PID/maps"          # its exec segment, off=0018c000
+adb shell "dd if=/proc/$PID/mem bs=4096 skip=$((0x7a3226942000/4096)) count=1 | od -An -tx1 -N8"
+#   -> 7f 45 4c 46 02 01 01 00   (ELF, 64-bit, little-endian)
+adb shell "dd if=/proc/$PID/mem bs=1 skip=$((0x7a3226942000+18)) count=2 | od -An -tx1"
+#   -> 3e 00                      (e_machine = EM_X86_64)
+
+# 2. the log tag is native-only
+grep -rn 'HydraJNI' app/src/main/       # -> cpp/hydra_jni.c only, never java/
+```
+
+`libhydra.so` does not appear *by name* in `/proc/<pid>/maps` because
+`extractNativeLibs` is off at minSdk 24 — the loader maps the executable segment
+straight out of `base.apk`. Reading the ELF header at that offset is what proves
+the C engine is loaded, rather than assumed from a passing UI.
+
+Correctness is then checked against a host reference rather than eyeballed:
+
+```bash
+python3 ../tools/make_model.py /tmp/ref.hydra
+./hydra-run /tmp/ref.hydra 42 32 --json        # host, same x86-64 ABI
+# compare the 32 tokens with the two "16 tokens:" lines in logcat
+```
+
+Last measured run: host and emulator both produced
+`[471, 386, 385, 386, …]` — bit-identical, including the leading `471`.
 
 ## Cancel is real, not cosmetic
 
@@ -82,6 +123,13 @@ The batching policy — when a block of tokens crosses into Kotlin, and the guar
 last partial block is always emitted with `done=true` — lives in
 `android/app/src/main/cpp/hydra_batch.h` and is shared with the host test
 `tests/test_jni_batch.c` (`make test-run`), so it is verified without a device.
+
+**Measured caveat.** Whether batching is actually *faster* is a separate question.
+On a software-emulated (TCG) emulator the in-app benchmark reported
+`batching_saves_per_token` as **negative**, because under emulation the engine
+work dominates and the JNI transition is proportionally cheap. The policy is
+verified deterministically by the host test; the performance win is not
+established on real hardware.
 
 ## Crash reports are written first, shown next launch
 
