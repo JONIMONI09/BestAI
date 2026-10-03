@@ -52,11 +52,14 @@ adb shell "cd /data/local/tmp && ./gpu_bench --dim 1024 --layers 64 --k 1,16,64,
 ```
 
 Each line of output is one JSON object, so it pipes straight into a
-plotting script:
+plotting script. **The block below is a SYNTHETIC illustration of the output
+shape, not a recording.** No number in it was measured: this program has never
+been run on a GPU (see the status note above). Real output carries
+`"measured":true` only after an actual run.
 
 ```json
-{"device":"cpu","dim":64,"layers":4,"steps":1000,"ns_per_step":12.4,"measured":true}
-{"device":"gpu","dim":64,"layers":4,"k_per_submit":16,"steps":1000,"ns_per_step":31.8,"ns_per_submit":509.0,"measured":true,"checksum_matches_cpu":true}
+{"_comment":"SYNTHETIC EXAMPLE - not measured, placeholder numbers","device":"cpu","dim":64,"layers":4,"steps":1000,"ns_per_step":0.0,"measured":false}
+{"_comment":"SYNTHETIC EXAMPLE - not measured, placeholder numbers","device":"gpu","dim":64,"layers":4,"k_per_submit":16,"steps":1000,"ns_per_step":0.0,"ns_per_submit":0.0,"measured":false,"checksum_matches_cpu":false}
 ```
 
 ## Deliberate limitations

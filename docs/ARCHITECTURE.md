@@ -24,7 +24,7 @@
 | `src/main.c` | CLI entry point (`--json` mode for machine-readable output) |
 | `src/hydra_neon.h` | NEON SIMD kernel — **actively integrated**: `step()` uses it on ARM in 16-lane chunks; bit-identical scalar fallback for remainders and x86 (proven by a same-build comparison test) |
 | `tools/make_model.py` | Test model generator (reference implementation of the format) |
-| `tests/test_engine.c` | 71 unit tests on x86-64, 77 on ARM (hand-computed cases, NEON-vs-scalar, seeded roundtrips, security regressions) |
+| `tests/test_engine.c` | unit tests (hand-computed cases, NEON-vs-scalar, seeded roundtrips, security regressions). The count is architecture-dependent and drift-gated: see `tools/test_count_baseline.txt` |
 | `server.js` | Web console server (Node, zero npm dependencies) |
 | `public/` | Hydra-Stone Console frontend (plain HTML/CSS/JS) |
 
@@ -34,13 +34,28 @@
 2. `mmap(PROT_READ, MAP_SHARED)` maps the file into the address space.
 3. `madvise(MADV_SEQUENTIAL)` tells the kernel the access pattern → aggressive read-ahead. This is a *sequencing* hint, **not** an eviction hint.
 4. 4-KiB pages are faulted in on demand and are clean → reclaimable under memory pressure without swap traffic.
-5. The runtime state is a **fixed** `int8_t[64]` vector plus a `int64_t[64]` stack accumulator → O(1) process memory, independent of model size.
+5. The runtime state is **fixed-size and independent of model size**: the recurrent state `int8_t[64]` (64 B), the two load-time aggregates `int32_t[64]` each (512 B for `agg_a` + `agg_b`), and an `int64_t[64]` accumulator (512 B). Nothing in that list grows with `layers` or with the file size.
 
-**Honest statement of what is (and is not) guaranteed.** The engine's *own* memory usage is constant and independent of model size: a fixed 512-byte state vector and a 512-byte accumulator, full stop. The weight pages are owned by the **kernel page cache**, not by the engine. Because `step()` walks the whole weight region per token, the working set is the entire file: each token re-faults the pages that were evicted. So:
+**Honest statement of what is (and is not) guaranteed.** The engine's *own*
+memory is ~1.1 KiB of fixed buffers — the state vector, both aggregate vectors
+and the accumulator — and is independent of model size. The weight pages are
+owned by the **kernel page cache**, not by the engine.
 
-- **Guaranteed:** zero heap allocation, O(1) engine RSS, no swap traffic (the mapping is `PROT_READ`/clean).
-- **Not guaranteed:** a zero resident set. Claiming otherwise would be untrue — `MADV_SEQUENTIAL` only controls read-ahead behaviour.
-- **Opt-in:** build with `-DHYDRA_DROP_CACHE` to issue `madvise(MADV_DONTNEED)` after every step, handing the touched pages back to the kernel. This trades throughput (a fresh page fault per 4 KiB per token) for a minimal resident set, and is the right knob on RAM-constrained devices.
+The weight region is **not** re-read per token. `hydra_build_aggregation()`
+walks it exactly **once**, at load, and folds it into `A[i]`/`B[i]`; after that
+the recurrent step executes `2 * dim` multiply-accumulates per token (128 at
+`d = 64`), invariant to layer depth. So the per-token working set is the fixed
+buffers, not the file. So:
+
+- **Guaranteed:** no heap allocation for weights, fixed-size engine buffers, no swap traffic (the mapping is `PROT_READ`/clean).
+- **Not guaranteed:** a zero resident set. The mapped weight pages are real
+  physical memory until the kernel reclaims them; a zero resident set would be untrue
+  (`MADV_SEQUENTIAL` only controls read-ahead, and an explicit
+  `MADV_DONTNEED` was tried, measured and rejected — it made RSS worse).
+- **Opt-in:** build with `-DHYDRA_DROP_CACHE` to issue `madvise(MADV_DONTNEED)`
+  after every step, handing the touched pages back to the kernel. This trades
+  throughput for a minimal resident set, and is the right knob on
+  RAM-constrained devices.
 
 ## Ternary Math
 

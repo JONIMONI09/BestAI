@@ -86,26 +86,42 @@ converter quietly disagree with itself depending on parity.
 
 ## 4. Which GGUF files are accepted
 
-Only the three dense float types are decoded:
+Four layouts are decoded — the three dense float types plus one
+block-quantised type:
 
-| `ggml_type` | Value | Bytes/element |
-|---|---|---|
-| `F32` | 0 | 4 |
-| `F16` | 1 | 2 |
-| `BF16` | 30 | 2 |
+| `ggml_type` | Value | Bytes/element | Kind |
+|---|---|---|---|
+| `F32` | 0 | 4 | dense float |
+| `F16` | 1 | 2 | dense float |
+| `BF16` | 30 | 2 | dense float |
+| `Q8_0` | 8 | 34 per 32 values | **block-quantised, dequantised at read time** |
 
-Every other layout (`Q4_0`, `Q8_0`, `Q4_K`, `MXFP4`, …) is a **block-quantised**
-format. This tool refuses those and says which type it found:
+`Q8_0` is the one block layout implemented, because it is also the one whose
+format is short enough to read without guessing. Each 34-byte block is an F16
+scale `d` followed by 32 signed int8 values, and dequantises as `w[i] = d *
+qs[i]` (`ggml-common.h`, `block_q8_0`). There is no second scale term and no
+interleaving to get wrong.
+
+Every other layout (`Q4_0`, `Q4_1`, `Q5_0`, `Q8_1`, `Q4_K`, `Q6_K`, `MXFP4`, …)
+is refused, by name:
 
 ```
-no dense F32/F16/BF16 1-D or 2-D tensor in this file.
-Quantised or unsupported tensors: Q4_K, Q4_0, …
+no F32/F16/BF16/Q8_0 1-D or 2-D tensor in this file.
+Unsupported quantised tensors: Q4_K, Q4_0, …
 Re-export with llama.cpp --convert-f16 and import again.
 ```
 
 Re-export from llama.cpp with `--convert-f16` if you need a file this tool can
-read. Decoding a block format would mean re-implementing a dozen quantisation
-kernels to throw the result away — the output is ternary either way.
+read. Decoding the remaining block formats would mean re-implementing a dozen
+quantisation kernels to throw the result away — the output is ternary either
+way.
+
+`tools/gguf_test.py` proves the `Q8_0` path rather than asserting it: a
+hand-built file with four different per-block scales is compared against
+`d * q` computed independently with `struct`, and a `Q8_0` fixture and the
+byte-equivalent `F16` fixture are converted and required to produce the same
+`.hydra`. Both directions of that test were checked against deliberately
+broken decoders, because a test nobody has seen fail is not a test.
 
 ---
 
@@ -205,7 +221,8 @@ round-trip against itself; it would not survive the engine.
 - **Not a Llama.** See §2. The dominant token behaviour of the original network
   is not preserved.
 - **Small.** 64 dimensions, ≤1024 vocabulary, ≤256 KiB of weights.
-- **Float types only.** Block-quantised GGUFs are refused by name, not guessed.
+- **Float types, plus `Q8_0`.** `F32`, `F16`, `BF16` and `Q8_0` are decoded;
+  every other block layout is refused by name, not guessed.
 - **Vocabulary is truncated** to the format ceiling; the count of dropped
   entries is reported.
 - **`A`/`B` are column sums.** Column sums discard the per-row structure that

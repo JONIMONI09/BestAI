@@ -58,7 +58,7 @@ header = struct.pack("<IHHIIII", MAGIC, VERSION, VOCAB, DIM, LAYERS,
 4. `layers <= 4096` (`HYDRA_MAX_LAYERS`) — bounds the worst-case accumulator magnitude to `4096 × 254`, well below `INT32_MAX`. (Discovered via proof-of-concept: without this rule, `layers = 16909321` with `dim = 1` and all weights `+1` overflows a signed accumulator after ~16.9 MB of file.)
 5. `weights_offset >= 24` — the weight region may not overlap the header, otherwise header bytes would be executed as weights.
 6. `weights_offset + weights_len <= file_size` — prevents out-of-bounds reads past the mmap. **The sum is computed in 64 bits**, even though both operands are `uint32`: in 32-bit arithmetic `0xFFFFF000 + 0x1000` wraps to `0`, the model looks valid, and the aggregation walk runs off the mapping. Measured: with a 32-bit sum, `tests/test_large_model.c` loses its child process with SIGSEGV.
-7. `layers * dim <= weights_len` — the inference step reads exactly `layers × dim` packed bytes, so the declared weight region must cover them. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
+7. `layers * dim <= weights_len` — the **loader** reads exactly `layers × dim` packed bytes once, when building the aggregates, so the declared weight region must cover them. The per-token step does not traverse the weight region at all. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
 
 If any rule is violated, the mapping is torn down immediately through a single cleanup path and a negative error code is returned (`-5` magic, `-7` version, `-8` dim/vocab, `-9` file bounds, `-10` weight region, `-11` layer cap, `-12` header overlap).
 

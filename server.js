@@ -444,6 +444,25 @@ function uploadTarget(name) {
  * syscall cannot pin a core forever. */
 const runningEngines = new Map();
 
+/* Single-active-import guard.
+ *
+ * An import is not a cheap request: it streams the whole upload to disk,
+ * spawns tools/gguf_to_hydra.py, and validates the result. Two of them at
+ * once means two temp files in models/converted/, two Python processes, and
+ * two conversions racing over the same CPU and page cache - on a tablet that
+ * is the difference between "slow" and "the browser appears to hang".
+ *
+ * So: at most one import at a time, and a concurrent one is refused with 429
+ * rather than queued. Queueing sounds friendlier but holds the uploaded body
+ * open on the socket while a several-minute conversion runs, which is worse
+ * than telling the client to come back.
+ *
+ * The flag is reset in a `finally`, so it comes back on EVERY path: success,
+ * a 400, a 413, an exception from streamToTmpFile or from the converter. A
+ * guard that needs a second "remember to reset it" at each return statement is
+ * a guard that eventually locks the endpoint forever. */
+let importInFlight = false;
+
 function killEngine(id, reason) {
   const entry = runningEngines.get(id);
   if (!entry) return false;
@@ -971,62 +990,86 @@ const server = http.createServer(async (req, res) => {
      * A conversion that quietly produced something different from what was
      * asked for is worse than one that is refused. */
     if (url.pathname === '/api/models/import' && req.method === 'POST') {
-      const name = url.searchParams.get('name') || '';
-      if (!name.toLowerCase().endsWith('.gguf')) {
-        return sendJSON(res, 400, {
-          error: 'invalid file name: the import expects a .gguf suffix '
-            + '(a .hydra model goes to /api/models/upload)',
+      /* The guard comes first, before any validation: whatever this request
+       * would have done, at most one request may be inside the try below. */
+      if (importInFlight) {
+        res.setHeader('Connection', 'close');
+        res.setHeader('Retry-After', '5');
+        sendJSON(res, 429, {
+          error: 'a GGUF import is already running. Imports are serialised '
+            + 'one at a time because each one streams a file to disk and runs '
+            + 'the converter; send this one again in a moment.',
+          busy: true,
         });
+        /* The body is still arriving. Draining a multi-megabyte upload to
+         * throw it away is worse than closing the connection, which is what
+         * the oversize path does for the same reason. */
+        res.on('finish', () => { if (!req.destroyed) req.destroy(); });
+        return;
       }
-      const target = convertedTarget(`${name.slice(0, -'.gguf'.length)}.hydra`);
-      if (!target) {
-        return sendJSON(res, 400, {
-          error: 'invalid file name: use letters, digits, dot, dash and underscore before the suffix',
-        });
-      }
-      fs.mkdirSync(CONVERTED_DIR, { recursive: true });
-      const tmp = path.join(CONVERTED_DIR, `.import-${process.pid}-${Date.now()}.gguf`);
+      importInFlight = true;
       try {
-        await streamToTmpFile(req, tmp, MAX_UPLOAD);
-      } catch (e) {
-        if (e.tooLarge) {
-          res.setHeader('Connection', 'close');
-          sendJSON(res, e.status, {
-            error: e.message,
-            rejected: true,
-            limitBytes: e.limitBytes,
-            limitHuman: formatBytes(e.limitBytes),
-            raiseWith: 'HYDRA_MAX_UPLOAD',
+        const name = url.searchParams.get('name') || '';
+        if (!name.toLowerCase().endsWith('.gguf')) {
+          return sendJSON(res, 400, {
+            error: 'invalid file name: the import expects a .gguf suffix '
+              + '(a .hydra model goes to /api/models/upload)',
           });
-          res.on('finish', () => { if (!req.destroyed) req.destroy(); });
-          return;
         }
-        return sendJSON(res, e.status || 400, { error: e.message });
+        const target = convertedTarget(`${name.slice(0, -'.gguf'.length)}.hydra`);
+        if (!target) {
+          return sendJSON(res, 400, {
+            error: 'invalid file name: use letters, digits, dot, dash and underscore before the suffix',
+          });
+        }
+        fs.mkdirSync(CONVERTED_DIR, { recursive: true });
+        const tmp = path.join(CONVERTED_DIR, `.import-${process.pid}-${Date.now()}.gguf`);
+        try {
+          await streamToTmpFile(req, tmp, MAX_UPLOAD);
+        } catch (e) {
+          if (e.tooLarge) {
+            res.setHeader('Connection', 'close');
+            sendJSON(res, e.status, {
+              error: e.message,
+              rejected: true,
+              limitBytes: e.limitBytes,
+              limitHuman: formatBytes(e.limitBytes),
+              raiseWith: 'HYDRA_MAX_UPLOAD',
+            });
+            res.on('finish', () => { if (!req.destroyed) req.destroy(); });
+            return;
+          }
+          return sendJSON(res, e.status || 400, { error: e.message });
+        }
+
+        const report = await runGgufConverter(tmp, target);
+        /* The source GGUF never reaches a model path: only the converted
+         * .hydra is offered, and only after the header check below. */
+        fs.unlinkSync(tmp);
+
+        if (!report.ok) {
+          if (fs.existsSync(target)) fs.unlinkSync(target);
+          return sendJSON(res, 400, { error: report.error, rejected: true });
+        }
+
+        const reason = validateHydraHeader(target);
+        if (reason !== null) {
+          fs.unlinkSync(target);
+          return sendJSON(res, 500, {
+            error: `the converter produced a model the engine refuses: ${reason}`,
+            rejected: true,
+          });
+        }
+
+        const info = inspectHeader(path.relative(ROOT, target));
+        /* The conversion report is the answer, not a log line: it is the only
+         * place that says what the new model actually is. */
+        return sendJSON(res, 200, { ok: true, model: info, conversion: report });
+      } finally {
+        /* Every exit from above lands here: the 400s, the 413, the 429s, a
+         * converter crash, a client that hung up mid-upload. */
+        importInFlight = false;
       }
-
-      const report = await runGgufConverter(tmp, target);
-      /* The source GGUF never reaches a model path: only the converted
-       * .hydra is offered, and only after the header check below. */
-      fs.unlinkSync(tmp);
-
-      if (!report.ok) {
-        if (fs.existsSync(target)) fs.unlinkSync(target);
-        return sendJSON(res, 400, { error: report.error, rejected: true });
-      }
-
-      const reason = validateHydraHeader(target);
-      if (reason !== null) {
-        fs.unlinkSync(target);
-        return sendJSON(res, 500, {
-          error: `the converter produced a model the engine refuses: ${reason}`,
-          rejected: true,
-        });
-      }
-
-      const info = inspectHeader(path.relative(ROOT, target));
-      /* The conversion report is the answer, not a log line: it is the only
-       * place that says what the new model actually is. */
-      return sendJSON(res, 200, { ok: true, model: info, conversion: report });
     }
 
     /* Why is this file not loading? One endpoint, one answer, the same

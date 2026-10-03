@@ -18,12 +18,12 @@ Layout (little-endian throughout, see ggml/docs/gguf.md):
     [pad to general.alignment]
     tensor data
 
-Only the three float types are decoded: F32, F16 and BF16. Every other
-ggml_type is a block-quantised layout (Q4_0, Q8_0, Q4_K, MXFP4, ...) whose
-scales are interleaved with the values, and there is no honest way to
-recover dense floats from it with arithmetic alone. Those tensors are
-reported by name and refused, not silently misread - see
-docs/GGUF-IMPORT.md.
+Four layouts are decoded: the three dense float types F32, F16 and BF16, plus
+the Q8_0 block-quantised type. Every other ggml_type (Q4_0, Q4_K, MXFP4, ...)
+is block-quantised with a scale layout this reader does not implement, and
+there is no honest way to recover dense floats from it with arithmetic
+alone. Those tensors are reported by name and refused, not silently
+misread - see docs/GGUF-IMPORT.md.
 
 Why no numpy: the engine, the console and the CI all work on a bare Python
 3. A converter that needs a wheel the rest of the project does not have is
@@ -35,6 +35,8 @@ import os
 import struct
 import sys
 from array import array
+from itertools import repeat
+from operator import mul
 
 GGUF_MAGIC = 0x46554747  # b"GGUF"
 GGUF_VERSION_MIN = 2
@@ -58,11 +60,33 @@ _KV_SCALAR = {
     KV_FLOAT64: ('<d', 8),
 }
 
-# ggml_type. Only the first three are dense floats.
-T_F32, T_F16, T_BF16 = 0, 1, 30
+# ggml_type. The first three are dense floats; Q8_0 is block-quantised.
+T_F32, T_F16, T_BF16, T_Q8_0 = 0, 1, 30, 8
 
 #: Dense float types this reader can decode, mapped to their byte width.
 DENSE_FLOAT_TYPES = {T_F32: 4, T_F16: 2, T_BF16: 2}
+
+#: ggml_type -> (elements per block, bytes per block) for the block-quantised
+#: layouts this reader dequantises. Q8_0 is
+#:
+#:     struct block_q8_0 { half d; int8_t qs[32]; }   // 2 + 32 = 34 bytes
+#:
+#: (ggml-common.h), so one block carries 32 values behind one F16 scale and
+#: dequantises as w[i] = d * qs[i]. That is the whole format: a scale and 32
+#: signed bytes, no interleaving, no second scale term, nothing to guess.
+#:
+#: A type in this table is NOT in DENSE_FLOAT_TYPES, so every existing caller
+#: that assumes "one width in bytes per element" keeps its meaning - it just
+#: never sees these types. Use decodable_types() / Tensor.is_decodable for
+#: "can this reader turn the bytes back into floats".
+BLOCK_TYPES = {T_Q8_0: (32, 34)}
+
+QK8_0 = 32
+Q8_0_BLOCK_BYTES = 34
+
+#: Every layout this reader can decode: dense floats plus the block types it
+#: implements. Anything outside this set is refused by name.
+DECODABLE_TYPES = frozenset(DENSE_FLOAT_TYPES) | frozenset(BLOCK_TYPES)
 
 #: The quantised layouts worth naming in an error message. A file full of
 #: these is the normal case for a 4-bit download, so saying so plainly is
@@ -202,6 +226,44 @@ class Tensor:
     def is_dense_float(self):
         return self.ggml_type in DENSE_FLOAT_TYPES
 
+    @property
+    def is_block_quantised(self):
+        """True for the block layouts, including Q8_0.
+
+        Q8_0 IS block-quantised - saying otherwise would be the same kind of
+        error the docs lint exists for. What matters is `is_decodable`.
+        """
+        return self.ggml_type in BLOCK_TYPES
+
+    @property
+    def is_decodable(self):
+        """Can this reader turn the bytes back into floats?"""
+        return self.ggml_type in DECODABLE_TYPES
+
+    def byte_size(self):
+        """Bytes this tensor occupies, or None when that is unknowable.
+
+        None means "the layout is not implemented here, so the end of the
+        file is the only bound we can state honestly" - it must never mean
+        "zero" or "unbounded".
+        """
+        width = DENSE_FLOAT_TYPES.get(self.ggml_type)
+        if width is not None:
+            return self.n_elements * width
+        block = BLOCK_TYPES.get(self.ggml_type)
+        if block is None:
+            return None
+        per_block, block_bytes = block
+        n = self.n_elements
+        if n % per_block:
+            # rules.md R14: a length-deriving field that does not divide is a
+            # malformed file, not something to round.
+            raise GgufError(
+                'tensor %r holds %d elements, which is not a multiple of the '
+                '%d elements a %s block carries'
+                % (self.name, n, per_block, self.type_name))
+        return (n // per_block) * block_bytes
+
     def shape(self):
         """(rows, cols) for a 1-D or 2-D tensor; None for anything else."""
         if self.n_dims == 1:
@@ -216,6 +278,7 @@ class Tensor:
             'dims': list(self.dims),
             'type': self.type_name,
             'dense_float': self.is_dense_float,
+            'decodable': self.is_decodable,
             'elements': self.n_elements,
             'bytes': self.size_bytes,
         }
@@ -309,14 +372,11 @@ class GgufFile:
         data_start = r.pos
         for t in self.tensors:
             t.data_start = data_start + t.offset
-            width = DENSE_FLOAT_TYPES.get(t.ggml_type)
-            if width is not None:
-                t.size_bytes = t.n_elements * width
-            else:
-                # The byte size of a block-quantised tensor depends on its
-                # geometry; the block sizes are not derivable here, so the
-                # end of the file is the only bound we can state honestly.
-                t.size_bytes = None
+            # byte_size() is None for a layout we do not implement, in which
+            # case the end of the file is the only bound we can state
+            # honestly. It raises when the element count cannot tile whole
+            # blocks - that is a malformed file, not a rounding problem.
+            t.size_bytes = t.byte_size()
             if t.size_bytes is not None and t.data_start + t.size_bytes > len(self.data):
                 raise GgufError(
                     'tensor %r runs past the end of the file (%d + %d > %d)'
@@ -331,13 +391,20 @@ class GgufFile:
         return None
 
     def dense_candidates(self):
-        """Tensors the converter can actually read, in file order."""
+        """Tensors stored as dense floats (F32/F16/BF16), in file order."""
         return [t for t in self.tensors
                 if t.is_dense_float and t.shape() is not None]
 
+    def decodable_candidates(self):
+        """Every tensor this reader can turn into floats: dense + Q8_0."""
+        return [t for t in self.tensors
+                if t.is_decodable and t.shape() is not None]
+
     def quantised_names(self):
+        """Names of the tensors that are REFUSED - block layouts we do not
+        implement. Q8_0 is block-quantised but decodable, so it is not here."""
         return [t.name for t in self.tensors
-                if not t.is_dense_float and t.shape() is not None]
+                if not t.is_decodable and t.shape() is not None]
 
     def tokens(self):
         """The vocabulary as a list of strings, or [] when absent."""
@@ -365,6 +432,7 @@ class GgufFile:
             'metadataKeys': sorted(self.metadata.keys()),
             'tokens': len(self.tokens()),
             'denseFloatTensors': [t.name for t in self.dense_candidates()],
+            'decodableTensors': [t.name for t in self.decodable_candidates()],
             'quantisedTensors': self.quantised_names(),
             'bytes': len(self.data),
         }
@@ -372,16 +440,23 @@ class GgufFile:
     # -- decoding ------------------------------------------------------
 
     def decode_rows(self, tensor, first_row, n_rows):
-        """Decode `n_rows` rows of a dense float tensor.
+        """Decode `n_rows` rows of a dense float or Q8_0 tensor.
 
         Row-major, so rows of a 2-D tensor are contiguous and one row block
         is one byte range. This is what keeps the converter's memory at
         O(block) instead of O(tensor): a 32000x4096 F32 embedding is 524 MB
         if decoded whole, and ~8 MB decoded 512 rows at a time.
+
+        For Q8_0 the byte range has to cover whole 34-byte blocks, so a
+        request that starts or ends mid-block decodes the blocks that cover
+        it and slices the edges off. Callers never see the extra values, and
+        the alternative - refusing - would break on a tensor whose row length
+        is not a multiple of 32 even though the tensor itself is valid.
         """
-        if not tensor.is_dense_float:
+        if not tensor.is_decodable:
             raise GgufError(
-                'tensor %r is %s - a block-quantised layout, not dense floats. '
+                'tensor %r is %s - a block-quantised layout this reader does '
+                'not implement (it decodes F32, F16, BF16 and Q8_0). '
                 'Re-export the model in F16 or F32 (llama.cpp: '
                 '--convert-f16) and import it again.'
                 % (tensor.name, tensor.type_name))
@@ -393,10 +468,28 @@ class GgufFile:
         if first_row < 0 or n_rows < 0 or first_row + n_rows > rows:
             raise GgufError('rows %d..%d are outside tensor %r (%d rows)'
                             % (first_row, first_row + n_rows, tensor.name, rows))
-        width = DENSE_FLOAT_TYPES[tensor.ggml_type]
         cols = shape[1]
+        first_el = first_row * cols
         n = n_rows * cols
-        start = tensor.data_start + first_row * cols * width
+
+        if tensor.ggml_type in BLOCK_TYPES:
+            per_block, block_bytes = BLOCK_TYPES[tensor.ggml_type]
+            b0 = first_el // per_block
+            b1 = -(-(first_el + n) // per_block)          # ceiling division
+            start = tensor.data_start + b0 * block_bytes
+            raw = self.data[start:start + (b1 - b0) * block_bytes]
+            if len(raw) != (b1 - b0) * block_bytes:
+                raise GgufError(
+                    'tensor %r ends inside a %s block: %d bytes needed at '
+                    'offset %d, %d available'
+                    % (tensor.name, tensor.type_name,
+                       (b1 - b0) * block_bytes, start, len(raw)))
+            out = _decode_q8_0(raw)
+            off = first_el - b0 * per_block
+            return out[off:off + n]
+
+        width = DENSE_FLOAT_TYPES[tensor.ggml_type]
+        start = tensor.data_start + first_el * width
         raw = self.data[start:start + n * width]
         return _decode_raw(tensor.ggml_type, raw, n)
 
@@ -408,6 +501,53 @@ class GgufFile:
             raise GgufError('tensor %r has %d dimensions; only 1-D and 2-D '
                             'tensors can be read' % (tensor.name, tensor.n_dims))
         return self.decode_rows(tensor, 0, shape[0])
+
+
+def _decode_q8_0(raw):
+    """Dequantise Q8_0 blocks: w[i] = d * qs[i], 34 bytes per 32 values.
+
+    The scales sit at byte 0 of every 34-byte block and the 32 int8 values at
+    bytes 2..33, so neither the scales nor the values are contiguous. Both
+    are gathered with strided slice assignment - 34 C-level copies - rather
+    than a Python loop over blocks, because a 37 M-value expert tensor is
+    1.16 M blocks and the difference is minutes.
+
+    Exactness note: d is an IEEE binary16 read through the shared half
+    table, so the only rounding is the float32 multiply that the format
+    itself mandates. tools/gguf_test.py proves the result is bit-identical
+    to the same weights stored as F16 and read through the F16 path.
+    """
+    n_blocks, rem = divmod(len(raw), Q8_0_BLOCK_BYTES)
+    if rem:
+        raise GgufError(
+            'Q8_0 data is %d bytes, which is %d whole %d-byte blocks plus %d '
+            'trailing bytes' % (len(raw), n_blocks, Q8_0_BLOCK_BYTES, rem))
+    if n_blocks == 0:
+        return array('f')
+
+    # The F16 scale of block b is at byte 34*b; de-interleave into a packed
+    # run of 2-byte halves so struct.iter_unpack can walk them.
+    span = Q8_0_BLOCK_BYTES * n_blocks
+    scale_bytes = bytearray(2 * n_blocks)
+    scale_bytes[0::2] = raw[0:span:Q8_0_BLOCK_BYTES]
+    scale_bytes[1::2] = raw[1:span:Q8_0_BLOCK_BYTES]
+    scales = array('f', (t[0] for t in
+                          struct.iter_unpack('<e', bytes(scale_bytes))))
+    del scale_bytes
+
+    # The int8 values are at bytes 34*b+2 .. 34*b+33; de-interleave the same way.
+    qs_bytes = bytearray(QK8_0 * n_blocks)
+    for i in range(QK8_0):
+        qs_bytes[i::QK8_0] = raw[2 + i:span:Q8_0_BLOCK_BYTES]
+    qs = array('b')
+    qs.frombytes(bytes(qs_bytes))
+    del qs_bytes
+
+    # Each scale applies to its own 32 values.
+    repeated = array('f')
+    for d in scales:
+        repeated.extend(repeat(d, QK8_0))
+    return array('f', map(mul, repeated, qs))
 
 
 def _decode_raw(gtype, raw, n):

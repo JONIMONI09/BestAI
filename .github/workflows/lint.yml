@@ -246,6 +246,21 @@ jobs:
       - name: Release trigger and version logic (including negative control)
         run: bash tools/ci_release_version_test.sh
 
+  # ---------- Dokumentation ----------
+  docs-lint:
+    name: Docs claim lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same gate as in ci.yml, run a second time on purpose: the two
+      # workflows have different triggers, and a claim checked in only one of
+      # them is practically unchecked. Banned claims: "zero-RAM", "all
+      # models", hard-coded test counts, and performance numbers with no
+      # provenance.
+      - name: Banned claims absent (zero-RAM, all-models, counts, provenance)
+        run: bash tools/docs_claim_check.sh
+
   # ---------- Android ----------
   android-lint:
     name: Android lint

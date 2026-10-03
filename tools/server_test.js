@@ -17,7 +17,7 @@ const { spawn, execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { writeGgufFile } = require('./gguf_fixture');
+const { writeGgufFile, buildGgufBytes, GGML_Q8_0 } = require('./gguf_fixture');
 
 const ROOT = path.resolve(__dirname, '..');
 const PORT = 8000 + Math.floor(process.pid % 1000);
@@ -895,6 +895,34 @@ test('the upload refusal and the inspect report state the same reason', async ()
 /* GGUF import: recognise it, convert it, and prove the result is real  */
 /* ------------------------------------------------------------------ */
 
+/** Waits until the server has actually begun streaming an import to disk.
+ *
+ * Polling for the temp file is what makes the concurrency test deterministic.
+ * A sleep would race: on a fast machine the first import could already be
+ * finished, and then the second request would succeed and the test would
+ * pass with no guard in the server at all. */
+async function waitForImportTempFile(timeoutMs = 10000) {
+  const dir = path.join(ROOT, 'models', 'converted');
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const hits = fs.readdirSync(dir).filter((f) => f.startsWith('.import-'));
+    if (hits.length) return hits;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(
+    'no .import-*.gguf temp file appeared, so the two imports never overlapped '
+    + 'and this test proved nothing about the guard');
+}
+
+function postImport(name, body, extra = {}) {
+  return fetch(`${BASE}/api/models/import?name=${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body,
+    ...extra,
+  });
+}
+
 /** Writes a syntactically valid GGUF with two dense F32 tensors. */
 function writeGguf(name, { rows = 64, cols = 32, tokens = ['a', 'b', '▁c', 'd'] } = {}) {
   const dir = path.join(ROOT, 'models', 'converted');
@@ -968,6 +996,123 @@ test('the import route only accepts .gguf and points .hydra at the other one', a
   assert.strictEqual(wrong.status, 400);
   assert.match((await wrong.json()).error, /api\/models\/upload/,
     'the refusal must name the route that does take a .hydra');
+});
+
+test('only one GGUF import runs at a time; a concurrent one gets 429', async () => {
+  const { Readable } = require('node:stream');
+  const a = writeGguf('serial-a.gguf');
+  const b = writeGguf('serial-b.gguf');
+  const c = writeGguf('serial-c.gguf');
+  for (const f of [a, b, c]) createdFiles.push(f);
+
+  const bytes = fs.readFileSync(a);
+  const half = Math.floor(bytes.length / 2);
+
+  /* The first upload stalls in the middle, so the server is provably still
+   * inside its import when the second one arrives. */
+  const first = postImport('serial-a.gguf', Readable.from((async function* drip() {
+    yield bytes.subarray(0, half);
+    await new Promise((r) => setTimeout(r, 2000));
+    yield bytes.subarray(half);
+  })()), { duplex: 'half' });
+
+  await waitForImportTempFile();
+
+  const second = await postImport('serial-b.gguf', fs.readFileSync(b));
+  const busyBody = await second.json();
+  assert.strictEqual(second.status, 429,
+    `a concurrent import must be refused with 429, got ${second.status}: ${JSON.stringify(busyBody)}`);
+  assert.strictEqual(busyBody.busy, true);
+  assert.match(busyBody.error, /already running/i,
+    `the message must say why, got: ${busyBody.error}`);
+  assert.ok(!fs.existsSync(path.join(ROOT, 'models', 'converted', 'serial-b.hydra')),
+    'a refused import must not produce a model');
+
+  const firstRes = await first;
+  const firstJson = await firstRes.json();
+  assert.strictEqual(firstRes.status, 200,
+    `the first import must still succeed, got ${firstRes.status}: ${JSON.stringify(firstJson)}`);
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'serial-a.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'serial-a.json'));
+
+  /* The guard has to come back on the success path too, or the endpoint is
+   * dead after the first import for the rest of the process's life. */
+  const third = await postImport('serial-c.gguf', fs.readFileSync(c));
+  const thirdJson = await third.json();
+  assert.strictEqual(third.status, 200,
+    `the guard must be released after a successful import, got ${third.status}: ${JSON.stringify(thirdJson)}`);
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'serial-c.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'serial-c.json'));
+});
+
+test('a refused GGUF import releases the guard', async () => {
+  /* A conversion that FAILS must not leave the endpoint permanently busy.
+   * That is the bug this catches: a flag cleared on the success path only. */
+  const junk = Buffer.alloc(512, 0x41);
+  const bad = await postImport('guard-junk.gguf', junk);
+  assert.strictEqual(bad.status, 400);
+
+  const src = writeGguf('guard-ok.gguf');
+  createdFiles.push(src);
+  const good = await postImport('guard-ok.gguf', fs.readFileSync(src));
+  const goodJson = await good.json();
+  assert.strictEqual(good.status, 200,
+    `the guard must be released after a refused import, got ${good.status}: ${JSON.stringify(goodJson)}`);
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'guard-ok.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'guard-ok.json'));
+});
+
+test('an import refused for a bad name also releases the guard', async () => {
+  const wrong = await fetch(`${BASE}/api/models/import?name=nope.hydra`, { method: 'POST' });
+  assert.strictEqual(wrong.status, 400);
+  const src = writeGguf('guard-name.gguf');
+  createdFiles.push(src);
+  const good = await postImport('guard-name.gguf', fs.readFileSync(src));
+  assert.strictEqual(good.status, 200,
+    'the guard must be released after a 400 that returns before any upload is read');
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'guard-name.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'guard-name.json'));
+});
+
+test('a Q8_0 GGUF imports, and matches the F16 twin of the same numbers', async () => {
+  /* The user-facing check for the Q8_0 support: a real POST through the
+   * route, a real conversion by the Python converter, a real .hydra out.
+   * And the equivalence is proved on that artefact, not only inside the
+   * Python test suite. */
+  const rows = 24, cols = 8;   /* 192 values = 6 Q8_0 blocks */
+  const q = await postImport('q80-live.gguf',
+    buildGgufBytes({ rows, cols, type: GGML_Q8_0 }));
+  const qJson = await q.json();
+  assert.strictEqual(q.status, 200,
+    `a Q8_0 GGUF must import, got ${q.status}: ${JSON.stringify(qJson)}`);
+  assert.strictEqual(qJson.conversion.planes[0].type, 'Q8_0',
+    'the report must say the plane really came from a Q8_0 tensor');
+  assert.strictEqual(qJson.conversion.planes[0].rowsRead, rows);
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'q80-live.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'q80-live.json'));
+
+  /* An F32 file holding the identical dequantised values must convert to the
+   * identical model. The fixture builds that twin from the same codes and the
+   * same scales, so any difference is a bug in one of the two paths. */
+  const f = await postImport('q80-f32-live.gguf',
+    buildGgufBytes({ rows, cols, q8_0Twin: true }));
+  const fJson = await f.json();
+  assert.strictEqual(f.status, 200,
+    `the F32 twin must import, got ${f.status}: ${JSON.stringify(fJson)}`);
+  createdFiles.push(path.join(ROOT, 'models', 'converted', 'q80-f32-live.hydra'));
+  createdFiles.push(path.join(ROOT, 'models', 'vocab', 'q80-f32-live.json'));
+
+  const qa = qJson.conversion.aggregation.A;
+  const fa = fJson.conversion.aggregation.A;
+  assert.deepStrictEqual(qa, fa,
+    `Q8_0 and F32 must aggregate to the same A; Q8_0 ${qa.slice(0, 8)} vs F32 ${fa.slice(0, 8)}`);
+  assert.deepStrictEqual(qJson.conversion.aggregation.B, fJson.conversion.aggregation.B);
+  assert.ok(qJson.model.valid, 'the Q8_0 import must pass the same header validation');
+
+  /* And the model has to run, not just convert. */
+  const run = await postJSON('/api/infer', { path: qJson.model.path, token: 2, steps: 8 });
+  assert.strictEqual(run.status, 200, `the Q8_0 model must run: ${JSON.stringify(run.body)}`);
+  assert.strictEqual(run.body.tokens.length, 8);
 });
 
 test('a converted model shows up in the chat model list as converted', async () => {

@@ -83,7 +83,12 @@
 
 21. **R21 — Run the full local gate before committing** (skill:
     `engine-ci-verify`): gcc, clang, cppcheck, python gate, build,
-    49 tests, smoke test.
+    the unit tests, smoke test. **Parse the assertion count from the
+    test binary's output; never hard-code an expected number.** The count
+    is architecture-dependent (the NEON comparison tests are compiled out
+    on x86) and changes when tests are added — a stale literal in a doc or
+    a gate is how this file ended up claiming "49 tests" long after the
+    suite had grown.
 22. **R22 — Determinism checks use platform-fixed seeds** (the LCG),
     never `rand()`, so ubuntu-gcc and macos-clang-ARM64 CI runners
     compare identical sequences across scalar and NEON paths.

@@ -62,7 +62,13 @@ def check(name, ok, detail=''):
 
 def build_gguf(path, tensors, metadata=None, version=3, alignment=32,
                magic=gguf_reader.GGUF_MAGIC, tensor_count=None, kv_count=None):
-    """Write a syntactically real GGUF. `tensors` is [(name, dims, type, values)]."""
+    """Write a syntactically real GGUF. `tensors` is [(name, dims, type, values)].
+
+    An entry may carry a fifth element: for Q8_0 that is the F16 scale, and
+    `values` must then be int8 codes in [-128, 127]. For a layout this
+    fixture writer does not implement the payload is a zero-filled
+    placeholder, which is what the "unsupported block layout" test needs.
+    """
     body = bytearray()
     body += struct.pack('<I', magic)
     body += struct.pack('<I', version)
@@ -95,20 +101,29 @@ def build_gguf(path, tensors, metadata=None, version=3, alignment=32,
     offsets = []
     cursor = 0
     payloads = []
-    for _name, dims, gtype, values in tensors:
+    for entry in tensors:
+        name, dims, gtype, values = entry[:4]
+        extra = entry[4] if len(entry) > 4 else None
         count = 1
         for d in dims:
             count *= d
         assert len(values) == count, 'fixture tensor size mismatch'
-        # A block-quantised layout has no single byte-per-element width, and
-        # the reader only validates byte sizes for dense tensors - so the
-        # fixture just reserves a payload and moves on.
-        width = gguf_reader.DENSE_FLOAT_TYPES.get(gtype, 1)
+        block = gguf_reader.BLOCK_TYPES.get(gtype)
+        if block is not None:
+            per_block, block_bytes = block
+            assert count % per_block == 0, 'Q8_0 needs whole blocks'
+            nbytes = (count // per_block) * block_bytes
+        else:
+            # A layout the writer does not implement just reserves a
+            # payload; the reader only validates byte sizes for the types it
+            # knows, so this is exactly what a refused file looks like.
+            nbytes = count * gguf_reader.DENSE_FLOAT_TYPES.get(gtype, 1)
         offsets.append(cursor)
-        payloads.append((gtype, values, width))
-        cursor += count * width
+        payloads.append((gtype, values, extra))
+        cursor += nbytes
 
-    for (name, dims, gtype, _values), offset in zip(tensors, offsets):
+    for entry, offset in zip(tensors, offsets):
+        name, dims, gtype = entry[0], entry[1], entry[2]
         body += put_string(name)
         body += struct.pack('<I', len(dims))
         for d in dims:
@@ -119,7 +134,7 @@ def build_gguf(path, tensors, metadata=None, version=3, alignment=32,
     pad = (-len(body)) % alignment
     body += bytes(pad)
 
-    for gtype, values, width in payloads:
+    for gtype, values, extra in payloads:
         if gtype == gguf_reader.T_F32:
             body += struct.pack('<%df' % len(values), *values)
         elif gtype == gguf_reader.T_F16:
@@ -130,6 +145,24 @@ def build_gguf(path, tensors, metadata=None, version=3, alignment=32,
             for v in values:
                 bits = struct.unpack('<I', struct.pack('<f', v))[0]
                 body += struct.pack('<H', bits >> 16)
+        elif gtype == gguf_reader.T_Q8_0:
+            # 34 bytes per block: F16 scale, then 32 int8 codes. `extra`
+            # may be one scale for every block or a list with one scale per
+            # block - a fixture with a single repeated scale cannot catch a
+            # decoder that reads the wrong block's scale.
+            scales = extra
+            if scales is None:
+                scales = 0.01
+            if isinstance(scales, (int, float)):
+                scales = [scales] * (len(values) // gguf_reader.QK8_0)
+            scales = list(scales)
+            assert len(scales) == len(values) // gguf_reader.QK8_0
+            for b, i in enumerate(range(0, len(values), gguf_reader.QK8_0)):
+                chunk = list(values[i:i + gguf_reader.QK8_0])
+                assert len(chunk) == gguf_reader.QK8_0
+                assert all(-128 <= c <= 127 for c in chunk), 'Q8_0 needs int8'
+                body += struct.pack('<e', scales[b])
+                body += struct.pack('<%db' % gguf_reader.QK8_0, *chunk)
         else:
             body += bytes(len(values))  # quantised payload placeholder
 
@@ -233,6 +266,24 @@ def run(engine, tmp):
                 _half_table_is_exact())
     ok &= check('all three dense float types decode through the same path',
                 _all_dense_types_decode(tmp))
+
+    # --- Q8_0 -----------------------------------------------------------
+    ok &= check('Q8_0 block geometry is 32 values in 34 bytes',
+                gguf_reader.QK8_0 == 32
+                and gguf_reader.Q8_0_BLOCK_BYTES == 34
+                and gguf_reader.BLOCK_TYPES[gguf_reader.T_Q8_0] == (32, 34))
+    ok &= check('Q8_0 dequantises a hand-built block exactly (w = d * q)',
+                _q8_0_exact(tmp))
+    ok &= check('Q8_0 rows decode independently of the row alignment',
+                _q8_0_row_slice(tmp))
+    ok &= check('a Q8_0 tensor is decodable, not on the refused list',
+                _q8_0_is_decodable(tmp))
+    ok &= check('a Q8_0 file and the equivalent F16 file convert identically',
+                _q8_0_matches_f16(tmp))
+    ok &= check('a Q8_0 element count that is not a whole block count is refused',
+                _q8_0_partial_block_refused(tmp))
+    ok &= check('a Q8_0 payload truncated mid-block is refused',
+                _q8_0_truncated_refused(tmp))
 
     out = os.path.join(tmp, 'converted.hydra')
     expect = os.path.join(tmp, 'expect.json')
@@ -411,13 +462,212 @@ def _convert_fails(out, src):
 
 def _quantised_message(tmp):
     path = os.path.join(tmp, 'q.gguf')
-    tensors = [('token_embd.weight', [4, 4], 8, [0.0] * 16)]  # type 8 == Q8_0
+    # type 2 == Q4_0, a block layout this reader does not implement. It used
+    # to be type 8 (Q8_0), which is now supported - a negative control that
+    # silently starts passing is worse than no control at all.
+    tensors = [('token_embd.weight', [4, 4], 2, [0.0] * 16)]
     build_gguf(path, tensors)
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         rc = gguf_to_hydra.main([path, '--out',
                                  os.path.join(os.path.dirname(path), 'q.hydra')])
     return rc != 0 and 'F16' in err.getvalue()
+
+
+# --------------------------------------------------------------- Q8_0 cases
+
+#: Half 0x3C00 is 1.0. Every scale below is a power of two, so scale * code
+#: is exactly representable in binary16 for every code in [-128, 127]. That
+#: is what makes the F16-equivalence test below an equality rather than a
+#: tolerance, and it lets the blocks carry DIFFERENT scales so a decoder
+#: that picks up the neighbouring block's scale cannot pass.
+Q8_0_SCALE = 1.0
+Q8_0_SCALES = [1.0, 0.5, 0.25, -2.0, 0.125, 4.0]
+
+
+def _q8_0_codes():
+    """int8 codes covering both signs, both zeros and the int8 extremes."""
+    return [(-128 + i * 8) % 256 - 128 for i in range(32)]
+
+
+def _q8_0_expect(codes, scales):
+    """d * q computed here with struct, sharing nothing with the reader."""
+    out = []
+    for b in range(0, len(codes), 32):
+        d = struct.unpack('<e', struct.pack('<e', scales[b // 32]))[0]
+        out.extend(d * q for q in codes[b:b + 32])
+    return out
+
+
+def _q8_0_exact(tmp):
+    """Decode hand-built blocks and compare against d * q computed here.
+
+    The expected value is derived from the codes and the scales with struct,
+    not with anything from gguf_reader, so a decoder that transposes the
+    block, reads the scale at the wrong offset, takes the neighbouring
+    block's scale or drops the int8 sign fails here rather than returning
+    plausible numbers (rules.md R9).
+
+    Four blocks with four DIFFERENT scales: a fixture that repeated one
+    scale everywhere would let a per-block indexing bug through - which a
+    mutation check on this suite demonstrated before the scales were
+    varied.
+    """
+    codes = _q8_0_codes() * 4
+    scales = [1.0, -0.5, 0.25, 8.0]
+    path = os.path.join(tmp, 'q80.gguf')
+    build_gguf(path, [('w', [4, 32], gguf_reader.T_Q8_0, codes, scales)])
+    with gguf_reader.GgufFile.open(path) as gguf:
+        got = gguf.decode_rows(gguf.tensors[0], 0, 4)
+
+    want = _q8_0_expect(codes, scales)
+    if len(got) != len(want):
+        return False
+    return all(a == b for a, b in zip(got, want))
+
+
+def _q8_0_row_slice(tmp):
+    """A partial row range must decode the same values as the whole tensor.
+
+    Row-major Q8_0 only keeps rows byte-aligned when the row length is a
+    multiple of 32. This picks a row length that is NOT (8 columns, 64
+    values), so every request but the first lands mid-block. Reading the
+    blocks that cover the range and slicing the edges off is what keeps the
+    answer correct; a decoder that assumed row alignment would not.
+    """
+    rows, cols = 24, 8          # 192 values = 6 blocks, one per scale below
+    codes = [(-100 + 7 * i) % 256 - 128 for i in range(rows * cols)]
+    scales = Q8_0_SCALES
+    path = os.path.join(tmp, 'q80rows.gguf')
+    build_gguf(path, [('w', [rows, cols], gguf_reader.T_Q8_0, codes, scales)])
+    want = _q8_0_expect(codes, scales)
+    with gguf_reader.GgufFile.open(path) as gguf:
+        tensor = gguf.tensors[0]
+        full = gguf.decode_rows(tensor, 0, rows)
+        for first in range(rows):
+            part = gguf.decode_rows(tensor, first, 1)
+            if list(part) != want[first * cols:(first + 1) * cols]:
+                return False
+            if list(part) != list(full[first * cols:(first + 1) * cols]):
+                return False
+        # and a two-row window in the middle
+        mid = gguf.decode_rows(tensor, 1, 2)
+        if list(mid) != want[cols:3 * cols]:
+            return False
+    return True
+
+
+def _q8_0_is_decodable(tmp):
+    """Q8_0 is block-quantised but decodable, so it must not be refused."""
+    codes = _q8_0_codes() * 2
+    path = os.path.join(tmp, 'q80list.gguf')
+    build_gguf(path, [('w', [2, 32], gguf_reader.T_Q8_0, codes, Q8_0_SCALE),
+                      ('blk.0.ffn_q.weight', [2, 32], 2, [0.0] * 64)])
+    with gguf_reader.GgufFile.open(path) as gguf:
+        tensor = gguf.tensors[0]
+        if not tensor.is_block_quantised or tensor.is_dense_float:
+            return False
+        if not tensor.is_decodable:
+            return False
+        if gguf_reader.GgufFile(
+                open(path, 'rb').read()).quantised_names() != ['blk.0.ffn_q.weight']:
+            return False
+        names = [t.name for t in gguf.decodable_candidates()]
+        if names != ['w']:
+            return False
+        # The byte size must be the block size, not n_elements * 1.
+        if tensor.size_bytes != 34 * (tensor.n_elements // 32):
+            return False
+    return True
+
+
+def _q8_0_matches_f16(tmp):
+    """The same weights as Q8_0 and as F16 must convert to the same model.
+
+    This is the end-to-end equivalence the audit asked for. The scale is 1.0,
+    so dequantising q gives exactly q, and q fits in binary16 with room to
+    spare - the two files therefore hold bit-identical values, and any
+    difference in the resulting .hydra would be a bug in the Q8_0 path, not
+    rounding. Both files hold exactly one readable tensor, so both take the
+    same "plane B is plane A's columns rolled" path.
+    """
+    rows, cols = 24, 8          # 192 values = 6 blocks, six different scales
+    codes = [(-128 + (i * 37) % 256) for i in range(rows * cols)]
+    codes = [c - 256 if c > 127 else c for c in codes]
+    scales = Q8_0_SCALES
+
+    # The F16 twin holds the dequantised values, computed here.
+    dequantised = _q8_0_expect(codes, scales)
+
+    q_path = os.path.join(tmp, 'eq_q.gguf')
+    build_gguf(q_path, [('token_embd.weight', [rows, cols],
+                         gguf_reader.T_Q8_0, codes, scales)])
+    f_path = os.path.join(tmp, 'eq_f16.gguf')
+    build_gguf(f_path, [('token_embd.weight', [rows, cols],
+                         gguf_reader.T_F16, dequantised)])
+
+    q_out = os.path.join(tmp, 'eq_q.hydra')
+    f_out = os.path.join(tmp, 'eq_f16.hydra')
+    buf_q, buf_f = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf_q):
+        rc_q = gguf_to_hydra.main([q_path, '--out', q_out, '--json',
+                                   '--max-rows', '0'])
+    with contextlib.redirect_stdout(buf_f):
+        rc_f = gguf_to_hydra.main([f_path, '--out', f_out, '--json',
+                                   '--max-rows', '0'])
+    if rc_q != 0 or rc_f != 0:
+        return False
+    a = read_hydra(q_out)
+    b = read_hydra(f_out)
+    if a['A'] != b['A'] or a['B'] != b['B']:
+        return False
+    if a['layers'] != b['layers'] or a['dim'] != b['dim']:
+        return False
+    # ...and the plane really was read from the Q8_0 tensor, not skipped.
+    plane = json.loads(buf_q.getvalue())['planes'][0]
+    return plane['type'] == 'Q8_0' and plane['tensor'] == 'token_embd.weight'
+
+
+def _q8_0_partial_block_refused(tmp):
+    """48 elements is one block plus 16 stragglers - the file is malformed.
+
+    The file is written well-formed and then the SECOND dimension in the
+    tensor directory is patched from 32 to 24 on disk, so this really is a
+    corrupt file rather than a fixture writer talking itself out of an
+    assertion.
+    """
+    path = os.path.join(tmp, 'q80odd.gguf')
+    build_gguf(path, [('w', [2, 32], gguf_reader.T_Q8_0, _q8_0_codes() * 2, Q8_0_SCALE)])
+    blob = open(path, 'rb').read()
+    marker = struct.pack('<Q', 1) + b'w' + struct.pack('<I', 2)
+    at = blob.find(marker)
+    if at < 0:
+        return False
+    dim2_at = at + len(marker) + 8          # skip dims[0]
+    patched = blob[:dim2_at] + struct.pack('<Q', 24) + blob[dim2_at + 8:]
+    with open(path, 'wb') as fh:
+        fh.write(patched)
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            gguf_reader.GgufFile(patched)
+        except gguf_reader.GgufError as exc:
+            return 'multiple of' in str(exc)
+    return False
+
+
+def _q8_0_truncated_refused(tmp):
+    """Cut the last block in half: the tensor no longer reaches the file end."""
+    path = os.path.join(tmp, 'q80trunc.gguf')
+    build_gguf(path, [('w', [2, 32], gguf_reader.T_Q8_0, _q8_0_codes() * 2, Q8_0_SCALE)])
+    blob = open(path, 'rb').read()
+    with open(path, 'wb') as fh:
+        fh.write(blob[:len(blob) - 17])
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            gguf_reader.GgufFile(open(path, 'rb').read())
+        except gguf_reader.GgufError as exc:
+            return 'past the end' in str(exc)
+    return False
 
 
 def _inspect(path, arch):

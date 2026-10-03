@@ -20,7 +20,11 @@ android/
 
 The CMake build compiles the **same** `src/hydra_engine.c` used by the
 desktop CLI — no fork of the engine. On ARM ABIs the NDK defines
-`__ARM_NEON`, so the NEON kernel path is active automatically.
+`__ARM_NEON`, so the NEON path is **compiled in** and selected at runtime on
+those ABIs. *Verification scope:* the NEON kernel is proven bit-identical to
+the scalar reference in an ARM64 build under qemu (`make test-run`), but
+**runtime behaviour on a physical ARM Android device has not been validated** —
+no such device was available.
 
 ## Requirements
 

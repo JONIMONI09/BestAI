@@ -37,7 +37,11 @@
   inversion (PoC: x86 `211,388,...` vs. ARM `211,28,...`) and layer
   overflow (UB) fixed, plus 12 further findings; `test_neon_matches_scalar`
   compares NEON and scalar **in the same build** and immediately found a
-  second, latent lane-offset bug. 49 tests x86 / 51 ARM.
+  second, latent lane-offset bug. 49 tests x86 / 51 ARM. **[historical,
+  superseded]** — those counts were true on that date; the suite has grown
+  since. The current counts are parsed from the test binaries by
+  `tools/test_count_check.sh` (see `tools/test_count_baseline.txt`), never
+  written down here.
 - ✅ **2026-10-02 — Web console, skills, Android APK:** see
   "Done (earlier today)" and `docs/ANDROID_SKILL.md`.
 
@@ -80,6 +84,305 @@
       emit `[471, 386, 385, 386, 385, 386, 385, 386]`.
 
 ## Current task
+
+**Adversarial doc-audit (2 external prompts) + v2 planning for a Snapdragon 8
+Elite / Android 15 tablet.** Two prompts overlap: they assert 12 doc defects,
+some code gaps (Q8_0, import 429 guard), and a 6-phase v2 sparse-expert plan.
+
+**Rule R26 + the prompt's own instruction: verify before applying.** HEAD is
+`0fa13ed`, NOT the `eba5cce` the prompts cite, so every claim is re-checked
+against the working tree before a single edit.
+
+### Plan
+
+- [x] **A0. Verify each of the 12 asserted doc defects** against the real files.
+      Apply only what is true; record the ones that are stale/false.
+      **All 12 confirmed real** (details below). All applied except #11,
+      which is applied at the end of this section (it edits this file).
+- [x] **A0b. CI assertion-count gate** — parse the count from the test binary
+      and fail on drift. No hard-coded number (R32 + audit #12).
+      `tools/test_count_check.sh` + `tools/test_count_baseline.txt`, wired
+      into `ci.yml` for both the x86-64 and the ARM64/NEON job.
+- [x] **A0c. Banned-claim lint** — `tools/docs_claim_check.sh`, four checks,
+      wired into `ci.yml` (lint job) and `lint.yml` (new `docs-lint` job).
+- [x] **A1. Q8_0 dequant** in `tools/gguf_reader.py` (34 B/block, w = d*q) +
+      exact binary fixtures + F16-equivalence test. Seven new checks.
+- [x] **A1b. `/api/models/import` single-active guard** -> HTTP 429, reset on
+      every path (`try/finally`). Three new server tests.
+- [x] **A1c. Tablet baseline** — **BLOCKED, NOT MEASURED.** No Snapdragon 8
+      Elite / Android 15 device is reachable from this container. No number in
+      this repository is presented as a device measurement. Details in the
+      "A1 — code fixes" section below.
+- [x] **B. `docs/FORMAT-V2.md` spec only** — no loader code in this phase.
+- [x] Report: deliberation log, measured results with provenance, gates
+      passed/blocked, limitations.
+
+### A0 follow-up — a CI defect in the gate I added
+
+While checking the deliverables rather than the code, one real defect surfaced
+in the ARM count step I had wired into `ci.yml`: it ran
+`test_count_check.sh ./hydra-test-arm arm`, and the script executes the binary
+it is given. That binary is AArch64; the runner is x86-64. It passes here
+because `qemu-user-static` has registered `binfmt_misc` in this container —
+it would have depended on a GitHub runner doing the same. `test_count_check.sh`
+now takes an optional command prefix and CI passes `qemu-aarch64-static`
+explicitly. Logged in `errors.md`.
+
+### A1 — code fixes, and how they were proven
+
+**A1.1 Q8_0 dequantisation** (`tools/gguf_reader.py`). The format is short
+enough to read without guessing, so it is read exactly: a 34-byte block is an
+F16 scale followed by 32 signed int8 values, `w[i] = d * qs[i]`. Scales and
+values are both interleaved in the file, so both are gathered with strided
+slice assignment rather than a Python loop over blocks.
+
+- `Tensor.byte_size()` derives the size for Q8_0 and **raises** when the
+  element count does not tile whole blocks (rules.md R14 — a length-deriving
+  field that does not divide is a malformed file, not something to round).
+- `decode_rows()` reads the blocks that cover a row range and slices the
+  edges, so a row length that is not a multiple of 32 still decodes exactly.
+- `decodable_candidates()` / `quantised_names()` now separate "can be read"
+  from "is refused". Q8_0 is block-quantised **and** decodable; saying
+  otherwise would be the same class of error this task exists to fix.
+
+*Proof:* seven new checks in `tools/gguf_test.py` (38 total, up from 31), plus
+one live-server test (37 total, up from 33). **Four deliberate decoder bugs**
+were injected; all three value checks caught every one:
+
+| Injected bug | `_q8_0_exact` | `_q8_0_row_slice` | `_q8_0_matches_f16` |
+|---|---|---|---|
+| scale taken from the neighbouring block | CAUGHT | CAUGHT | CAUGHT |
+| the 32 codes rotated by one | CAUGHT | CAUGHT | CAUGHT |
+| int8 sign flipped | CAUGHT | CAUGHT | CAUGHT |
+| scale ignored, raw int8 returned | CAUGHT | CAUGHT | CAUGHT |
+
+The first mutant originally **passed** — every fixture used one repeated
+scale. That was a real coverage gap, fixed by giving each block a different
+power-of-two scale, which keeps the F16-equivalence check an equality rather
+than a tolerance. Logged in `errors.md`.
+
+**A1.2 Single-active-import guard** (`server.js`). At most one
+`POST /api/models/import` at a time; a concurrent one gets **HTTP 429** with
+`Retry-After` and `busy: true`. The flag is released in a `finally`, so every
+exit path — success, 400, 413, converter crash, client hang-up — returns it.
+
+*Proof:* three new server tests. The 429 test polls for the `.import-*.gguf`
+temp file rather than sleeping, so it cannot silently pass by never
+overlapping. **Negative control:** with the guard disabled the test fails with
+`got 200`; the server was restored byte-identically afterwards (`diff` against
+a pre-test copy).
+
+**A1.3 Tablet baseline — BLOCKED, NOT MEASURED.**
+
+No Snapdragon 8 Elite / Android 15 tablet is reachable from this container.
+**No peak RSS, no ns/token, no bytes/token and no page-fault figure exists for
+the target device**, and none is estimated anywhere in this repository. The
+one deliberate exception is spelled out in `docs/FORMAT-V2.md` §6.3 as an
+explicitly-marked placeholder: the planning arithmetic is parameterised on
+`B_eff` and the two bracketing estimates are labelled **invalid**, because
+they assume a stream that sparse expert reads are not. Colibri's own measured
+figures (12.7 GB of routed experts per token; 0.05–0.1 tok/s cold on a 25 GB
+box) are cited with their provenance as an order-of-magnitude check, not as
+this project's result.
+
+A desktop `pread` micro-benchmark in this container was considered and
+**rejected**: it measures NVMe behind a page cache under Linux, not UFS 4.0
+under Android, and a number from the wrong storage stack is precisely the
+failure this whole task exists to fix. Recorded in `errors.md`.
+
+### A0 — what the audit found, verified against the working tree
+
+HEAD at the time of the audit was `0fa13ed`, not the `eba5cce` both prompts
+cite. Every finding was re-checked by reading the actual file before editing
+it; all twelve turned out to be real, not stale:
+
+| # | Finding | Verified against | Fixed in |
+|---|---|---|---|
+| 1 | "Zero-RAM" in the README title | `README.md:1` vs. the `errors.md` entry that already called it unproven | `README.md` |
+| 2 | "step() walks the whole weight region per token" | `docs/ARCHITECTURE.md`; contradicts `hydra_build_aggregation()` in `src/hydra_engine.c` | `docs/ARCHITECTURE.md` |
+| 3 | FORMAT rule 7 describes a per-token traversal | `docs/FORMAT.md`; `hydra_engine_step()` never reads the weight region | `docs/FORMAT.md` |
+| 4 | README size table implies v1 holds 1.5 B parameters | `include/hydra_model.h` caps weights at 256 KiB | `README.md` |
+| 5 | "packs 4 weights per byte, which doubles file size" | internal contradiction with line 359 of the same file | `README.md` |
+| 6 | gpu_bench example JSON says `"measured":true` under "NOT MEASURED" | `tools/gpu_bench/README.md` | same |
+| 7 | Five conflicting counts in the skill file | `.claude/skills/engine-ci-verify/SKILL.md` | same |
+| 8 | `rules.md` R21 hard-codes 49 | `rules.md` | same |
+| 9 | "the NEON path is active automatically" | `android/README.md`; no physical ARM device has ever run this | same |
+| 10 | Performance numbers with no host named | `README.md` Performance section | same |
+| 11 | Historical sections with drifted numbers | `session.md` | `session.md` |
+| 12 | CI enforces no test count | `.github/workflows/ci.yml` | `ci.yml` + new scripts |
+
+Findings 7 and 8 turned out to be worse than the audit said: after the first
+pass removed the counts the new lint found **three more** stale ones in the
+same skill file (lines 66, 69, 130). That is the falsifiability evidence for
+the lint, and it is why the lint had to run before the gate was called green.
+
+### Measured in this task (provenance)
+
+| Fact | How it was measured | When |
+|---|---|---|
+| x86-64 assertion count = 71 | `./hydra-test`, parsed from its own output | 2026-10-03, this container |
+| ARM64/NEON assertion count = 77 | `aarch64-linux-gnu-gcc-12 -static` under `qemu-aarch64-static` | 2026-10-03, this container |
+| GGUF suite = 38 checks, 0 failed | `python3 tools/gguf_test.py --engine ./hydra-run` | 2026-10-03 |
+| Server suite = 36 tests, 0 failed | `node --test tools/server_test.js` | 2026-10-03 |
+| Q8_0 dequant is exact | 4 hand-built blocks, 4 different scales, compared against `d*q` computed with `struct` | 2026-10-03 |
+| Import guard returns 429 | live server, two overlapping POSTs, second one while the first's temp file exists | 2026-10-03 |
+
+### Three-role adversarial review (before implementation)
+
+#### Role 1 — Critic (physical and semantic constraints)
+
+The strongest objection is to the *premise* of the v2 phases, not to any
+detail of them. Every storage figure quoted in the prompts is a **sequential**
+figure, and MoE expert streaming is not sequential.
+
+- **Evidence (primary source, fetched 2026-10-03):**
+  benchmarks.ul.com's Xiaomi Pad 8 Pro page — the same Snapdragon 8 Elite
+  class of device — reports, as the median of user submissions to PCMark for
+  Android Storage 2.0: internal **sequential read 3,328 MB/s** but internal
+  **random read 55 MB/s**. Same page, same device, same run.
+- **Evidence (primary source, fetched 2026-10-03):** Colibri's own README
+  states GLM-5.2's routed experts cost **12.7 GB per token**, and that the
+  project measures **0.05–0.1 tok/s cold** on a 25 GB desktop, which it calls
+  "the proven floor".
+- **Therefore:** `tokens/s <= B_eff / bytes_per_token` evaluated at
+  3,328 MB/s gives an upper bound of ~0.26 tok/s for GLM-5.2 — and that
+  bound *assumes a perfectly sequential stream, which the workload is not*.
+  Evaluated at the same device's measured random-read figure the number is
+  two orders of magnitude worse. The planning model is sound; using
+  `B_seq` where the model says `B_eff` is the error.
+- **Second objection:** dense streaming and sparse expert streaming are
+  different problems wearing the same word. Dense streaming can prefetch a
+  contiguous run and amortise the seek. Sparse routing is, per layer, a few
+  `pread` calls at addresses the previous layer did not predict perfectly —
+  Colibri's own **71.6%** is one-layer-ahead *predictability*, which is an
+  upper bound on what prefetch can save and is **not** a cache-hit rate.
+  Treating 71.6% as a hit rate would overstate Phase E by roughly the
+  difference between those two quantities.
+- **Third objection:** the prompts' Phase D budget line
+  ("resident + slots*expert_bytes + state/KV + work buffers + system
+  headroom") omits the file-backed page cache, which is physical RAM on
+  Android and is charged to the app's RSS until it is reclaimed. A budget
+  that does not name it is not a budget.
+
+#### Role 2 — Math & Web Researcher (labels: MEASURED / SPEC / ESTIMATE)
+
+| Quantity | Value | Label | Source |
+|---|---|---|---|
+| PCMark internal sequential read, Xiaomi Pad 8 Pro (SD 8 Elite) | 3,328 MB/s | **MEASURED** (median of user submissions, *not* a lab result; device runs Android 16, not 15) | benchmarks.ul.com, fetched 2026-10-03 |
+| PCMark internal random read, same device | 55 MB/s | **MEASURED** (same caveats; block size not stated on the page) | same |
+| Samsung UFS 4.0 sequential read | 4,200 MB/s | **SPEC** — manufacturer peak datasheet, not any device's sustained rate | semiconductor.samsung.com |
+| Colibri resident dense weights (GLM-5.2) | ~9.9 GB | **MEASURED** by that project, reported in its README | github.com/JustVugg/colibri README, fetched 2026-10-03 |
+| Colibri routed experts | 19,456 (75 layers x 256 + MTP head), ~19 MB each int4 | **MEASURED** by that project | same |
+| Colibri system RAM requirement | 16 GB min / 24 GB comfortable | **SPEC** of their container — *not* the dense size | same |
+| Colibri 71.6% | one-layer-ahead routing predictability | **MEASURED** by that project; **not** a hit rate | same |
+| Colibri routed bytes per token | 12.7 GB (GLM-5.2), 4.5 GB (DeepSeek V4.1 Flash) | **MEASURED** by that project | same |
+| `B_eff` on the target tablet | — | **NOT MEASURED. Blocked.** | no device reachable |
+| Any tokens/s figure for this project on the target tablet | — | **NOT MEASURED. Blocked.** | no device reachable |
+
+Reconciliation against the prompts' own numbers: everything they list for
+Colibri checks out against the README, **with the qualifications intact** —
+the 16/24 GB figures are system RAM, the 71.6% is routing predictability, and
+4,200 MB/s is a datasheet peak. Nothing in the prompts was found to be false.
+
+#### Role 3 — Systems Architect (staged design, gates, responses)
+
+Responding to the Critic's strongest objection directly: **do not build Phase
+D before the disk can be characterised.** The Critic is right that a bounded
+LRU cache is the right design and also that its usefulness is bounded by a
+number nobody has measured. The resolution is to make `B_eff` a *required
+input to the gate*, not a design constant:
+
+- Gate D becomes "measured RSS within budget **and** measured `B_eff` on the
+  same device in the same session". A cache that is within budget but slower
+  than streaming straight through is a failed gate, not a passing one.
+- `docs/FORMAT-V2.md` therefore carries a worked budget whose throughput
+  section is explicitly parameterised on `B_eff`, with the worked number
+  marked **PLACEHOLDER — NOT MEASURED**, and the Colibri figure used only as
+  an order-of-magnitude sanity check with its provenance attached.
+- Both bounds on every offset/length/count are specified as a rule, because
+  this repository's own history has a real missing-lower-bound bug; the spec
+  states it as a checklist item rather than as advice.
+
+#### Deliberation summary
+
+| Disagreement | Resolution |
+|---|---|
+| Critic: "3,328 MB/s makes the MoE plan look fine." Architect: "it does not, and the prompts' own model already says so." | **Unanimous against the sequential figure.** `B_eff` stays a measured input; the spec and every planning number are parameterised on it. The 3,328 MB/s figure is retained only as a labelled *sequential* upper bound, never as `B_eff`. |
+| Critic: "71.6% sounds like a cache hit rate." Researcher: "it is not; the README says 'predictable one layer ahead'." | **Unanimous.** Phase E's gate measures predicted-vs-actual routing and reports hit rate separately. The 71.6% figure appears in the spec only with that wording. |
+| Architect wanted the tablet benchmark run first. Critic: it is the one thing that cannot be faked, and also the one thing unavailable. | **Split.** A1c is recorded as **BLOCKED, NOT MEASURED** with the reason, and the harness requirement is written down so the run is a single command later. No estimate is promoted to a measurement. |
+| Researcher proposed adding a synthetic micro-benchmark for `pread` on the container as a stand-in. Architect: a desktop container's `pread` on NVMe says nothing about UFS 4.0 under Android. | **Rejected.** A number from the wrong storage stack would be exactly the failure this whole task exists to fix. Recorded in `errors.md`. |
+
+### Phase B — `docs/FORMAT-V2.md` (specification only)
+
+**No v2 loader was written.** `src/hydra_v2_reader.c` does not exist and no
+v2 file can be opened; the document says so in its first line. What it does
+specify: 64-bit little-endian offsets and lengths; a 128-byte header with
+`file_size` so a truncated transfer is detectable; a resident trunk (router,
+embeddings, norms, shared experts) that is the only thing mapped at open; an
+expert directory of 48-byte entries carrying `(layer, expert_id, offset,
+length, first_element, type_id, crc32)`; contiguous payloads assigned in
+directory order so one expert is one `pread`; routing metadata with
+`v2.top_k` **required, never defaulted**; both bounds validated on every
+offset, length and count with the missing-lower-bound bug named as the reason
+the rule exists; the supported architecture and tensor-type tables written
+out explicitly, including the ones deliberately **not** implemented; and a
+worked 10 GB memory and throughput budget whose `B_eff` is a clearly-marked
+unmeasured placeholder.
+
+Gate B is **spec review**, and this is the document under review. Four open
+questions are listed at the end rather than silently decided — the largest is
+whether CRC-32 is worth a pass over every byte read when read bandwidth is
+already the bottleneck.
+
+### Gates
+
+| Gate | Status | Evidence |
+|---|---|---|
+| A0 — doc & CI integrity | **PASS** | 12/12 findings fixed; both new gates wired into `ci.yml` and `lint.yml`; `git status` shows the workflow edits |
+| A0 negative controls | **PASS** | `test_count_check.sh` with a wrong baseline → exit 1; `docs_claim_check.sh` on planted claims → exit 1 (all four checks proven) |
+| A1 — code fixes, x86-64 | **PASS** | C 71/71, GGUF 38/38, Node 37/37, ESLint clean, cppcheck clean |
+| A1 — code fixes, ARM64/NEON | **PASS (cross-build under qemu)** | 77/77, count gate green |
+| A1.3 — tablet baseline | **BLOCKED — NOT MEASURED** | no target device reachable |
+| B — v2 specification | **DELIVERED, AWAITING REVIEW** | `docs/FORMAT-V2.md` |
+| C–F — reader, cache, prefetch, benchmark | **NOT STARTED, BY DESIGN** | B must be reviewed first; D and F need the tablet |
+
+### Limitations that stand
+
+- No physical ARM Android device has run this. ARM evidence is an AArch64
+  cross-build under qemu plus a native Apple Silicon CI runner.
+- The Q8_0 support is in the **Python GGUF import path only**. There is no C
+  reader for it yet, so a `.hydra2` file containing Q8_0 is specified, not
+  implemented.
+- `B_eff`, peak RSS, ns/token, bytes/token and page faults on the target
+  device: **not measured**, not estimated.
+- The Q8_0 dequantiser is correct for `w = d * q` on 32-value blocks. It is
+  **not** a general GGUF block-format implementation: `Q8_1` (which carries a
+  second `min` term), `Q4_0`, `Q4_1`, `Q5_*`, the K-quants and `MXFP4` are
+  still refused by name.
+- The release APK is debug-key signed; a real key needs the four
+  `HYDRA_KEYSTORE*` repository secrets.
+
+### Files changed in this task
+
+**Modified:** `README.md`, `docs/ARCHITECTURE.md`, `docs/FORMAT.md`,
+`docs/GGUF-IMPORT.md`, `android/README.md`, `tools/gpu_bench/README.md`,
+`.claude/skills/engine-ci-verify/SKILL.md`, `rules.md`, `errors.md`,
+`session.md`, `.github/workflows/ci.yml`, `.github/workflows/lint.yml`,
+`server.js`, `public/app.js`, `tools/gguf_reader.py`, `tools/gguf_to_hydra.py`,
+`tools/gguf_inspect.py`, `tools/gguf_test.py`, `tools/gguf_fixture.js`,
+`tools/server_test.js`.
+
+**New:** `docs/FORMAT-V2.md`, `tools/test_count_check.sh`,
+`tools/test_count_baseline.txt`, `tools/docs_claim_check.sh`.
+
+### Constraints honoured
+
+- **R32 / hard warning 2:** the target tablet is NOT available here. Any
+  device number is reported "blocked, not measured" — never estimated.
+- **R14/R17:** no merge; v1 stays byte-compatible; v2 is separately versioned.
+- Hard warning 4: supported architectures/tensor types listed explicitly.
+
+## Previous task (superseded)
 
 **GGUF import + measured load performance + a truthful README, all verified on
 a running emulator.** 20 GB support (header v2) is still open.
@@ -285,7 +588,9 @@ a running emulator.** 20 GB support (header v2) is still open.
 - [x] Test output string aligned with the documentation: the C test
       suite prints `Tests, failures` in English, and the regression
       test expectation in the skill file matches
-- [x] Verification: `make test` → `=== 49 Tests, 0 failures ===`; final
+- [x] Verification: `make test` → `=== 49 Tests, 0 failures ===` **[historical,
+      superseded]** — the count has grown since; see
+      `tools/test_count_baseline.txt`. Final
       grep over all tracked `.md` files finds no German left
 - [x] Final grep for German leftovers in `.md` files → none
 - [x] PR #16 merged by the user (merge commit `1cc31d7`), main verified
