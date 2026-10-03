@@ -146,19 +146,44 @@ static void print_json(const HydraEngine *e, const uint16_t *tokens,
  * Warmup: ein kompletter Durchlauf ueber das Modell, damit die
  * mmap-Seiten im Page-Cache liegen. Ohne Warmup misst man in erster
  * Linie den Page-Cache, nicht den Kernel. */
-static double bench_run(const char *model_path, uint16_t start_token, long steps,
-                        int fast_mode, uint16_t *first_out, HydraEngine *stats)
+/* Which path bench_run() measures. */
+typedef enum { HYDRA_BENCH_FULL = 0, HYDRA_BENCH_FAST = 1 } BenchMode;
+
+/* What to run. These three used to be three adjacent scalar parameters
+ * (uint16_t token, long steps, int mode). Every one of them implicitly
+ * converts into the others, so `bench_run(path, steps, token, 1)` compiles,
+ * runs, and reports a plausible number for the wrong experiment
+ * (bugprone-easily-swappable-parameters). Bundling them makes the mistake
+ * impossible to express: the fields are named, not positional. */
+typedef struct {
+    uint16_t start_token;
+    long     steps;
+    BenchMode mode;
+} BenchRequest;
+
+static double bench_run(const char *model_path, const BenchRequest *req,
+                        uint16_t *first_out, HydraEngine *stats)
 {
     HydraEngine e;
+    /* Zeroed so that `*stats = e` copies a fully-defined struct: the loader
+     * fills the fields it needs and the caller prints others, and copying
+     * indeterminate padding into a struct that is later printed is a real
+     * way to hand the analyser (and valgrind) undefined bytes. */
+    memset(&e, 0, sizeof e);
+    /* Publish a defined "not measured" state BEFORE any early return. The
+     * load-failure path below returns without touching *stats, so a caller
+     * that looked at it first would read uninitialised stack. -1 is the
+     * engine's own "unknown" marker and the caller already tests for it. */
+    if (stats) { memset(stats, 0, sizeof *stats); stats->rss_kb_before_load = -1; stats->resident_kb_after_load = -1; }
     if (hydra_engine_load(&e, model_path) != 0) return -1.0;
     if (stats) *stats = e;
 
     /* Warmup: ein voller Durchlauf, damit die mmap-Seiten im Page-Cache
      * liegen. Ohne das misst man den Page-Cache, nicht den Kernel. */
-    uint16_t tok = start_token;
+    uint16_t tok = req->start_token;
     for (long i = 0; i < e.header.layers; ++i) {
         uint16_t n = 0;
-        if (fast_mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
+        if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
         else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
         tok = n;
     }
@@ -168,16 +193,16 @@ static double bench_run(const char *model_path, uint16_t start_token, long steps
      * eine GPU-Vergleichsmessung zeigen soll. */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (long s = 0; s < steps; ++s) {
+    for (long s = 0; s < req->steps; ++s) {
         uint16_t n = 0;
-        if (fast_mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
+        if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
         else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
         tok = n;
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     double ns = ((double)(t1.tv_sec - t0.tv_sec) * 1e9 +
-                 (double)(t1.tv_nsec - t0.tv_nsec)) / (double)steps;
+                 (double)(t1.tv_nsec - t0.tv_nsec)) / (double)req->steps;
     if (first_out) *first_out = tok;
     hydra_engine_unload(&e);
     return ns;
@@ -196,11 +221,13 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
      * Zustand, und ein zweiter Lauf auf einem gesättigten Vektor ist ein
      * anderes Experiment als ein frischer Start. */
     uint16_t sink = 0;
-    HydraEngine full_stats;
-    double ns_full = bench_run(model_path, start_token, steps, 0, &sink, &full_stats);
+    HydraEngine full_stats = {0};   /* bench_run publishes the real values, or -1 */
+    const BenchRequest full_req = { start_token, steps, HYDRA_BENCH_FULL };
+    double ns_full = bench_run(model_path, &full_req, &sink, &full_stats);
     if (ns_full < 0) { fprintf(stderr, "[Hydra] Bench: Modell konnte nicht geladen werden\n"); return 1; }
     uint16_t sink_fast = 0;
-    double ns_fast = bench_run(model_path, start_token, steps, 1, &sink_fast, NULL);
+    const BenchRequest fast_req = { start_token, steps, HYDRA_BENCH_FAST };
+    double ns_fast = bench_run(model_path, &fast_req, &sink_fast, NULL);
     if (ns_fast < 0) { fprintf(stderr, "[Hydra] Bench: Fast Path fehlgeschlagen\n"); return 1; }
 
     /* Beide Ströme muessen identisch sein - sonst vergleicht der Benchmark

@@ -166,17 +166,17 @@ The inference step is now two multiply-adds per dimension, not two per
 
 ```
 python3 tools/make_model.py models/starter.hydra
-./hydra-run models/starter.hydra 0 --bench 20000
+./hydra-run models/starter.hydra 0 --bench 50000
 {"mode":"bench","engine":"cpu","model":"models/starter.hydra","dim":64,"layers":4,
- "vocab":512,"steps":20000,"warmup_layers":4,"ns_per_token_full":140.60,
- "ns_per_token_fast":15.75,"speedup":8.929,"tokens_equal":true,"load_ms":0.037,
+ "vocab":512,"steps":50000,"warmup_layers":4,"ns_per_token_full":137.03,
+ "ns_per_token_fast":16.49,"speedup":8.311,"tokens_equal":true,"load_ms":0.015,
  "weights_bytes":256,"rss_before_kb":948,"rss_after_kb":948,"rss_delta_kb":0,
  "note":"JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device"}
 ```
 
 `load_ms` and `rss_delta_kb` are measured, not asserted: the loader reports how long the map took and how much resident memory the run added. For this model `rss_delta_kb` is **0**, because the 256 weight bytes are mmap'd and never copied — the kernel owns those pages.
 
-The `ns_per_token_*` figures are from one run on the host and move by a few percent between runs (a fresh `--bench 20000` on the same machine gave `141.43` / `17.27`); they are a sample, not a specification. `load_ms` and `rss_delta_kb` are the stable results — sub-millisecond mapping and zero RSS growth regardless of timing noise.
+The `ns_per_token_*` figures are from one warm run on an idle host and move noticeably when the machine is busy (repeat runs on the same box gave 141.90 / 15.96 and 160.41 / 26.44). They are a sample, not a specification; take the median of a few runs. `load_ms` and `rss_delta_kb` are the stable results — sub-millisecond mapping and zero RSS growth regardless of timing noise.
 
 * **Layer aggregation** — `A[i] = sum_l w1[l][i]` and `B[i] = sum_l w2[l][i]`
   are computed once at load time, because the token and the state vector

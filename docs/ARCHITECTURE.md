@@ -66,7 +66,9 @@ No FP32/FP16 multiplication in the inner loop → maximum ALU throughput even wi
 | ARM, `dim % 16 != 0` | NEON for multiples of 16, scalar for the remainder | active |
 | x86 / x86-64 | purely **scalar** | no SIMD — AVX2 on the roadmap |
 
-Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Confirmed empirically on three targets — host x86-64, ARM64/NEON under qemu, and the x86_64 Android emulator — which all emit `[471, 42, 471, 42, 471, 42, 471, 42]` for `models/starter.hydra` with `start_token=42` and 8 steps.
+Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Confirmed empirically on three targets — host x86-64 (scalar), ARM64/NEON under qemu, and the x86_64 Android emulator — which all emit `[471, 386, 385, 386, 385, 386, 385, 386]` for `models/starter.hydra` with `start_token=42` and 8 steps.
+
+Note that the sequence is *not* a constant cycle. `B[0] != 0` in the shipped starter model, so the recurrent state genuinely contributes to `acc[0]` and the output varies. An earlier starter model had `B[0] == 0`, which made it state-blind: it looped `471, 42, 471, 42` forever and `--prompt` could have no observable effect. `tools/make_model.py` now guarantees `A[0] != 0` and `B[0] != 0` by construction and asserts it.
 
 NEON overflow analysis: `|w| ≤ 1`, `|token| ≤ 1023`, `|state| ≤ 127` → per-lane product ≤ 1150, safely within int16; accumulation happens in an `int64_t` array, which cannot overflow for any layer count the loader accepts.
 

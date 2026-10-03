@@ -1175,3 +1175,82 @@
 - **Prevention:** every new gate gets a negative control *before* it is
   trusted. The first version of this one passed every run, which is exactly
   what a worthless gate looks like.
+
+## CI failed the prompt check while the prompt code was correct
+
+- **Symptom:** `AssertionError: a longer prompt must change the output` in the
+  "Prompt prefill reaches the engine" CI step, exit 1.
+- **Cause:** `tools/make_model.py` produced a model whose column-0 sums had
+  `B[0] == 0`. The token decoder reads exactly one value,
+  `acc[0] = A[0]*token + B[0]*state[0]`, so with `B[0] == 0` the state term
+  vanishes and **prefill cannot change the output for that model** - no matter
+  how correct the prefill code is. The starter model was *state-blind*: it
+  looped `471, 42, 471, 42` forever, and the assertion blamed the engine.
+  The generator's own docstring claimed "A and B both non-zero", which was
+  true somewhere in the vector and false at the only index that matters.
+- **Proof:** with a hand-built model having `B[0] = 1`, seed 5 yields
+  `[11, 33, 109]` while `--prompt 1,5` yields `[13, 41, 137]` - different, as
+  it should be. The engine was never broken.
+- **Fix:** `build()` now *guarantees* `A[0] != 0` and `B[0] != 0`. Setting one
+  entry to `+1` is not enough - the other layers can cancel it - so the last
+  layer's column-0 entry takes the value that makes the **total** non-zero
+  (`+1` unless the other layers sum to exactly `-1`). The invariant is asserted
+  in the generator and checked across `layers 1..63 x dim 1..8`.
+- **Prevention:** when a format exposes only one index to a decoder, a
+  generator must guarantee *that* index, not "the vector is non-zero
+  somewhere". And when an assertion fails, check whether the fixture can
+  express the property before touching the code under test.
+
+## bench_run returned without initialising the caller's stats
+
+- **Symptom:** `clang-analyzer-core.UndefinedBinaryOperatorResult` —
+  "The left operand of '>=' is a garbage value" on
+  `full_stats.rss_kb_before_load`.
+- **Cause:** real, though unreachable *today*. `bench_run()` returned `-1.0`
+  on `hydra_engine_load()` failure **without writing `*stats`**. The caller
+  happens to check `ns_full < 0` before reading the struct, so no wrong value
+  was ever produced - but the safety depended entirely on statement order in a
+  different function. `*stats = e` also copied whatever padding the loader
+  left in `e`.
+- **Fix:** `bench_run` publishes a defined "not measured" state
+  (`memset` + `rss_* = -1`, the engine's own "unknown" marker) before any early
+  return, and `e` is zeroed so the struct copy is fully defined. `full_stats` is
+  initialised at its declaration too.
+- **Prevention:** a function with an out-parameter should define that
+  parameter on **every** path. An initialised struct is cheap; an
+  uninitialised read that happens to be ordered correctly is not.
+
+## sscanf could not report a conversion failure
+
+- **Symptom:** `cert-err34-c` on `sscanf(buf, "%lu %lu", &total, &resident)`.
+- **Cause:** `sscanf` returns a count but not *why* it failed. A truncated or
+  malformed `/proc/self/statm` line would leave `resident` at its initialiser
+  `0` and report a perfectly plausible **0 KiB RSS** - a silent measurement
+  failure that reads as a real result.
+- **Fix:** `strtoul` with an endptr; the value is only accepted when the first
+  field parsed *and* a second numeric field follows.
+- **Prevention:** never let a measurement return a plausible default when the
+  input was not understood. Returning `-1` (the engine's "unknown" marker) is
+  correct; returning `0` is a fabricated number.
+
+## An enum "fix" that satisfied the default clang-tidy run and the CI one
+
+- **Symptom:** after replacing `int fast_mode` with a `BenchMode` enum,
+  `clang-tidy src/main.c src/hydra_engine.c -- -std=gnu99 -Iinclude`
+  reported **0 findings** - but the real CI step kept failing with
+  `bugprone-easily-swappable-parameters`.
+- **Cause:** I had verified the *wrong invocation*. CI runs
+  `--checks='-*,clang-analyzer-*,bugprone-*,cert-*,-cert-err33-c,concurrency-*,-concurrency-mt-unsafe'`
+  **and includes `tests/test_engine.c`**, which my local command omitted. More
+  importantly, an enum is still implicitly convertible to and from every
+  integer type in C, so `uint16_t`, `long` and the enum remained three
+  adjacent mutually-convertible parameters. The check was right; the "fix"
+  only hid the shape of the API, not the risk.
+- **Fix:** bundled the three scalars into a `BenchRequest` struct
+  (`{start_token, steps, mode}`) passed by pointer. The mistake is now
+  impossible to *express* - the fields are named, not positional - instead of
+  being merely unlikely.
+- **Prevention:** run the lint command exactly as CI writes it, including its
+  `--checks` list and every input file. "My linter is clean" is only evidence
+  if it was the same linter with the same flags; a green run with default
+  checks proves almost nothing about a CI job that selects checks explicitly.
