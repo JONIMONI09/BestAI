@@ -70,12 +70,22 @@ static long hydra_resident_kb(void)
         close(fd);
         if (n > 0) {
             buf[n] = '\0';
-            /* size resident shared text lib data dt, in pages */
-            unsigned long total = 0, resident = 0;
-            if (sscanf(buf, "%lu %lu", &total, &resident) == 2) {
-                long page_kb = sysconf(_SC_PAGESIZE) / 1024;
-                if (page_kb < 1) page_kb = 4;
-                return (long)(resident * (unsigned long)page_kb);
+            /* size resident shared text lib data dt, in pages.
+             * strtoul instead of sscanf("%lu %lu"): sscanf cannot report a
+             * conversion failure, so a malformed line would silently leave
+             * `resident` at 0 and report a plausible-looking 0 KiB. strtoul
+             * gives us the endptr, so a partial or bad read is rejected. */
+            char *end = NULL;
+            unsigned long total = strtoul(buf, &end, 10);
+            if (end != buf) {
+                while (*end == ' ' || *end == '\t' || *end == '\n') end++;
+                if (*end >= '0' && *end <= '9') {
+                    unsigned long resident = strtoul(end, NULL, 10);
+                    (void)total;
+                    long page_kb = sysconf(_SC_PAGESIZE) / 1024;
+                    if (page_kb < 1) page_kb = 4;
+                    return (long)(resident * (unsigned long)page_kb);
+                }
             }
         }
     }

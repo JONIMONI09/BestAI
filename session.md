@@ -51,6 +51,34 @@
   by user)
 - ✅ All PRs from that line are now closed: #7–#14 merged
 
+### CI fix round (2026-10-03)
+
+- [x] **Blocking CI failure fixed at the root.** `AssertionError: a longer
+      prompt must change the output` was **not** a prompt bug: the starter
+      model had `B[0] == 0`, so the decoder's `acc[0] = A[0]*token +
+      B[0]*state[0]` dropped the state term entirely and prefill could not
+      possibly change the output. `tools/make_model.py` now guarantees
+      `A[0] != 0` and `B[0] != 0` by construction and asserts it. Verified:
+      seed 5 → `[11, 33, 109]` vs `--prompt 1,5` → `[13, 41, 137]`.
+- [x] **The starter model is no longer a degenerate cycle.** It emitted
+      `471, 42, 471, 42` forever; it now emits
+      `471, 386, 385, 386, …` - the recurrence actually contributes.
+- [x] **`bench_run` initialised its out-parameter on every path** (real
+      uninitialised read, only masked by statement order in the caller).
+- [x] **`sscanf` → `strtoul`** for `/proc/self/statm`; a malformed line used to
+      report a plausible `0 KiB` instead of "unknown".
+- [x] **`bugprone-easily-swappable-parameters`**: the three mutually-convertible
+      scalars (`start_token`, `steps`, `mode`) are now a `BenchRequest` struct
+      passed by pointer. An enum was tried first and did **not** work — C enums
+      are still implicitly convertible to every integer type, so the check
+      still fired. Verified with CI's *exact* `--checks` list and file set,
+      which is what the first (falsely green) local run had omitted.
+- [x] clang-tidy + clang Static Analyzer: **0 findings**.
+- [x] ASan+UBSan clean on the suite (71) and on the CLI bench path.
+- [x] Cross-platform determinism re-verified on the **new** model across three
+      targets: x86-64 host, ARM64/NEON under qemu, and the x86_64 emulator all
+      emit `[471, 386, 385, 386, 385, 386, 385, 386]`.
+
 ## Current task
 
 **GGUF import + measured load performance + a truthful README, all verified on

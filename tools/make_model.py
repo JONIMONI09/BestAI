@@ -11,8 +11,23 @@ The weights are a deterministic seeded pattern rather than noise, because a
 model whose behaviour cannot be re-derived is a bad thing to ship inside an
 APK and to hand to somebody debugging a first run. The pattern alternates
 +1/-1 in plane w1 and 0/+1 in plane w2 with a fixed LCG, which gives the
-engine a non-trivial aggregation (A and B both non-zero) instead of the
-degenerate all-zero case that a zeroed buffer would produce.
+engine a non-trivial aggregation instead of the degenerate all-zero case that
+a zeroed buffer would produce.
+
+DIMENSION 0 IS THE ONE THAT MATTERS. The token decoder reads a single value:
+
+    acc[0] = A[0]*token + B[0]*state[0]
+
+so a model whose column-0 sums are both zero is *state-blind*: the recurrence
+contributes nothing, the output depends only on the seed token, and
+hydra_engine_prefill() can have no observable effect at all. A previous
+version of this generator produced exactly that (B[0] == 0) while still being
+correct, which is why it shipped a starter model that looped 471, 42, 471, 42
+forever and made the CI prompt check fail with the misleading message "a longer
+prompt must change the output" - the prompt path was fine, the fixture was not.
+
+build() therefore GUARANTEES A[0] != 0 and B[0] != 0 by construction, and the
+guarantee is asserted rather than assumed.
 
 It is NOT a trained model and does not claim to be one: 4 layers x 64 dims is
 a working starter, not a language model. Training a real one is what
@@ -49,6 +64,31 @@ def build(vocab=VOCAB, dim=DIM, layers=LAYERS):
         state = lcg(state)
         w2 = ((state >> 16) % 3 + 1) % 3  # shifted, so plane w2 is not a copy
         body[i] = (w1 & 0x03) | ((w2 & 0x03) << 2)
+
+    # Force a non-zero column-0 sum in BOTH planes (see the module docstring).
+    # Setting one entry to +1 is not enough: the remaining layers can cancel
+    # it. So the last layer's column-0 entry is chosen so that the *total* is
+    # non-zero - take +1 unless that would cancel a sum of exactly -1, in
+    # which case take -1. Only that one entry in each plane is touched, so the
+    # file is still a pure function of (vocab, dim, layers).
+    value = {0: 0, 1: 1, 2: -1, 3: 0}          # the C loader's codeToValue
+    code = {0: 0, 1: 1, 2: -1}
+
+    last = (layers - 1) * dim                    # (layer layers-1, dim 0)
+    for shift, mask in ((0, 0xFC), (2, 0xF3)):   # plane w1, then plane w2
+        others = sum(value[(body[l * dim] >> shift) & 0x03]
+                     for l in range(layers - 1))
+        want = -1 if others == -1 else 1         # never let the total reach 0
+        enc = next(c for c, v in code.items() if v == want)
+        body[last] = (body[last] & mask) | (enc << shift)
+
+    # Assert the invariant the whole starter model depends on, so a future edit
+    # to the pattern cannot quietly reintroduce a state-blind model.
+    col_a = sum(value[body[l * dim] & 0x03] for l in range(layers))
+    col_b = sum(value[(body[l * dim] >> 2) & 0x03] for l in range(layers))
+    assert col_a != 0 and col_b != 0, (
+        'column 0 must reach the decoder: A[0]=%d B[0]=%d' % (col_a, col_b))
+
     return header + bytes(body)
 
 
