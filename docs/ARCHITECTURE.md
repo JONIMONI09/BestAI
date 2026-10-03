@@ -44,7 +44,7 @@
 
 ## Ternary Math
 
-Weights: `W ∈ {-1, 0, +1}`, 2 bits per weight, two weights per byte (upper 4 bits reserved).
+Weights: `W ∈ {-1, 0, +1}`, 2 bits per weight, two weights per byte (`w1` in bits 0–1, `w2` in bits 2–3; upper 4 bits reserved). One byte covers one `(layer, dim)` pair, so `weights_len = layers × dim` bytes.
 
 ```
 00 = 0    01 = +1    10 = -1    11 = reserved (treated as 0)
@@ -66,7 +66,7 @@ No FP32/FP16 multiplication in the inner loop → maximum ALU throughput even wi
 | ARM, `dim % 16 != 0` | NEON for multiples of 16, scalar for the remainder | active |
 | x86 / x86-64 | purely **scalar** | no SIMD — AVX2 on the roadmap |
 
-Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Empirically confirmed on three targets — host x86-64, ARM64 under NEON, and the Android emulator — which all emit the token sequence `211, 36, 185, 410, 7, 40, 197, 478` for `models/starter.hydra` with `start_token=42`.
+Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Confirmed empirically on three targets — host x86-64, ARM64/NEON under qemu, and the x86_64 Android emulator — which all emit `[471, 42, 471, 42, 471, 42, 471, 42]` for `models/starter.hydra` with `start_token=42` and 8 steps.
 
 NEON overflow analysis: `|w| ≤ 1`, `|token| ≤ 1023`, `|state| ≤ 127` → per-lane product ≤ 1150, safely within int16; accumulation happens in an `int64_t` array, which cannot overflow for any layer count the loader accepts.
 

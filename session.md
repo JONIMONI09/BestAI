@@ -86,6 +86,16 @@ a running emulator.** 20 GB support (header v2) is still open.
       redundant string removed (Android Lint back to **0 issues**).
 - [x] **README audited claim by claim and corrected.** It was wrong in eight
       places — see `docs/GGUF-IMPORT.md` and the corrections below.
+- [x] **The shipped starter model was not in git.** `.gitignore` ignores
+      `*.hydra`; `demo.hydra` had been force-added long ago, so the rename to
+      `starter.hydra` silently deleted the asset from the repository. Local
+      builds still had it, fresh checkouts did not — CI failed with
+      “starter.hydra differs from tools/make_model.py output”, and the APK
+      content assertions in `ci.yml`/`release.yml` would have failed too.
+      Fixed with a `!android/app/src/main/assets/starter.hydra` negation rule
+      plus staging the file. The autostart gate now asks the question that
+      actually matters (`git check-ignore --no-index`), because the
+      byte-comparison it sat next to runs locally and can never catch this.
 
 ### README claims that were false and are now fixed
 
@@ -102,8 +112,9 @@ a running emulator.** 20 GB support (header v2) is still open.
 
 ### Still open
 
-- 20 GB models need header v2 (64-bit offsets, true 2-bit packing). The v1
-  ceiling is **128 KiB of weights** — a format limit, not a RAM limit.
+- 20 GB models need header v2 (64-bit offsets, 4-weights-per-byte packing).
+  The v1 ceiling is **256 KiB of weights** (dim ≤ 64 × layers ≤ 4096 bytes) —
+  a format limit, not a RAM limit.
 - No physical ARM device was available; all Android numbers come from an
   x86_64 emulator under TCG.
 

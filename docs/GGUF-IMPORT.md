@@ -70,7 +70,7 @@ b1.58 and by scalable ternary PTQ. The report carries it per plane:
 
 | Field | Meaning |
 |---|---|
-| `meanAbs` | `mean(|W|)` over the rows read |
+| `meanAbs` | mean absolute weight over the rows read |
 | `gamma` | `1 / meanAbs` |
 | `ternaryZeros` | weights that rounded to `0` |
 | `density` | `1 - zeros/count` — the fraction that stayed ±1 |
@@ -119,13 +119,13 @@ compile-time constants shared with the C engine:
 | `HYDRA_EMBED_DIM` | 64 | dim ≤ 64 |
 | `MAX_VOCAB` | 1024 | vocabulary ≤ 1024 entries |
 | `MAX_LAYERS` | 4096 | at most 4096 layers per plane |
-| bytes on disk | **4 bits per weight** | two weights per byte |
+| bytes on disk | **2 bits per weight** | two weights per byte, one byte per `(layer, dim)` pair |
 
-**The v1 ceiling is therefore 128 KiB of weights** (`64 × 4096 × 4 bit` =
-131 072 bytes). A 20 GB checkpoint is ~163 840× larger than anything the current
+**The v1 ceiling is therefore 256 KiB of weights** (`64 × 4096` bytes =
+262 144 bytes). A 20 GB checkpoint is ~81 920× larger than anything the current
 format can describe, no matter how the converter is written. That is a format
-limit, and `docs/FORMAT.md` carries the v2 plan (true 2-bit packing, 64-bit
-offsets) that lifts it.
+limit, and `docs/FORMAT.md` carries the v2 plan (4-weights-per-byte packing,
+64-bit offsets) that lifts it.
 
 **RAM is not the blocker.** A 5 GiB sparse `.hydra` maps and generates fine
 (`tests/test_large_model.c`). The obstruction is the header, not memory.
@@ -204,7 +204,7 @@ round-trip against itself; it would not survive the engine.
 
 - **Not a Llama.** See §2. The dominant token behaviour of the original network
   is not preserved.
-- **Small.** 64 dimensions, ≤1024 vocabulary, ≤128 KiB of weights.
+- **Small.** 64 dimensions, ≤1024 vocabulary, ≤256 KiB of weights.
 - **Float types only.** Block-quantised GGUFs are refused by name, not guessed.
 - **Vocabulary is truncated** to the format ceiling; the count of dropped
   entries is reported.

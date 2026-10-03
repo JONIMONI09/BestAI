@@ -16,6 +16,11 @@ node_modules/
 models/
 # Uploaded models are user data, never committed.
 models/uploaded/
+# The one exception: the starter model is packaged into the APK, so it has to
+# be in git. Without this rule the rename demo.hydra -> starter.hydra silently
+# dropped it from the tree, and CI failed with "starter.hydra differs from
+# tools/make_model.py output" - a fresh checkout had no file to compare to.
+!android/app/src/main/assets/starter.hydra
 
 # Release staging (produced by .github/workflows/release.yml)
 dist/

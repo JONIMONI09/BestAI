@@ -20,6 +20,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KT="$ROOT/android/app/src/main/java/dev/hydrastone/MainActivity.kt"
 STRINGS="$ROOT/android/app/src/main/res/values/strings.xml"
 ASSET="$ROOT/android/app/src/main/assets/starter.hydra"
+# Same file, relative to the repo root - git check-ignore wants that form.
+REL_ASSET="android/app/src/main/assets/starter.hydra"
 PASS=0
 FAIL=0
 
@@ -103,6 +105,27 @@ if [ -f "$ASSET" ]; then
   fi
 else
   bad "the starter model is shipped in the assets" "missing: $ASSET"
+fi
+
+# The byte-comparison below runs against the file on disk, so it PASSES on a
+# developer machine that happens to have the asset and fails only in CI, where
+# a fresh checkout does not. That is exactly how demo.hydra -> starter.hydra
+# shipped an APK with no model in it: .gitignore ignores *.hydra, the renamed
+# file was never staged, and nothing failed until GitHub Actions ran.
+#
+# So check the thing that actually broke: git must be willing to track it.
+if command -v git >/dev/null 2>&1 && [ -d "$ROOT/.git" ]; then
+  # --no-index is load-bearing: by default git check-ignore skips paths that
+  # are already tracked, so the moment someone fixes the .gitignore and stages
+  # the file, this check would report "ok" forever and stop catching the
+  # regression. --no-index asks the pure question we care about: if this file
+  # were added fresh, would .gitignore refuse it?
+  if (cd "$ROOT" && git check-ignore -q --no-index "$REL_ASSET"); then
+    bad "the starter model is NOT git-ignored" \
+        "$REL_ASSET is ignored by .gitignore, so it is missing from every fresh checkout"
+  else
+    ok "the starter model is NOT git-ignored"
+  fi
 fi
 
 # The shipped asset must be a real model, not the header alone, and it must
