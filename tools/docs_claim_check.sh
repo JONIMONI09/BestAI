@@ -18,17 +18,24 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAIL=0
 
-# Documentation under audit.
-FILES=$(ls "$ROOT"/README.md "$ROOT"/docs/*.md "$ROOT"/android/README.md \
-            "$ROOT"/tools/gpu_bench/README.md 2>/dev/null)
+# Documentation under audit. An ARRAY, not a space-joined string: a path
+# containing a space was split into words, grep failed on the non-existent
+# half, and 2>/dev/null swallowed the error - so the file was skipped and the
+# lint still reported success.
+FILES=("$ROOT"/README.md "$ROOT"/docs/*.md "$ROOT"/android/README.md \
+       "$ROOT"/tools/gpu_bench/README.md)
 # Skill files and rules.md are audited too: they are where a hard-coded test
 # count survives longest.
-FILES="$FILES $(ls "$ROOT"/rules.md "$ROOT"/.claude/skills/*/SKILL.md 2>/dev/null)"
+FILES+=("$ROOT"/rules.md "$ROOT"/.claude/skills/*/SKILL.md)
 
 check() { # id  regex  human-explanation
   local id="$1" re="$2" why="$3" hits
-  hits=$(grep -nEi "$re" $FILES 2>/dev/null \
-         | grep -vE 'docs_claim_check|banned claim|no longer claims|was an unproven|previously claimed|ended up claiming' \
+  # The allow-list is matched against the CONTENT only, never the path.
+  # grep -n prefixes every hit with "file:line:", so an unanchored pattern
+  # meant that renaming a file to docs_claim_check_notes.md exempted it from
+  # every check - a banned claim could be hidden by choosing a filename.
+  hits=$(grep -nEi "$re" "${FILES[@]}" 2>/dev/null \
+         | grep -vE '^[^:]*:[0-9]+:.*(docs_claim_check|banned claim|no longer claims|was an unproven|previously claimed|ended up claiming)' \
          || true)
   if [ -n "$hits" ]; then
     echo "FAIL  $id — $why" >&2
@@ -64,7 +71,7 @@ check "no-hardcoded-test-count" \
 PERF_RE='"?(ns_per_token|ns_per_step|rss_delta_kb|load_ms)"?:[[:space:]]*[0-9]'
 PROV_RE='[Mm]easurement provenance|[Mm]easured on|not measured|SYNTHETIC|container|NOT MEASURED|host x86-64'
 perf_bad=0
-for f in $FILES; do
+for f in "${FILES[@]}"; do
   [ -f "$f" ] || continue
   if grep -Eq "$PERF_RE" "$f" 2>/dev/null && ! grep -Eq "$PROV_RE" "$f" 2>/dev/null; then
     echo "FAIL  no-unqualified-perf — ${f#$ROOT/} quotes benchmark numbers but never names the host" >&2

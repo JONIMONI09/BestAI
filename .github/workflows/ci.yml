@@ -193,6 +193,10 @@ jobs:
   build-test:
     needs: lint
     strategy:
+      # Both legs must report. With the default fail-fast: true a failure on
+      # one leg CANCELS the other, which is how a macOS-only defect can go
+      # unreported while the workflow still looks green on that leg.
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     runs-on: ${{ matrix.os }}
@@ -209,8 +213,20 @@ jobs:
       # compared against the reviewed baseline - no number is hard-coded
       # here. A silent test deletion now fails CI instead of shrinking the
       # suite unnoticed (rules.md R21/R25).
-      - name: Test-count drift gate (x86-64)
-        run: bash tools/test_count_check.sh ./hydra-test x86
+      #
+      # The architecture label comes from the HOST, not from the runner name.
+      # macos-latest is an arm64 image, so its binary legitimately runs MORE
+      # assertions than the x86 build (the NEON-vs-scalar comparison tests are
+      # compiled in) and must be compared against the arm baseline. Hard-coding
+      # `x86` for both legs made this leg fail on a correct test suite.
+      - name: Test-count drift gate (host architecture)
+        run: |
+          case "$(uname -m)" in
+            arm64|aarch64) ARCH=arm ;;
+            *)             ARCH=x86 ;;
+          esac
+          echo "runner arch: $(uname -m) -> baseline '$ARCH'"
+          bash tools/test_count_check.sh ./hydra-test "$ARCH"
 
       # The JNI batching policy and the large-model/32-bit arithmetic run
       # on the host, with no device involved. Both are part of `make test`,

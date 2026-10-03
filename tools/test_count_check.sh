@@ -36,26 +36,53 @@ BASELINE="$ROOT/tools/test_count_baseline.txt"
 BIN="${1:-}"
 ARCH="${2:-}"
 shift 2 2>/dev/null || true
-RUNNER=("$@")
+# An EMPTY array expanded under `set -u` is an "unbound variable" error in
+# bash < 4.4, and every macOS runner still ships /bin/bash 3.2. The no-prefix
+# call is the common one, so the gate aborted before it ever ran the binary
+# and reported the misleading "no '<N> Tests, <F> failures' line". Guard the
+# expansion instead of relying on the host's bash version.
+RUNNER=()
+if [ "$#" -gt 0 ]; then RUNNER=("$@"); fi
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -n "$BIN" ] || fail "usage: test_count_check.sh <binary> <arch-label> [runner ...]"
 [ -x "$BIN" ] || fail "not an executable test binary: $BIN"
 [ -n "$ARCH" ] || fail "no architecture label given"
+# ARCH is looked up through an awk regex below. An unescaped label such as
+# `.*` therefore matched whatever the baseline happened to contain and passed
+# on any count, so the label is restricted to characters that cannot change
+# the meaning of the pattern.
+case "$ARCH" in
+  *[!a-z0-9_-]*) fail "illegal architecture label: '$ARCH'" ;;
+esac
 [ -f "$BASELINE" ] || fail "missing baseline file: $BASELINE"
 
 # Run it and capture stdout+stderr: the summary line goes to stdout, but a
 # crash could put it anywhere.
-OUT="$("${RUNNER[@]}" "$BIN" 2>&1)"
+if [ "${#RUNNER[@]}" -gt 0 ]; then
+  OUT="$("${RUNNER[@]}" "$BIN" 2>&1)"
+else
+  OUT="$("$BIN" 2>&1)"
+fi
 STATUS=$?
 
-# Parse the last "<N> Tests, <F> failures" line.
-LINE="$(printf '%s\n' "$OUT" | grep -E '[0-9]+ Tests?, [0-9]+ failures?' | tail -1)"
-[ -n "$LINE" ] || fail "no '<N> Tests, <F> failures' line in the output of $BIN"
+# Parse "<N> Tests, <F> failures". EVERY matching line is inspected, not just
+# the last one: keeping only the tail let a binary that printed a FAILING
+# summary and then a clean one pass the gate with the failure discarded.
+LINES="$(printf '%s\n' "$OUT" | grep -E '[0-9]+ Tests?, [0-9]+ failures?' || true)"
+[ -n "$LINES" ] || fail "no '<N> Tests, <F> failures' line in the output of $BIN"
 
-COUNT="$(printf '%s' "$LINE" | sed -E 's/.*[^0-9]([0-9]+) Tests?,.*/\1/')"
-FAILS="$(printf '%s' "$LINE" | sed -E 's/.*, *([0-9]+) failures?.*/\1/')"
+UNIQ="$(printf '%s\n' "$LINES" \
+          | sed -E 's/.*[^0-9]([0-9]+) Tests?, *([0-9]+) failures?.*/\1 \2/' \
+          | sort -u)"
+NUNIQ="$(printf '%s\n' "$UNIQ" | grep -c . || true)"
+[ "$NUNIQ" -eq 1 ] || fail "$BIN printed disagreeing summary lines:
+$(printf '%s\n' "$LINES" | sed 's/^/       /')"
+
+LINE="$(printf '%s\n' "$LINES" | head -1)"
+COUNT="${UNIQ% *}"
+FAILS="${UNIQ#* }"
 
 if [ "$STATUS" -ne 0 ]; then
   printf '%s\n' "$OUT" | tail -20 >&2
