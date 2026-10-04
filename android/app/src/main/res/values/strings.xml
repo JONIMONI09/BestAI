@@ -55,8 +55,11 @@
     <string name="err_pair_count_human">layers × dim = %1$d, but weights_len covers only %2$d</string>
     <string name="info_shape_ceiling">weights use %1$s; the current format can describe at most %2$s</string>
     <string name="log_import_header">[Hydra] header: %1$s</string>
-    <string name="err_replace">cannot replace the previous model</string>
-    <string name="err_rename">cannot move the imported file into place</string>
+    <string name="log_import_restored">[Hydra] the previous model %1$s was put back</string>
+    <string name="log_import_restore_failed">[Hydra] %1$s could not be loaded and the previous model could not be restored — import a working model</string>
+    <string name="log_model_import_invalid">[Hydra] the imported model %1$s does not pass the header rules; falling back to the bundled starter model</string>
+    <string name="log_bench_busy">[Hydra] the benchmark did not start: a run is already in progress</string>
+    <string name="action_benchmark_busy">Benchmark running…</string>
 
     <!-- Crash handler -->
     <string name="crash_title">Hydra-Stone stopped</string>

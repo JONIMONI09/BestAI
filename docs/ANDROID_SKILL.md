@@ -81,9 +81,22 @@ directories.
 - `Java_dev_hydrastone_HydraBridge_runInference` — the symbol name must
   match the Kotlin package/class exactly or `UnsatisfiedLinkError`
   strikes at runtime, not compile time.
-- Token streaming back to the UI: `GetObjectClass` → `GetMethodID`
-  (`"(II)V"` signature) → `CallVoidMethod` per step, plus
-  `DeleteLocalRef`. Local refs leak fast in loops without it.
+- Token streaming back to the UI is **batched**, not per token:
+  `GetObjectClass` → `GetMethodID` (`"([IZ)V"` signature, i.e.
+  `onTokens(int[] tokens, boolean done)`) → tokens are staged into a
+  `jint[HYDRA_JNI_BATCH]` array (`hydra_batch.h`, currently **16**) and
+  delivered with **one** `CallVoidMethod` per block, plus
+  `DeleteLocalRef` for the `int[]` and for the class. Local refs leak fast
+  in loops without it.
+  The old per-token shape `onToken(int step, int token)` with the
+  `"(II)V"` signature is **still present**, but only on the benchmark
+  path: `HydraBridge.benchmark()` uses it so the cost of the calling
+  convention can be *measured* rather than assumed
+  (`android_crash_check.sh` and `jni-batch-test` both depend on the
+  distinction). Anything new should use `onTokens`.
+- `HYDRA_JNI_BATCH` is `16`, not a tunable: `tests/test_jni_batch.c`
+  asserts the exact block sizes, so changing the constant without
+  changing that test is how a batching regression ships.
 - **Model must be a real file**: the engine's loader is `mmap`-based
   and assets live inside the APK zip. Copy the asset to
   `context.filesDir` on first launch, then mmap works untouched.
@@ -252,8 +265,6 @@ $SDK/build-tools/34.0.0/apksigner verify --print-certs app-debug.apk
 
 ## 5. What is still open
 
-- The Android build is **not part of CI** (needs the full Android SDK
-  on runners). The C core CI now covers lint + dual-compiler builds.
 - Only debug signing (apksigner with the debug keystore). Release
   signing/Play setup is a follow-up.
 - APK size is unoptimized (3 ABIs × debug). App bundles (.aab) or

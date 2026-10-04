@@ -12,9 +12,22 @@ A whole token sequence can be fed in as a prompt — every token before the last
 ./hydra-run my_model.hydra 0 16 --prompt 7,9,11 --json
 ```
 
-Hydra-Stone is a C99 engine that streams ternary weights ({-1, 0, +1}) directly from disk via `mmap`. The inference step consists purely of integer additions.
+Hydra-Stone is a C99 engine that maps a `.hydra` file of ternary weights ({-1, 0, +1}) read-only via `mmap` and **aggregates them once at load time**. The inference step then consists purely of integer additions.
 
-**Memory claim, stated honestly:** the engine performs **no heap allocation at all** — the only process memory it uses is the O(1) `int8_t[64]` state vector. The weight pages themselves are owned by the kernel page cache and are reclaimed under memory pressure by LRU eviction. The engine cannot and does not keep the model's resident set size at zero; build with `-DHYDRA_DROP_CACHE` to explicitly hand touched pages back after every step.
+**Memory claim, stated honestly:** the engine performs **no heap allocation for weights** — `src/hydra_engine.c` contains no `malloc`/`calloc`/`realloc` at all, only `mmap`/`madvise`. What it does use is a **fixed working set that does not grow with model size**:
+
+| Buffer | Type | Size | Lives in |
+|---|---|---|---|
+| recurrent state | `int8_t[64]` | 64 B | `HydraEngine.state_vector` |
+| aggregate A | `int32_t[64]` | 256 B | `HydraEngine.agg_a` |
+| aggregate B | `int32_t[64]` | 256 B | `HydraEngine.agg_b` |
+| per-step accumulator | `int64_t[64]` | 512 B | stack in `hydra_engine_step()` |
+| **total while stepping** | | **1088 B ≈ 1.06 KiB** | |
+| load-time scratch (released) | `int64_t[64]` × 2 | 1024 B | stack in `hydra_build_aggregation()` |
+
+`sizeof(HydraEngine)` is 656 B in total — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header and the load-measurement fields. Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
+
+The weight pages are **not** counted there, because they are not the engine's memory: they live in the **kernel page cache**, appear in `dumpsys meminfo` as *Private Clean*, and are reclaimed by the OS under memory pressure. The engine therefore cannot and does not keep the model's resident set size at zero. Build with `-DHYDRA_DROP_CACHE` to explicitly hand touched pages back after every step.
 
 ---
 
@@ -24,13 +37,13 @@ Hydra-Stone is a C99 engine that streams ternary weights ({-1, 0, +1}) directly 
 |---|---|---|---|
 | FP32 Transformer | O(N² · d) | KV cache grows unbounded | HBM bandwidth |
 | INT8 quantization | O(N² · d) | KV cache grows unbounded | Dequantization overhead |
-| **Hydra-Stone (ternary + mmap)** | **`2·d`, independent of depth** | **none (O(1) state)** | disk/cache bandwidth only |
+| **Hydra-Stone (ternary + mmap)** | **`2·d`, independent of depth** | **fixed-size engine buffers (~1.06 KiB), independent of model size; mapped weight pages are page-cache-backed and count toward physical memory** | disk/cache bandwidth only |
 
 Three levers:
 
 1. **Ternary weights** — in the inner loop the weight is one of `{-1, 0, +1}`, so no FP multiply is needed: `y = Σ_{w=+1} x − Σ_{w=−1} x`. Layer aggregation then collapses this to exactly `2·d` integer multiply-adds per token (128 at `d = 64`) — **constant in the number of layers**, which is the claim that matters. Saying "0 multiplications" would be false: the aggregated form does multiply, just not by depth.
 2. **mmap paging** — the kernel faults in only the 4-KiB pages the compute cursor actually touches; clean pages are reclaimable under memory pressure (no swap traffic).
-3. **O(1) recurrent state** — instead of a growing KV cache, a fixed `int8_t[64]` vector carries the state.
+3. **Fixed-size recurrent state** — instead of a growing KV cache, a fixed `int8_t[64]` state vector plus the two `int32_t[64]` load-time aggregates and an `int64_t[64]` per-step accumulator carry the whole working set (~1.06 KiB, see the memory claim above).
 
 ### A bug worth reading about
 
@@ -145,7 +158,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 
 ## Features
 
-- ✅ **Zero-heap inference** — weights are never copied, only mapped; no `malloc` in the inference path
+- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path, and the engine's own working set is a fixed ~1.06 KiB
 - ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 2 bits per weight on disk** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The planned v2 packs 4 weights per byte at the same 2 bits per weight, which **halves the file** by removing the wasted half of each byte — see `docs/FORMAT.md`.
 - ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
@@ -323,7 +336,8 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── docs/ARCHITECTURE.md       Architecture & math
 ├── docs/FORMAT.md             .hydra binary format specification
 ├── docs/GGUF-IMPORT.md        GGUF import, absmean ternarisation, limits
-├── docs/FORMAT-V2.md          .hydra2 sparse-expert format — SPEC ONLY, no loader yet
+├── docs/FORMAT-V2.md          .hydra2 sparse-MoE format — CANONICAL v2 spec, no loader yet
+├── docs/HYDRA2-RESEARCH.md    research spec: bounded measured memory, load strategies, ternary math
 ├── docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
 ├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
 ├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
@@ -413,7 +427,8 @@ make ui       # builds hydra-run + the starter model and serves on :8787
 - [ ] Min-P sampling & repetition penalty
 - [ ] safetensors import with automatic absmean ternarization (GGUF is done — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md))
 - [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
-- [ ] 4-weights-per-byte packing (same 2 bits/weight, but no wasted byte) and an aggregated `A[i]/B[i]` model format — see the redundancy analysis in `docs/ARCHITECTURE.md`
+- [ ] 4-weights-per-byte packing (same 2 bits/weight, but no wasted byte) — a v1.1 file-level optimisation, not the v2 container
+- [ ] The `.hydra2` sparse-MoE container — the canonical v2 spec is [`docs/FORMAT-V2.md`](docs/FORMAT-V2.md); **no part of it is implemented**, and the aggregated `A[i]/B[i]` container sketched in `docs/ARCHITECTURE.md` is a superseded alternative, see its *Roadmap status* section
 - [ ] Streaming ring-buffer KV with attention sinks
 
 Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.

@@ -110,9 +110,15 @@ Packing 4 weights per byte in v2 does not change the weight data density — it 
 
 ## Planned Extensions (v2)
 
+> **The v2 container is NOT the aggregated `A[i]/B[i]` form.** The canonical v2
+> specification is [`docs/FORMAT-V2.md`](FORMAT-V2.md), and it specifies a
+> sparse-MoE layout. The aggregated-container idea below is a **superseded
+> exploratory sketch**; see *Roadmap status* in `FORMAT-V2.md` for why it lost,
+> and for the note that it remains available as a v1.1 file-level optimisation.
+
 - 64-bit offset fields, so weights may start at or above 4 GiB (see "Model Size vs RAM" —
   this is the only size limit that RAM does not solve)
 - Per-layer scale factors (γ from absmean quantization)
 - 4-weights-per-byte packing (same 2 bits/weight, but no wasted byte — roughly halves file size)
 - Checksum (xxHash) over the weight region
-- **Aggregated container** holding only `A[i] = Σ_l w1[l][i]` and `B[i] = Σ_l w2[l][i]`, signalled by a `HYDRA_AGGREGATE_V2` flag. The layer loop in v1 is algebraically redundant (see "Known Structural Redundancy" in `docs/ARCHITECTURE.md`), so v1 models compress losslessly into this form. v1 files keep loading unchanged.
+- **Aggregated container** holding only `A[i] = Σ_l w1[l][i]` and `B[i] = Σ_l w2[l][i]`, signalled by a `HYDRA_AGGREGATE_V2` flag. The layer loop in v1 is algebraically redundant (see "Known Structural Redundancy" in `docs/ARCHITECTURE.md`), so v1 models do compress losslessly into this form, and v1 files would keep loading unchanged. **Superseded as the v2 design** — see the note above.
