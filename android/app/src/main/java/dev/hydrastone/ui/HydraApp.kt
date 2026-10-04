@@ -96,6 +96,8 @@ data class MainUiState(
     val chatState: ChatState = ChatState.IDLE,
     val input: String = "",
     val lastTurnCancelled: Boolean = false,
+    /** True while the benchmark thread is alive. Disables the benchmark button. */
+    val isBenchmarking: Boolean = false,
     val log: String = ""
 ) {
     /** Convenience for the banner and the model row. */
@@ -104,6 +106,19 @@ data class MainUiState(
 
     val engineIsExperimental: Boolean
         get() = selectedEngine?.isExperimental == true
+
+    /**
+     * True while the engine is busy with anything.
+     *
+     * A benchmark and a generation run compete for the same native compute
+     * threads, so neither may start while the other is in flight. Derived
+     * rather than stored twice, because a second flag for "busy" is a second
+     * thing that can disagree with the first.
+     */
+    val engineBusy: Boolean
+        get() = isBenchmarking ||
+            chatState == ChatState.GENERATING ||
+            chatState == ChatState.CANCELLING
 }
 
 /** Callbacks the shell invokes. The shell owns no engine and no file system. */
@@ -482,8 +497,19 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold
         )
-        FilledTonalButton(onClick = actions.onBenchmark, enabled = state.hasModel) {
-            Text(stringResource(R.string.action_benchmark))
+        // Disabled while the engine is busy, and the label says WHY it is
+        // disabled. A greyed-out button with the same text as the enabled one
+        // is a control the user has to guess at.
+        FilledTonalButton(
+            onClick = actions.onBenchmark,
+            enabled = state.hasModel && !state.engineBusy
+        ) {
+            Text(
+                stringResource(
+                    if (state.isBenchmarking) R.string.action_benchmark_busy
+                    else R.string.action_benchmark
+                )
+            )
         }
         Text(
             text = stringResource(R.string.section_engine_info),

@@ -10,7 +10,8 @@ android/
 ├── app/src/main/cpp/CMakeLists.txt   NDK CMake build (references the shared C core)
 ├── app/src/main/cpp/hydra_jni.c      JNI bridge: load model, run steps, stream tokens
 ├── app/src/main/java/dev/hydrastone/
-│   ├── HydraBridge.kt                `external fun runInference(...)` + token callback
+│   ├── HydraBridge.kt                `external fun runInference(...)` + batched token callback
+│   ├── AtomicModelSwap.kt            replaces a model file without ever losing the old one
 │   ├── MainActivity.kt               UI: token/steps input, live token log, import, benchmark
 │   ├── CrashHandler.kt               writes the report, then delegates to the platform
 │   └── CrashActivity.kt              shows the report on the next launch (copy / delete)
@@ -45,6 +46,29 @@ gradle assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
 The APK contains `libhydra.so` for `arm64-v8a`, `armeabi-v7a` (the
 legacy 32-bit target from the original spec) and `x86_64` (emulators),
 plus the starter model as an asset.
+
+### Import limits
+
+The two import routes have **different** caps, and the difference is not an
+accident:
+
+| Route | Constant | Limit | Why it differs |
+|---|---|---|---|
+| `.hydra` (v1 engine) | `MAX_UPLOAD_BYTES` | **64 MiB** | The v1 format caps the weight region at 256 KiB (`dim ≤ 64`, `layers ≤ 4096`), so anything much larger cannot be expressed. The limit is generous on purpose. |
+| `.gguf` (llama.cpp) | `MAX_GGUF_BYTES` | **4 GiB** | A GGUF is a real LLM checkpoint; 64 MiB would reject every model worth importing. |
+
+Both are enforced **while the copy runs**, not after it: the file is streamed
+into private storage in 64 KiB chunks and the running total is compared on every
+chunk, so an oversized file never lands on disk and the user gets a readable
+message naming the limit rather than a truncated model.
+
+Both are compile-time constants in `MainActivity.kt`. The web console's
+equivalent, `HYDRA_MAX_UPLOAD`, *is* configurable and also defaults to 64 MiB —
+raise it there by setting the environment variable; there is no Android
+equivalent to set.
+
+See [`../docs/GGUF-IMPORT.md`](../docs/GGUF-IMPORT.md) for the tensor types the
+converter accepts and for the v1 format ceiling.
 
 ## Run
 

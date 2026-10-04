@@ -74,7 +74,7 @@ b1.58 and by scalable ternary PTQ. The report carries it per plane:
 | `gamma` | `1 / meanAbs` |
 | `ternaryZeros` | weights that rounded to `0` |
 | `density` | `1 - zeros/count` — the fraction that stayed ±1 |
-| `rowsRead` / `rowsTotal` | how much of the tensor was actually consumed |
+| `rowsRead` / `rowsTotal` | how much of the tensor was actually consumed — `rowsRead` is a **prefix** of `rowsTotal`, see §6 |
 | `rescale` | final fold factor, see §5 |
 
 **Rounding is half-away-from-zero, deliberately.** Python's built-in `round()`
@@ -166,9 +166,9 @@ python3 tools/gguf_to_hydra.py INPUT --out OUT [options]
   --out PATH          where to write the .hydra          (required)
   --json              machine-readable report
   --dim N             target dim (default 64, the format maximum)
-  --max-rows N        sample at most N rows per tensor
+  --max-rows N        use only the FIRST N rows of each tensor (default 4096, 0 = all)
   --a-tensor NAME     GGUF tensor for plane A   (default: the embedding)
-  --b-tensor NAME     GGUF tensor for plane B   (default: the next dense tensor)
+  --b-tensor NAME     GGUF tensor for plane B   (default: the next decodable tensor)
   --vocab N           force the header vocab size (default: taken from the file)
   --vocab-out PATH    also write the vocabulary as JSON for the chat UI
   --expect PATH       write an .expected.json sidecar with A and B
@@ -178,9 +178,39 @@ python3 tools/gguf_to_hydra.py INPUT --out OUT [options]
 `tools/gguf_test.py` recomputes `A` and `B` from the **packed bytes** with an
 independent implementation and compares them value for value.
 
-If the GGUF has no second dense tensor, plane B is built from plane A's columns
-rolled by one, and the report says so (`"columns rolled by 1 - no second dense
-tensor"`).
+### "The next decodable tensor" — what that actually means
+
+`--b-tensor` defaults to the first 2-D tensor **after** plane A that the reader
+can decode, and "decodable" is a precise list, not a guess
+(`tools/gguf_to_hydra.py`, `pick_tensors()`):
+
+- **F32, F16, BF16** — read directly, and
+- **Q8_0** — a *quantised* type, dequantised at read time (F16 scale `d` plus
+  32 int8 per block, `w = d*q`).
+
+So "next dense tensor" was wrong twice over: it excluded Q8_0, which is the one
+quantised type the importer handles, and it implied a float tensor rather than a
+decoding path. Anything outside that list — Q4_0, Q4_K, MXFP4 and the rest — is
+**refused by name**, never silently skipped, so an import either uses a tensor
+it really understands or says which type stopped it.
+
+If the GGUF has no second decodable tensor, plane B is built from plane A's
+columns rolled by one, and the report says so (`"columns rolled by 1 - no second
+decodable tensor"`).
+
+### `--max-rows` is a prefix, not a sample
+
+`--max-rows` takes the **first** N rows of each tensor
+(`used_rows = min(rows, max_rows)`, then `_row_blocks()` walks
+`0 .. used_rows`). It does **not** pick rows at random or spread them evenly.
+The default is **4096**; `0` means every row.
+
+The distinction matters because the scale is derived from the rows that were
+read: `mean_abs()` averages over exactly `used_rows`, so the gamma the weights
+were ternarised against describes the same matrix the weights came from. On a
+32 000-row embedding the default therefore folds rows `0..4095` and **discards
+the rest** — a deliberate, stated truncation, not a representative sample of the
+tensor.
 
 ---
 

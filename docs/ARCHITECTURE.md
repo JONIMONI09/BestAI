@@ -103,7 +103,17 @@ Consequences, stated plainly:
 - **Inference is equivalent to a single recurrence** with `2·dim` aggregates in `[−layers, +layers]`. Depth buys no expressive power in v1.
 - **Every v1 model is losslessly compressible** by a factor of roughly `4·layers / ⌈log₂(2·layers+1)⌉` (≈ 4× at `layers = 4`) by pre-summing to `A[i]/B[i]`.
 - **This is not a bug and the v1 format is not being changed.** Retaining the layer dimension keeps the door open for genuine depth-dependent behaviour (per-layer scales, ordering, future residual structure) and preserves backwards compatibility.
-- **Proposed design:** an aggregated v2 container carrying only `A[i]`/`B[i]`, signalled by a new `HYDRA_AGGREGATE_V2` capability flag in the header plus a distinct loader path and error code, so v1 files keep loading unchanged. Spec lives here as a design proposal; the implementation is roadmap work.
+- **Proposed design — SUPERSEDED, do not implement from here.** An aggregated
+  v2 container carrying only `A[i]`/`B[i]`, signalled by a new
+  `HYDRA_AGGREGATE_V2` capability flag in the header plus a distinct loader path
+  and error code, was sketched here as a design proposal. **It is not the v2
+  format.** `docs/FORMAT-V2.md` is the canonical v2 specification; the design it
+  specifies is sparse-MoE, which changes what is possible rather than halving a
+  file. The observation below is still correct and worth keeping — an aggregated
+  container would be a lossless *file-level* optimisation — but shipping it as
+  "v2" would deliver a file holding nothing the running engine does not
+  already compute at load time into ~1.1 KiB of RAM. If it is ever revived it
+  belongs as a v1.1 optimisation, not as a second version.
 
 ## Testing Strategy
 

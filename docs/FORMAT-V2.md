@@ -11,6 +11,58 @@
 > (`.hydra` vs `.hydra2`). A v1 loader must refuse a v2 file loudly, not read
 > it partially.
 
+## Roadmap status — this is THE canonical v2 spec
+
+Two different designs have been called "v2" in this repository, and they are not
+the same thing. Rather than quietly reconciling them, the disagreement is
+recorded here:
+
+| Design | Where it is described | Status |
+|---|---|---|
+| **Sparse-MoE `.hydra2`** — trunk plus streamed experts, `top_k` routing, an expert cache, a bounded resident set | **this document** | **CANONICAL.** This is the v2 specification of record. |
+| Aggregated container holding only `A[i]`/`B[i]`, flagged `HYDRA_AGGREGATE_V2` | `docs/ARCHITECTURE.md` § *Known Structural Redundancy*, `docs/FORMAT.md` § *Planned Extensions (v2)* | **SUPERSEDED exploratory sketch.** Not a competing spec. See below. |
+
+### Why the aggregated container is superseded, not rejected
+
+The aggregated container is a **real, correct observation**: v1's layer loop is
+algebraically redundant, so a v1 model compresses losslessly into `A[i]/B[i]`
+(see `docs/ARCHITECTURE.md`). It is simply **not the format to build next**, for
+one reason: `A[i]/B[i]` is exactly what the v1 loader *already computes at load
+time* and discards on every call. An aggregated container would ship a file that
+holds nothing the running engine does not already have in ~1.1 KiB of RAM
+(`docs/ARCHITECTURE.md` § *Memory Model*). It would halve the file size and
+change nothing about capability.
+
+The sparse-MoE design, by contrast, is the only one that changes **what is
+possible**: it makes models larger than RAM viable, because weights that are not
+resident are fetched on demand instead of demanded up front. That is the whole
+reason v2 exists (see §1), and the brief for the format is
+[`docs/HYDRA2-RESEARCH.md`](HYDRA2-RESEARCH.md).
+
+**So:** the two passages above are kept, and clearly marked, rather than deleted
+— deleting a documented observation because it lost an argument is how a
+repository stops being able to explain why a design was rejected. Anyone
+implementing "v2" implements **this** document. The aggregated container stays
+available as a possible *v1.1 file-level optimisation* if it is ever wanted, and
+that is the only sense in which it is still on the table.
+
+### Implementation status of this document: nothing
+
+Stated plainly, because the tensor table in §3.2 used to imply otherwise:
+
+- **No part of the `.hydra2` container is implemented.** There is no reader, no
+  writer, no magic, no header parser, no expert directory, no routing metadata,
+  no expert cache. Not one byte of a `.hydra2` file can be produced or consumed
+  by this repository.
+- The **Q8_0 decoder** that appears in §3.2 is real code, but it belongs to the
+  **GGUF import path** (`tools/gguf_reader.py`, feeding
+  `tools/gguf_to_hydra.py`). It is a Python reader for somebody else's file
+  format that converts to a **v1** `.hydra`. It is not a v2 reader and does not
+  become one by being listed here.
+- The **research** that motivates the sparse-MoE path is in
+  [`docs/HYDRA2-RESEARCH.md`](HYDRA2-RESEARCH.md). Its benchmark plan is
+  explicitly **not yet run**; nothing in it may be quoted as a result.
+
 ## Provenance rule for this document
 
 Every claim below carries one of three labels:
@@ -97,8 +149,11 @@ table is refused before a single tensor directory entry is read. **[SPEC]**
 | `0x0031` | `Q4_K` | reserved, **not implemented** |
 | `0x0032` | `MXFP4` | reserved, **not implemented** |
 
-Only the first five are implemented in this phase. The last three are listed
-so a future reader rejects them **by name** rather than by falling through to
+**None of these is implemented in a v2 reader — there is no v2 reader.** The
+first five rows exist as decoders somewhere in this repository only in the sense
+that `tools/gguf_reader.py` can read F32/F16/BF16/Q8_0 for the **GGUF import
+path**, which produces a **v1** `.hydra`. The last three are listed so that a
+future reader rejects them **by name** rather than by falling through to
 "unsupported". **[SPEC]**
 
 ### 3.3 Out of scope

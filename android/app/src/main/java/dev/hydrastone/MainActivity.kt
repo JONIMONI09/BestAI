@@ -231,13 +231,28 @@ class MainActivity : ComponentActivity() {
      * copied out of the assets because hydra_engine_load() mmaps a real path
      * and assets live inside the APK zip.
      *
+     * "Wins" only means "is tried first". Existence and size are not
+     * validity: a file that was interrupted mid-write, truncated by a full
+     * filesystem, or replaced by something else entirely is still a file of
+     * more than 24 bytes. So the imported file is **validated**, and an
+     * invalid one falls through to the starter instead of returning false -
+     * which used to leave the app with no model at all and the message
+     * "No model available", for a model the user had never even asked to
+     * remove. The warning is logged rather than swallowed.
+     *
      * @return true when [modelFile] points at a usable .hydra.
      */
     private fun prepareModel(): Boolean {
         val imported = File(filesDir, IMPORTED_NAME)
         if (imported.isFile && imported.length() > HEADER_BYTES) {
             modelFile = imported
-            return reportModel(imported, getString(R.string.log_model_imported))
+            if (reportModel(imported, getString(R.string.log_model_imported))) {
+                return true
+            }
+            /* Invalid: fall through to the starter rather than giving up. The
+             * file is NOT deleted - the user may be able to recover it, and a
+             * silent delete of somebody's model is not ours to do. */
+            log(getString(R.string.log_model_import_invalid, imported.name))
         }
 
         val starter = File(filesDir, STARTER_NAME)
@@ -437,10 +452,21 @@ class MainActivity : ComponentActivity() {
      */
     private fun runBenchmark() {
         val file = modelFile ?: return
+        /* A benchmark and a generation run both drive the same native engine,
+         * and the benchmark's numbers are only meaningful while nothing else is
+         * competing for the same 4 compute threads. Two overlapping runs would
+         * report timings for neither. Both entry points check this, and the
+         * button is disabled while either is in flight, so the guard is
+         * visible rather than a silent refusal. */
+        if (running || ui.value.isBenchmarking) {
+            log(getString(R.string.log_bench_busy))
+            return
+        }
         // The old screen took this from a text field. The chat screen has no
         // such field, so it uses the same bound the engine runs with.
         val steps = MAX_STEPS
         lineCount.clear()
+        _ui.update { it.copy(isBenchmarking = true) }
         log(resources.getQuantityString(R.plurals.log_bench_start, steps, steps))
 
         Thread {
@@ -459,6 +485,10 @@ class MainActivity : ComponentActivity() {
                 log(getString(R.string.log_bench_result, json))
             } catch (e: Throwable) {
                 log(getString(R.string.log_error, e.message))
+            } finally {
+                // In a finally, not after the log: an exception on the way out
+                // would otherwise leave the button disabled forever.
+                _ui.update { it.copy(isBenchmarking = false) }
             }
         }.start()
     }
@@ -524,21 +554,29 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val target = File(filesDir, IMPORTED_NAME)
-                // Atomic within the same directory: readers see either the
-                // old file or the complete new one, never a partial write.
-                if (target.exists() && !target.delete()) {
+                /* The swap never destroys the previous model before the new
+                 * one is in place, and puts it back if the swap fails. The old
+                 * code deleted first and renamed second, so a failed rename
+                 * left the user with no model at all - and the comment above it
+                 * called that "atomic within the same directory", which is true
+                 * of renameTo and false of delete-then-rename. See
+                 * AtomicModelSwap for the full reasoning. */
+                val swap = AtomicModelSwap.swap(tmp, target)
+                if (swap !is AtomicModelSwap.Outcome.Swapped) {
                     tmp.delete()
-                    log(getString(R.string.log_import_failed, getString(R.string.err_replace)))
-                    return@Thread
-                }
-                if (!tmp.renameTo(target)) {
-                    tmp.delete()
-                    log(getString(R.string.log_import_failed, getString(R.string.err_rename)))
+                    val why = when (swap) {
+                        is AtomicModelSwap.Outcome.NotSwapped -> swap.why
+                        is AtomicModelSwap.Outcome.RolledBack -> swap.why
+                        is AtomicModelSwap.Outcome.RestoreFailed -> swap.why
+                        else -> "unknown"
+                    }
+                    log(getString(R.string.log_import_failed, why))
                     return@Thread
                 }
 
                 modelFile = target
                 if (reportModel(target, getString(R.string.log_model_imported))) {
+                    AtomicModelSwap.discardBackup(swap.backup)
                     log(getString(R.string.log_import_ok, target.name))
                     /* An import is an explicit "use this model now", so it
                      * runs straight away - otherwise the new model sits
@@ -546,6 +584,17 @@ class MainActivity : ComponentActivity() {
                      * ignored. */
                     startInference()
                 } else {
+                    /* The file passed the header rules but is still not usable.
+                     * Put the previous model back instead of leaving the app
+                     * with a model it cannot load: the user chose "replace",
+                     * and a failed replacement should end where it started. */
+                    if (AtomicModelSwap.rollback(swap.backup, target)) {
+                        modelFile = target
+                        loadIntoSelectedEngine(target.absolutePath)
+                        log(getString(R.string.log_import_restored, target.name))
+                    } else {
+                        log(getString(R.string.log_import_restore_failed, target.name))
+                    }
                     log(getString(R.string.log_import_rejected, getString(R.string.err_import_invalid)))
                 }
             } catch (e: Throwable) {
@@ -772,30 +821,37 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val target = File(filesDir, IMPORTED_GGUF_NAME)
-                if (target.exists() && !target.delete()) {
+                /* Same swap as the .hydra path, for the same reason. The old
+                 * comment here claimed "the load is attempted BEFORE the old
+                 * model is dropped" while the code two lines above had already
+                 * dropped it; the swap makes the comment true. */
+                val swap = AtomicModelSwap.swap(tmp, target)
+                if (swap !is AtomicModelSwap.Outcome.Swapped) {
                     tmp.delete()
-                    log(getString(R.string.log_import_failed, getString(R.string.err_replace)))
-                    return@Thread
-                }
-                if (!tmp.renameTo(target)) {
-                    tmp.delete()
-                    log(getString(R.string.log_import_failed, getString(R.string.err_rename)))
+                    val why = when (swap) {
+                        is AtomicModelSwap.Outcome.NotSwapped -> swap.why
+                        is AtomicModelSwap.Outcome.RolledBack -> swap.why
+                        is AtomicModelSwap.Outcome.RestoreFailed -> swap.why
+                        else -> "unknown"
+                    }
+                    log(getString(R.string.log_import_failed, why))
                     return@Thread
                 }
 
-                // Only now is the new model allowed to replace the old one.
-                // The load is attempted BEFORE the old model is dropped, so a
-                // file llama.cpp refuses leaves the previous model in place
-                // rather than leaving the app with nothing.
-                val previous = if (selectedEngine === llamaEngine) llamaEngine else null
                 val result = llamaEngine.load(target.absolutePath)
                 if (!result.ok) {
+                    // A file llama.cpp refuses must leave the previous model in
+                    // place rather than leaving the app with nothing.
                     log(getString(R.string.log_import_rejected, result.error ?: "load failed"))
-                    target.delete()
-                    // Put the old engine back if there was one.
-                    if (previous != null) selectedEngine = llamaEngine
+                    if (AtomicModelSwap.rollback(swap.backup, target)) {
+                        loadIntoSelectedEngine(target.absolutePath)
+                        log(getString(R.string.log_import_restored, target.name))
+                    } else {
+                        log(getString(R.string.log_import_restore_failed, target.name))
+                    }
                     return@Thread
                 }
+                AtomicModelSwap.discardBackup(swap.backup)
 
                 selectedEngine = llamaEngine
                 modelFile = target
