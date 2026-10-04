@@ -308,10 +308,12 @@ number for any of them appears anywhere in this repository:
   for Qwen2.5-0.5B Q5_K_M on a Snapdragon 855 comes from a third-party report and is
   **NOT MEASURED here**.
 - **Thermal behaviour, sustained-load throttling, battery impact.**
-- **Release APK size delta** after the llama.cpp integration.
-- **Native build time delta** after the llama.cpp integration.
-- **Whether any specific GGUF file loads**, at any quantisation, on any device.
-  Nothing in this repository has executed llama.cpp yet.
+- **Release APK size delta** and **native build time delta** were NOT MEASURED at
+  Phase 0. Both are now measured; see §8.2 and §8.3.
+- ~~Whether any specific GGUF file loads~~ — this is no longer unknown: one
+  specific GGUF has now been loaded and generated from on an emulator (§8.1).
+  It is still NOT MEASURED on any physical ARM device, and the 852 MB figure
+  for Qwen2.5-0.5B Q5_K_M remains UNVERIFIED.
 
 ---
 
@@ -331,3 +333,123 @@ number for any of them appears anywhere in this repository:
 
 **Phase 0 is complete.** Seven findings (§4) carry forward; **B1** and **B3** must be
 handled before the Phase 1 and Phase 2 gates can be honestly declared green.
+
+
+---
+
+## 8. LlamaEngine: measured on an emulator
+
+This section records what was actually executed, so the claims above and the
+exit criteria below can be judged against measurements rather than intentions.
+
+### 8.1 What ran, and what the log proves
+
+Platform: the `hydra_test` AVD — Android 7.0 (API 24), x86_64, **TCG software
+emulation, no KVM, no `/dev/kvm`**. That is a property of the only machine
+available here, not of any phone, and it is why nothing below is a performance
+claim.
+
+Model: `bartowski/SmolLM2-135M-Instruct-GGUF`,
+`SmolLM2-135M-Instruct-Q4_K_M.gguf`, **105 454 432 bytes**, Apache-2.0,
+fetched by `tools/fetch_test_model.sh` (the script asserts the byte count).
+
+`LlamaBridge` runs inside the app process and links `libllama_jni.so`, which
+links `libllama.so` / `libggml*.so`. `llama_log_set()` routes llama.cpp's own
+output into logcat under the tag `HydraLlamaNative` at INFO and above (DEBUG
+is dropped on purpose: it dumps every node of every graph and rotates the log
+buffer away). Verbatim lines from a passing run:
+
+```
+HydraLlamaNative: JNI_OnLoad: libllama_jni.so loaded, llama log redirected to logcat
+HydraLlamaNative: load_tensors:   CPU_Mapped model buffer size =    98.87 MiB
+HydraLlamaNative: llama_kv_cache:        CPU KV buffer size =    11.25 MiB
+HydraLlamaNative: sched_reserve:        CPU compute buffer size =    49.13 MiB
+HydraLlamaNative: load: ctx created n_ctx=512 n_batch=256 n_ubatch=256
+HydraLlamaNative: load: model ok arch=llama n_embd=576 n_layer=30 n_ctx=512
+                          n_ctx_train=8192 weights=103668480 state_bytes=17 quant=Q4_K - Medium
+HydraLlamaNative: generate: prompt_tokens=1 prefill_batches=1 pos=1 prefill_ms=13841
+HydraLlamaNative: generate: llama sampled id=260 piece=' the' (1 of 8)
+HydraLlamaNative: generate: llama sampled id=1867 piece=' next' (2 of 8)
+HydraLlamaNative: generate: finished generated=8 cancelled=0 n_past=9 native_calls=4
+HydraLlamaNative: cancel: stop requested; the running decode ends at the next check
+HydraLlamaNative: generate: finished generated=1 cancelled=1 n_past=5 native_calls=2
+```
+
+Those lines are emitted by llama.cpp and ggml themselves and by the JNI bridge;
+the Kotlin side cannot produce them, which is what makes them usable as
+evidence that the native engine, and not a stand-in, did the work.
+
+Behaviour proven by `LlamaEngineInstrumentedTest` (5 tests, all passing, run on
+that emulator against that exact file):
+
+| Test | What it asserts |
+|---|---|
+| `loadReportsRealModelMetadata` | arch / n_embd / n_layer / n_ctx / quant read out of the file; `size_bytes` is the weights and is below the file size |
+| `generatesAndStreamsTokensInOrder` | `onFirstToken` fires once and before the first piece; 8 pieces arrive in order and reassemble into English |
+| `cancelStopsGenerationAndKeepsWhatWasProduced` | Stop after the first token ends the run with `cancelled=true` and keeps the partial text |
+| `cancelBeforeAnyTokenStillTerminates` | a Stop with no token yet produces `generated=0`, no callback, and returns |
+| `unloadIsSafeToRepeatAndAllowsReload` | double unload is safe; reload works |
+
+### 8.2 Sizes (measured)
+
+| Artefact | Bytes |
+|---|---|
+| Release APK, all three ABIs | 19 074 387 |
+| Debug APK, all three ABIs | 35 497 863 |
+| `lib/arm64-v8a/libhydra.so` | 18 816 (unchanged — v1 is untouched) |
+| `lib/arm64-v8a/libllama.so` | 3 873 008 |
+| `lib/x86_64/libllama.so` | 4 206 992 |
+| `lib/arm64-v8a/libllama_jni.so` | 52 968 |
+
+`armeabi-v7a` carries `libhydra.so` only and no llama libraries at all, as
+intended: that ABI is excluded from the llama build.
+
+### 8.3 Native build time (measured, 2 host cores)
+
+- CMake configure: ~1 s
+- Full `llama_jni` + llama.cpp native build, `arm64-v8a`: 78 s
+- Full native build, `x86_64`: 1 m 51 s
+- Whole Android build from `clean` (3 ABIs, debug + release + androidTest + lint): 6 m 5 s
+
+### 8.4 Defects found by running it, and what was fixed
+
+1. **`R.plurals.log_running` crashed the app on its first frame.** The entry
+   used `%2$d` and is read with `getQuantityString(id, qty, qty)` — one
+   argument — so `MainActivity.startInference` threw
+   `MissingFormatArgumentException` during `onCreate`. Lint does not check
+   indexed specifiers inside a `<plurals>` entry, every unit test stayed green,
+   and only launching the app found it. Fixed, and
+   `tools/string_format_check.py` plus its negative control now hold the line
+   in CI.
+2. **A prefill-time Stop was never observed during prompt evaluation.** The
+   stop flag was only checked inside the sampling loop, so a Stop pressed while
+   a long prompt was still being evaluated was ignored for the whole prefill.
+   Now checked between prefill batches as well.
+3. **A Stop issued in the window between "the user pressed Stop" and "the
+   generation thread started" was dropped**, because the flag was cleared on
+   entry. The flags are now consumed on exit, and `unload()` can no longer free
+   the context out from under a decode loop that is still using it.
+
+An earlier build also **segfaulted in `ggml_compute_forward_mul_mat`** on all
+four compute threads while prefilling a 47-token prompt, writing through a
+near-null tensor pointer. The changes above removed the crash and it did not
+recur across the full suite and the UI runs, but no single line has been
+identified as the cause, so it is recorded here as "fixed by the above changes,
+root cause not isolated" rather than as a diagnosis.
+
+### 8.5 Still NOT MEASURED
+
+- **Tokens/second, memory residency, thermal behaviour on any phone.** Every
+  timing above is a property of a TCG-emulated x86_64 guest and is labelled as
+  such. The instrumented tests deliberately contain no throughput assertion.
+- **The SAF import tap-through on a real device.** On this API 24 guest the
+  document picker does not surface a non-media `.gguf` in its Downloads root,
+  and the guest does not survive a 105 MB write while the app holds a loaded
+  model. The model is loaded through the app's own `LlamaBridge` instead, which
+  is the code the picker hands the file to.
+- **A previously imported GGUF is not restored on the next launch.**
+  `prepareModel()` only looks for `imported.hydra`, so relaunching after a GGUF
+  import silently falls back to the starter model even though
+  `filesDir/imported.gguf` is still on disk. Found, not fixed, and not fixed
+  here deliberately: it changes launch behaviour and could not be re-verified
+  within this pass.

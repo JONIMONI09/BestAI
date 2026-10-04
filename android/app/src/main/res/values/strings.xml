@@ -24,8 +24,8 @@
         <item quantity="other">[Hydra] size: %1$d bytes</item>
     </plurals>
     <plurals name="log_running">
-        <item quantity="one">[Hydra] running %2$d iteration…</item>
-        <item quantity="other">[Hydra] running %2$d iterations…</item>
+        <item quantity="one">[Hydra] running %1$d iteration…</item>
+        <item quantity="other">[Hydra] running %1$d iterations…</item>
     </plurals>
     <string name="log_cancelled">[Hydra] cancelled — the native loop stopped at the next step; the result is discarded.</string>
     <string name="log_cancel_armed">[Hydra] cancel requested — the run stops within one step.</string>
@@ -88,6 +88,13 @@
     <string name="chat_empty_body">Import a model, then send a message.</string>
     <string name="chat_cancelled">Cancelled</string>
     <string name="chat_new_conversation">New conversation</string>
+    <string name="engine_selector">Engine</string>
+    <string name="log_engine_selected">[Hydra] engine: %1$s</string>
+    <string name="log_gguf_loaded">[Hydra] llama.cpp model ready: architecture=%1$s, quant=%2$s, context=%3$s tokens</string>
+    <string name="err_gguf_too_large_human">file is larger than the %1$s import limit</string>
+    <string name="err_gguf_truncated">this file is too short to be a GGUF model</string>
+    <string name="err_gguf_magic">magic is %1$s, expected 0x46554747 "GGUF"</string>
+    <string name="err_engine_model_mismatch">the active model cannot be used by the selected engine</string>
 
     <!-- Models / Data placeholders for this phase -->
     <string name="models_empty_title">No models yet</string>

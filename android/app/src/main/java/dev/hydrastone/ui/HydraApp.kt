@@ -31,6 +31,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -71,6 +72,13 @@ enum class Tab(@StringRes val labelRes: Int, val icon: ImageVector) {
     SETTINGS(R.string.tab_settings, Icons.Filled.Settings)
 }
 
+/** One selectable engine, as the shell needs to see it. */
+data class EngineInfo(
+    val id: String,
+    val displayName: String,
+    val isExperimental: Boolean
+)
+
 /**
  * Everything the shell renders, as one value.
  *
@@ -81,15 +89,22 @@ data class MainUiState(
     val selectedTab: Tab = Tab.CHAT,
     val modelLabel: String = "",
     val hasModel: Boolean = false,
-    val engineDisplayName: String = "",
-    val engineIsExperimental: Boolean = false,
+    val engines: List<EngineInfo> = emptyList(),
+    val selectedEngineId: String = "",
     val autoRun: Boolean = true,
     val chatMessages: List<ChatMessage> = emptyList(),
     val chatState: ChatState = ChatState.IDLE,
     val input: String = "",
     val lastTurnCancelled: Boolean = false,
     val log: String = ""
-)
+) {
+    /** Convenience for the banner and the model row. */
+    val selectedEngine: EngineInfo?
+        get() = engines.firstOrNull { it.id == selectedEngineId }
+
+    val engineIsExperimental: Boolean
+        get() = selectedEngine?.isExperimental == true
+}
 
 /** Callbacks the shell invokes. The shell owns no engine and no file system. */
 data class MainActions(
@@ -100,7 +115,8 @@ data class MainActions(
     val onNewConversation: () -> Unit = {},
     val onImportModel: () -> Unit = {},
     val onAutoRunChanged: (Boolean) -> Unit = {},
-    val onBenchmark: () -> Unit = {}
+    val onBenchmark: () -> Unit = {},
+    val onEngineSelected: (String) -> Unit = {}
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -198,9 +214,11 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
         }
         ModelRow(
             modelLabel = state.modelLabel,
-            engineDisplayName = state.engineDisplayName,
             onImportModel = actions.onImportModel
         )
+        if (state.engines.size > 1) {
+            EngineSelector(state, actions)
+        }
         HorizontalDivider()
         AutoRunRow(state.autoRun, actions.onAutoRunChanged)
         HorizontalDivider()
@@ -247,7 +265,6 @@ private fun SurfaceTintedCard(
 @Composable
 private fun ModelRow(
     modelLabel: String,
-    engineDisplayName: String,
     onImportModel: () -> Unit
 ) {
     Row(
@@ -259,16 +276,39 @@ private fun ModelRow(
                 text = "${stringResource(R.string.label_model)}: $modelLabel",
                 style = MaterialTheme.typography.bodySmall
             )
-            if (engineDisplayName.isNotEmpty()) {
-                Text(
-                    text = engineDisplayName,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
         FilledTonalButton(onClick = onImportModel) {
             Text(stringResource(R.string.action_import_model))
+        }
+    }
+}
+
+/**
+ * Engine selector.
+ *
+ * Only rendered when more than one engine is available. On an ABI without
+ * llama.cpp packaged there is nothing to choose between, and showing a single
+ * chip would imply a choice that does not exist.
+ */
+@Composable
+private fun EngineSelector(state: MainUiState, actions: MainActions) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = stringResource(R.string.engine_selector),
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(end = 8.dp)
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            state.engines.forEach { engine ->
+                FilterChip(
+                    selected = engine.id == state.selectedEngineId,
+                    onClick = { actions.onEngineSelected(engine.id) },
+                    label = { Text(engine.displayName) }
+                )
+            }
         }
     }
 }
@@ -454,9 +494,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
             onClick = {},
             label = {
                 Text(
-                    state.engineDisplayName.ifEmpty {
-                        stringResource(R.string.coming_soon)
-                    }
+                    state.selectedEngine?.displayName ?: stringResource(R.string.coming_soon)
                 )
             }
         )

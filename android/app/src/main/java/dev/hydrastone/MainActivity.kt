@@ -1,6 +1,7 @@
 package dev.hydrastone
 
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
@@ -54,17 +55,46 @@ class MainActivity : ComponentActivity() {
     private var modelFile: File? = null
 
     /**
-     * The engine the chat talks to. This phase ships only the Hydra engine;
-     * the llama.cpp engine arrives behind the same [EngineInterface], and
-     * nothing above this line will have to change when it does.
+     * The engine the chat talks to.
+     *
+     * Both engines are constructed once and held here; the chat screen asks
+     * for an [EngineInterface] and never learns which one it got. Selecting
+     * llama.cpp is therefore a change to one line, not a change to the UI.
      */
-    private val engine: EngineInterface = HydraEngine()
+    private val hydraEngine = HydraEngine()
+    private val llamaEngine = LlamaEngine()
+
+    private val engines: List<EngineInterface> = listOf(llamaEngine, hydraEngine)
+
+    /**
+     * llama.cpp is only packaged for arm64-v8a in this phase, so on the other
+     * ABIs the selector must not offer an engine whose library is absent:
+     * System.loadLibrary("llama_jni") would throw at class-initialisation and
+     * take the whole app down, not just the engine.
+     */
+    private val availableEngines: List<EngineInterface> = buildList {
+        if (Build.SUPPORTED_ABIS.contains("arm64-v8a")) add(llamaEngine)
+        add(hydraEngine)
+    }
+
+    @Volatile
+    private var selectedEngine: EngineInterface = hydraEngine
 
     /** Conversation state, kept outside composition so rotation cannot lose it. */
     private val chat = ChatStateHolder()
 
-    private val _ui = MutableStateFlow(MainUiState())
+    private val _ui = MutableStateFlow(
+        MainUiState(
+            engines = engineInfos(),
+            selectedEngineId = selectedEngine.id
+        )
+    )
     private val ui: StateFlow<MainUiState> = _ui.asStateFlow()
+
+    /** Keeps the selector in sync with the engine that is actually loaded. */
+    private fun engineInfos() = availableEngines.map {
+        dev.hydrastone.ui.EngineInfo(it.id, it.displayName, it.isExperimental)
+    }
 
     /** Run automatically on launch. Off = the app waits for Send. */
     @Volatile
@@ -141,7 +171,7 @@ class MainActivity : ComponentActivity() {
                             chat.onCancelRequested()
                             syncChat()
                             log(getString(R.string.log_cancel_armed))
-                            engine.cancel()
+                            selectedEngine.cancel()
                         },
                         onNewConversation = { chat.clear(); syncChat() },
                         onImportModel = {
@@ -151,7 +181,10 @@ class MainActivity : ComponentActivity() {
                             openModel.launch(arrayOf("*/*"))
                         },
                         onAutoRunChanged = { checked -> autoRun = checked },
-                        onBenchmark = { runBenchmark() }
+                        onBenchmark = { runBenchmark() },
+                        onEngineSelected = { id ->
+                            availableEngines.firstOrNull { it.id == id }?.let { selectEngine(it) }
+                        }
                     )
                 )
             }
@@ -259,6 +292,7 @@ class MainActivity : ComponentActivity() {
         _ui.update {
             it.copy(
                 hasModel = true,
+                selectedEngineId = selectedEngine.id,
                 modelLabel = buildString {
                     append(file.name)
                     append(" · dim ").append(report.fields["dim"])
@@ -266,8 +300,13 @@ class MainActivity : ComponentActivity() {
                 }
             )
         }
-        engine.load(file.absolutePath)
+        loadIntoSelectedEngine(file.absolutePath)
         return true
+    }
+
+    /** Loads the model into the currently selected engine. */
+    private fun loadIntoSelectedEngine(path: String) {
+        selectedEngine.load(path)
     }
 
     /** Sends whatever is in the composer. The engine, not the UI, is paged. */
@@ -323,7 +362,7 @@ class MainActivity : ComponentActivity() {
 
         val t0 = SystemClock.elapsedRealtime()
         Thread {
-            engine.generate(
+            selectedEngine.generate(
                 prompt,
                 MAX_STEPS,
                 object : GenerationCallbacks {
@@ -441,6 +480,15 @@ class MainActivity : ComponentActivity() {
     private fun importModel(uri: Uri) {
         val displayName = queryDisplayName(uri) ?: "imported.hydra"
         log(getString(R.string.log_import_start, displayName))
+
+        // Route on the extension, not on a guess. A GGUF goes to llama.cpp and
+        // a .hydra to the v1 engine; running the v1 header rules over a GGUF
+        // would reject it as "wrong magic" when it is in fact the right file
+        // for a different engine.
+        if (displayName.endsWith(".gguf", ignoreCase = true)) {
+            importGguf(uri, displayName)
+            return
+        }
 
         Thread {
             try {
@@ -666,6 +714,168 @@ class MainActivity : ComponentActivity() {
         return HeaderReport(size, fields, detected, advice, rules)
     }
 
+    /**
+     * Imports a GGUF model for llama.cpp.
+     *
+     * Copy-then-rename, exactly like the .hydra path, because llama.cpp mmaps
+     * a real file path and a content:// URI is not one. The copy is validated
+     * BEFORE the old model is replaced: a file that llama.cpp refuses must not
+     * be able to leave the app with no model at all.
+     */
+    private fun importGguf(uri: Uri, displayName: String) {
+        Thread {
+            val tmp = File(filesDir, "import.gguf.tmp")
+            try {
+                var bytes = 0L
+                contentResolver.openInputStream(uri).use { input ->
+                    if (input == null) throw IllegalStateException(getString(R.string.err_no_stream))
+                    tmp.outputStream().use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            bytes += n
+                            if (bytes > MAX_GGUF_BYTES) {
+                                throw IllegalStateException(
+                                    getString(R.string.err_gguf_too_large_human, formatBytes(MAX_GGUF_BYTES))
+                                )
+                            }
+                            out.write(buf, 0, n)
+                        }
+                        out.fd.sync()
+                    }
+                }
+
+                // Cheap structural check before a multi-hundred-millisecond
+                // native load: the first four bytes are the GGUF magic.
+                val head = ByteArray(4)
+                java.io.FileInputStream(tmp).use { input ->
+                    if (input.read(head) != 4) {
+                        tmp.delete()
+                        log(getString(R.string.log_import_rejected, getString(R.string.err_gguf_truncated)))
+                        return@Thread
+                    }
+                }
+                val magic = (head[0].toLong() and 0xFF) or
+                    ((head[1].toLong() and 0xFF) shl 8) or
+                    ((head[2].toLong() and 0xFF) shl 16) or
+                    ((head[3].toLong() and 0xFF) shl 24)
+                if (magic != GGUF_MAGIC) {
+                    tmp.delete()
+                    log(
+                        getString(
+                            R.string.log_import_rejected,
+                            getString(R.string.err_gguf_magic, hex32(magic))
+                        )
+                    )
+                    return@Thread
+                }
+
+                val target = File(filesDir, IMPORTED_GGUF_NAME)
+                if (target.exists() && !target.delete()) {
+                    tmp.delete()
+                    log(getString(R.string.log_import_failed, getString(R.string.err_replace)))
+                    return@Thread
+                }
+                if (!tmp.renameTo(target)) {
+                    tmp.delete()
+                    log(getString(R.string.log_import_failed, getString(R.string.err_rename)))
+                    return@Thread
+                }
+
+                // Only now is the new model allowed to replace the old one.
+                // The load is attempted BEFORE the old model is dropped, so a
+                // file llama.cpp refuses leaves the previous model in place
+                // rather than leaving the app with nothing.
+                val previous = if (selectedEngine === llamaEngine) llamaEngine else null
+                val result = llamaEngine.load(target.absolutePath)
+                if (!result.ok) {
+                    log(getString(R.string.log_import_rejected, result.error ?: "load failed"))
+                    target.delete()
+                    // Put the old engine back if there was one.
+                    if (previous != null) selectedEngine = llamaEngine
+                    return@Thread
+                }
+
+                selectedEngine = llamaEngine
+                modelFile = target
+                _ui.update {
+                    it.copy(
+                        hasModel = true,
+                        selectedEngineId = llamaEngine.id,
+                        modelLabel = describeGguf(result.detail)
+                    )
+                }
+                chat.clear()
+                syncChat()
+                log(getString(R.string.log_import_ok, target.name))
+                log(
+                    getString(
+                        R.string.log_gguf_loaded,
+                        result.detail["architecture"] ?: "?",
+                        result.detail["quant"] ?: "?",
+                        result.detail["n_ctx"] ?: "?"
+                    )
+                )
+            } catch (e: Throwable) {
+                tmp.delete()
+                log(getString(R.string.log_import_failed, e.message ?: "unknown"))
+            }
+        }.start()
+    }
+
+    /** Read-only metadata for the active GGUF. Nothing here is inferred. */
+    private fun describeGguf(detail: Map<String, String>): String {
+        val arch = detail["architecture"] ?: "unknown"
+        val quant = detail["quant"] ?: "unknown"
+        val ctx = detail["n_ctx"] ?: "?"
+        val layers = detail["n_layer"] ?: "?"
+        return "$arch · $quant · ctx $ctx · $layers layers"
+    }
+
+    private fun selectEngine(engine: EngineInterface) {
+        if (engine === selectedEngine) return
+        // Unload the other one FIRST: two models mapped at once on a phone is
+        // how you get killed by lmkd rather than by your own code.
+        if (engine !== llamaEngine) llamaEngine.unload()
+        if (engine !== hydraEngine) hydraEngine.unload()
+
+        val file = modelFile
+        val result = if (file == null) {
+            EngineLoadResult(false, getString(R.string.err_no_model))
+        } else {
+            engine.load(file.absolutePath)
+        }
+
+        selectedEngine = engine
+        if (result.ok) {
+            _ui.update {
+                it.copy(
+                    hasModel = true,
+                    selectedEngineId = engine.id,
+                    modelLabel = if (engine === llamaEngine) {
+                        describeGguf(result.detail)
+                    } else {
+                        file?.name ?: ""
+                    }
+                )
+            }
+            chat.clear()
+            syncChat()
+        } else {
+            // Say what happened instead of leaving a chat screen whose Send
+            // button silently refuses to work.
+            _ui.update {
+                it.copy(
+                    hasModel = false,
+                    selectedEngineId = engine.id,
+                    modelLabel = result.error ?: getString(R.string.err_engine_model_mismatch)
+                )
+            }
+        }
+        log(getString(R.string.log_engine_selected, engine.displayName))
+    }
+
     private fun queryDisplayName(uri: Uri): String? =
         try {
             contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
@@ -696,6 +906,17 @@ class MainActivity : ComponentActivity() {
         const val STARTER_ASSET = "starter.hydra"
         const val STARTER_NAME = "starter.hydra"
         const val IMPORTED_NAME = "imported.hydra"
+        const val IMPORTED_GGUF_NAME = "imported.gguf"
+
+        /**
+         * Upper bound on a GGUF import.
+         *
+         * Deliberately generous: a phone cannot run a 30 GB model anyway, but
+         * refusing a file because of a guessed ceiling would be worse than
+         * letting llama.cpp load it and report what it actually needed. The
+         * real limit is memory, and llama.cpp's own loader is what finds it.
+         */
+        const val MAX_GGUF_BYTES = 4L * 1024 * 1024 * 1024
         const val HYDRA_MAGIC = 0x48594452L
         const val HYDRA_VERSION = 1L
 

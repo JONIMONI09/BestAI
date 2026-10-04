@@ -17,6 +17,13 @@ android {
         versionCode = (System.getenv("HYDRA_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("HYDRA_VERSION_NAME") ?: "1.0.0"
 
+        // Instrumented tests run the REAL app process against the REAL native
+        // libraries. That is the only way to satisfy rules.md R23 here: the
+        // llama.cpp engine only exists as libllama_jni.so inside the APK, so a
+        // host-side test could prove nothing about whether it loads a model,
+        // streams tokens, or stops when cancelled.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndkVersion = "26.3.11579264"
 
         ndk {
@@ -27,7 +34,14 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += "-DANDROID_STL=none"
+                // c++_static, NOT the previous "-DANDROID_STL=none".
+                //
+                // The v1 engine is pure C99 and genuinely needs no C++ runtime.
+                // llama.cpp is C++ and does: with ANDROID_STL=none the linker
+                // has no std:: types at all and the build fails. c++_static
+                // links the runtime INTO the APK rather than shipping a second
+                // shared object, so the app keeps exactly one .so per ABI.
+                arguments += "-DANDROID_STL=c++_static"
                 cppFlags += ""
             }
         }
@@ -122,4 +136,14 @@ dependencies {
     // Basic icon set for the bottom navigation. The -extended set is ~10x
     // larger and is not needed for four tabs.
     implementation("androidx.compose.material:material-icons-core")
+
+    // Instrumented-test harness. Pinned for the same reason everything else is
+    // (rules.md R15): these versions are the ones verified against
+    // compileSdk 34. `runner` brings the AndroidJUnitRunner named above;
+    // `ext:junit` brings AndroidJUnit4 and the rule that every assertion must
+    // come from androidx.test, which is what makes a failing native call
+    // surface as a real test failure instead of a silent no-op.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }
