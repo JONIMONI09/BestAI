@@ -73,20 +73,45 @@ void native_log(ggml_log_level level, const char * text, void * user_data) {
 // Kotlin side merely believing it is.
 std::atomic<uint64_t> g_native_calls{0};
 
-void bridge_log(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
+// Every call below passes a string LITERAL as the format, and the attribute on
+// the declaration is what makes that a guarantee rather than a convention:
+// clang and gcc both reject a call whose format argument is not a literal, and
+// reject arguments that do not match the conversions. The CWE-134 case
+// flawfinder warns about - a format string an attacker can influence - is
+// therefore a compile error here, not a runtime risk.
+//
+// flawfinder still reports that one line, because the attribute contains the
+// token "printf". This single hit carries the suppression the tool documents.
+// It is scoped to this line and nothing else: the body uses
+// __android_log_vprint, so no printf-family call is left in this file at all.
+//
+// The va_list goes to logcat directly instead of through a char buffer.
+// __android_log_vprint is the vprintf-shaped member of the same API, so there
+// is no fixed-size stack buffer, no copy, and no silent truncation of the
+// longest lines ("load: model ok ...", one line per sampled token). A log line
+// cut in half is missing evidence exactly when it is needed.
+void bridge_log(const char * fmt, ...) __attribute__((format(printf, 1, 2)));  // flawfinder: ignore
 void bridge_log(const char * fmt, ...) {
-    char    line[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
+    __android_log_vprint(ANDROID_LOG_INFO, LOG_TAG, fmt, ap);
     va_end(ap);
-    __android_log_write(ANDROID_LOG_INFO, LOG_TAG, line);
 }
 
 // Fixed, not LLAMA_DEFAULT_SEED. A random seed would make every run a
 // different run, which makes a bug impossible to reproduce and a regression
 // impossible to compare against a previous measurement (rules.md R22).
 constexpr uint32_t SAMPLER_SEED = 0x484E4459;  // "HNDY"
+
+// The temperature the sampler chain is built with until a caller asks for a
+// different one. This is the SAME value LlamaEngine.TEMPERATURE passes, so the
+// default is a no-op rather than a second source of truth about sampling.
+constexpr float DEFAULT_TEMPERATURE = 0.7f;
+
+// Above this the distribution is flat enough that the output is noise. The
+// bound exists so an impossible request is clamped and reported instead of
+// silently producing a different kind of model.
+constexpr float MAX_TEMPERATURE = 2.0f;
 
 // Two independent stop reasons, because they are set by different threads and
 // mean different things:
@@ -132,11 +157,36 @@ struct Session {
     int32_t         n_batch = 0;
     int32_t         n_past  = 0;  // tokens already in the KV cache
     bool            batch_ok = false;
+    // Temperature the live `smpl` chain was built with. llama.cpp bakes the
+    // temperature into the sampler at construction time, so a different
+    // requested value means a new chain, and this is how generate() knows.
+    float           temperature = DEFAULT_TEMPERATURE;
 };
 
 // One session. The app drives one engine at a time; a second load replaces it.
 Session g_session;
 bool    g_backend_ready = false;
+
+// The sampling chain. top_k and min_p bound the candidates, temp shapes the
+// distribution, dist draws from it. The seed is fixed (SAMPLER_SEED), so a run
+// is reproducible and a regression is comparable against a previous one.
+//
+// `temp` is a parameter because the JNI signature carries a temperature and the
+// Kotlin side passes one. A hard-coded value here would leave that argument
+// decorative: changing it on the Kotlin side would change nothing, and the
+// signature would be a lie about what the function does.
+llama_sampler * build_sampler_chain(float temp) {
+    llama_sampler * chain =
+        llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (chain == nullptr) {
+        return nullptr;
+    }
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 1));
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(SAMPLER_SEED));
+    return chain;
+}
 
 // JSON string escaping. A model path or an error message can contain a quote
 // or a backslash, and unescaped output would produce invalid JSON that Kotlin
@@ -175,7 +225,12 @@ std::string jstring_to_utf8(JNIEnv * env, jstring s) {
 
 // The single error channel back to Kotlin. Every failure lands here, so no
 // internal detail can leak past a string the user will read (rules.md R27).
-std::string fail(JNIEnv * env, const std::string & reason, const std::string & detail) {
+//
+// The reason is the sentence the user reads and must be actionable on its own;
+// `detail` is the developer-facing part. The JNIEnv is deliberately NOT a
+// parameter: this function never touches the JVM, and taking one made it look
+// as if it did.
+std::string fail(const std::string & reason, const std::string & detail) {
     return std::string("{\"ok\":false,\"error\":\"") + json_escape(reason) +
            "\",\"detail\":\"" + json_escape(detail) + "\"}";
 }
@@ -198,6 +253,7 @@ void session_release() {
         g_session.model = nullptr;
     }
     g_session.n_past = 0;
+    g_session.temperature = DEFAULT_TEMPERATURE;
 }
 
 }  // namespace
@@ -225,9 +281,12 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void * reserved) {
  */
 JNIEXPORT jstring JNICALL
 Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, jint n_ctx) {
+    // `self` is part of every JNI instance-method signature and this function
+    // is static, so nothing reads it. Marked, not silenced with a pragma.
+    (void) self;
     const std::string model_path = jstring_to_utf8(env, path);
     if (model_path.empty()) {
-        return env->NewStringUTF(fail(env, "No model path was given", "").c_str());
+        return env->NewStringUTF(fail("No model path was given", "").c_str());
     }
 
     // A second load replaces the first. Quit is raised BEFORE the lock so a
@@ -255,7 +314,7 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
         // and cache keys (rules.md R27).
         bridge_log("load: llama_model_load_from_file returned null");
         return env->NewStringUTF(
-            fail(env,
+            fail(
                  "This GGUF file could not be loaded. It may be corrupt, truncated, "
                  "or use an architecture this build does not support.",
                  model_path)
@@ -279,7 +338,7 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
     if (ctx == nullptr) {
         llama_model_free(model);
         return env->NewStringUTF(
-            fail(env,
+            fail(
                  "The model loaded but no inference context could be created. "
                  "A smaller context size usually fixes this on a phone.",
                  model_path)
@@ -297,13 +356,27 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
     bridge_log("load: ctx created n_ctx=%d n_batch=%u n_ubatch=%u",
                g_session.n_ctx, cparams.n_batch, cparams.n_ubatch);
 
-    g_session.smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(g_session.smpl, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(g_session.smpl, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(g_session.smpl, llama_sampler_init_temp(0.7f));
-    llama_sampler_chain_add(g_session.smpl, llama_sampler_init_dist(SAMPLER_SEED));
+    g_session.smpl = build_sampler_chain(DEFAULT_TEMPERATURE);
+    if (g_session.smpl == nullptr) {
+        bridge_log("load: the sampler chain could not be allocated");
+        llama_free(ctx);
+        llama_model_free(model);
+        g_session.model = nullptr;
+        g_session.ctx   = nullptr;
+        return env->NewStringUTF(
+            fail("There was not enough memory to start a conversation with this model. "
+                 "Close other apps and try again.",
+                 "")
+                .c_str());
+    }
+    g_session.temperature = DEFAULT_TEMPERATURE;
 
-    g_session.n_batch = std::min<int32_t>(cparams.n_batch, g_session.n_ctx);
+    // cparams.n_batch was set to min(256, n_ctx) above, so the narrowing is
+    // bounded by construction. The cast is spelled out rather than left to the
+    // explicit <int32_t> template argument alone, because this value sizes the
+    // batch arrays and a wrong sign here is an out-of-bounds write, not a
+    // wrong number on screen.
+    g_session.n_batch = std::min<int32_t>(static_cast<int32_t>(cparams.n_batch), g_session.n_ctx);
     if (g_session.n_batch < 1) g_session.n_batch = 1;
     g_session.batch = llama_batch_init(g_session.n_batch, 0, 1);
     // Every array of the batch must exist. A partially built batch with a null
@@ -321,7 +394,7 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
         g_session.model = nullptr;
         g_session.ctx   = nullptr;
         return env->NewStringUTF(
-            fail(env,
+            fail(
                  "There was not enough memory to start a conversation with this model. "
                  "Close other apps and try again.",
                  "")
@@ -376,8 +449,9 @@ Java_dev_hydrastone_LlamaBridge_generate(
         JNIEnv * env, jobject self, jstring prompt, jint max_tokens, jfloat temperature,
         jobject callback) {
 
+    (void) self;
     if (g_session.ctx == nullptr) {
-        return env->NewStringUTF(fail(env, "No model is loaded", "").c_str());
+        return env->NewStringUTF(fail("No model is loaded", "").c_str());
     }
     ++g_native_calls;
 
@@ -399,22 +473,26 @@ Java_dev_hydrastone_LlamaBridge_generate(
         vocab, prompt_text.c_str(), static_cast<int32_t>(prompt_text.size()),
         tokens.data(), static_cast<int32_t>(tokens.size()), /*add_special*/ true,
         /*parse_special*/ false);
+    // Every resize below is guarded by a sign test on the value being resized,
+    // and the cast says so at the point where it matters: vector::resize takes
+    // an unsigned count, so a negative that slipped through would not be a
+    // short prompt, it would be a request for SIZE_MAX elements.
     if (n_prompt < 0) {
-        tokens.resize(-n_prompt);
+        tokens.resize(static_cast<size_t>(-n_prompt));
         const int32_t again = llama_tokenize(
             vocab, prompt_text.c_str(), static_cast<int32_t>(prompt_text.size()),
             tokens.data(), static_cast<int32_t>(tokens.size()), true, false);
         if (again < 0) {
             return env->NewStringUTF(
-                fail(env, "The prompt could not be tokenized by this model.", prompt_text).c_str());
+                fail("The prompt could not be tokenized by this model.", prompt_text).c_str());
         }
-        tokens.resize(again);
+        tokens.resize(static_cast<size_t>(again));
     } else {
-        tokens.resize(n_prompt);
+        tokens.resize(static_cast<size_t>(n_prompt));
     }
     if (tokens.empty()) {
         return env->NewStringUTF(
-            fail(env, "The prompt produced no tokens.", prompt_text).c_str());
+            fail("The prompt produced no tokens.", prompt_text).c_str());
     }
 
     // ---- context window -----------------------------------------------------
@@ -434,6 +512,50 @@ Java_dev_hydrastone_LlamaBridge_generate(
     // top of the same positions, and attention reads a mix of both.
     llama_memory_clear(llama_get_memory(g_session.ctx), /*data=*/ true);
     g_session.n_past = 0;
+
+    // Honour the temperature the caller asked for. llama.cpp stores the
+    // temperature inside the sampler, so a new value needs a new chain; it is
+    // not a field that can be written in place.
+    //
+    // The clamp is not defensive noise. At temp <= 0 llama.cpp switches to
+    // argmax - greedy decoding, a categorically different model - and a very
+    // large value flattens the distribution into noise. Both are silently
+    // plausible outputs, so an unchecked float from the UI layer would turn a
+    // typo into a behaviour nobody can explain afterwards. Clamping and saying
+    // so is the honest outcome; the log line is the record of it.
+    //
+    // Written as two named comparisons rather than as
+    // "clamp it, then check whether the clamp changed anything": detecting the
+    // change that way is a float equality test, and a NaN would compare false
+    // against itself and pass through unclamped. `!(x <= MAX)` is true for
+    // NaN, so an unusable temperature is clamped AND reported.
+    const bool  too_low  = !(temperature >= 0.0f);   // also true for NaN
+    const bool  too_high = !(temperature <= MAX_TEMPERATURE);
+    const float requested = too_low ? 0.0f
+                                    : (too_high ? MAX_TEMPERATURE : temperature);
+    if (too_low || too_high) {
+        bridge_log("generate: temperature %.3f out of range, using %.3f",
+                   static_cast<double>(temperature), static_cast<double>(requested));
+    }
+    // Exact equality is the intent here, not an oversight: both sides are the
+    // output of the clamp above, so the caller repeating the same float must
+    // reuse the chain instead of rebuilding it every message. A tolerance
+    // would be wrong in the other direction - it would rebuild on values that
+    // do not differ, which is wasted work and a torn-down sampler for nothing.
+    if (g_session.smpl == nullptr || requested != g_session.temperature) {
+        llama_sampler * rebuilt = build_sampler_chain(requested);
+        if (rebuilt != nullptr) {
+            llama_sampler_free(g_session.smpl);
+            g_session.smpl        = rebuilt;
+            g_session.temperature = requested;
+        } else {
+            // Keep the old chain rather than generating with none: a finished
+            // answer beats an error, and the log line records which
+            // temperature actually ran.
+            bridge_log("generate: sampler rebuild failed; keeping temp=%.3f",
+                       static_cast<double>(g_session.temperature));
+        }
+    }
 
     // Reset the sampler: a chain that keeps its history across turns would
     // carry the previous conversation's repetition penalties into this one.
@@ -468,7 +590,7 @@ Java_dev_hydrastone_LlamaBridge_generate(
         GGML_ASSERT(n >= 1 && n <= g_session.n_batch);
         g_session.batch.n_tokens = n;
         for (int32_t i = 0; i < n; ++i) {
-            g_session.batch.token[i]    = tokens[off + i];
+            g_session.batch.token[i]    = tokens[static_cast<size_t>(off + i)];
             g_session.batch.pos[i]      = pos + i;
             g_session.batch.n_seq_id[i] = 1;
             g_session.batch.seq_id[i][0] = 0;
@@ -481,7 +603,7 @@ Java_dev_hydrastone_LlamaBridge_generate(
         if (rc != 0) {
             bridge_log("generate: llama_decode(prefill) returned %d", rc);
             return env->NewStringUTF(
-                fail(env, "The model could not process the prompt.", "").c_str());
+                fail("The model could not process the prompt.", "").c_str());
         }
         pos += n;
     }
@@ -544,7 +666,13 @@ Java_dev_hydrastone_LlamaBridge_generate(
         g_session.batch.seq_id[0][0] = 0;
         g_session.batch.logits[0]   = 1;
 
-        if (llama_decode(g_session.ctx, g_session.batch) != 0) {
+        const int rc = llama_decode(g_session.ctx, g_session.batch);
+        if (rc != 0) {
+            // Logged, not swallowed: a decode that fails mid-stream ends the
+            // answer early, and without this line the truncation looks exactly
+            // like the model choosing to stop.
+            bridge_log("generate: llama_decode(after token) returned %d at token %d",
+                       rc, i);
             break;
         }
         ++g_session.n_past;
@@ -554,8 +682,9 @@ Java_dev_hydrastone_LlamaBridge_generate(
         env->CallVoidMethod(callback, on_done);
     }
 
-    bridge_log("generate: finished generated=%d cancelled=%d n_past=%d native_calls=%llu",
+    bridge_log("generate: finished generated=%d cancelled=%d n_past=%d temp=%.3f native_calls=%llu",
                generated, cancelled ? 1 : 0, g_session.n_past,
+               static_cast<double>(g_session.temperature),
                static_cast<unsigned long long>(g_native_calls.load()));
 
     std::string out = "{\"ok\":true";
