@@ -286,7 +286,12 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
+      # submodules: true ist Pflicht, keine Optimierung: der native Build
+      # ruft add_subdirectory(llama) auf. Ohne Submodul bricht CMake die
+      # Konfiguration ab und dieser Job liefert kein APK.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

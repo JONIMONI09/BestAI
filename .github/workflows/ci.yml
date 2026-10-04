@@ -357,7 +357,11 @@ jobs:
           java-version: 17
 
       - name: Every native method must exist in the C bridge
-        run: bash tools/jni_signature_check.sh
+        run: |
+          bash tools/jni_signature_check.sh
+          bash tools/jni_signature_check.sh \
+            android/app/src/main/java/dev/hydrastone/LlamaBridge.kt \
+            android/app/src/main/cpp/llama_jni.cpp
 
       # The crash-reporting contract cannot be executed without a device,
       # but the properties that were the bugs can be: the handler writes
@@ -381,6 +385,59 @@ jobs:
       - name: Android autostart and packaged starter model
         run: bash tools/android_autostart_check.sh
 
+      # rules.md R25: a gate that cannot fail is decoration. The Compose
+      # rewrite changed what nine of the autostart checks assert, so every
+      # check is proved here by removing its behaviour and requiring the
+      # gate to go red. It is a separate step from the gate itself so a
+      # weakened check cannot hide inside a passing run.
+      - name: Negative control for the Android autostart gate
+        run: bash tools/android_autostart_negative_test.sh
+
+      # A resource whose format specifiers its call site cannot satisfy is a
+      # crash on a user's screen, not a build failure: Android lint does not
+      # check indexed specifiers inside a <plurals> entry. R.plurals.log_running
+      # shipped with "%2$d" against a one-argument call and the app died on its
+      # first frame with MissingFormatArgumentException, with every unit test
+      # green. Only running the app found it, so it is now gated.
+      - name: Android string format arguments match their call sites
+        run: python3 tools/string_format_check.py
+
+      # rules.md R25 again: this gate is brand new, so each of its checks is
+      # proved by breaking exactly the property it protects.
+      - name: Negative control for the string format gate
+        run: bash tools/string_format_negative_test.sh
+
+  # ---------- Stage 3c: the llama.cpp pin is asserted ----------
+  # The whole native integration is written against ONE llama.cpp API, and
+  # parts of that API moved between releases. A submodule that followed its
+  # default branch would break the build at some unrelated future commit, with
+  # an error pointing at llama_jni.cpp rather than at the pin. So the pin is
+  # asserted: the gitlink a fresh clone would obtain must be exactly
+  # 7fe450e1 (v0.5.0), and the vendored code must carry its own MIT licence,
+  # because a submodule is not covered by this repository's licence file.
+  llama-pin:
+    name: llama.cpp pin (submodule)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 plus submodules: true. The negative control below
+      # needs a second, off-pin commit object to point the gitlink at, and a
+      # shallow submodule would not have the pin's parent.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: llama.cpp is pinned, and no GGUF weights are tracked
+        run: bash tools/llama_pin_check.sh
+
+      # rules.md R25: a gate that has never failed is decoration. This gate
+      # was written in the same commit that introduced the submodule, so each
+      # of its checks is proved by removing the property it protects and
+      # requiring that specific check to turn red. Separate step from the gate
+      # so a weakened check cannot hide inside a passing run.
+      - name: Negative control for the llama.cpp pin gate
+        run: bash tools/llama_pin_negative_test.sh
+
   # ---------- Stage 3b: the APK is built on every push ----------
   # Previously the APK was only built by the release workflow, i.e. only
   # on a tag. main therefore never proved that the app still builds.
@@ -392,7 +449,13 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
+      # submodules: true is REQUIRED, not an optimisation. The native build
+      # does add_subdirectory(llama), so without it the APK job sees an empty
+      # directory and CMake fails to configure - and it would fail on main,
+      # on every release, and on every pull request that touches Android.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: actions/setup-java@v4
         with:
@@ -432,6 +495,30 @@ jobs:
           for abi in arm64-v8a armeabi-v7a x86_64; do
             if ! grep -q "lib/$abi/libhydra.so" apk-unzip.txt; then
               echo "::error::libhydra.so missing for $abi"
+              exit 1
+            fi
+          done
+          # llama.cpp is built for arm64-v8a AND x86_64 (see
+          # HYDRA_LLAMA_ABIS in android/app/src/main/cpp/CMakeLists.txt), and
+          # deliberately NOT for armeabi-v7a. Both of those facts are asserted
+          # here, so a change to that list cannot silently ship an engine for an
+          # ABI nobody can verify or quietly drop one from an ABI that needs it.
+          # The arm64 list is a minimum requirement, asserted separately rather
+          # than by relaxing the loop above: libhydra.so still has to ship for
+          # every ABI, and the llama engine has to be really there where it is
+          # claimed to be.
+          for lib in libllama_jni.so libllama.so libggml.so libggml-base.so libggml-cpu.so; do
+            for abi in arm64-v8a x86_64; do
+              if ! grep -q "lib/$abi/$lib" apk-unzip.txt; then
+                echo "::error::$lib missing for $abi"
+                exit 1
+              fi
+            done
+            # armeabi-v7a must NOT carry the engine: that ABI cannot be
+            # verified here, and shipping an unverified one is worse than
+            # shipping none.
+            if grep -q "lib/armeabi-v7a/$lib" apk-unzip.txt; then
+              echo "::error::$lib is packaged for armeabi-v7a, which is excluded from the llama build"
               exit 1
             fi
           done

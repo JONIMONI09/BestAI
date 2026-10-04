@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -16,6 +17,13 @@ android {
         versionCode = (System.getenv("HYDRA_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("HYDRA_VERSION_NAME") ?: "1.0.0"
 
+        // Instrumented tests run the REAL app process against the REAL native
+        // libraries. That is the only way to satisfy rules.md R23 here: the
+        // llama.cpp engine only exists as libllama_jni.so inside the APK, so a
+        // host-side test could prove nothing about whether it loads a model,
+        // streams tokens, or stops when cancelled.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndkVersion = "26.3.11579264"
 
         ndk {
@@ -26,7 +34,14 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += "-DANDROID_STL=none"
+                // c++_static, NOT the previous "-DANDROID_STL=none".
+                //
+                // The v1 engine is pure C99 and genuinely needs no C++ runtime.
+                // llama.cpp is C++ and does: with ANDROID_STL=none the linker
+                // has no std:: types at all and the build fails. c++_static
+                // links the runtime INTO the APK rather than shipping a second
+                // shared object, so the app keeps exactly one .so per ABI.
+                arguments += "-DANDROID_STL=c++_static"
                 cppFlags += ""
             }
         }
@@ -81,6 +96,10 @@ android {
         }
     }
 
+    buildFeatures {
+        compose = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -91,13 +110,40 @@ android {
 }
 
 dependencies {
-    // Only the Activity Result API for the SAF model picker. No AppCompat,
-    // no Compose, no Material Components - the UI stays programmatic Views.
-    // The -ktx artifact, not the plain one: lint's KtxExtensionAvailable
-    // check flags the plain artifact as an informational finding, and the
-    // release gate requires a report without findings.
-    // 1.9.3 is the newest androidx.activity that still builds against
-    // compileSdk 34; 1.13.0 requires compileSdk 36. Bumping the compile SDK
-    // is a toolchain change, not a bug fix, so it is not smuggled in here.
+    // SAF model picker. The -ktx artifact, not the plain one: lint's
+    // KtxExtensionAvailable check flags the plain artifact as an
+    // informational finding, and the release gate requires a report without
+    // findings. 1.9.3 is the newest androidx.activity that still builds
+    // against compileSdk 34; 1.13.0 requires compileSdk 36. Bumping the
+    // compile SDK is a toolchain change, not a bug fix, so it is not smuggled
+    // in here.
     implementation("androidx.activity:activity-ktx:1.9.3")
+
+    // Compose / Material 3. Every version is pinned and the versions are not
+    // written out individually: the BOM is the single place that decides
+    // which ui/material3/runtime versions are used together, which is the
+    // only way to keep a Compose set mutually compatible (rules.md R15).
+    //
+    // 2024.09.03 is the newest BOM whose ui/material3 artifacts still build
+    // against compileSdk 34. Newer BOMs (2024.12+) require compileSdk 35,
+    // and raising the compile SDK is a toolchain decision, not a UI change.
+    implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    // Basic icon set for the bottom navigation. The -extended set is ~10x
+    // larger and is not needed for four tabs.
+    implementation("androidx.compose.material:material-icons-core")
+
+    // Instrumented-test harness. Pinned for the same reason everything else is
+    // (rules.md R15): these versions are the ones verified against
+    // compileSdk 34. `runner` brings the AndroidJUnitRunner named above;
+    // `ext:junit` brings AndroidJUnit4 and the rule that every assertion must
+    // come from androidx.test, which is what makes a failing native call
+    // surface as a real test failure instead of a silent no-op.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }

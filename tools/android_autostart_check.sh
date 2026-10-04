@@ -14,10 +14,17 @@
 # Each check below is a grep with a stated reason. The negative control is
 # the point: delete prepareModel()'s guard and this gate has to fail, or it
 # is decoration.
+#
+# The UI is Compose, so a check has to know which file a behaviour lives in.
+# MainActivity.kt orchestrates; ui/HydraApp.kt renders. Both are checked,
+# and every check below names the file it asserts against, because "the
+# check moved from one file to another" and "the behaviour is gone" look
+# identical from the outside if the gate only ever greps one of them.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KT="$ROOT/android/app/src/main/java/dev/hydrastone/MainActivity.kt"
+UI="$ROOT/android/app/src/main/java/dev/hydrastone/ui/HydraApp.kt"
 STRINGS="$ROOT/android/app/src/main/res/values/strings.xml"
 ASSET="$ROOT/android/app/src/main/assets/starter.hydra"
 # Same file, relative to the repo root - git check-ignore wants that form.
@@ -39,6 +46,7 @@ notneed() { # notneed <label> <file> <extended-regex>
 printf '== Android auto-start and model preparation ==\n'
 
 [ -f "$KT" ] || { bad "MainActivity.kt exists" "missing: $KT"; printf '\nANDROID-AUTOSTART-CHECK: %d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
+[ -f "$UI" ] || { bad "HydraApp.kt exists" "missing: $UI"; printf '\nANDROID-AUTOSTART-CHECK: %d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
 [ -f "$STRINGS" ] || { bad "strings.xml exists" "missing: $STRINGS"; }
 
 need "model preparation exists as its own function" "$KT" 'fun prepareModel\(\): *Boolean'
@@ -59,16 +67,39 @@ else
 fi
 
 need "a run is started automatically after preparation" "$KT" 'log_auto_run'
-need "the automatic run goes through the same path as the button" "$KT" 'root\.post *\{ *startInference\(\) *\}'
-need "the auto-run switch exists" "$KT" 'CheckBox'
-need "the switch is labelled from resources, not hardcoded" "$KT" 'setText\(R\.string\.action_auto_run\)'
+
+# Compose replaced root.post { startInference() } with a LaunchedEffect, so
+# the invariant is now "the auto-run effect actually calls startInference()".
+# Two independent greps would both pass if the effect existed but did nothing
+# while a bare startInference() call sat elsewhere in the file, so this is
+# checked as an ORDER inside one window, the same way android_crash_check.sh
+# checks that a report is written before the crash is delegated.
+if awk '/LaunchedEffect\(Unit\)/,/^                \}/' "$KT" \
+     | grep -Eq 'startInference\(\)'; then
+  ok "the automatic run goes through the same path as the button"
+else
+  bad "the automatic run goes through the same path as the button" \
+      "the LaunchedEffect that replaced root.post { startInference() } does not call startInference()"
+fi
+
+need "the auto-run switch exists" "$UI" 'Switch\('
+need "the switch is labelled from resources, not hardcoded" "$UI" 'stringResource\(R\.string\.action_auto_run\)'
 need "the switch state is readable" "$KT" 'autoRun *= *checked'
 
 need "an imported model wins over the starter model" "$KT" 'IMPORTED_NAME'
-need "the active model is shown in the UI" "$KT" 'modelLabel\.text'
-need "the model label text comes from resources" "$KT" 'R\.string\.label_model'
+need "the active model is shown in the UI" "$UI" 'text = ".*modelLabel'
+need "the model label text comes from resources" "$UI" 'stringResource\(R\.string\.label_model\)'
 
-need "no model means the run button is disabled" "$KT" 'runButton\.isEnabled *= *false'
+# A send button that is enabled with no model loaded does nothing when pressed.
+# Scoped to the composer on purpose: `enabled = state.hasModel` also appears on
+# the benchmark button, so an unscoped grep would still pass after the SEND
+# button's guard was deleted - which is the regression this check exists for.
+if awk '/private fun InputRow/,/^}/' "$UI" | grep -Eq 'enabled *= *state\.hasModel'; then
+  ok "no model means the run button is disabled"
+else
+  bad "no model means the run button is disabled" \
+      "the composer's send button is not gated on hasModel"
+fi
 need "no model means an explanation is shown" "$KT" 'R\.string\.err_no_model'
 need "an import also starts a run straight away" "$KT" 'startInference\(\)'
 
@@ -82,12 +113,41 @@ need "the logcat tag is a constant, not an inline literal" "$KT" 'const val LOG_
 # the screen lays its last children out below the bottom edge, and on a
 # 320x640 device that put the whole token log out of sight: the engine ran
 # and the user saw nothing.
-need "the whole screen is scrollable" "$KT" 'setContentView\(ScrollView'
-need "the log view is added directly to that scroll container" "$KT" 'root\.addView\(output\)'
-need "the log has a guaranteed minimum height" "$KT" 'minLines *= *[0-9]'
-if grep -Eq 'addView\(\s*ScrollView\(this\)\.apply \{ addView\(output\) \}' "$KT"; then
+#
+# In Compose the same defect has two shapes: a column that does not scroll at
+# all, and a transcript rendered outside the container that does.
+need "the whole screen is scrollable" "$UI" 'verticalScroll\(rememberScrollState\(\)\)'
+need "the conversation is a lazy list" "$UI" 'LazyColumn\('
+
+# The transcript must sit INSIDE the scrolling container. Grepping for both
+# patterns independently would pass if the transcript were rendered outside
+# the scrollable column, which is exactly the original defect, so the order
+# inside one window is what is asserted.
+if awk '/verticalScroll\(rememberScrollState\(\)\)/,/^private fun SettingsTab/' "$UI" \
+     | grep -q 'text = state\.log'; then
+  ok "the log view is added directly to that scroll container"
+else
+  bad "the log view is added directly to that scroll container" \
+      "state.log is not rendered inside the scrolling column"
+fi
+
+# Also scoped: `heightIn(min = ` appears on the progress indicator too, so an
+# unscoped grep passes even when the conversation itself has lost its floor.
+if awk '/private fun ColumnScope\.MessageList/,/^}/' "$UI" \
+     | grep -Eq 'heightIn\(min = [0-9]'; then
+  ok "the log has a guaranteed minimum height"
+else
+  bad "the log has a guaranteed minimum height" \
+      "the conversation has no heightIn(min = ...) floor"
+fi
+
+# Two same-direction scroll containers fight each other and the outer one
+# cannot reach the inner content. In Views that was ScrollView-in-ScrollView;
+# in Compose it is a LazyColumn placed inside a verticalScroll column.
+if awk '/private fun ColumnScope\.MessageList/,/^}/' "$UI" \
+     | grep -Eq 'verticalScroll\('; then
   bad "the log is not nested inside a second scroll view" \
-      "two same-direction scroll views fight each other and the outer one cannot reach the log"
+      "the conversation LazyColumn is nested inside a verticalScroll column"
 else
   ok "the log is not nested inside a second scroll view"
 fi

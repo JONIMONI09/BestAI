@@ -10,7 +10,11 @@
 #   4. assert the symbol exists in hydra_jni.c and that its C parameter
 #      list matches the JVM types javac derived
 #
-# Usage: bash tools/jni_signature_check.sh [HydraBridge.kt] [hydra_jni.c]
+# Usage: bash tools/jni_signature_check.sh [Bridge.kt] [bridge.cpp]
+#   bash tools/jni_signature_check.sh
+#   bash tools/jni_signature_check.sh \
+#     android/app/src/main/java/dev/hydrastone/LlamaBridge.kt \
+#     android/app/src/main/cpp/llama_jni.cpp
 # The optional arguments exist for the negative control: point the script
 # at a bridge that declares a method the C side does not implement and it
 # must fail (exit 1).
@@ -18,6 +22,14 @@ set -uo pipefail
 
 KT="${1:-android/app/src/main/java/dev/hydrastone/HydraBridge.kt}"
 JNI_C="${2:-android/app/src/main/cpp/hydra_jni.c}"
+
+# The Kotlin `object` is named after its file in every bridge in this repo
+# (HydraBridge.kt -> object HydraBridge, LlamaBridge.kt -> object LlamaBridge),
+# so the class name for the generated stub comes from the file name rather than
+# being hard-coded. That is what lets the same gate check the llama.cpp bridge
+# as well, instead of shipping a second set of native methods with nothing
+# verifying their descriptors.
+KTCLASS="$(basename "$KT" .kt)"
 
 command -v javac > /dev/null || { echo "SKIP: javac not available"; exit 0; }
 test -f "$KT"  || { echo "FAIL: $KT not found"; exit 1; }
@@ -53,6 +65,7 @@ JMAP = {
     "Boolean": "boolean",
     "Long": "long",
     "Double": "double",
+    "Float": "float",
     "Unit": "void",
     "Callback": "dev.hydrastone.%s.Callback" % cls,
 }
@@ -128,7 +141,11 @@ for hdr in "$WORK/h"/*.h; do
   test -n "$symbols" || { echo "FAIL: no JNI symbol in $hdr"; fail=1; continue; }
 
   for sym in $symbols; do
-    if ! grep -q "$sym" "$JNI_C"; then
+    # -w matters: a plain substring search is satisfied by
+    # Java_..._LlamaBridge_unloadXX when the check is for
+    # Java_..._LlamaBridge_unload, so renaming a native method out of the way
+    # would pass. -w anchors on non-word characters at both ends.
+    if ! grep -qw "$sym" "$JNI_C"; then
       echo "FAIL: $sym is declared on the Kotlin/Java side but missing in $JNI_C"
       fail=1
       continue
@@ -182,7 +199,7 @@ fi
 # every native signature check still passes while the app can never
 # receive a single token. So the JVM descriptor of each callback method is
 # derived from the generated stub and must appear in hydra_jni.c.
-cb_sig="$(python3 - "$WORK/dev/hydrastone/HydraBridge.java" <<'PY'
+cb_sig="$(python3 - "$WORK/dev/hydrastone/$KTCLASS.java" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 m = re.search(r"interface\s+Callback\s*\{(.*?)\}", src, re.S)
@@ -192,8 +209,10 @@ body = m.group(1)
 out = []
 for mm in re.finditer(r"void\s+(\w+)\s*\(([^)]*)\)\s*;", body):
     name = mm.group(1)
-    jt = {"int": "I", "int[]": "[I", "boolean": "Z", "long": "J",
-          "java.lang.String": "Ljava/lang/String;"}
+    # The generated stub writes bare `String` (it has no java.lang import) for
+    # some bridges and the qualified form for others, so both are accepted.
+    jt = {"int": "I", "int[]": "[I", "boolean": "Z", "long": "J", "float": "F",
+          "String": "Ljava/lang/String;", "java.lang.String": "Ljava/lang/String;"}
     params = []
     for p in (x.strip() for x in mm.group(2).split(",")):
         if not p:

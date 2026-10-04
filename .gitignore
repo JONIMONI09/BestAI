@@ -13,6 +13,10 @@ node_modules/
 
 # Models
 *.hydra
+# GGUF weights are third-party model weights under their own licence, not
+# source. tools/fetch_test_model.sh downloads them on demand; committing one
+# would add ~100 MB per model to the history permanently.
+*.gguf
 models/
 # Uploaded models are user data, never committed.
 models/uploaded/

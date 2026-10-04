@@ -266,7 +266,13 @@ jobs:
     name: Android lint
     runs-on: ubuntu-latest
     steps:
+      # submodules: true ist Pflicht, keine Optimierung: der native Build
+      # ruft add_subdirectory(llama) auf. Ohne Submodul sieht der Job ein
+      # leeres Verzeichnis und CMake schlaegt fehl - auf main, bei jedem
+      # Release und bei jedem Pull Request, der Android anfasst.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: actions/setup-java@v4
         with:
