@@ -58,10 +58,41 @@ jobs:
 
       # Level 4 = high/critical. Level 2 would report every fopen/open
       # and every char array; those are false positives here.
+      #
+      # The input list is resolved through `git ls-files` instead of by passing
+      # the directories, because android/app/src/main/cpp/ CONTAINS the vendored
+      # llama.cpp submodule. Passing the directory scanned 787,044 lines of
+      # third-party MIT code and reported 180 findings inside llama.cpp that
+      # this project cannot act on; CI, which checks this job out WITHOUT
+      # submodules, saw 3,879 lines and passed. The same command must not mean
+      # two different things depending on whether a submodule happens to be
+      # populated on the machine - and a developer following the documented
+      # "run the failing gate locally first" procedure got 180 irrelevant hits.
+      #
+      # `git ls-files` is what makes the exclusion exact rather than a path
+      # filter to forget later: the submodule is a single mode-160000 gitlink
+      # entry in this repository's index, so its 787k lines are not first-party
+      # sources and can never appear in the list. `:(glob)` is still explicit
+      # about intent - it pins `*` to not cross a `/`.
       - name: flawfinder (security, level >= 4)
         run: |
-          flawfinder -m 4 --error-level=4 -C -Q src/ tests/ \
-                     android/app/src/main/cpp/
+          set -euo pipefail
+          mapfile -t OWN_SRC < <(git ls-files \
+            ':(glob)src/*.c' \
+            ':(glob)src/*.h' \
+            ':(glob)tests/*.c' \
+            ':(glob)android/app/src/main/cpp/*.c' \
+            ':(glob)android/app/src/main/cpp/*.cpp')
+          # A gate that scans nothing exits 0 and looks green (rules.md R25).
+          if [ "${#OWN_SRC[@]}" -lt 3 ]; then
+            echo "::error::flawfinder matched only ${#OWN_SRC[@]} file(s); the input list is broken, not clean"
+            exit 1
+          fi
+          echo "first-party sources under analysis (${#OWN_SRC[@]}):"
+          printf '  %s\n' "${OWN_SRC[@]}"
+          # The vendored llama.cpp tree is deliberately NOT in that list: it is
+          # third-party, pinned to v0.5.0 and audited by tools/llama_pin_check.sh.
+          flawfinder -m 4 --error-level=4 -C -Q "${OWN_SRC[@]}"
 
       - name: Upload C lint report
         if: failure()
@@ -71,7 +102,7 @@ jobs:
             echo "gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Wall -Wextra -Iinclude -c src/hydra_engine.c -o /dev/null"
             echo "clang --analyze -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude src/hydra_engine.c"
             echo "clang-tidy src/*.c --checks='-*,clang-analyzer-*,bugprone-*,cert-*,-cert-err33-c,concurrency-*,-concurrency-mt-unsafe'"
-            echo "flawfinder -m 4 --error-level=4 src/ tests/"
+            echo "flawfinder -m 4 --error-level=4 -C -Q <first-party sources from git ls-files>"
           } > c-lint-report.txt
           exit 0
 
