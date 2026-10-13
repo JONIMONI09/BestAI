@@ -125,8 +125,65 @@ static long hydra_resident_kb(void)
  * Ueberlauf: |A[i]|,|B[i]| <= layers <= HYDRA_MAX_LAYERS (4096), passt
  * also sicher in int32 (hier trotzdem in int64 gerechnet und erst am
  * Ende geklemmt, damit die Rechnung unabhaengig vom Layer-Cap bleibt). */
+
+
+/**
+ * hydra_build_aggregation_v1_1
+ * 2026 Integer-Only Load-Time Aggregation (v1.1 Format: 4 weights/byte)
+ * Decodes packed ternary weights and pre-sums them into 32-bit aggregation arrays.
+ */
+static void hydra_build_aggregation_v1_1(
+    const uint8_t* packed_weights_a,
+    const uint8_t* packed_weights_b,
+    int32_t* agg_a,
+    int32_t* agg_b,
+    size_t hidden_size)
+{
+    // Pure integer lookup table. Resides strictly in L1 Cache.
+    static const int32_t TERNARY_INT_MAP[4] = { 0, 1, -1, 0 };
+
+    // Processing 4 weights per byte
+    size_t packed_length = hidden_size / 4;
+
+    for (size_t i = 0; i < packed_length; ++i) {
+        uint8_t pack_a = packed_weights_a[i];
+        uint8_t pack_b = packed_weights_b[i];
+
+        size_t base_idx = i * 4;
+
+        // --- Decode and pre-sum for agg_a ---
+        agg_a[base_idx + 0] += TERNARY_INT_MAP[pack_a & 0x03];
+        agg_a[base_idx + 1] += TERNARY_INT_MAP[(pack_a >> 2) & 0x03];
+        agg_a[base_idx + 2] += TERNARY_INT_MAP[(pack_a >> 4) & 0x03];
+        agg_a[base_idx + 3] += TERNARY_INT_MAP[(pack_a >> 6) & 0x03];
+
+        // --- Decode and pre-sum for agg_b ---
+        agg_b[base_idx + 0] += TERNARY_INT_MAP[pack_b & 0x03];
+        agg_b[base_idx + 1] += TERNARY_INT_MAP[(pack_b >> 2) & 0x03];
+        agg_b[base_idx + 2] += TERNARY_INT_MAP[(pack_b >> 4) & 0x03];
+        agg_b[base_idx + 3] += TERNARY_INT_MAP[(pack_b >> 6) & 0x03];
+    }
+}
+
 static void hydra_build_aggregation(HydraEngine *engine)
 {
+    if (engine->header.version == 2) {
+        // In v2 (v1.1 packed), weights_len must cover layers * (dim/4) * 2 bytes.
+        // Assuming weights are split into A and B sequentially.
+        const uint8_t *w = engine->mapped_weights + engine->header.weights_offset;
+        size_t layer_bytes = engine->header.dim / 4;
+
+        memset(engine->agg_a, 0, sizeof(engine->agg_a));
+        memset(engine->agg_b, 0, sizeof(engine->agg_b));
+
+        for (uint32_t l = 0; l < engine->header.layers; ++l) {
+            const uint8_t* packed_a = w + (l * layer_bytes * 2);
+            const uint8_t* packed_b = packed_a + layer_bytes;
+            hydra_build_aggregation_v1_1(packed_a, packed_b, engine->agg_a, engine->agg_b, engine->header.dim);
+        }
+        return;
+    }
+
     int64_t a[HYDRA_EMBED_DIM];
     int64_t b[HYDRA_EMBED_DIM];
     memset(a, 0, sizeof(a));
@@ -218,8 +275,8 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
                 engine->header.magic, HYDRA_MAGIC);
         rc = -5; goto fail;
     }
-    if (engine->header.version != HYDRA_VERSION) {
-        fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u)\n",
+    if (engine->header.version != HYDRA_VERSION && engine->header.version != 2) {
+        fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u oder 2)\n",
                 (unsigned)engine->header.version, (unsigned)HYDRA_VERSION);
         rc = -7; goto fail;
     }
