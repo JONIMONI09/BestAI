@@ -18,7 +18,7 @@
 4. **R4 — Session end.** Mark done steps, move open items, verify
    `errors.md` is complete; both files go into the commit/PR.
 
-## 2. Correctness & honesty (KEIN Fake)
+## 2. Correctness & honesty
 
 5. **R5 — No fake tests.** Every test must be falsifiable. Ask for
    each test: "What code change would this catch?" Tautologies
