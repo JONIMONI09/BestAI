@@ -51,6 +51,43 @@ Measured (x86-64 sandbox with AVX2, so the SIMD path is live):
 AVX2 build (end-to-end parity); `jni-batch-test` 86/0,
 `large-model-test` 7/0, `gguf_test.py` 40/0; zero warnings.
 
+## 2026-10-25 — M5: safetensors import -> version-2 .hydra (4 ternary weights/byte)
+
+- **`tools/safetensors_to_hydra.py`** (new, Python standard library only):
+  reads a safetensors container (8-byte LE header length + JSON header +
+  data region), validates every tensor's `data_offsets` at BOTH ends
+  (`start >= 0`, `end > start`, `8+N+end <= file_size`, and the span equals
+  `n_elements * bytes_per_element`) and refuses malformed input by name -
+  a header length past the end, an unparseable header, an unsupported dtype
+  (only F32/F16/BF16), a 3-D tensor, out-of-order offsets or a range that
+  runs past the file end. Decodes F32 (struct), F16 (IEEE binary16 via
+  `<e>`) and BF16 (top 16 bits of an F32).
+  - Ternarises each plane with the b1.58 absmean rule: `gamma = mean|W|`,
+    `W_q = clip(round(W/(gamma+1e-8)))` with half-away-from-zero rounding
+    (the +1e-8 keeps an all-zero tensor finite). The ternary column sums
+    are two counts per column (the threshold form of the rounding), so the
+    ternary matrix is never materialised.
+  - Folds the column sums to the 64-wide state and writes a **version-2**
+    `.hydra` (4 ternary weights per byte, two `dim/4`-byte planes per
+    layer) whose aggregation A/B reproduces the folded sums value for
+    value - the same exactness guarantee as the v1 GGUF converter.
+- **`tools/gguf_test.py`**: a `run_safetensors` round-trip gate (called
+  from `run()`), proven three independent ways:
+  1. **Packing** - `read_hydra_v2` re-derives A/B from the packed bytes
+     with no shared code and compares to the reported A/B (catches a
+     transposed bit order or a swapped plane).
+  2. **Quantisation** - an oracle written from the spec's literal rule
+     (element-wise half-away round-clip, its own decode and fold) must
+     equal the reported A/B (catches a wrong gamma/rounding/threshold).
+  3. **The real engine** - `./hydra-run` on the v2 file is compared to a
+     reference step, plus F32/F16/BF16-of-the-same-weights-convert-
+     identically and six negative controls.
+
+Measured: `gguf_test.py` 40 -> **59 checks, 0 failed** (the 19 new
+safetensors checks; the C count is unchanged, so `test_count_baseline.txt`
+needs no edit); the baseline `[471,386,385,386,385,386,385,386]` @ 42/8 is
+untouched (the starter model is v1 and the v1 path is unchanged).
+
 ## 2026-10-25 — M4: Transformer primitives (RMSNorm/RoPE/SwiGLU) + streaming KV cache
 
 - **`include/hydra_model.h` / `src/hydra_engine.c`** (new API, zero-heap,

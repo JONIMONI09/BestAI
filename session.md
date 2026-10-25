@@ -127,7 +127,7 @@ tracker, per the established pattern.)
       streaming ring buffer with permanently retained attention sinks,
       O(1) in sequence length; unit tests: hand-computed values +
       eviction with sinks preserved.
-- [ ] **M5 Safetensors import.** `tools/safetensors_to_hydra.py`
+- [x] **M5 Safetensors import.** `tools/safetensors_to_hydra.py`
       (stdlib only): 8-byte LE header length + JSON header with offset
       validation, F32/F16/BF16 decoding, absmean scale,
       RoundClip ternarization, **first shipped writer for header
@@ -278,6 +278,35 @@ window tokens with oldest resident append = `max(S, n−(C−S))`. The
 first CONSUMERS of these primitives appear in M5/M6 (a transformer
 head over the ternary engine), which keeps M4 a self-contained,
 tested building-block layer.
+
+### M5 results & errors (2026-10-25, logged per R2/R3)
+
+**Measured:** `gguf_test.py` 40 -> **59 checks, 0 failed** on the x86
+AVX2 build with `--engine ./hydra-run` (19 new safetensors checks:
+converter acceptance, v2 header shape, independent byte-reader A/B
+parity, independent quantisation oracle, F32/F16/BF16 equivalence, the
+real C engine on two (token, steps) pairs, six negative controls,
+different-source-different-model). The C test count is unchanged (142
+x86 / 140 arm), so `tools/test_count_baseline.txt` needed no edit.
+Baseline `[471,386,385,386,385,386,385,386]` @ 42/8 untouched (the
+starter model is v1; the v1 path is byte-identical).
+
+**Error found & fixed (R3):** `_st_fails` in the new gate originally
+wrote its argument as bytes unconditionally, so the path-based negative
+controls (truncated / past-end files) crashed the gate with
+`TypeError: a bytes-like object is required, not 'str'` instead of
+testing the converter. Fixed by accepting either raw bytes or an
+existing path (mirroring `_convert_fails`). Caught immediately on the
+first run - the gate is its own negative control.
+
+**Design notes:** the converter never materialises the ternary matrix -
+`W_q = clip(round(W/(gamma+eps)))` is a threshold, so the ternary column
+sums are `count(W >= s/2) - count(W <= -s/2)`. The v2 writer stores the
+folded column sums as layer sums of +/-1 (the same exactness trick as
+the v1 GGUF converter), so `sum_l w1[l][i] == A[i]` by construction.
+The first shipped WRITER for the v2 format is this tool; the engine's
+v2 reader (and, on AVX2 builds, the AVX2 unpack kernel) has now had its
+first end-to-end file-level exercise.
 
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 
