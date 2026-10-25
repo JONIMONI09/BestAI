@@ -343,10 +343,31 @@ jobs:
         run: /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
 
       - name: Check the lint report for warnings/errors
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REPORT=android/app/build/reports/lint-results-debug.txt
           cat "$REPORT"
           if ! grep -q "No issues found" "$REPORT"; then
+            # The report above is also in the job log, but the log is only
+            # readable in the Actions UI: log-download and artifact hosts are
+            # not reachable by API-only clients. Mirror the report where the
+            # API can see it — a PR comment on pull-request runs, plus the
+            # step summary always — so a failure is diagnosable without
+            # opening the UI.
+            {
+              echo "### Android Lint report ($(git rev-parse --short HEAD))"
+              echo
+              echo '```'
+              cat "$REPORT"
+              echo '```'
+            } > /tmp/lint-report.md
+            cat /tmp/lint-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "${PR_NUMBER}" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 || true
+            fi
             echo "::error::Android Lint reported findings"
             exit 1
           fi

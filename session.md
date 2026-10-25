@@ -246,7 +246,32 @@ is a `<plurals>` (log_size, log_running, log_bench_start), and the gate
 fails on ANY finding. Fixed by converting to `<plurals>` (one/other,
 matching the existing style) and updating the three `stringResource`
 call sites in HydraApp.kt. Committed on the new session branch
-`arena/6bf4fc8e-bestai`, pushed, PR opened (R17: merge is the user's).
+`arena/6bf4fc8e-bestai`, pushed, **PR #48** opened (R17: merge is the
+user's).
+
+**CI round 1 (db85ccd):** CI green (7m32s), Lint & Security red — with a
+different finding than inferred: **"3 errors, 0 warnings"**. The
+PluralsCandidate warnings are gone (conversion was right), but each
+`stringResource(R.plurals…, …)` call raised ERROR `ResourceType`
+("Expected resource of type string") at HydraApp.kt:329/331/333: in this
+Compose version (BOM 2024.09.03) overload resolution picks the
+`stringResource(@StringRes Int, vararg Any)` overload, and lint rejects
+an R.plurals id at a @StringRes parameter. The report itself was
+unreadable from this sandbox (log/artifact hosts outside egress) — the
+user pasted it, and asked to make such reports retrievable going forward.
+
+**Round 2 (this commit):** (a) call sites switched to
+`LocalResources.current.getQuantityString(R.plurals…, …)` — one
+unambiguous signature, @PluralsRes parameter, same pattern MainActivity
+already uses; the strings stay plurals. (b) `lint.yml` now mirrors the
+full report on failure as a **PR comment** (pull-request runs) and
+**step summary** (always) — the report lands where API-only clients can
+read it; an in-sandbox fetch script is impossible (egress blocks the log
+hosts), so CI-side mirroring is the workable form of the user's request.
+errors.md: overload trap + two-round principle; CHANGELOG updated.
+**Open:** round-2 CI green (CI + Lint & Security); user merge; the
+main-branch Release run goes green automatically after the merge
+(same lint gate).
 
 ### Session close (2026-10-25)
 

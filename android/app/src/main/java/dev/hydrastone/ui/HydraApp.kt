@@ -48,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -325,12 +326,19 @@ private fun EngineStatusRow(state: MainUiState) {
 @Composable
 private fun RunTelemetryRow(state: MainUiState) {
     val run = state.lastRun ?: return
+    // getQuantityString, not stringResource: in this Compose version the
+    // stringResource(id, vararg) overload wins over the plurals overload in
+    // overload resolution, which lint then rejects as ResourceType
+    // ("expected resource of type string"). Resources.getQuantityString has
+    // a single unambiguous signature and the @PluralsRes parameter, and it
+    // is the same pattern MainActivity already uses for its plurals.
+    val resources = LocalResources.current
     val text = if (run.live) {
-        stringResource(R.plurals.run_live, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
+        resources.getQuantityString(R.plurals.run_live, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
     } else if (run.cancelled) {
-        stringResource(R.plurals.run_done_cancelled, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
+        resources.getQuantityString(R.plurals.run_done_cancelled, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
     } else {
-        stringResource(R.plurals.run_done, run.tokens, run.tokens, run.elapsedMs, formatRate(run.tokensPerSecond))
+        resources.getQuantityString(R.plurals.run_done, run.tokens, run.tokens, run.elapsedMs, formatRate(run.tokensPerSecond))
     }
     Row(
         modifier = Modifier

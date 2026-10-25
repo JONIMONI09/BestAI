@@ -22,6 +22,22 @@ All notable changes to this project, per change, are recorded here and in
   call sites in `HydraApp.kt` to the plurals form
   (`quantity, args…`). CI compile + APK build + APK verification were
   already green on the merged commit — only the lint gate was red.
+  **Round 2 (after the first CI run):** the plurals conversion removed
+  all warnings (report: "3 errors, 0 warnings"), but the
+  `stringResource(R.plurals…, …)` call style hit a second wall: in this
+  Compose version (BOM 2024.09.03) overload resolution picks the
+  `stringResource(@StringRes Int, vararg Any)` overload, so lint raised
+  three ERROR-level `ResourceType` findings ("Expected resource of type
+  string"). The call sites now use
+  `LocalResources.current.getQuantityString(R.plurals…, …)` — one
+  unambiguous signature, a `@PluralsRes` parameter, and the same pattern
+  `MainActivity` already uses for its plurals. The strings stay plurals.
+- **`.github/workflows/lint.yml` — self-publishing lint reports.** The
+  report was only readable in the Actions UI (job log + artifact, both on
+  hosts outside API-only egress). The "Check the lint report" step now
+  also posts the full report as a PR comment (on pull-request runs) and
+  to the step summary on every failure, so lint failures are diagnosable
+  from the API alone.
 
 ## 2026-10-25 — CI fix round (post-PR, same run)
 

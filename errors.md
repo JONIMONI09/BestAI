@@ -1565,3 +1565,34 @@
   args, the repo's positional-arg style) and match it. A green gate
   that has been green for months is a statement about the conventions
   of the file, not just about its current contents.
+
+## 2026-10-25 — the plurals fix itself tripped a second wall: Compose stringResource overload resolution
+- **Symptom:** after converting the three telemetry strings to
+  `<plurals>` and calling `stringResource(R.plurals.X, quantity, args...)`,
+  CI's lint failed with three ERROR-level findings: "Expected resource of
+  type string [ResourceType]" at each call. The build compiled fine —
+  the wrong overload simply accepts any Int.
+- **Cause:** `stringResource(@StringRes Int, vararg Any)` and
+  `stringResource(@PluralsRes Int, Int, vararg Any)` are both applicable
+  to a 4-argument call; in this Compose version (BOM 2024.09.03) the
+  compiler resolved to the STRING overload, and lint's ResourceType check
+  then rejected an R.plurals id passed to a @StringRes parameter. So the
+  first fix (plurals — which the previous report's 0-warnings count
+  confirmed it had achieved) was right, but the call style it implied
+  was not unambiguous on this toolchain. Two consecutive lint runs were
+  needed to learn this: run 1 proved the warnings were gone, run 2
+  exposed the overload trap.
+- **Fix:** `LocalResources.current.getQuantityString(R.plurals.X,
+  quantity, args...)` — one unambiguous signature, a @PluralsRes
+  parameter (lint-clean), and the exact pattern MainActivity already uses
+  for its plurals. No change to the strings themselves (they stay
+  plurals).
+- **Prevention:** when a call crosses into a library API with several
+  overloads distinguished only by resource-type annotations
+  (@StringRes/@PluralsRes/@ArrayRes), do not rely on Kotlin overload
+  resolution to pick the annotated one — call the platform API with the
+  explicit type, or verify with the real compiler/lint before shipping.
+  And: a red gate whose report you cannot read is a two-round
+  investigation by necessity; the new lint.yml step now posts the full
+  report as a PR comment + step summary on failure, so round one becomes
+  round zero for API-only clients.
