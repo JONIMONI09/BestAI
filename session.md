@@ -443,6 +443,24 @@ the Android SDK, the aarch64 toolchain, and CodeQL only exist there.
    world-writable under permissive umask) — replaced with explicit
    `open(..., 0644)` + `fdopen`.
 
+**CI follow-up, rounds 2-4 (same day) — CI fully green:** the job-log
+hosts stay egress-blocked, so the two Android workflows now emit their
+failure from the build step itself as a check-run annotation (Kotlin
+`e:` lines + gradle tail in one `::error::`; the lint job annotates
+each lint finding individually). Annotations are API-readable and need
+no permissions — that annotation delivered the real error:
+`Unresolved reference 'value'` at `constraints.maxHeight.value`.
+Root cause: `BoxWithConstraintsScope.constraints` is the pixel-based
+`ui.unit.Constraints` (`maxHeight` = Float, no `.value`); the Dp value
+is the scope's own `maxHeight` property (verified in the
+foundation-1.7.3-era sources). Cap now
+`(maxHeight.value * headerFraction).dp`; the deprecated
+`SOFT_INPUT_ADJUST_NOTHING` dropped (API 30+ edge-to-edge delivers the
+IME as an inset under the default mode — and it was the "0 findings"
+lint culprit). Negative control re-anchored to the new expression.
+Final state: runs 40237612415 (CI) + 40237612492 (Lint & Security)
+on `5445742` — every check pass. **Next:** user merges (R17).
+
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 
 **2026-10-25 — Full-repository audit, Claude-skills adherence, 6-milestone

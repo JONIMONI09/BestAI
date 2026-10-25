@@ -102,6 +102,39 @@ reproduce (no Android SDK, no aarch64 toolchain, no CodeQL):
   exactly those wirings. Local proof: gate 32/0, negative control 15
   proved / 0 could not fail, `hydra-test` 142/0.
 
+### CI follow-up, round 2-4 (same day): API-readable diagnostics + the px/Dp root cause
+
+The second CI run showed that the compile errors had moved, but the
+sandbox cannot read Actions job logs (the log-download and artifact
+hosts are egress-blocked; the check-run output API does not index step
+summaries; PR-comment posting is refused by the repository token
+policy). The two Android jobs now therefore publish their failure from
+the build step itself as a **check-run annotation** — one `::error::`
+line with the Kotlin `e:` compiler lines plus a short gradle log tail
+(lint job: the same, plus per-finding annotations when the lint report
+exists). Annotations are served by the API and need no permissions.
+The lint job also gained `issues:write` (the PR-comment mirror stays
+for when the token policy allows it).
+
+The annotation from run 4 of the round delivered the error text:
+`HydraApp.kt:340:36 Unresolved reference 'value'`. Root cause:
+`BoxWithConstraintsScope.constraints` is the **pixel-based**
+`androidx.compose.ui.unit.Constraints`, whose `maxHeight` is a plain
+`Float` — it has no `.value`. (Verified against the foundation
+1.7.3-era sources, which also show the scope exposing the Dp-converted
+value as its own `maxHeight` property.) The cap now uses that scope
+property: `(maxHeight.value * headerFraction).dp` — no new imports.
+`SOFT_INPUT_ADJUST_NOTHING` (deprecated since API 30, and not what
+edge-to-edge wants — a non-resizing window on API 30+ delivers the IME
+as an inset under the default soft-input mode) was dropped, which
+also cleared the "0 findings" lint gate. The negative-control
+scenario for the cap is re-anchored to the new expression.
+
+Result: **all CI green** (runs 40237612415 "CI" + 40237612492
+"Lint & Security" on commit `5445742`): Android APK build, Android
+lint, neon-test (incl. cross-arch determinism), CodeQL built-in /
+c-cpp / js, sanitizers, docs claim lint, and every other leg pass.
+
 ## 2026-10-25 — M6: docs + baseline (roadmap checkboxes only for verified work)
 
 - **`README.md`**: the Roadmap now reflects reality, with **exact
