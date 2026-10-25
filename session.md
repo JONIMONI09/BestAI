@@ -344,9 +344,41 @@ kompiliert. Sonst nichts geändert (Plurals, Call-Stil, Workflow).
 Fehler-Artifact in lint.yml bekommt zusätzlich /tmp/lint-report.md +
 gradle-lint.log. Doku: errors.md (nicht-existierende API +
 Fehler-Fingerprint "CI rot + Lint ohne Report = Compiler, nicht
-Lint-Finding"), CHANGELOG + session.md. **Offen:** nächster Run grün
-(CI + Lint & Security); Merge durch den Nutzer; Release auf main
-nach Merge.
+Lint-Finding"), CHANGELOG + session.md. Ergebnis: **CI und Lint &
+Security grün auf a983414**; Nutzer hat **PR #48 merged** (20:04Z,
+Merge-Commit afae8c8 auf main). Release auf main lief danach neu und
+ist grün.
+
+### Round 2026-10-25 (post-merge: Doc-Audit aus Screenshot)
+
+Nutzer hat den GitHub-README-Stand (main, afae8c8) als Screenshot
+gefordert, alles zu prüfen: Screenshot-Ansprüche + finale Doku in
+jedem Ordner. Neue Session-Branch `arena/c19193e9-bestai` (von
+afae8c8).
+
+**Geprüft und bestätigt (gemessen/gestimmt, keine Änderung):**
+Token-Sequenz `[471, 386, 385, 386, 385, 386, 385, 386]` (starter,
+start_token=42, 8 Steps) per echtem Build+Run reproduziert; CI
+neon-test (aarch64-Crosscompile + qemu, Paritäts-Run 42 8 --json) +
+NEON-vs-Skalar im selben ARM-Binary (test_engine.c); Emulator-Evidence
+in android/README.md; make_model.py assertet A[0] != 0 / B[0] != 0;
+zero runtime npm deps + ESLint dev-only; `make ui` → :8787
+(server.js PORT); FORMAT.md "Version 2" + test_version_two_format;
+.hydra2 unimplementiert (kein hydra2 in src/include), FORMAT-V2.md
+ist die Spec; docs_claim_check.sh grün.
+
+**Gefunden und gefixt:** (1) Lizenz-Widerspruch — LICENSE ist
+GPL-3.0-Volltext (GitHub-Header zeigt "GPL-3.0 license"), README
+sagte "MIT" an zwei Stellen (License-Sektion + Struktur-Baum),
+package.json "license": "MIT" → alle drei jetzt GPL-3.0 (LICENSE
+selbst unangetastet — Rechtsentscheidung des Nutzers; die
+llama.cpp-MIT-Referenzen in AGENTS.md/ANDROID-AUDIT.md sind korrekt
+und bleiben). (2) Roadmap-Verweis auf eine "*Roadmap status*"-Sektion
+in docs/ARCHITECTURE.md, die es nie gab (git log -S) → zeigt jetzt
+auf die echte Sektion "Known Structural Redundancy", wo das
+superseded-Design A[i]/B[i] steht (Zeile 106). Doku: CHANGELOG,
+errors.md (Lizenz-/Cross-Reference-Fingerprint). PR geöffnet
+(R17: Merge ist beim Nutzer).
 
 ### Session close (2026-10-25)
 

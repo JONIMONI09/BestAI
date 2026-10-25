@@ -3,6 +3,56 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — post-merge doc audit (screenshot verification pass)
+
+PR #48 merged (20:04Z, main = afae8c8). Audit of the GitHub README
+state + final docs across all folders, per user request.
+
+### Fixed
+
+- **License contradiction.** The LICENSE file is the full GPL-3.0
+  text (GitHub's own header detects "GPL-3.0 license"), but README.md
+  said "MIT — see LICENSE" in two places (License section and the
+  project-structure tree) and package.json carried
+  `"license": "MIT"`. All three references now say GPL-3.0. The
+  LICENSE file itself is untouched — changing it is a legal decision
+  for the user, not a documentation fix. (The MIT references in
+  AGENTS.md / docs/ANDROID-AUDIT.md describe the pinned llama.cpp
+  v0.5.0, which really is MIT, and stay as-is.)
+- **Broken cross-reference in the roadmap.** The `.hydra2` item
+  pointed readers to a "*Roadmap status* section" of
+  `docs/ARCHITECTURE.md` — a section that never existed in that file
+  (`git log -S` shows it was only ever written in the README). The
+  superseded aggregated `A[i]/B[i]` design is documented under
+  "Known Structural Redundancy: the Layer Loop Is Algebraically
+  Free"; the reference now names that section.
+
+### Verified (measured or checked against the tree — no change)
+
+- Token sequence `[471, 386, 385, 386, 385, 386, 385, 386]` for the
+  starter model (start_token=42, 8 steps) — reproduced with a real
+  build + run.
+- CI enforces the ARM64 half on every push: the `neon-test` job
+  cross-compiles for aarch64, runs the suite under qemu (scalar vs
+  NEON comparison happens inside the same ARM binary,
+  `tests/test_engine.c` under `#ifdef __ARM_NEON`), and replays the
+  parity run `42 8 --json`.
+- The emulator evidence claimed for Android is present in
+  `android/README.md` ("host and emulator both produced
+  `[471, 386, 385, 386, …]` — bit-identical").
+- `tools/make_model.py` guarantees AND asserts `A[0] != 0` and
+  `B[0] != 0` (the state-blind `B[0] == 0` history is documented in
+  the file).
+- Web console: zero runtime npm dependencies, ESLint dev-only and
+  used by the lint gate; `make ui` builds hydra-run + the starter
+  model and serves on port 8787 (`server.js`).
+- "4-weights-per-byte packing" roadmap item: `docs/FORMAT.md`
+  "Version 2" section and `tests/test_engine.c`
+  `test_version_two_format` both exist.
+- ".hydra2 not implemented": no `hydra2` anywhere in `src/` or
+  `include/`; `docs/FORMAT-V2.md` is the spec.
+- `tools/docs_claim_check.sh`: all banned claims absent.
+
 ## 2026-10-25 — post-merge lint fix (branch `arena/6bf4fc8e-bestai`)
 
 ### Fixed
