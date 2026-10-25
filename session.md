@@ -369,8 +369,16 @@ dann PR".
 - `tools/android_autostart_check.sh`: the old "guaranteed minimum
   height" grep (scoped on `ColumnScope.MessageList`) is replaced by two
   checks scoped on `AdaptiveHeaderSplit` (headerFraction cap; remainder
-  hand-over). Negative control verified: renamed `headerFraction` in a
-  copy of the tree → the check fails, exit 1.
+  hand-over).
+- CI caught (run after PR open): `tools/android_autostart_negative_test.sh`
+  still removed the OLD behaviour (the 120dp floor) and looked for the
+  OLD check name — so its scenario was a no-op. Fixed properly: the
+  gate's cap check now greps the cap expression (`maxHeight *
+  headerFraction`), not the parameter alone (a parameter nothing
+  multiplies is a cap in name only), and the negative test's scenario
+  is replaced by two — one per new check — each removing the real
+  wiring. Local proof: gate 32/0 on the real tree, negative test
+  15 proved / 0 could not fail (was 13/1 in CI).
 
 **Full .md audit (21 tracked files, via the new local scanner):**
 - 1 real doc bug found and fixed: `docs/ARCHITECTURE.md` SIMD table

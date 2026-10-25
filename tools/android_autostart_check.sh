@@ -139,15 +139,17 @@ fi
 # always keeps (1 - headerFraction) of the space above the composer, and
 # the composer itself is a plain sibling after the weighted split.
 #
-# Also scoped: 'headerFraction' and the remainder expression would match
-# any comment anywhere in the file, so the awk window is what asserts they
-# live inside the split's measurement logic.
+# Also scoped: the patterns below would match any comment anywhere in the
+# file, so the awk window is what asserts they live inside the split's
+# measurement logic. And the first one greps the CAP EXPRESSION
+# (maxHeight * headerFraction), not the parameter alone: a parameter that
+# nothing multiplies is a cap in name only.
 if awk '/private fun AdaptiveHeaderSplit/,/^}/' "$UI" \
-     | grep -Eq 'headerFraction'; then
+     | grep -Eq 'maxHeight \* headerFraction'; then
   ok "the header block is capped at a fraction of the space"
 else
   bad "the header block is capped at a fraction of the space" \
-      "AdaptiveHeaderSplit no longer caps the header with headerFraction"
+      "AdaptiveHeaderSplit no longer computes a cap from headerFraction"
 fi
 if awk '/private fun AdaptiveHeaderSplit/,/^}/' "$UI" \
      | grep -Eq 'maxHeight - headerPlaceable\.height'; then

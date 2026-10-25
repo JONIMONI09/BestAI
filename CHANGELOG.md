@@ -34,11 +34,16 @@ All notable changes to this project, per change, are recorded here and in
   instead. The input row is a plain sibling after the weighted split and
   can no longer be pushed off screen.
 - `tools/android_autostart_check.sh`: the "guaranteed minimum height"
-  check now asserts the new mechanism (the `headerFraction` cap inside
-  `AdaptiveHeaderSplit` plus the remainder hand-over to the content);
-  the nested-scroll check now scopes on `MessageList`. Negative
-  control: a copy of the tree with `headerFraction` renamed fails
-  (exit 1), verified.
+  check now asserts the new mechanism — the header block is capped at a
+  fraction of the space (grep on the cap EXPRESSION
+  `maxHeight * headerFraction`, not the parameter alone, so a cap in
+  name only fails) plus the remainder hand-over to the content; the
+  nested-scroll check now scopes on `MessageList`.
+  `tools/android_autostart_negative_test.sh` (the CI-side proof that
+  every gate check can fail) is updated to match: the old
+  min-height scenario is replaced by two scenarios, one per new check,
+  each removing the real wiring — all 15 scenarios now turn their
+  check red (15 proved, 0 could not fail).
 
 **Docs**
 
