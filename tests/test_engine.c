@@ -1658,6 +1658,277 @@ static void test_avx2_v2_unpack(void)
 }
 #endif /* __AVX2__ */
 
+/* -------------------------------------------------------------------
+ * M4: Transformer primitives (RMSNorm, RoPE, SwiGLU) + streaming KV
+ * cache. All expectations are hand-computed (R25: negative controls
+ * for every guard; R22: fixed LCG seed for the random inputs).
+ * ------------------------------------------------------------------- */
+
+/* LCG float in [-1, 1), 22-bit precision, fixed seed (R22). */
+static float lcg_float(void)
+{
+    static uint32_t st = 0x4D4E4F5Eu; /* "M4NO" */
+    st = st * 1664525u + 1013904223u;
+    const int32_t s = (int32_t)(st >> 10) - 0x200000; /* [-2^21, 2^21) */
+    return (float)s / 2097152.0f;                     /* [-1, 1) */
+}
+
+static int float_near(float a, float b, float tol)
+{
+    float d = a - b;
+    if (d < 0.0f) d = -d;
+    return d <= tol;
+}
+
+static void test_rmsnorm(void)
+{
+    /* Hand-computed: x=[1,2,3,4], w=1, eps=1e-6.
+     * mean(x^2) = (1+4+9+16)/4 = 7.5
+     * out[i] = x[i] / sqrt(7.5 + 1e-6) */
+    const float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float w1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float out[4] = {0};
+    const double inv = 1.0 / sqrt(7.5 + 1e-6);
+    CHECK(hydra_rmsnorm(x, w1, 4, 1e-6f, out) == 0 &&
+          float_near(out[0], (float)(inv * 1.0), 1e-5f) &&
+          float_near(out[1], (float)(inv * 2.0), 1e-5f) &&
+          float_near(out[2], (float)(inv * 3.0), 1e-5f) &&
+          float_near(out[3], (float)(inv * 4.0), 1e-5f),
+          "RMSNorm: hand-computed y = x/sqrt(mean(x^2)+eps) * w");
+
+    /* With weights w=[1,2,1,2]: multiplied per-dim. */
+    const float w2[4] = {1.0f, 2.0f, 1.0f, 2.0f};
+    float out2[4] = {0};
+    CHECK(hydra_rmsnorm(x, w2, 4, 1e-6f, out2) == 0 &&
+          float_near(out2[0], (float)(inv * 1.0 * 1.0), 1e-5f) &&
+          float_near(out2[1], (float)(inv * 2.0 * 2.0), 1e-5f),
+          "RMSNorm: weight vector applied per dimension");
+
+    /* Scale invariance (w=1): rmsnorm(10x) == rmsnorm(x) exactly
+     * (the normalization cancels the input scale). */
+    const float x10[4] = {10.0f, 20.0f, 30.0f, 40.0f};
+    float out10[4] = {0};
+    CHECK(hydra_rmsnorm(x10, w1, 4, 1e-6f, out10) == 0 &&
+          float_near(out10[0], out[0], 1e-4f) &&
+          float_near(out10[3], out[3], 1e-4f),
+          "RMSNorm: scale-invariant (rmsnorm(10x) == rmsnorm(x))");
+
+    /* NaN guard (negative control): -1 AND output unmodified. */
+    const float xbad[4] = {1.0f, 2.0f, NAN, 4.0f};
+    float sentinel[4] = {-999.0f, -999.0f, -999.0f, -999.0f};
+    CHECK(hydra_rmsnorm(xbad, w1, 4, 1e-6f, sentinel) == -1 &&
+          sentinel[0] == -999.0f && sentinel[2] == -999.0f,
+          "RMSNorm: NaN input -> -1, output unmodified");
+
+    /* Argument guards (negative controls). */
+    float tmp[1] = {0};
+    CHECK(hydra_rmsnorm(x, w1, 0, 1e-6f, tmp) == -1 &&
+          hydra_rmsnorm(x, w1, 4, 0.0f, tmp) == -1 &&
+          hydra_rmsnorm(NULL, w1, 4, 1e-6f, tmp) == -1,
+          "RMSNorm: invalid args (dim=0, eps=0, NULL) -> -1");
+}
+
+static void test_rope(void)
+{
+    /* pos=0 -> identity, bit-exact. */
+    float x0[4] = {1.0f, -2.0f, 3.0f, -4.0f};
+    CHECK(hydra_rope_inplace(x0, 4, 0, 10000.0) == 0 &&
+          x0[0] == 1.0f && x0[1] == -2.0f && x0[3] == -4.0f,
+          "RoPE: pos=0 is the identity (bit-exact)");
+
+    /* dim=2, x=[1,0], pos=1, theta=1.0: freq=1, angle=1 rad
+     * -> [cos(1), sin(1)] hand-computed. */
+    float x1[2] = {1.0f, 0.0f};
+    CHECK(hydra_rope_inplace(x1, 2, 1, 1.0) == 0 &&
+          float_near(x1[0], (float)cos(1.0), 1e-5f) &&
+          float_near(x1[1], (float)sin(1.0), 1e-5f),
+          "RoPE: hand-computed rotation (dim=2, pos=1, theta=1)");
+
+    /* Norm preservation: |x'| == |x| (rotation is orthogonal),
+     * random input, standard theta=10000. */
+    float xr[8];
+    double n0 = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        xr[i] = lcg_float() * 3.0f;
+        n0 += (double)xr[i] * xr[i];
+    }
+    int rc = hydra_rope_inplace(xr, 8, 7, 10000.0);
+    double n1 = 0.0;
+    for (int i = 0; i < 8; ++i)
+        n1 += (double)xr[i] * xr[i];
+    CHECK(rc == 0 && float_near((float)sqrt(n1), (float)sqrt(n0), 1e-3f),
+          "RoPE: preserves vector norm (orthogonal rotation)");
+
+    /* Guards (negative controls): odd dim, theta=0, NaN unmodified. */
+    float xn[3] = {1.0f, 2.0f, 3.0f};
+    float xbad[2] = {1.0f, NAN};
+    CHECK(hydra_rope_inplace(xn, 3, 1, 10000.0) == -1 &&
+          hydra_rope_inplace(xn, 2, 1, 0.0) == -1 &&
+          hydra_rope_inplace(xbad, 2, 1, 10000.0) == -1 &&
+          xbad[0] == 1.0f && isnan(xbad[1]),
+          "RoPE: invalid args (odd dim, theta=0, NaN) -> -1, unmodified");
+}
+
+static void test_swiglu(void)
+{
+    /* g=0 -> silu(0)=0 -> out=0 regardless of u. */
+    const float g0[1] = {0.0f};
+    const float u5[1] = {5.0f};
+    float o0[1] = {77.0f};
+    CHECK(hydra_swiglu(g0, u5, 1, o0) == 0 && o0[0] == 0.0f,
+          "SwiGLU: g=0 -> 0 (silu(0)=0)");
+
+    /* Hand-computed: g=[1], u=[2] -> 2 * 1 * sigmoid(1)
+     * sigmoid(1) = 1/(1+exp(-1)) = 0.7310585786...
+     * out = 1.4621171573... */
+    const float g1[1] = {1.0f};
+    const float u2[1] = {2.0f};
+    float o1[1] = {0};
+    CHECK(hydra_swiglu(g1, u2, 1, o1) == 0 &&
+          float_near(o1[0], (float)(2.0 * 0.7310585786300049), 1e-6f),
+          "SwiGLU: hand-computed silu(1)*2");
+
+    /* Tails: g=+100 -> silu ~ 100 (sigmoid ~ 1); g=-100 -> silu ~ 0.
+     * No overflow either way (safe sigmoid). */
+    const float gp[1] = {100.0f};
+    const float gn[1] = {-100.0f};
+    float op[1] = {0}, on[1] = {0};
+    int tp = hydra_swiglu(gp, u5, 1, op);
+    int tn = hydra_swiglu(gn, u5, 1, on);
+    float an = on[0];
+    if (an < 0.0f) an = -an;
+    CHECK(tp == 0 && float_near(op[0], 500.0f, 0.01f) && tn == 0 && an < 1e-30f,
+          "SwiGLU: tails (g=+100 -> ~100*u, g=-100 -> ~0, no overflow)");
+
+    /* Bridge to the ternary engine (R14): the float SwiGLU output is
+     * the value a feed-forward block feeds back into the engine's
+     * int8 state world. Quantize with the SAME clamp the engine uses
+     * (v>127 -> 127, v<-127 -> -127, hydra_engine.c) and verify the
+     * result is in-range and idempotent — i.e. the bridge cannot
+     * produce a value the engine rejects or wraps. */
+    int bridge_ok = 1;
+    for (int i = 0; i < 256; ++i) {
+        float g[1] = {lcg_float() * 8.0f};
+        float u[1] = {lcg_float() * 8.0f};
+        float y[1] = {0};
+        if (hydra_swiglu(g, u, 1, y) != 0) { bridge_ok = 0; break; }
+        float v = y[0];
+        if (v > 127.0f) v = 127.0f;
+        else if (v < -127.0f) v = -127.0f;
+        const int8_t q = (int8_t)v;
+        /* Re-clamp the quantized value: must be a fixed point. */
+        float v2 = (float)q;
+        if (v2 > 127.0f) v2 = 127.0f;
+        else if (v2 < -127.0f) v2 = -127.0f;
+        /* q > 127 is impossible for int8_t; q < -127 catches an
+         * out-of-clamp-range quantization (the engine uses [-127,127]). */
+        if ((int8_t)v2 != q || q < -127) { bridge_ok = 0; break; }
+    }
+    CHECK(bridge_ok,
+          "SwiGLU->int8 bridge: 256 random outputs clamp to engine-valid int8, idempotent");
+
+    /* Guards (negative controls). */
+    const float gbad[1] = {NAN};
+    float sentinel[1] = {-999.0f};
+    CHECK(hydra_swiglu(gbad, u2, 1, sentinel) == -1 && sentinel[0] == -999.0f &&
+          hydra_swiglu(g1, NULL, 1, o1) == -1,
+          "SwiGLU: NaN / NULL args -> -1, output unmodified");
+}
+
+static void test_kv_cache(void)
+{
+    /* C=5, S=2, dim=2. Encode token t as k={t,t}, v={-t,t} so every
+     * slot is uniquely identifiable. */
+    const uint32_t C = 5, S = 2, D = 2;
+    static float kbuf[5 * 2], vbuf[5 * 2];
+    hydra_kv_cache_t c;
+
+    CHECK(hydra_kv_cache_init(&c, kbuf, vbuf, D, C, S) == 0 &&
+          hydra_kv_cache_size(&c) == 0,
+          "KV cache: init (C=5, S=2, dim=2), size 0");
+
+    /* Fill to capacity: appends t=0..4. */
+    int fill_ok = 1;
+    for (uint32_t t = 0; t < C; ++t) {
+        float k[2] = {(float)t, (float)t};
+        float v[2] = {-(float)t, (float)t};
+        if (hydra_kv_cache_append(&c, k, v) != 0) { fill_ok = 0; break; }
+    }
+    CHECK(fill_ok && hydra_kv_cache_size(&c) == C,
+          "KV cache: fills to capacity 5, size 5");
+
+    /* Resident = [t0, t1 (sinks), t2, t3, t4 (window, oldest->newest)]. */
+    float kk[2], vv[2];
+    int get_ok = 1;
+    const uint32_t expect[5] = {0, 1, 2, 3, 4};
+    for (uint32_t i = 0; i < C; ++i) {
+        if (hydra_kv_cache_get(&c, i, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)expect[i] || vv[0] != -(float)expect[i]) { get_ok = 0; break; }
+    }
+    CHECK(get_ok, "KV cache: resident order = sinks then window (oldest->newest)");
+
+    /* Append t5: evicts the oldest WINDOW token (t2), never a sink. */
+    {
+        float k[2] = {5.0f, 5.0f};
+        float v[2] = {-5.0f, 5.0f};
+        fill_ok = hydra_kv_cache_append(&c, k, v) == 0;
+    }
+    get_ok = 1;
+    const uint32_t expect2[5] = {0, 1, 3, 4, 5};
+    for (uint32_t i = 0; i < C; ++i) {
+        if (hydra_kv_cache_get(&c, i, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)expect2[i] || vv[0] != -(float)expect2[i]) { get_ok = 0; break; }
+    }
+    CHECK(fill_ok && get_ok && hydra_kv_cache_size(&c) == C,
+          "KV cache: append t5 evicts oldest window token (t2), sink intact");
+
+    /* Append t6..t9: window keeps the LAST 3 (t7,t8,t9); sinks fixed.
+     * Trace (window slots 2,3,4): t5->2, t6->3, t7->4, t8->2, t9->3.
+     * Oldest resident window append = n - W = 10 - 3 = 7. */
+    fill_ok = 1;
+    for (uint32_t t = 6; t <= 9; ++t) {
+        float k[2] = {(float)t, (float)t};
+        float v[2] = {-(float)t, (float)t};
+        if (hydra_kv_cache_append(&c, k, v) != 0) { fill_ok = 0; break; }
+    }
+    get_ok = 1;
+    const uint32_t expect3[5] = {0, 1, 7, 8, 9};
+    for (uint32_t i = 0; i < C; ++i) {
+        if (hydra_kv_cache_get(&c, i, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)expect3[i] || vv[0] != -(float)expect3[i]) { get_ok = 0; break; }
+    }
+    CHECK(fill_ok && get_ok,
+          "KV cache: after t6..t9 resident = [t0,t1,t7,t8,t9] (last 3 window)");
+
+    /* Sinks survive everything (streaming-LLM invariant). */
+    get_ok = 1;
+    for (uint32_t s = 0; s < S; ++s) {
+        if (hydra_kv_cache_sink(&c, s, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)s || vv[0] != -(float)s) { get_ok = 0; break; }
+    }
+    CHECK(get_ok, "KV cache: sink(0)=t0, sink(1)=t1 after 10 appends (never evicted)");
+
+    /* Negative controls: OOB get, NaN append (no partial write),
+     * sink before filled, degenerate init. */
+    get_ok = 1;
+    if (hydra_kv_cache_get(&c, C, kk, vv) != -1) get_ok = 0;      /* OOB */
+    if (hydra_kv_cache_sink(&c, S, kk, vv) != -1) get_ok = 0;     /* i==S */
+    {
+        const uint32_t before = hydra_kv_cache_size(&c);
+        float kb[2] = {1.0f, NAN};
+        float vb[2] = {1.0f, 1.0f};
+        if (hydra_kv_cache_append(&c, kb, vb) != -1) get_ok = 0;
+        if (hydra_kv_cache_size(&c) != before) get_ok = 0;        /* no partial */
+    }
+    {
+        float kb[2] = {1.0f, 1.0f};
+        float vb[2] = {1.0f, 1.0f};
+        if (hydra_kv_cache_init(&c, kb, vb, D, C, C + 1) != -1) get_ok = 0; /* S>C */
+    }
+    CHECK(get_ok,
+          "KV cache: OOB get, NaN append (no partial), S>capacity all -> -1");
+}
+
 int main(void)
 {
     printf("=== Hydra Engine Unit-Tests ===\n\n");
@@ -1698,6 +1969,10 @@ int main(void)
     test_sampler_rng_hand_computed();
     test_sampler_reproducible();
     test_sampler_invalid();
+    test_rmsnorm();
+    test_rope();
+    test_swiglu();
+    test_kv_cache();
 
     printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

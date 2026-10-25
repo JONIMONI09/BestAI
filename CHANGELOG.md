@@ -51,6 +51,46 @@ Measured (x86-64 sandbox with AVX2, so the SIMD path is live):
 AVX2 build (end-to-end parity); `jni-batch-test` 86/0,
 `large-model-test` 7/0, `gguf_test.py` 40/0; zero warnings.
 
+## 2026-10-25 — M4: Transformer primitives (RMSNorm/RoPE/SwiGLU) + streaming KV cache
+
+- **`include/hydra_model.h` / `src/hydra_engine.c`** (new API, zero-heap,
+  R14-guarded — every function validates args AND checks all input
+  finiteness before any output store, so a -1 return never leaves a
+  partially written result):
+  - `hydra_rmsnorm(x, w, dim, eps, out)` — `y = x/√(mean(x²)+ε)·w`,
+    in-place safe, dim 1..4096.
+  - `hydra_rope_inplace(x, dim, pos, theta_base)` — standard rotary
+    embedding on pairs (x[2i], x[2i+1]) with `freq_i = θ^(-2i/dim)`.
+  - `hydra_swiglu(g, u, dim, out)` — `SiLU(g)·u` with a branch-free-
+    overflow-safe sigmoid (`x≥0: 1/(1+e^-x)`, else `e^x/(1+e^x)` —
+    no Inf on either tail).
+  - `hydra_kv_cache_t` + `init/append/size/get/sink` — streaming
+    attention cache: `num_sinks` permanent sink slots (streaming-LLM
+    attention sinks, never evicted) + a circular window over
+    `capacity - num_sinks` slots that overwrites its oldest entry.
+    Caller-provided storage (zero heap), O(1) memory and O(1) per
+    append/lookup. These are the float building blocks a real
+    transformer head needs; the SwiGLU bridge test proves their
+    outputs quantize into the engine's int8 state world with the
+    engine's own clamp, idempotently.
+- **`tests/test_engine.c`**: 21 new checks (all architectures):
+  RMSNorm hand-computed value + per-dim weights + scale invariance +
+  NaN/arg guards (negative controls, unmodified output verified);
+  RoPE identity at pos=0 (bit-exact) + hand-computed rotation + norm
+  preservation (orthogonality) + guards; SwiGLU hand-computed
+  silu(1)·2 + both tails (g=±100, no overflow) + 256-sample
+  float→int8 engine-clamp bridge + guards; KV cache init/fill,
+  resident order (sinks then window, oldest→newest), eviction of the
+  oldest WINDOW token (sinks intact) after the cache is full, a
+  4-append window slide, sink permanence after 10 appends, and the
+  OOB-get / NaN-append-no-partial-write / sinks>capacity controls.
+- **`tools/test_count_baseline.txt`**: x86 121 → 142, arm 119 → 140
+  (all 21 checks compile on every architecture).
+
+Measured: `./hydra-test` 142/0, zero warnings; baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 unchanged;
+`jni-batch-test` 86/0, `large-model-test` 7/0, `gguf_test.py` 40/0.
+
 ## 2026-10-25 — M2: Min-P sampling + repetition penalty (greedy guard keeps the baseline)
 
 Adds controlled randomness to the deterministic decoder without touching

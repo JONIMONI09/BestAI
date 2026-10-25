@@ -592,6 +592,194 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
  *     exp(0) = 1) or underflow the whole distribution (the max
  *     element always survives).
  * ------------------------------------------------------------------- */
+/* -------------------------------------------------------------------
+ * M4: Transformer primitives (float, zero-heap, R14-guarded).
+ *
+ * Contract of every function below: all inputs are validated AND all
+ * finiteness is checked BEFORE any output store, so an error return
+ * (-1) always leaves the destination unmodified. No allocation
+ * anywhere — these run on the same zero-heap budget as the engine.
+ * ------------------------------------------------------------------- */
+
+static int hydra_is_finite_float_range(const float *p, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+        if (!isfinite(p[i]))
+            return 0;
+    return 1;
+}
+
+int hydra_rmsnorm(const float *x, const float *w, size_t dim,
+                  float eps, float *out)
+{
+    if (!x || !w || !out || dim < 1 || dim > HYDRA_MAX_LAYERS)
+        return -1;
+    if (!(eps > 0.0f) || !isfinite(eps))
+        return -1;
+    if (!hydra_is_finite_float_range(x, dim))
+        return -1;
+    if (!hydra_is_finite_float_range(w, dim))
+        return -1;
+
+    float ss = 0.0f;
+    for (size_t i = 0; i < dim; ++i)
+        ss += x[i] * x[i];
+    const float inv = 1.0f / sqrtf(ss / (float)dim + eps);
+    for (size_t i = 0; i < dim; ++i)
+        out[i] = x[i] * inv * w[i];
+    return 0;
+}
+
+int hydra_rope_inplace(float *x, size_t dim, uint32_t pos, double theta_base)
+{
+    if (!x || dim < 2 || dim > 8192 || (dim % 2) != 0)
+        return -1;
+    if (!(theta_base > 0.0) || !isfinite(theta_base))
+        return -1;
+    if (!hydra_is_finite_float_range(x, dim))
+        return -1;
+
+    for (size_t i = 0; i < dim / 2; ++i) {
+        const double freq = 1.0 / pow(theta_base, (double)(2 * i) / (double)dim);
+        const double angle = (double)pos * freq;
+        const double c = cos(angle);
+        const double s = sin(angle);
+        const float a = x[2 * i];
+        const float b = x[2 * i + 1];
+        x[2 * i] = (float)(a * c - b * s);
+        x[2 * i + 1] = (float)(a * s + b * c);
+    }
+    return 0;
+}
+
+/* Numerically safe sigmoid: no intermediate overflow on either tail
+ * (x >= 0 uses exp(-x), x < 0 uses exp(x); both arguments stay <= 0). */
+static float hydra_sigmoid(float x)
+{
+    if (x >= 0.0f)
+        return 1.0f / (1.0f + expf(-x));
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
+int hydra_swiglu(const float *g, const float *u, size_t dim, float *out)
+{
+    if (!g || !u || !out || dim < 1 || dim > HYDRA_MAX_LAYERS)
+        return -1;
+    if (!hydra_is_finite_float_range(g, dim))
+        return -1;
+    if (!hydra_is_finite_float_range(u, dim))
+        return -1;
+
+    for (size_t i = 0; i < dim; ++i)
+        out[i] = g[i] * hydra_sigmoid(g[i]) * u[i];
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * M4: Streaming KV cache (sinks + circular window, O(1) memory/time).
+ *
+ * Slot layout for capacity C, sinks S, total appends n:
+ *   - appends t = 0..S-1          -> sink slots 0..S-1 (permanent)
+ *   - appends t >= S              -> window slots
+ *       S + (t - S) mod (C - S)
+ * Resident set (size min(n, C)): the filled sinks in append order,
+ * then the window tokens oldest -> newest, where the oldest resident
+ * window append is max(S, n - (C - S)).
+ * ------------------------------------------------------------------- */
+
+static int hydra_kv_cache_arg_ok(const hydra_kv_cache_t *c)
+{
+    return c && c->k && c->v && c->dim >= 1 && c->dim <= 8192 &&
+           c->capacity >= 1 && c->capacity <= 8192 &&
+           c->num_sinks <= c->capacity && c->count <= c->capacity + (1u << 28);
+}
+
+int hydra_kv_cache_init(hydra_kv_cache_t *c, float *k, float *v,
+                        uint32_t dim, uint32_t capacity, uint32_t num_sinks)
+{
+    if (!c)
+        return -1;
+    c->k = k;
+    c->v = v;
+    c->dim = dim;
+    c->capacity = capacity;
+    c->num_sinks = num_sinks;
+    c->count = 0;
+    return hydra_kv_cache_arg_ok(c) ? 0 : -1;
+}
+
+int hydra_kv_cache_append(hydra_kv_cache_t *c, const float *k, const float *v)
+{
+    if (!hydra_kv_cache_arg_ok(c) || !k || !v)
+        return -1;
+    if (!hydra_is_finite_float_range(k, c->dim))
+        return -1;
+    if (!hydra_is_finite_float_range(v, c->dim))
+        return -1;
+
+    const uint32_t t = c->count;
+    uint32_t slot;
+    if (t < c->num_sinks) {
+        slot = t;                                  /* permanent sink */
+    } else if (c->num_sinks < c->capacity) {
+        slot = c->num_sinks + ((t - c->num_sinks) % (c->capacity - c->num_sinks));
+    } else {
+        return -1;                                 /* degenerate init */
+    }
+    memcpy(c->k + (size_t)slot * c->dim, k, c->dim * sizeof(float));
+    memcpy(c->v + (size_t)slot * c->dim, v, c->dim * sizeof(float));
+    c->count++;
+    return 0;
+}
+
+uint32_t hydra_kv_cache_size(const hydra_kv_cache_t *c)
+{
+    if (!hydra_kv_cache_arg_ok(c))
+        return 0;
+    return c->count < c->capacity ? c->count : c->capacity;
+}
+
+int hydra_kv_cache_get(const hydra_kv_cache_t *c, uint32_t i,
+                       float *k_out, float *v_out)
+{
+    if (!hydra_kv_cache_arg_ok(c) || !k_out || !v_out)
+        return -1;
+    const uint32_t size = hydra_kv_cache_size(c);
+    if (i >= size)
+        return -1;
+
+    uint32_t slot;
+    if (i < c->num_sinks) {
+        slot = i;                                  /* sinks first */
+    } else {
+        const uint32_t window = c->capacity - c->num_sinks;
+        const uint32_t n = c->count;
+        /* Oldest resident window append: S until full, then slides. */
+        const uint32_t oldest = (n > c->capacity) ? (n - window) : c->num_sinks;
+        const uint32_t t = oldest + (i - c->num_sinks);
+        slot = c->num_sinks + ((t - c->num_sinks) % window);
+    }
+    memcpy(k_out, c->k + (size_t)slot * c->dim, c->dim * sizeof(float));
+    memcpy(v_out, c->v + (size_t)slot * c->dim, c->dim * sizeof(float));
+    return 0;
+}
+
+int hydra_kv_cache_sink(const hydra_kv_cache_t *c, uint32_t i,
+                        float *k_out, float *v_out)
+{
+    if (!hydra_kv_cache_arg_ok(c) || !k_out || !v_out)
+        return -1;
+    if (i >= c->num_sinks || i >= c->count)
+        return -1;
+    memcpy(k_out, c->k + (size_t)i * c->dim, c->dim * sizeof(float));
+    memcpy(v_out, c->v + (size_t)i * c->dim, c->dim * sizeof(float));
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * M2: Sampling (greedy guard + repetition penalty + min-p).
+ * ------------------------------------------------------------------- */
 static uint64_t hydra_xorshift64(uint64_t *state)
 {
     uint64_t x = *state;

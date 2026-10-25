@@ -167,4 +167,80 @@ int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
                        const uint16_t *recent_tokens, size_t recent_len,
                        uint16_t *token_out);
 
+/* -------------------------------------------------------------------
+ * M4: Transformer primitives (float, zero-heap, guarded) and the
+ * streaming KV cache. These are the building blocks a real
+ * transformer head needs (RMSNorm on layernorm, RoPE on q/k, SwiGLU
+ * in the feed-forward) and they bridge to the ternary engine: their
+ * float outputs quantize into the engine's int8 state world (see the
+ * swiglu bridge test in tests/test_engine.c). Every function is
+ * R14-guarded: invalid arguments or non-finite input return -1 and
+ * leave the output UNMODIFIED (checked before any store).
+ * ------------------------------------------------------------------- */
+
+/* RMSNorm: out[i] = x[i] / sqrt(mean_j(x[j]^2) + eps) * w[i].
+ * In-place safe (out may alias x). dim 1..4096, eps > 0.
+ * Returns 0 on success, -1 on invalid arguments or any non-finite
+ * x[i]/w[i] (out left unmodified). */
+int hydra_rmsnorm(const float *x, const float *w, size_t dim,
+                  float eps, float *out);
+
+/* Rotary position embedding (in-place, pairs (x[2i], x[2i+1])):
+ *   freq_i  = 1 / pow(theta_base, 2i / dim)
+ *   angle   = pos * freq_i
+ *   x'[2i]   =  x[2i]*cos(angle) - x[2i+1]*sin(angle)
+ *   x'[2i+1] =  x[2i]*sin(angle) + x[2i+1]*cos(angle)
+ * dim even, 2..8192; theta_base > 0 finite; pos any uint32.
+ * Returns 0 on success, -1 on invalid arguments or non-finite x
+ * (x left unmodified). */
+int hydra_rope_inplace(float *x, size_t dim, uint32_t pos, double theta_base);
+
+/* SwiGLU: out[i] = g[i] * sigmoid(g[i]) * u[i]  (= SiLU(g) * u).
+ * dim 1..4096. Returns 0 on success, -1 on invalid arguments or any
+ * non-finite g[i]/u[i] (out left unmodified). */
+int hydra_swiglu(const float *g, const float *u, size_t dim, float *out);
+
+/* Streaming KV cache: fixed capacity, zero-heap (the caller provides
+ * the k/v storage), O(1) memory, O(1) per append and per lookup.
+ *
+ * The first num_sinks appends land in permanent SINK slots
+ * (streaming-LLM attention sinks) that are never evicted. The
+ * remaining capacity - num_sinks slots form a CIRCULAR WINDOW that
+ * overwrites its oldest non-sink entry once full, so the resident
+ * set is always: sinks (append order) + the last (capacity - sinks)
+ * tokens. */
+typedef struct hydra_kv_cache {
+    float *k;            /* capacity * dim floats (caller storage)  */
+    float *v;            /* capacity * dim floats (caller storage)  */
+    uint32_t dim;        /* key/value vector length                 */
+    uint32_t capacity;   /* total slots (sinks + window)            */
+    uint32_t num_sinks;  /* permanent sink slots (<= capacity)      */
+    uint32_t count;      /* total appends since init                */
+} hydra_kv_cache_t;
+
+/* Initialize on caller-provided storage. num_sinks <= capacity.
+ * Returns 0 on success, -1 on invalid arguments (cache left zeroed). */
+int hydra_kv_cache_init(hydra_kv_cache_t *c, float *k, float *v,
+                        uint32_t dim, uint32_t capacity, uint32_t num_sinks);
+
+/* Append one token's key and value (dim floats each). O(1).
+ * Returns 0 on success, -1 on invalid arguments or non-finite k/v
+ * (nothing is written, count unchanged). */
+int hydra_kv_cache_append(hydra_kv_cache_t *c, const float *k, const float *v);
+
+/* Resident token count: min(count, capacity). */
+uint32_t hydra_kv_cache_size(const hydra_kv_cache_t *c);
+
+/* Copy resident token i (0 = oldest resident = first sink; then
+ * window tokens oldest -> newest) into k_out/v_out (dim floats each).
+ * Returns 0 on success, -1 if i >= hydra_kv_cache_size(c). */
+int hydra_kv_cache_get(const hydra_kv_cache_t *c, uint32_t i,
+                       float *k_out, float *v_out);
+
+/* Copy sink i (0..num_sinks-1, in append order) into k_out/v_out.
+ * Returns 0 on success, -1 if the sink is not filled yet or i is
+ * out of range. */
+int hydra_kv_cache_sink(const hydra_kv_cache_t *c, uint32_t i,
+                        float *k_out, float *v_out);
+
 #endif /* HYDRA_MODEL_H */

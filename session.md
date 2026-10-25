@@ -122,7 +122,7 @@ tracker, per the established pattern.)
       compiler `-mavx2` support; parity tests (AVX2 kernel vs scalar
       reference, random + edge-case matrices) guarded `#ifdef __AVX2__`
       like the NEON tests.
-- [ ] **M4 Transformer primitives.** `hydra_rmsnorm`, `hydra_rope_inplace`,
+- [x] **M4 Transformer primitives.** `hydra_rmsnorm`, `hydra_rope_inplace`,
       `hydra_swiglu` (zero-heap, NaN/Inf guards) + `hydra_kv_cache_t`
       streaming ring buffer with permanently retained attention sinks,
       O(1) in sequence length; unit tests: hand-computed values +
@@ -254,6 +254,30 @@ reference). The first END-TO-END v2 dim-64 model (file → load → AVX2
 unpack → step) appears with M5, when `safetensors_to_hydra.py`
 becomes the first shipped v2 writer — its gguf_test.py round-trip
 will run on this AVX2 build and prove the path end-to-end.
+
+### M4 results & errors (2026-10-25, logged per R2/R3)
+
+**Measured:** `./hydra-test` 142/0 (zero warnings; +21 checks, all
+architectures); baseline `[471,386,385,386,385,386,385,386]` @ 42/8
+unchanged; jni-batch 86/0, large-model 7/0, gguf_test 40/0. Baseline
+file: x86 121→142, arm 119→140.
+
+**Error found & fixed (R3):** the KV-cache test itself had a bug —
+`(float)-expect[i]` with `expect` declared `uint32_t` negates in
+unsigned arithmetic (−1 → 4294967295), so the comparison failed from
+i=1 on while the engine was correct (proven by instrumenting
+`hydra_kv_cache_get`: slots, sinks, and buffer contents were all
+right). Always negate after casting to a signed/float type:
+`-(float)expect[i]`. Same trap fixed in 4 places.
+
+**Design notes:** the M4 primitives are float/zero-heap and
+R14-guarded (finiteness checked before any store). The KV cache
+layout: appends t < S go to permanent sink slots; appends t ≥ S go to
+window slot `S + (t−S) mod (C−S)`; `get(i)` maps sinks first, then
+window tokens with oldest resident append = `max(S, n−(C−S))`. The
+first CONSUMERS of these primitives appear in M5/M6 (a transformer
+head over the ternary engine), which keeps M4 a self-contained,
+tested building-block layer.
 
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 
