@@ -82,6 +82,30 @@ is half-to-**even**, and the two disagree on every exact `.5` — which in a sma
 dense matrix is most of the entries. Using the built-in would make the
 converter quietly disagree with itself depending on parity.
 
+**Why the code compares against `mean|W| / 2` instead of rounding every
+element.** The formula above is what the report describes; the implementation
+(`ternarise_column_sums`) counts, per column, how many weights satisfy
+`w >= mean/2` (the +1 count) and `w <= -mean/2` (the −1 count), because the
+two forms are equivalent:
+
+```
+round_half_away(gamma * w) >= 1   <=>   gamma * w >= 0.5
+                                  <=>   w >= 0.5 / gamma
+                                  <=>   w >= mean(|W|) / 2
+```
+
+and `clip(·, −1, +1)` maps everything above the threshold to +1 regardless of
+how far above. The same identity is the one the b1.58 literature states for
+its own reference code (a weight's ternary code is nonzero exactly when
+`|w| > mean|W|/2`), and it is what makes the whole quantisation two counters
+per column — the ternary matrix is never materialised, which is what keeps a
+4 GB download inside a phone's RAM. One float-level caveat, stated rather than
+hidden: the comparison `w >= mean/2` and the hypothetical elementwise
+`round(gamma*w) >= 0.5` can differ by one ulp for weights sitting exactly on
+the threshold (because `fl(1/m) * m` is not exactly 1). That is a measure-zero
+case for real weight distributions and does not change any column sum a
+converted model in this repository stores.
+
 ---
 
 ## 4. Which GGUF files are accepted
@@ -140,8 +164,12 @@ compile-time constants shared with the C engine:
 **The v1 ceiling is therefore 256 KiB of weights** (`64 × 4096` bytes =
 262 144 bytes). A 20 GB checkpoint is ~81 920× larger than anything the current
 format can describe, no matter how the converter is written. That is a format
-limit, and `docs/FORMAT.md` carries the v2 plan (4-weights-per-byte packing,
-64-bit offsets) that lifts it.
+limit. The 4-weights-per-byte packing already exists in the loader as header
+version 2 (see `docs/FORMAT.md`, "Version 2") and halves the file for the same
+model, but it does not raise the ceiling: the header's 32-bit fields and the
+256 KiB bound are the same. 64-bit offsets live in the `.hydra2` container
+spec (`docs/FORMAT-V2.md`) and remain unimplemented there, as stated in that
+document.
 
 **RAM is not the blocker.** A 5 GiB sparse `.hydra` maps and generates fine
 (`tests/test_large_model.c`). The obstruction is the header, not memory.

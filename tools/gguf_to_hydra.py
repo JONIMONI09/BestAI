@@ -319,7 +319,14 @@ def pick_vocab(gguf, a_tensor, override):
     the report says how many were dropped.
     """
     if override is not None:
-        return max(2, min(override, MAX_VOCAB)), override or 0, []
+        # No tokens were read from the file on this path, so "dropped" can
+        # only mean "how much of the requested count does not fit the
+        # header". The kept count is clamped to [2, MAX_VOCAB], which can
+        # exceed the request (--vocab 1 keeps 2), and that is not a drop:
+        # dropped is max(0, requested - kept), never the raw request.
+        requested = override or 0
+        kept = max(2, min(requested, MAX_VOCAB))
+        return kept, max(0, requested - kept), []
     tokens = gguf.tokens()
     if tokens:
         keep = tokens[:MAX_VOCAB]

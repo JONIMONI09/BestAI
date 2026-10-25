@@ -836,6 +836,144 @@ static void test_neon_matches_scalar(void)
 }
 #endif /* __ARM_NEON */
 
+/* Version 2 (4 weights per byte, docs/FORMAT.md): positive parity test and
+ * negative controls.
+ *
+ * Hand-computed reference (the test fails if any bit order, plane order or
+ * code value is wrong):
+ *   vocab=64, dim=4, layers=2, v2 payload = [0x55 0xAA 0x63 0x82]
+ *   layer0: A w=+1 +1 +1 +1    B w=-1 -1 -1 -1
+ *   layer1: A w= 0  0 -1 +1    B w=-1  0  0 -1
+ *   A = [1,1,0,2]  B = [-2,-1,-1,-2]
+ *   first step, token=5, state=0: acc = [5,5,0,10], out = (5+5+1) % 64 = 11
+ * The equivalent v1 file (8 bytes, 2 weights per byte) must produce the
+ * identical aggregates and the identical 40-step token stream: the two
+ * versions are the same model with different packing. */
+static void wr_header_version(FILE *f, uint16_t version, uint16_t vocab,
+                              uint32_t dim, uint32_t layers, uint32_t off,
+                              uint32_t wlen)
+{
+    wr_u32le(f, HYDRA_MAGIC);
+    wr_u16le(f, version);
+    wr_u16le(f, vocab);
+    wr_u32le(f, dim);
+    wr_u32le(f, layers);
+    wr_u32le(f, off);
+    wr_u32le(f, wlen);
+}
+
+/* Runs `steps` steps with generated-token feedback; returns 0 on success and
+ * stores the generated stream in `out`. */
+static int run_stream(HydraEngine *e, uint16_t seed, int steps, uint16_t *out)
+{
+    uint16_t tok = seed;
+    for (int i = 0; i < steps; ++i) {
+        if (hydra_engine_step(e, tok, &tok) != 0) return -1;
+        out[i] = tok;
+    }
+    return 0;
+}
+
+static void test_version_two_format(void)
+{
+    char p2[64], p1[64];
+    tmp_path_new(p2, sizeof(p2));
+    tmp_path_new(p1, sizeof(p1));
+
+    /* v2 file: 4 bytes = 2 layers x (dim/4 bytes A + dim/4 bytes B).
+     * The declared weights_len is exactly the read size (layers*dim/2),
+     * i.e. the minimal valid v2 file. */
+    {
+        FILE *f = fopen(p2, "wb");
+        const uint8_t body[4] = {0x55, 0xAA, 0x63, 0x82};
+        if (f) {
+            wr_header_version(f, 2u, 64u, 4u, 2u, (uint32_t)sizeof(HydraModelHeader), 4u);
+            fwrite(body, 1, sizeof(body), f);
+            fclose(f);
+        }
+    }
+    /* v1 file with the same logical weights: one byte per (layer, dim). */
+    {
+        FILE *f = fopen(p1, "wb");
+        const uint8_t body[8] = {0x09, 0x09, 0x09, 0x09, 0x08, 0x00, 0x02, 0x09};
+        if (f) {
+            wr_header_version(f, 1u, 64u, 4u, 2u, (uint32_t)sizeof(HydraModelHeader), 8u);
+            fwrite(body, 1, sizeof(body), f);
+            fclose(f);
+        }
+    }
+
+    HydraEngine e2, e1;
+    int rc2 = hydra_engine_load(&e2, p2);
+    int rc1 = hydra_engine_load(&e1, p1);
+    CHECK(rc2 == 0, "Version 2 (4 weights/byte) model with minimal weights_len loads");
+    CHECK(rc1 == 0, "Equivalent version 1 model loads");
+    if (rc2 == 0) {
+        CHECK(e2.agg_a[0] == 1 && e2.agg_a[1] == 1 && e2.agg_a[2] == 0 && e2.agg_a[3] == 2,
+              "v2 aggregation A matches the hand-computed [1,1,0,2]");
+        CHECK(e2.agg_b[0] == -2 && e2.agg_b[1] == -1 && e2.agg_b[2] == -1 && e2.agg_b[3] == -2,
+              "v2 aggregation B matches the hand-computed [-2,-1,-1,-2]");
+    }
+    if (rc1 == 0 && rc2 == 0) {
+        int same_agg = 1;
+        for (int i = 0; i < 4; ++i) {
+            if (e1.agg_a[i] != e2.agg_a[i] || e1.agg_b[i] != e2.agg_b[i]) same_agg = 0;
+        }
+        CHECK(same_agg, "v1 and v2 aggregates are identical (same model, different packing)");
+        uint16_t s1[40], s2[40];
+        int ok1 = run_stream(&e1, 5u, 40, s1) == 0;
+        int ok2 = run_stream(&e2, 5u, 40, s2) == 0;
+        CHECK(ok1 && ok2, "both versions run 40 steps without error");
+        if (ok1 && ok2) {
+            int same = 1;
+            for (int i = 0; i < 40; ++i) if (s1[i] != s2[i]) { same = 0; break; }
+            CHECK(same, "v1 and v2 produce the identical 40-token stream");
+            CHECK(s2[0] == 11, "v2 first token is 11 (hand-computed from A, B, token 5)");
+        }
+    }
+    hydra_engine_unload(&e2);
+    hydra_engine_unload(&e1);
+    unlink(p2);
+    unlink(p1);
+
+    /* Negative: v2 with dim % 4 != 0 must be refused (-8), not truncated.
+     * Without the guard, this file would load and silently zero out the
+     * last dimension of the aggregation. */
+    {
+        char p[64];
+        tmp_path_new(p, sizeof(p));
+        FILE *f = fopen(p, "wb");
+        if (f) {
+            wr_header_version(f, 2u, 64u, 2u, 1u, (uint32_t)sizeof(HydraModelHeader), 1u);
+            fputc(0x55, f);
+            fclose(f);
+        }
+        HydraEngine e;
+        int rc = hydra_engine_load(&e, p);
+        CHECK(rc == -8, "v2 model with dim % 4 != 0 is refused with -8");
+        hydra_engine_unload(&e);
+        unlink(p);
+    }
+    /* Negative: v2 with weights_len below layers*dim/2 must be refused (-10):
+     * the aggregation walk would read past the declared weight region. */
+    {
+        char p[64];
+        tmp_path_new(p, sizeof(p));
+        FILE *f = fopen(p, "wb");
+        if (f) {
+            wr_header_version(f, 2u, 64u, 4u, 2u, (uint32_t)sizeof(HydraModelHeader), 3u);
+            const uint8_t body[3] = {0x55, 0xAA, 0x63};
+            fwrite(body, 1, sizeof(body), f);
+            fclose(f);
+        }
+        HydraEngine e;
+        int rc = hydra_engine_load(&e, p);
+        CHECK(rc == -10, "v2 model with weights_len < layers*dim/2 is refused with -10");
+        hydra_engine_unload(&e);
+        unlink(p);
+    }
+}
+
 static void test_engine_rejects_garbage(void)
 {
     char path[64];
@@ -1093,6 +1231,7 @@ int main(void)
     test_engine_rejects_offset_in_header();
     test_engine_rejects_symlink();
     test_load_metrics_are_measured();
+    test_version_two_format();
     test_axiom();
 
     printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);

@@ -85,6 +85,48 @@
 
 ## Current task
 
+**2026-10-25 — Full-repository audit, Claude-skills adherence, 6-milestone
+deepening run (adversarial verification, zero deletions).** User instruction:
+analyse and document everything, follow every `.claude/skills/*` rule, find
+bugs or "lies" (unverifiable claims), never delete what works, and make the
+whole verification matrix pass. Artefacts in English (R31); conversation may
+stay German. Milestones M1–M6, verification V.
+
+### Plan (2026-10-25)
+
+- [x] **M0. Baseline (before any change).** All gates run and recorded:
+      `make all && make test` builds clean; `./hydra-test` 71/0 (x86);
+      `./jni-batch-test` 86/0; `./large-model-test` 7/0;
+      `python3 tools/gguf_test.py --engine ./hydra-run` 38/0;
+      `node --test tools/server_test.js` 37/0; console-train, contrast,
+      string-format, all bash guard scripts green. Environment repairs:
+      pyyaml installed (PEP 668 -> `--break-system-packages` in sandbox),
+      llama.cpp submodule initialised at the pinned v0.5.0 commit
+      (`llama_pin_check` 5/0, negative test 7 proved,
+      `ci_release_version_test` green). `jni_signature_check` SKIPs without
+      javac; ARM/NEON parity gate **blocked, not measured** (no aarch64
+      cross toolchain or qemu in this container) — stated, never hidden (R32).
+- [ ] **M1.** File inventory + live audit of GitHub Issues #46/#44 +
+      git-ignored agent brain (`.agent_memory/`, `RESEARCH.md`).
+- [ ] **M2.** Canonical root `AGENTS.md` + Notion "AI Notizen" documentation
+      (local mirror `.agent_memory/NOTION_AI_NOTES.md`).
+- [ ] **M3.** Mathematical audit of the GGUF -> .hydra conversion
+      (absmean gamma, ternary projection, packing, shapes, vocab metadata);
+      fix only what is actually wrong; proof in `RESEARCH.md` and
+      `docs/GGUF-IMPORT.md`.
+- [ ] **M4.** C engine / JNI / dual-engine hardening audit (leaks, file
+      descriptors, overflow, JNI local refs, thread safety, gpu_bench
+      consistency).
+- [ ] **M5.** Android UI/UX: active-engine status, tok/s telemetry, RAM
+      display, atomic-switch ergonomics; `android_autostart_check`,
+      `android_crash_check` and `contrast_check` must stay green.
+- [ ] **M6.** Docs + `CHANGELOG.md` + session sync (English, R31); README
+      audited against `docs_claim_check.sh`.
+- [ ] **V.** Full verification matrix re-run until 100% green; git hygiene:
+      `RESEARCH.md` and `.agent_memory/` ignored, tracked changes clean.
+
+### Superseded current task (2026-10-03, all steps done above it)
+
 **Adversarial doc-audit (2 external prompts) + v2 planning for a Snapdragon 8
 Elite / Android 15 tablet.** Two prompts overlap: they assert 12 doc defects,
 some code gaps (Q8_0, import 429 guard), and a 6-phase v2 sparse-expert plan.

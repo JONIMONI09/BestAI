@@ -19,11 +19,12 @@
  * (any value can become either of the other two). A move shifts acc[0] by
  * (new - old) * token for w1 and by (new - old) * state[0] for w2, so every
  * candidate is evaluated and the one with the smallest circular error against
- * the target wins. When no single move helps, the best pair is tried, then a
- * sideways move (same error, unseen state) escapes a plateau. Because the
- * search explores, an epoch can end worse than the previous one - therefore
- * the trainer keeps the BEST snapshot seen and returns that, so the returned
- * model is never worse than the seed.
+ * the target wins. When no single move helps, the best strictly-improving
+ * PAIR is tried (two weights at once; pairs that share a slot are skipped),
+ * and then a sideways move - same sample score, lower circular error -
+ * escapes a plateau. Because the search explores, an epoch can end worse
+ * than the previous one - therefore the trainer keeps the BEST snapshot seen
+ * and returns that, so the returned model is never worse than the seed.
  */
 
 const fs = require('fs');
@@ -251,7 +252,14 @@ function candidateMoves(w1, w2, cfg, token, state0) {
  * Optimising one step in isolation reliably destroys the following ones - the
  * weights are shared along the whole sequence - so a move is only accepted
  * when replaying the complete sample afterwards yields more correct steps.
- * Ties are broken by the circular error of the step that was wrong. The best
+ * Ties are broken by the circular error of the step that was wrong.
+ *
+ * The search has three rungs, in order: (1) a single ternary move, (2) when
+ * no single move improves the score, a pair of non-conflicting moves - two
+ * weights change at once, which is the only way to leave a plateau where the
+ * right acc[0] shift needs two slot changes together, (3) a sideways single
+ * move (same score, lower error) so the walk can still creep across a flat
+ * region. A pair only takes strictly better sample scores, and the best
  * snapshot over all epochs is returned, so the result is never worse than the
  * seed.
  */
@@ -294,7 +302,11 @@ function train(cfg, samples, epochs) {
         (((sample.target[stepIndex] - token - 1) % cfg.vocab) + cfg.vocab) % cfg.vocab;
       const moves = candidateMoves(w1, w2, cfg, token, state0).filter((m) => m.step !== 0);
 
-      let chosen = null;
+      // Single moves, evaluated one at a time. A strictly improving move and
+      // the best sideways move (same score, lower error) are tracked
+      // separately, because the pair search below slots between them.
+      let bestStrict = null;
+      let bestSide = null;
       for (const mv of moves) {
         const prev = mv.arr[mv.idx][0];
         mv.arr[mv.idx][0] = mv.next;
@@ -302,13 +314,60 @@ function train(cfg, samples, epochs) {
         const err = Math.abs(circDelta((acc0 + mv.step) % cfg.vocab, wantAcc, cfg.vocab));
         mv.arr[mv.idx][0] = prev;
         if (score < currentScore) continue;
-        if (!chosen || score > chosen.score || (score === chosen.score && err < chosen.err)) {
-          chosen = { mv, score, err };
+        const better = (c) => c === null || score > c.score || (score === c.score && err < c.err);
+        if (score > currentScore) {
+          if (better(bestStrict)) bestStrict = { mv, score, err };
+        } else if (better(bestSide)) {
+          bestSide = { mv, score, err };
         }
       }
+
+      // Pair search, the documented middle rung: when NO single move improves
+      // the sample score, two weights change at once. That is what can leave
+      // a plateau no single ternary move can fix - e.g. a +1 in one slot and
+      // a -1 in another whose combined acc[0] shift is the right one while
+      // each alone is not. Two restrictions keep it honest and cheap:
+      //  - pairs sharing a slot are skipped: the second write would just
+      //    overwrite the first, so they add cost, not reach;
+      //  - a pair is accepted only on a STRICTLY better sample score, exactly
+      //    as a move, because trading the sample score for one step's error
+      //    is how the old single-step optimiser wrecked the following steps.
+      let bestPair = null;
+      if (!bestStrict) {
+        for (let i = 0; i < moves.length; i += 1) {
+          for (let j = i + 1; j < moves.length; j += 1) {
+            const ma = moves[i];
+            const mb = moves[j];
+            if (ma.arr === mb.arr && ma.idx === mb.idx) continue;
+            const pa = ma.arr[ma.idx][0];
+            const pb = mb.arr[mb.idx][0];
+            ma.arr[ma.idx][0] = ma.next;
+            mb.arr[mb.idx][0] = mb.next;
+            const score = scoreSample(w1, w2, cfg, sample);
+            ma.arr[ma.idx][0] = pa;
+            mb.arr[mb.idx][0] = pb;
+            if (score <= currentScore) continue;
+            const err = Math.abs(
+              circDelta((acc0 + ma.step + mb.step) % cfg.vocab, wantAcc, cfg.vocab),
+            );
+            if (!bestPair || score > bestPair.score || (score === bestPair.score && err < bestPair.err)) {
+              bestPair = { ma, mb, score, err };
+            }
+          }
+        }
+      }
+
+      const chosen = bestStrict || bestPair || bestSide;
       if (chosen) {
-        chosen.mv.arr[chosen.mv.idx][0] = chosen.mv.next;
-        flips += 1;
+        if (chosen.ma) {
+          // A pair changes two weights, so it is two weight moves.
+          chosen.ma.arr[chosen.ma.idx][0] = chosen.ma.next;
+          chosen.mb.arr[chosen.mb.idx][0] = chosen.mb.next;
+          flips += 2;
+        } else {
+          chosen.mv.arr[chosen.mv.idx][0] = chosen.mv.next;
+          flips += 1;
+        }
       }
     }
 
