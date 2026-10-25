@@ -28,6 +28,15 @@
 # reproducibility, and argument negative controls). x86 re-measured at 113;
 # ARM is 87 + 32 = 119 because all thirty-two compile on every
 # architecture — re-measure on the ARM CI leg to confirm.
+#
+# 2026-10-25 (implementation round, M3): +8 x86-ONLY checks (AVX2 parity
+# suite: runtime probe, step-kernel vs scalar reference over 11 dims with
+# LCG-random matrices + layer-cap extremes, v2 plane unpack vs an
+# independent scalar reference + the 4-code table sweep). These compile
+# only into -mavx2 builds (Makefile adds -mavx2 on x86-64 hosts with a
+# compiler probe) and print SKIP on non-AVX2 x86 CPUs, so they raise the
+# x86 number to 121 (re-measured on an AVX2 CPU; both this sandbox and
+# the ubuntu-latest CI runner have AVX2) and leave ARM at 119.
 
-x86: 113
+x86: 121
 arm: 119

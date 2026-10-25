@@ -114,7 +114,7 @@ tracker, per the established pattern.)
       `--temp`/`--min-p`/`--rep-penalty`; tests: penalty breaks a
       2-token oscillation, min-p filters the tail, greedy == native,
       hand-computed seeded sample.
-- [ ] **M3 AVX2.** `src/hydra_simd.h`: `#ifdef __AVX2__` step-time kernel
+- [x] **M3 AVX2.** `src/hydra_simd.h`: `#ifdef __AVX2__` step-time kernel
       (8 dims per 256-bit lane, int32 math provably exact under the layer
       cap, widen to int64) + load-time v2-plane unpack kernel
       (`_mm256_shuffle_epi8` LUT); runtime CPU detection with scalar
@@ -214,6 +214,46 @@ decode `out = (acc0 mod V + c + 1) mod V` is injective in the chosen
 candidate c only for ODD V (or A0+1 coprime to V) — min-P/CDF tests
 therefore use V=65/V=5, and the penalty tests verify the (A0,B0,s0)
 combination makes the two candidate outputs distinguishable.
+
+### M3 results & errors (2026-10-25, logged per R2/R3)
+
+**Measured:** `./hydra-test` 121/0 (x86 AVX2 build; +8 AVX2-only
+checks); baseline `[471,386,385,386,385,386,385,386]` @ 42/8
+UNCHANGED on the AVX2 build (the SIMD step path is live — end-to-end
+parity); jni-batch 86/0, large-model 7/0, gguf_test 40/0; zero
+warnings; count check ok at 121. Baseline file: x86 113→121, arm
+119 unchanged (AVX2 checks compile only into -mavx2 builds).
+
+**Errors found & fixed (R3) — the SIMD revision was NOT bit-parity on
+the first pass; the parity test caught all four of these:**
+
+1. **256-bit lane width:** a __m256i holds 8 int32, not 16 — the first
+   step kernel left dims 4-7 (and 12-15) unwritten. Fixed at 8 dims
+   per iteration with a correct 4+4 → 8 int64 widening.
+2. **v2 unpack element count + layout:** a 256-bit lane = 32 bytes =
+   128 weights, not 32 dims; and the original "sum the four weight
+   vectors" collapsed 4 dimensions into one (horizontal add instead of
+   per-dim values). Rewritten at 16 bytes = 64 dims with the correct
+   scatter: dim 4k+j gets exactly weight j of byte k.
+3. **`_mm_shuffle_epi8` operand order:** the TABLE is the FIRST
+   argument, the index the second — the first revision looked up
+   `bytes[table[i]]` instead of `table[bytes[i]]` (raw bytes came out
+   of the "LUT").
+4. **VPSHUFB bit-7 zeroing:** any index byte with bit 7 set is
+   zeroed. The 16-bit lane shifts leak the next byte's low bits into
+   bits 6-7 of the index (0x5555 → 0x...8A), so ALL four indices need
+   the `& 0x0F` mask — the code lives in 2 bits and the table absorbs
+   bits 2-3. Symptom: code-10 (−1) lanes randomly became 0.
+5. **(compile) `const` lazy init** in the header LUT is not legal C
+   (function-scope `static const uint8_t T[256]` written once) →
+   non-const `static uint8_t T[16]` + ready flag.
+
+**Design notes kept for M5:** the AVX2 v2 unpack is covered
+kernel-level (random + all-code sweep vs an independent scalar
+reference). The first END-TO-END v2 dim-64 model (file → load → AVX2
+unpack → step) appears with M5, when `safetensors_to_hydra.py`
+becomes the first shipped v2 writer — its gguf_test.py round-trip
+will run on this AVX2 build and prove the path end-to-end.
 
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 

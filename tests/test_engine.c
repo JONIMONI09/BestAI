@@ -1519,6 +1519,145 @@ static void test_sampler_invalid(void)
     unlink(path2);
 }
 
+/* ---------------------------------------------------------------------
+ * M3: AVX2 kernels vs scalar reference (parity tests, same pattern as
+ * the NEON comparison). Compiled only into -mavx2 builds; when such a
+ * build runs on a CPU without AVX2 the tests print SKIP (the engine
+ * itself falls back to scalar via hydra_simd_has_avx2()).
+ * ------------------------------------------------------------------- */
+#if defined(__AVX2__)
+#include "../src/hydra_simd.h"
+
+static void test_avx2_step_kernel(void)
+{
+    if (!hydra_simd_has_avx2()) {
+        printf("SKIP: AVX2 step kernel (build is -mavx2, CPU lacks AVX2)\n");
+        return;
+    }
+    CHECK(hydra_simd_has_avx2(), "AVX2: runtime CPU probe reports AVX2");
+
+    /* Random matrices (platform-fixed LCG, R22) over dims that hit
+     * every SIMD/tail combination: below one chunk (8), mid-chunk
+     * tails (7, 9, 15, 17, 31, 33, 63) and full chunks (16, 32, 64). */
+    static const size_t dims[] = {8, 7, 9, 15, 16, 17, 31, 32, 33, 63, 64};
+    int all_match = 1;
+    for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
+        const size_t dim = dims[di];
+        int32_t a[HYDRA_EMBED_DIM], b[HYDRA_EMBED_DIM];
+        int8_t state[HYDRA_EMBED_DIM];
+        int64_t ref[HYDRA_EMBED_DIM] = {0};
+        int64_t avx[HYDRA_EMBED_DIM] = {0};
+        int32_t token;
+
+        for (size_t i = 0; i < dim; ++i) {
+            a[i] = (int32_t)(lcg_byte() % 8193u) - 4096;   /* [-4096, 4096] */
+            b[i] = (int32_t)(lcg_byte() % 8193u) - 4096;
+            state[i] = (int8_t)((int32_t)(lcg_byte() % 255u) - 127);
+        }
+        token = (int32_t)(lcg_byte() % 1024u);
+
+        for (size_t i = 0; i < dim; ++i)
+            ref[i] = (int64_t)a[i] * token
+                   + (int64_t)b[i] * (int32_t)state[i];
+        for (size_t i = 0; i + 8 <= dim; i += 8)
+            hydra_avx2_accumulate_agg(avx + i, a + i, b + i, state + i, token);
+        for (size_t i = dim - (dim % 8); i < dim; ++i)
+            avx[i] = (int64_t)a[i] * token
+                   + (int64_t)b[i] * (int32_t)state[i];
+        if (memcmp(ref, avx, dim * sizeof(int64_t)) != 0) all_match = 0;
+    }
+    CHECK(all_match,
+          "AVX2 step kernel == scalar reference (11 dims, random A/B/state/token, LCG seed)");
+
+    /* Extreme values at the exact layer-cap bound:
+     * |4096*1023 + (-4096)*127| = 3,673,024 — the worst case the loader
+     * admits, hand-computed; the int32 lanes must hold it exactly. */
+    const size_t dim = 8;
+    int32_t a[8], b[8];
+    int8_t state[8];
+    int64_t avx[8] = {0};
+    for (size_t i = 0; i < dim; ++i) {
+        a[i] = 4096; b[i] = -4096; state[i] = 127;
+    }
+    hydra_avx2_accumulate_agg(avx, a, b, state, 1023);
+    const int64_t expected = (int64_t)4096 * 1023 + (int64_t)(-4096) * 127;
+    int exact = 1;
+    for (size_t i = 0; i < dim; ++i)
+        if (avx[i] != expected) exact = 0;
+    CHECK(exact, "AVX2 step kernel: layer-cap extremes (A=4096, t=1023, B=-4096, s=127) exakt");
+}
+
+/* Independent scalar reference of the v2 plane unpack (4 weights per
+ * byte, weight j at bits 2j..2j+1): the SAME code table as the engine
+ * (00=0, 01=+1, 10=-1, 11=0), written from docs/FORMAT.md, not from
+ * hydra_build_aggregation_v1_1. */
+static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
+{
+    static const int8_t map[4] = {0, 1, -1, 0};
+    for (size_t i = 0; i < dim / 4; ++i) {
+        const uint8_t byte = plane[i];
+        for (int j = 0; j < 4; ++j)
+            agg[i * 4 + j] += map[(byte >> (2 * j)) & 0x03];
+    }
+}
+
+static void test_avx2_v2_unpack(void)
+{
+    if (!hydra_simd_has_avx2()) {
+        printf("SKIP: AVX2 v2 unpack (build is -mavx2, CPU lacks AVX2)\n");
+        return;
+    }
+
+    /* Random planes over 3 layers (the multi-layer ADD path of the
+     * kernel) at dim=64 (the engine's supported AVX2 case, 16-byte
+     * planes). */
+    {
+        const size_t dim = 64;
+        int32_t ref[HYDRA_EMBED_DIM] = {0};
+        int32_t avx[HYDRA_EMBED_DIM] = {0};
+        uint8_t plane_a[16], plane_b[16];
+        for (uint32_t l = 0; l < 3; ++l) {
+            for (size_t i = 0; i < dim / 4; ++i) {
+                plane_a[i] = lcg_byte();
+                plane_b[i] = lcg_byte();
+            }
+            ref_unpack_v2_plane(ref, plane_a, dim);
+            hydra_avx2_unpack_v2_plane(avx, plane_a, dim);
+            ref_unpack_v2_plane(ref, plane_b, dim);
+            hydra_avx2_unpack_v2_plane(avx, plane_b, dim);
+        }
+        CHECK(memcmp(ref, avx, dim * sizeof(int32_t)) == 0,
+              "AVX2 v2 unpack == scalar reference (dim 64, 3 random layers)");
+    }
+
+    /* All-code sweep: every 2-bit code repeated in all 4 slots of a
+     * byte must sum to 4 * map(code) per dimension — the code table
+     * itself, pinned per code. */
+    for (int code = 0; code < 4; ++code) {
+        const size_t dim = 64;
+        int32_t ref[HYDRA_EMBED_DIM] = {0};
+        int32_t avx[HYDRA_EMBED_DIM] = {0};
+        uint8_t plane[16];
+        const uint8_t byte = (uint8_t)(code | (code << 2) | (code << 4) | (code << 6));
+        for (size_t i = 0; i < dim / 4; ++i) plane[i] = byte;
+        ref_unpack_v2_plane(ref, plane, dim);
+        hydra_avx2_unpack_v2_plane(avx, plane, dim);
+        const int8_t map[4] = {0, 1, -1, 0};
+        int ok = (memcmp(ref, avx, dim * sizeof(int32_t)) == 0);
+        for (size_t i = 0; ok && i < dim; ++i)
+            if (avx[i] != map[code]) ok = 0;
+        if (code == 1)
+            CHECK(ok, "AVX2 v2 unpack: code 01 -> +1 in all 4 slots/dim, Tafel exakt");
+        else if (code == 2)
+            CHECK(ok, "AVX2 v2 unpack: code 10 -> -1 in all 4 slots/dim, Tafel exakt");
+        else if (code == 0)
+            CHECK(ok, "AVX2 v2 unpack: code 00 -> 0 in all 4 slots/dim, Tafel exakt");
+        else
+            CHECK(ok, "AVX2 v2 unpack: code 11 (reserved) -> 0 in all 4 slots/dim, Tafel exakt");
+    }
+}
+#endif /* __AVX2__ */
+
 int main(void)
 {
     printf("=== Hydra Engine Unit-Tests ===\n\n");
@@ -1549,6 +1688,10 @@ int main(void)
     test_load_metrics_are_measured();
     test_version_two_format();
     test_axiom();
+#if defined(__AVX2__)
+    test_avx2_step_kernel();
+    test_avx2_v2_unpack();
+#endif
     test_sampler_greedy_guard();
     test_sampler_repetition_penalty();
     test_sampler_min_p();

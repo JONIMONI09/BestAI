@@ -3,6 +3,54 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — M3: AVX2 x86-64 kernels (step kernel + v2 unpack LUT), runtime dispatch
+
+- **`src/hydra_simd.h`** (new): the two AVX2 kernels, compiled only
+  when the build carries `-mavx2` (`__AVX2__`):
+  - **Step kernel** `hydra_avx2_accumulate_agg` — 8 dims per 256-bit
+    iteration (a 256-bit lane holds 8 int32). The int32 lanes are
+    provably exact: |A|,|B| ≤ 4096 (layer cap), |t| ≤ 1023, |s| ≤ 127
+    → |A·t + B·s| ≤ 4,710,400 < INT32_MAX, so `mullo_epi32` +
+    `add_epi32` cannot wrap, and the `cvtepi32_epi64` widening is a
+    re-interpretation. Bit-identical to the scalar expression by
+    construction (same integer ops); the parity test is the proof.
+  - **v2 plane unpack** `hydra_avx2_unpack_v2_plane` — the 2-bit →
+    signed LUT decode (one `shuffle_epi8` per weight position over a
+    16-entry table, leak-proof masked 16-bit shifts, and the
+    mandatory `& 0x0F` index mask because VPSHUFB zeroes any lane
+    whose index has bit 7 set). Honest scope note: the 4-weights/byte
+    scatter into stride-4 dimension slots stays a small scalar loop —
+    a 4×16 byte transpose is not cleanly expressible with plain AVX2
+    shuffles and the operation runs once at load time, not per token.
+  - `hydra_simd_has_avx2()` — runtime CPUID probe
+    (`__builtin_cpu_supports`), constant 0 in non-AVX2 builds.
+- **`src/hydra_engine.c`**: `hydra_engine_step()` dispatches to the
+  AVX2 kernel (8-dim chunks + scalar tail) when the CPU supports AVX2,
+  otherwise the scalar loop — a `-mavx2` build therefore still runs on
+  non-AVX2 x86 CPUs; a plain build contains no AVX2 instruction at all
+  (no SIGILL risk). The v2 load path uses the unpack kernel for
+  dim=64 (the standard dimension), scalar otherwise. The ARM NEON path
+  is untouched (mutually exclusive architectures).
+- **`Makefile`**: adds `-mavx2` only when `uname -m` is x86_64 AND the
+  compiler accepts the flag (probe compile); the probe artifact is
+  removed in `clean`. Cross-compilation (the ARM CI leg) never matches.
+- **`tests/test_engine.c`**: 8 new x86-only checks (compile-guarded
+  `#ifdef __AVX2__`, runtime SKIP on non-AVX2 CPUs — the NEON test
+  pattern): runtime probe; step kernel vs scalar reference over 11
+  dims (sub-chunk, mid-chunk tails, full chunks) with LCG-random
+  matrices (R22 platform-fixed seed) and the layer-cap extreme
+  (A=4096, t=1023, B=−4096, s=127 → 3,673,024 hand-computed); v2
+  unpack vs an independent scalar reference (3 random layers, dim 64)
+  and the full 4-code table sweep.
+- **`tools/test_count_baseline.txt`**: x86 113 → 121 (the 8 AVX2 checks
+  compile only into `-mavx2` builds), arm unchanged at 119.
+
+Measured (x86-64 sandbox with AVX2, so the SIMD path is live):
+`./hydra-test` 121/0; baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 UNCHANGED on the
+AVX2 build (end-to-end parity); `jni-batch-test` 86/0,
+`large-model-test` 7/0, `gguf_test.py` 40/0; zero warnings.
+
 ## 2026-10-25 — M2: Min-P sampling + repetition penalty (greedy guard keeps the baseline)
 
 Adds controlled randomness to the deterministic decoder without touching

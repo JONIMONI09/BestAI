@@ -1,5 +1,6 @@
 #include "hydra_model.h"
 #include "hydra_neon.h"
+#include "hydra_simd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,19 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 #endif
+
+/* Runtime AVX2 probe (M3). A -mavx2 build contains AVX2 instructions,
+ * but it must still run on CPUs without AVX2: the caller checks this
+ * once and falls back to the scalar path. In a plain build this is a
+ * constant 0 and the AVX2 code is compiled out entirely. */
+int hydra_simd_has_avx2(void)
+{
+#if defined(__AVX2__)
+    return __builtin_cpu_supports("avx2") != 0;
+#else
+    return 0;
+#endif
+}
 
 /* Explizite Little-Endian-Dekodierung: docs/FORMAT.md definiert das
  * Headerlayout als little-endian, memcpy in native Integer wuerde auf
@@ -185,9 +199,28 @@ static void hydra_build_aggregation(HydraEngine *engine)
         memset(engine->agg_a, 0, sizeof(engine->agg_a));
         memset(engine->agg_b, 0, sizeof(engine->agg_b));
 
+        /* AVX2 load-time unpack (M3): the 2-bit LUT decode of 64 dims
+         * (16 bytes) per iteration, bit-identical to the scalar
+         * accumulation (same integer adds per dimension). Requires
+         * dim % 64 == 0 (the standard dim=64); other dimensions take
+         * the scalar path unchanged. */
+#if defined(__AVX2__)
+        const int use_avx2 = hydra_simd_has_avx2()
+                            && engine->header.dim % 64 == 0;
+#endif
+
         for (uint32_t l = 0; l < engine->header.layers; ++l) {
             const uint8_t* packed_a = w + (l * layer_bytes * 2);
             const uint8_t* packed_b = packed_a + layer_bytes;
+#if defined(__AVX2__)
+            if (use_avx2) {
+                for (size_t d = 0; d < engine->header.dim; d += 64) {
+                    hydra_avx2_unpack_v2_plane(engine->agg_a + d, packed_a + d / 4, 64);
+                    hydra_avx2_unpack_v2_plane(engine->agg_b + d, packed_b + d / 4, 64);
+                }
+                continue;
+            }
+#endif
             hydra_build_aggregation_v1_1(packed_a, packed_b, engine->agg_a, engine->agg_b, engine->header.dim);
         }
         return;
@@ -447,6 +480,28 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
     }
     if (dim % 16) {
         for (size_t i = dim - (dim % 16); i < dim; ++i) {
+            accumulator[i] = (int64_t)engine->agg_a[i] * token_val
+                           + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
+        }
+    }
+#elif defined(__AVX2__)
+    /* AVX2 step kernel (M3): 8 dims per iteration (a 256-bit lane
+     * holds 8 int32), int32 math is exact under the layer cap (see
+     * src/hydra_simd.h), then widened to int64. Runtime fallback to
+     * the scalar loop when the CPU has no AVX2 (a -mavx2 build must
+     * stay portable). */
+    if (hydra_simd_has_avx2()) {
+        for (size_t i = 0; i + 8 <= dim; i += 8) {
+            hydra_avx2_accumulate_agg(accumulator + i, engine->agg_a + i,
+                                      engine->agg_b + i,
+                                      engine->state_vector + i, token_val);
+        }
+        for (size_t i = dim - (dim % 8); i < dim; ++i) {
+            accumulator[i] = (int64_t)engine->agg_a[i] * token_val
+                           + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
+        }
+    } else {
+        for (size_t i = 0; i < dim; ++i) {
             accumulator[i] = (int64_t)engine->agg_a[i] * token_val
                            + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
         }
