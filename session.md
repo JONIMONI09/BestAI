@@ -269,9 +269,31 @@ full report on failure as a **PR comment** (pull-request runs) and
 read it; an in-sandbox fetch script is impossible (egress blocks the log
 hosts), so CI-side mirroring is the workable form of the user's request.
 errors.md: overload trap + two-round principle; CHANGELOG updated.
-**Open:** round-2 CI green (CI + Lint & Security); user merge; the
-main-branch Release run goes green automatically after the merge
-(same lint gate).
+Committed as 199221c on top of db85ccd (push).
+
+**CI round 2 (199221c):** Lint & Security red — but EARLIER than
+expected: the `gradle lintDebug` step itself (which sits before the
+report step) aborted, so the publishing step was skipped and the report
+was again UI-only (no PR comment). The actual findings of 199221c are
+still unknown — the tree is verified consistent (plurals in
+strings.xml + getQuantityString call sites), so either the overload fix
+was insufficient or a different error-level finding appeared. Side
+finding: the sandbox snapshot had restored strings.xml to the pre-db85ccd
+version while HydraApp.kt kept the db85ccd state; a blind commit would
+have shipped a dangling R.plurals reference (compile error). Caught,
+recovered with `git reset --soft` + `git restore --source=HEAD`; the
+pushed 199221c contains the correct plurals.
+
+**Round 3 (this commit):** workflow restructure in **lint.yml AND
+release.yml**: (1) the `gradle lintDebug` step is no longer fatal
+(`|| echo` — gradle writes the report before aborting anyway); (2) the
+check step verifies the report exists, and on findings publishes step
+summary + PR comment (PR number from the event, or resolved from the
+commit SHA via `/commits/{sha}/pulls`, which also covers push runs that
+update a PR) and fails the job itself. YAML validated. The next failed
+run will therefore be readable via the API (PR comment) — read the
+report, fix the actual finding, done. **Open:** round-4 CI green; user
+merge; main-branch Release after merge.
 
 ### Session close (2026-10-25)
 

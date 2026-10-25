@@ -340,7 +340,15 @@ jobs:
 
       - name: Android Lint (must report 0 findings)
         working-directory: android
-        run: /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
+        run: |
+          # Deliberately NOT fatal here: gradle lintDebug aborts on
+          # error-level findings but has already written the report.
+          # If this step failed the job itself, the next step would be
+          # skipped and the report would stay in the UI-only job log.
+          # The next step reads the report, publishes it where API-only
+          # clients can read it, and fails the job itself.
+          /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q \
+            || echo "gradle lintDebug reported findings; the next step publishes the report"
 
       - name: Check the lint report for warnings/errors
         env:
@@ -348,14 +356,19 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REPORT=android/app/build/reports/lint-results-debug.txt
+          if [ ! -f "$REPORT" ]; then
+            echo "::error::Android Lint report missing: $REPORT"
+            exit 1
+          fi
           cat "$REPORT"
           if ! grep -q "No issues found" "$REPORT"; then
             # The report above is also in the job log, but the log is only
-            # readable in the Actions UI: log-download and artifact hosts are
-            # not reachable by API-only clients. Mirror the report where the
-            # API can see it — a PR comment on pull-request runs, plus the
-            # step summary always — so a failure is diagnosable without
-            # opening the UI.
+            # readable in the Actions UI: log-download and artifact hosts
+            # are not reachable by API-only clients. Publish the report
+            # where the API can see it: step summary always, PR comment
+            # when the run belongs to a pull request (the number is
+            # resolved from the commit SHA when the event itself does
+            # not carry one, so push runs that update a PR are covered).
             {
               echo "### Android Lint report ($(git rev-parse --short HEAD))"
               echo
@@ -364,8 +377,13 @@ jobs:
               echo '```'
             } > /tmp/lint-report.md
             cat /tmp/lint-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "${PR_NUMBER}" ]; then
-              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            PR="${PR_NUMBER:-}"
+            if [ -z "$PR" ]; then
+              PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                       --jq '.[0].number // empty' 2>/dev/null || true)"
+            fi
+            if [ -n "$PR" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
                 -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 || true
             fi
             echo "::error::Android Lint reported findings"

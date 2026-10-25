@@ -367,11 +367,42 @@ jobs:
             | grep -E "^package:|^sdkVersion:|^application-label:"
       - name: Android Lint must be error-free
         working-directory: android
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
+          # Same two-step pattern as lint.yml: gradle aborts on
+          # error-level findings, but the report is already written by
+          # then. Do not let the gradle call fail the step first — the
+          # check below publishes the report (step summary + PR comment,
+          # resolved from the commit SHA when the event carries no
+          # number) and fails the job, so the findings are readable by
+          # API-only clients instead of staying in the UI-only log.
+          /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q \
+            || echo "gradle lintDebug reported findings; the report is published below"
           REPORT=app/build/reports/lint-results-debug.txt
           cat "$REPORT"
-          grep -q "No issues found" "$REPORT"
+          if ! grep -q "No issues found" "$REPORT"; then
+            {
+              echo "### Android Lint report ($(git rev-parse --short HEAD))"
+              echo
+              echo '```'
+              cat "$REPORT"
+              echo '```'
+            } > /tmp/lint-report.md
+            cat /tmp/lint-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            PR="${PR_NUMBER:-}"
+            if [ -z "$PR" ]; then
+              PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                       --jq '.[0].number // empty' 2>/dev/null || true)"
+            fi
+            if [ -n "$PR" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 || true
+            fi
+            echo "::error::Android Lint reported findings"
+            exit 1
+          fi
       - name: Checksums
         working-directory: dist
         run: sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt

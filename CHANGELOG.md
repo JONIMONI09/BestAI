@@ -32,12 +32,21 @@ All notable changes to this project, per change, are recorded here and in
   `LocalResources.current.getQuantityString(R.plurals…, …)` — one
   unambiguous signature, a `@PluralsRes` parameter, and the same pattern
   `MainActivity` already uses for its plurals. The strings stay plurals.
-- **`.github/workflows/lint.yml` — self-publishing lint reports.** The
-  report was only readable in the Actions UI (job log + artifact, both on
-  hosts outside API-only egress). The "Check the lint report" step now
-  also posts the full report as a PR comment (on pull-request runs) and
-  to the step summary on every failure, so lint failures are diagnosable
-  from the API alone.
+- **`.github/workflows/lint.yml` + `release.yml` — self-publishing lint
+  reports.** The report was only readable in the Actions UI (job log +
+  artifact, both on hosts outside API-only egress). Two changes make
+  failures diagnosable from the API alone: (1) the `gradle lintDebug`
+  step no longer aborts the job (it captures the non-zero exit — gradle
+  writes the report before it aborts anyway); (2) the dedicated check
+  step now publishes the full report on failure as a PR comment (via the
+  issues API; the PR number comes from the event, or is resolved from
+  the commit SHA via `/commits/{sha}/pulls` so push runs that update a
+  PR are covered too) and to the job step summary (always), and fails
+  the job itself. The first attempt (199221c) proved why the
+  restructuring was needed: the publishing step sat behind the gradle
+  step and was skipped on exactly the runs where the report was needed.
+  The actual findings of that run will arrive as a PR comment on the
+  next failed run and are fixed in the following round.
 
 ## 2026-10-25 — CI fix round (post-PR, same run)
 

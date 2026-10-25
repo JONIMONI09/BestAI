@@ -1596,3 +1596,25 @@
   investigation by necessity; the new lint.yml step now posts the full
   report as a PR comment + step summary on failure, so round one becomes
   round zero for API-only clients.
+
+## 2026-10-25 — diagnostic step placed after the very step that aborts on the same failure
+- **Symptom:** after adding a "publish the lint report as PR comment /
+  step summary" step to the Android lint job, the next run still left
+  the report unreadable: the job failed in the `gradle lintDebug` step
+  (it aborts on error-level findings) and the publishing step was
+  skipped entirely. The mirror could never run, because it sat behind
+  the step that dies first.
+- **Cause:** gate and diagnostics must not share a failure point.
+  `gradle lintDebug` exits non-zero on errors, so any step after it is
+  skipped on exactly the runs where the report is needed.
+- **Fix:** the gradle step no longer fails the job (it captures the
+  non-zero exit with a `|| echo` note); the dedicated check step reads
+  the report (which gradle writes before aborting), publishes it (step
+  summary always, PR comment via issues API — PR number from the event,
+  or resolved from the commit SHA via `/commits/{sha}/pulls` so push
+  runs that update a PR are covered too), and fails the job itself.
+  Applied to both lint.yml and release.yml (same pattern).
+- **Prevention:** when adding diagnostics to a CI job, ask "on which
+  step does this job die, and does my diagnostic step run before or
+  after it?" If the gate can abort before the diagnostics, make the
+  gate non-fatal and centralize the failure in the diagnostic step.
