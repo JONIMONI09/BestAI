@@ -87,6 +87,9 @@ class HydraEngine : EngineInterface {
         val started = System.nanoTime()
         running = true
 
+        var totalTokens = 0
+        var completed = false
+
         val bridgeCallback = object : HydraBridge.Callback {
             override fun onTokens(tokens: IntArray, done: Boolean) {
                 // One block, not one token per callback: the bridge batches
@@ -94,10 +97,18 @@ class HydraEngine : EngineInterface {
                 // than the engine step itself at this model size.
                 if (tokens.isNotEmpty() && !done) callbacks.onFirstToken()
                 tokens.forEach { callbacks.onToken(it, "") }
+                totalTokens += tokens.size
                 if (done) {
                     running = false
-                    val summary = parseSummary(tokens.size, System.nanoTime() - started)
-                    callbacks.onComplete(summary)
+                    // Deliberately NO onComplete here. The batch callback can
+                    // only say "the run ended", not how: a run the user
+                    // cancelled reports ok:false + cancelled:true in the
+                    // JSON that runInference() returns, and that total
+                    // ("emitted") counts every block, not just this last
+                    // one. Completing from the callback (as the old code
+                    // did) marked a cancelled run as completed and counted
+                    // only the final block's tokens. The summary is built
+                    // once, after runInference() returns, from that JSON.
                 }
             }
 
@@ -107,22 +118,33 @@ class HydraEngine : EngineInterface {
             }
         }
 
-        // runInference() blocks on the calling thread until the run finishes.
+        // runInference() blocks on the calling thread until the run finishes,
+        // so by the time it returns every onTokens block has already been
+        // delivered on this same thread and totalTokens is final.
         val json = try {
             HydraBridge.runInference(path, tokens, steps, bridgeCallback)
         } catch (e: Throwable) {
             running = false
-            callbacks.onComplete(
-                GenerationSummary(0, false, "Native engine call failed: ${e.javaClass.simpleName}")
-            )
+            if (!completed) {
+                completed = true
+                callbacks.onComplete(
+                    GenerationSummary(
+                        generatedTokens = totalTokens,
+                        cancelled = false,
+                        error = "Native engine call failed: ${e.javaClass.simpleName}",
+                        elapsedMs = (System.nanoTime() - started) / 1_000_000
+                    )
+                )
+            }
             return
         }
 
-        // Safety net: if the run ended without a final callback, still complete
-        // exactly once so the chat state machine can never be left in
-        // GENERATING with nothing able to move it out.
-        if (running) {
-            running = false
+        // The single completion point: exactly once, from the native JSON,
+        // which is the only place that knows whether the run was cancelled
+        // and how many tokens were emitted in total.
+        running = false
+        if (!completed) {
+            completed = true
             callbacks.onComplete(parseSummaryFrom(json, System.nanoTime() - started))
         }
     }
@@ -164,25 +186,33 @@ class HydraEngine : EngineInterface {
         return out
     }
 
-    private fun parseSummary(generated: Int, elapsedNs: Long): GenerationSummary {
-        return GenerationSummary(
-            generatedTokens = generated,
-            cancelled = false,
-            elapsedMs = elapsedNs / 1_000_000
-        )
-    }
-
     /**
      * Reads the native JSON result. A cancelled run reports `cancelled: true`,
      * which is not an error: partial output is kept and labelled by the UI.
+     * This is the ONLY place a run's summary is built for generate(): the
+     * callback can say the run ended, but only this JSON says how it ended
+     * and how many tokens were emitted in total.
      */
     private fun parseSummaryFrom(json: String, elapsedNs: Long): GenerationSummary {
         return try {
             val o = JSONObject(json)
+            val cancelled = o.optBoolean("cancelled", false)
             GenerationSummary(
-                generatedTokens = o.optInt("tokens", 0),
-                cancelled = o.optBoolean("cancelled", false),
-                error = if (o.optBoolean("ok", false)) null else o.optString("error", "Run failed"),
+                // The native summary reports "emitted" (the total across all
+                // blocks). The old code read "tokens", which does not exist
+                // in the native JSON and silently yielded 0 - invisible while
+                // this code path was unreachable.
+                generatedTokens = o.optInt("emitted", 0),
+                cancelled = cancelled,
+                // A cancelled run is not a failure. The native side answers
+                // it with ok:false and an "error" that only names the
+                // cancellation; surfacing that string as an error would make
+                // the UI treat a user-requested stop as a fault.
+                error = if (cancelled || o.optBoolean("ok", false)) {
+                    null
+                } else {
+                    o.optString("error", "Run failed")
+                },
                 elapsedMs = elapsedNs / 1_000_000
             )
         } catch (e: Throwable) {
