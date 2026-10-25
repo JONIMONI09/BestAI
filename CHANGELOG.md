@@ -3,6 +3,26 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — post-merge lint fix (branch `arena/6bf4fc8e-bestai`)
+
+### Fixed
+
+- **Android Lint findings broke the Lint & Security and Release workflows
+  after the #47 merge** ("Android Lint reported findings" / "Android
+  Lint must be error-free"; the gate greps the report for "No issues
+  found", so even warnings fail it). Root cause: the three M5 telemetry
+  strings (`run_live`, `run_done`, `run_done_cancelled`) were plain
+  `<string>` resources containing `%1$d tokens` — a quantity — which is
+  exactly what the `PluralsCandidate` check flags, and it violated the
+  repo's own established convention (`log_size`, `log_running`,
+  `log_bench_start` are all `<plurals>`; no non-plural `%d` string
+  existed before this merge, which is why the gate had been green).
+  Converted all three to `<plurals>` (one/other, `%1$d` positional,
+  matching the existing entries) and updated the three `stringResource`
+  call sites in `HydraApp.kt` to the plurals form
+  (`quantity, args…`). CI compile + APK build + APK verification were
+  already green on the merged commit — only the lint gate was red.
+
 ## 2026-10-25 — CI fix round (post-PR, same run)
 
 ### Fixed

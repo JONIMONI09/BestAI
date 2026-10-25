@@ -326,11 +326,11 @@ private fun EngineStatusRow(state: MainUiState) {
 private fun RunTelemetryRow(state: MainUiState) {
     val run = state.lastRun ?: return
     val text = if (run.live) {
-        stringResource(R.string.run_live, run.tokens, formatRate(run.tokensPerSecond))
+        stringResource(R.plurals.run_live, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
     } else if (run.cancelled) {
-        stringResource(R.string.run_done_cancelled, run.tokens, formatRate(run.tokensPerSecond))
+        stringResource(R.plurals.run_done_cancelled, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
     } else {
-        stringResource(R.string.run_done, run.tokens, run.elapsedMs, formatRate(run.tokensPerSecond))
+        stringResource(R.plurals.run_done, run.tokens, run.tokens, run.elapsedMs, formatRate(run.tokensPerSecond))
     }
     Row(
         modifier = Modifier

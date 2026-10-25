@@ -1533,3 +1533,35 @@
   scripts in a PR, run the shebang scan and make the set consistent;
   and remember that a user's 666/644 on a non-exec file is their umask,
   not something the repo can change — only the exec bit is committable.
+
+## 2026-10-25 — three new quantity strings ignored the repo's plurals convention and turned the lint gate red
+- **Symptom:** after the #47 merge, the "Android lint" job (Lint &
+  Security) and the "Android Lint must be error-free" step (Release)
+  failed with "Android Lint reported findings". The gate greps
+  lint-results-debug.txt for "No issues found", so even a warning fails
+  it. Compile, APK build and APK verification were all green — only
+  lint was red.
+- **Cause:** the M5 telemetry strings (`run_live`, `run_done`,
+  `run_done_cancelled`) were plain `<string>` resources containing
+  "%1$d tokens". A quantity inside a plain string is exactly what
+  PluralsCandidate (and ImpliedQuantity) flag. The repo already had a
+  convention for this: every quantity string is a `<plurals>`
+  (`log_size`, `log_running`, `log_bench_start`), and no non-plural
+  `%d` string existed anywhere — a one-minute grep of strings.xml would
+  have shown it. Instead the new strings were written from the needs
+  of the code, not from the shape of the file they were added to.
+  (Secondary constraint: the job logs and the lint-report artifact are
+  on hosts outside this sandbox's egress, so the report could not be
+  read — the finding class was inferred from the diff + conventions,
+  which worked because the repo's convention made the candidate
+  unique.)
+- **Fix:** the three strings became `<plurals>` (one/other, `%1$d`
+  positional — byte-identical style to the existing entries) and the
+  three `stringResource` call sites in HydraApp.kt use the plurals form
+  (quantity first, then the format args). XML validated, call sites
+  checked, no other `R.string.run_*` references remain.
+- **Prevention:** before adding ANY string resource, grep the existing
+  strings.xml for the same category (quantities → plurals, format
+  args, the repo's positional-arg style) and match it. A green gate
+  that has been green for months is a statement about the conventions
+  of the file, not just about its current contents.

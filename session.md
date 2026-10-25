@@ -232,6 +232,22 @@ Git hygiene: `git status` shows only tracked changes; `RESEARCH.md` and
       (the APK-inspection step creates `dist/`); no workflow change.
 - [x] Committed and pushed; PR #47 updated.
 
+### Round 2026-10-25 (post-merge: CI red on lint)
+
+PR #47 merged by the user at 18:31 (23baf2b). Post-merge CI: **CI green**
+(Kotlin fix verified — full gradle build + APK verification passed on
+both the PR head and main), but **Lint & Security** and **Release**
+failed on the Android-lint gate. Job logs/artifacts are unreachable from
+this sandbox (results-receiver + Azure blob not in egress), so the
+findings were inferred from the diff and the repo's own conventions:
+three M5 telemetry strings were plain `<string>` resources with `%1$d
+tokens` — a quantity — while every existing quantity string in the repo
+is a `<plurals>` (log_size, log_running, log_bench_start), and the gate
+fails on ANY finding. Fixed by converting to `<plurals>` (one/other,
+matching the existing style) and updating the three `stringResource`
+call sites in HydraApp.kt. Committed on the new session branch
+`arena/6bf4fc8e-bestai`, pushed, PR opened (R17: merge is the user's).
+
 ### Session close (2026-10-25)
 
 Everything the spec asked for is either done and verified or explicitly
