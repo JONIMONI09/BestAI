@@ -148,15 +148,15 @@ platforms.
 
 ## Density, stated exactly (Honest Note)
 
-The format stores **2 ternary weights per byte, i.e. 2 bits per weight on disk**: `w1` in bits 0–1, `w2` in bits 2–3, with the upper 4 bits reserved. One byte therefore covers one `(layer, dim)` pair, and `weights_len = layers × dim` **bytes** (verified: a 4-layer, dim-64 model declares `weights_len = 256`).
+The format stores **2 ternary weights per byte, i.e. 4 bits per weight on disk**: `w1` in bits 0–1, `w2` in bits 2–3, with the upper 4 bits reserved. One byte therefore covers one `(layer, dim)` pair, and `weights_len = layers × dim` **bytes** (verified: a 4-layer, dim-64 model declares `weights_len = 256`).
 
-The reserved code `11` is decoded as `0`, so a byte carries `3 × 3 = 9` distinct states, i.e. `log₂9 ≈ 3.17` bits of information **per byte** — `log₂3 ≈ 1.58` bits **per weight**. The honest figures are therefore:
+The reserved code `11` is decoded as `0`, so a byte carries `3 × 3 = 9` distinct states, i.e. `log₂9 ≈ 3.17` bits of information **per byte** — about **1.58 bits per weight** of information inside 4 allocated bits. The honest figures are therefore:
 
-- **allocated:** 2 bits per weight,
+- **allocated (v1):** 4 bits per weight (two 2-bit codes in 8 bits),
 - **informational:** ~1.58 bits per weight,
-- **used:** half of each byte (4 of 8 bits).
+- **allocated (v2, header version 2):** 2 bits per weight, no reserved bits.
 
-Packing 4 weights per byte (header version 2) does not change the weight data density — it stays 2 bits per weight. What it removes is the wasted half of every byte, which halves the file size.
+Packing 4 weights per byte (header version 2) halves the file for the same model: v1's 4 bits per weight (half of each byte reserved) become exactly the 2-bit code of every weight.
 
 ## Planned Extensions (v2)
 

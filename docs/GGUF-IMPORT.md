@@ -159,7 +159,7 @@ compile-time constants shared with the C engine:
 | `HYDRA_EMBED_DIM` | 64 | dim ≤ 64 |
 | `MAX_VOCAB` | 1024 | vocabulary ≤ 1024 entries |
 | `MAX_LAYERS` | 4096 | at most 4096 layers per plane |
-| bytes on disk | **2 bits per weight** | two weights per byte, one byte per `(layer, dim)` pair |
+| bytes on disk | **4 bits per weight** | two weights per byte (one per plane), one byte per `(layer, dim)` pair |
 
 **The v1 ceiling is therefore 256 KiB of weights** (`64 × 4096` bytes =
 262 144 bytes). A 20 GB checkpoint is ~81 920× larger than anything the current

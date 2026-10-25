@@ -158,8 +158,8 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 
 ## Features
 
-- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path, and the engine's own working set is a fixed ~1.06 KiB
-- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 2 bits per weight on disk** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The planned v2 packs 4 weights per byte at the same 2 bits per weight, which **halves the file** by removing the wasted half of each byte — see `docs/FORMAT.md`.
+- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path, and the engine's own working set is fixed and measured: a 656-byte context, of which 576 bytes (two `int32[64]` aggregates + one `int8[64]` state) is what the per-token step touches
+- ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 4 bits of file per weight** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The v2 header variant packs 4 weights per byte — exactly the 2-bit code of each weight, no reserved bits — which **halves the file** — implemented, tested and documented in `docs/FORMAT.md` ("Version 2"); it is the same 24-byte header, not the `.hydra2` container.
 - ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
@@ -361,17 +361,18 @@ acc_i += (+1) · x_j   for every w_ij = +1
 acc_i += (−1) · x_j   for every w_ij = −1
 ```
 
-**On-disk footprint per weight (v1): 2 bits** — two ternary weights per byte
-(`w1` in bits 0–1, `w2` in bits 2–3), upper 4 bits reserved.
+**On-disk footprint per weight (v1): 4 bits** — one byte per `(layer, dim)`
+pair, each holding *two* ternary weights (plane `w1` in bits 0–1, plane
+`w2` in bits 2–3); the upper 4 bits are reserved.
 
 The table below is a **bits-per-parameter density comparison only**. It is
 *not* a statement that Hydra-Stone can store models of that size:
 
-| Parameters | FP16 | INT4 (4 bits) | v1 density (2 bits) | v2 packing (same 2 bits) |
+| Parameters | FP16 | INT4 (4 bits) | v1 (4 bits/weight) | v2 (2 bits/weight) |
 |---|---|---|---|---|
-| 0.5 B | 1000 MiB | 250 MiB | **125 MiB** | 62.5 MiB |
-| 1.0 B | 2000 MiB | 500 MiB | **250 MiB** | 125 MiB |
-| 1.5 B | 3000 MiB (OOM) | 750 MiB | **375 MiB** | 187.5 MiB |
+| 0.5 B | 1000 MiB | 250 MiB | **250 MiB** | 125 MiB |
+| 1.0 B | 2000 MiB | 500 MiB | **500 MiB** | 250 MiB |
+| 1.5 B | 3000 MiB (OOM) | 750 MiB | **750 MiB** | 375 MiB |
 
 **What v1 can actually hold:** `dim <= 64`, `layers <= 4096`, `vocab <= 1024`,
 which caps the weight region at **256 KiB** (`64 x 4096` bytes). A parameter
@@ -380,14 +381,15 @@ format ceiling, not a memory problem (a 5 GiB sparse `.hydra` maps and
 generates fine; `tests/test_large_model.c`). Lifting the ceiling is the job of
 the v2 container, specified in `docs/FORMAT-V2.md`.
 
-The honest framing: **v1 is INT2 on disk — it halves INT4, and beats it in
-compute too** (additions only, no dequantization, no FP unit). Two honest
-caveats. First, v1 wastes half of every byte: the reserved codes mean a byte
-carries `log₂9 ≈ 3.17` bits of information, i.e. **1.58 bits per weight** — so
-the real figure is *better* than the allocated 2. Second, v2's
-4-weights-per-byte packing does **not** change the 2 bits/weight of weight data;
-it only removes the wasted half of each byte, halving the file. See
-`docs/FORMAT.md`.
+The honest framing: **v2 is INT2 on disk — it halves INT4, and beats it in
+compute too** (additions only, no dequantization, no FP unit); v1 matches
+INT4 in footprint. Two honest caveats. First, v1 wastes half of every byte:
+the reserved upper nibble and the unused code `11` mean a byte carries only
+`log₂9 ≈ 3.17` bits of information across its two weights — about **1.58 bits
+per weight** of information inside 4 allocated bits. Second, v2's
+4-weights-per-byte packing stores exactly the 2-bit code of every weight with
+nothing reserved, so the file halves while the code table stays identical.
+See `docs/FORMAT.md`.
 
 ## Testing Strategy
 
@@ -427,7 +429,7 @@ make ui       # builds hydra-run + the starter model and serves on :8787
 - [ ] Min-P sampling & repetition penalty
 - [ ] safetensors import with automatic absmean ternarization (GGUF is done — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md))
 - [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
-- [ ] 4-weights-per-byte packing (same 2 bits/weight, but no wasted byte) — a v1.1 file-level optimisation, not the v2 container
+- [x] 4-weights-per-byte packing (2 bits/weight, no wasted byte) — implemented as header version 2 and tested (`docs/FORMAT.md`, "Version 2"; `tests/test_engine.c`, `test_version_two_format`) — a v1.1 file-level optimisation, distinct from the v2 container
 - [ ] The `.hydra2` sparse-MoE container — the canonical v2 spec is [`docs/FORMAT-V2.md`](docs/FORMAT-V2.md); **no part of it is implemented**, and the aggregated `A[i]/B[i]` container sketched in `docs/ARCHITECTURE.md` is a superseded alternative, see its *Roadmap status* section
 - [ ] Streaming ring-buffer KV with attention sinks
 

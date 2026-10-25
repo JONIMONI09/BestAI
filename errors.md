@@ -1422,3 +1422,68 @@
   architecture, the emulator invocation is part of the step, not an inherited
   property of the machine. A step that works locally because your container
   happens to have binfmt registered is a step that works by accident.
+
+## 2026-10-25 — audit sandbox: four gates could not be measured (stated, not hidden)
+- **Symptom:** `jni_signature_check` has no `javac`; ARM/NEON parity has
+  no `aarch64-linux-gnu-gcc` and no `qemu-aarch64-static`; the APK build
+  has no Android SDK egress; Python is PEP-668 managed (system pip
+  refused pyyaml).
+- **Cause:** the audit container is not the CI runner. Different
+  egress, different toolchain.
+- **Fix:** pyyaml installed with `--break-system-packages` (sandbox-only,
+  not a repo change); llama.cpp submodule initialised at the pinned
+  commit so the pin gates could run. The four unmeasurable gates were
+  marked **blocked, not measured** in every place they are claimed
+  (RESEARCH.md §2, session.md V-table, CHANGELOG) — never "verified" and
+  never silently dropped.
+- **Prevention:** R32 now has a concrete list attached (this sandbox,
+  2026-10-25): no javac, no aarch64 cross, no qemu, no NDK/SDK egress.
+  Any future claim touching those surfaces in this container is a lie
+  until it says "blocked" or runs in CI.
+
+## 2026-10-25 — F-14 class: a UI state machine consumes native JSON it never checked
+- **Symptom:** `HydraEngine.kt` built the run summary from Kotlin
+  counters, but the completion path read a key `"tokens"` that the
+  native JSON never emits (it emits `"emitted"`), and a cancelled run
+  surfaced as an error. No gate could see it: Kotlin is not compiled in
+  this sandbox, and no test drives the Android engine class.
+- **Cause:** the producer (JNI summary JSON) and the consumer (Kotlin
+  `runSummary`) were written against different contracts; the
+  divergence accumulated silently. The class of bug: **any value that
+  crosses a language boundary is only as true as its consumer's
+  parser, and no compiler on either side checks the other side.**
+- **Fix:** single completion summary built once after `runInference`
+  from the native JSON (key `"emitted"`); `cancelled` ⇒ completed with
+  null error; dead `parseSummary` removed (F-14, commit c477a52).
+- **Prevention:** when a value crosses a boundary (native→Kotlin,
+  Python→C, JSON→UI), read the producer's literal key names against the
+  consumer's literal key names in the same sitting. Grep for the key
+  string on both sides; if the producer's file does not contain the
+  consumer's key, that is a bug until proven otherwise.
+
+## 2026-10-25 — F-16 class: a wrong "2 bits per weight" claim, copy-propagated by this agent into a fourth file
+- **Symptom:** the README claimed v1 = "2 bits per weight on disk" and
+  v2 = "same 2 bits, halves the file" with table values that do not
+  follow from the loader (v1 is 1 byte per `(layer, dim)` pair holding
+  **two** ternary weights → 4 bits of file per weight; v2 is 4
+  weights/byte → 2 bits). While writing the FORMAT.md "Version 2"
+  section in M3, **I copied the README's phrasing into FORMAT.md
+  instead of re-deriving it** — the lie gained a second, authoritative
+  home. The same wrong number sat in GGUF-IMPORT.md and
+  ARCHITECTURE.md from before.
+- **Cause:** density claims were treated as inherited text, not as
+  arithmetic. One `8 bits / 2 weights = 4 bits` derivation would have
+  caught every instance; instead the phrase was copied four times.
+  The trigger: writing a *new* doc section (feels like fresh work) from
+  an *old* doc (feels like trusted source) without looking at the code
+  the new section documents.
+- **Fix:** re-derived from `hydra_build_aggregation`, `make_model.py`
+  and hand-decoded the `test_version_two_format` fixtures (v1 body 8 B,
+  v2 body 4 B, same 8 weights). Corrected in README.md, FORMAT.md,
+  GGUF-IMPORT.md, ARCHITECTURE.md and a server.js comment; the roadmap
+  item moved to done.
+- **Prevention:** any bits/bytes/MiB figure in a doc must be traceable
+  in the same sitting to (a) the code that allocates the bytes and (b)
+  a fixture or measurement that produces it. When a doc cites another
+  doc for a number, re-derive it from code — doc-to-doc citation is how
+  one error becomes four.
