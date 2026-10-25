@@ -215,6 +215,23 @@ Git hygiene: `git status` shows only tracked changes; `RESEARCH.md` and
 - `c477a52` — M5: `HydraEngine.kt` cancel-state fix; `HydraApp.kt`/`MainActivity.kt` engine status, live telemetry, model detail; `strings.xml` +4.
 - (M6 commit) — README/FORMAT/GGUF-IMPORT/ARCHITECTURE/server.js density corrections (F-15/F-16), `CHANGELOG.md`, session close-out, `errors.md` append, RESEARCH.md F-14..F-16.
 
+### CI fix round (2026-10-25, after the PR opened)
+
+- [x] CI failed on `compileDebugKotlin`: `MainActivity.kt:987:57` — the
+      M5 `selectEngine()` edit called `file.absolutePath` on a nullable
+      `File?` (the compiler cannot infer `result.ok ⇒ file != null`).
+      Fixed with an early return for the no-model case (same UI state +
+      log line as before); the rest of the function now runs on a
+      smart-cast non-null `file`. Not compilable in the sandbox (no
+      kotlinc) — verified by reading; CI is the compile proof.
+- [x] User-reported 666 permissions: 5 of 12 gate scripts were committed
+      100644 despite `#!/usr/bin/env bash` (on a umask-000 checkout they
+      show up as `-rw-rw-rw-` and cannot run directly). All five are now
+      100755 in git; every shipped shebang script has the exec bit.
+- [x] CI `dist/` upload error was the downstream of the Kotlin failure
+      (the APK-inspection step creates `dist/`); no workflow change.
+- [x] Committed and pushed; PR #47 updated.
+
 ### Session close (2026-10-25)
 
 Everything the spec asked for is either done and verified or explicitly

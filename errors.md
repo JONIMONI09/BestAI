@@ -1487,3 +1487,49 @@
   a fixture or measurement that produces it. When a doc cites another
   doc for a number, re-derive it from code — doc-to-doc citation is how
   one error becomes four.
+
+## 2026-10-25 — a nullable-receiver compile error survived because the M5 Kotlin edit was never compiled
+- **Symptom:** CI `compileDebugKotlin` failed:
+  `MainActivity.kt:987:57 Only safe (?.) or non-null asserted (!!.) calls
+  are allowed on a nullable receiver of type 'java.io.File?'`. The M5
+  edit passed `file.absolutePath` into `detailFor()` in the success
+  branch, where `file` is `File?` — the guard `result.ok ⇒ file != null`
+  is true at runtime but invisible to the compiler, which only tracks
+  explicit null checks on the local.
+- **Cause:** the sandbox has no kotlinc/NDK egress, so the Android code
+  was shipped "verified by reading" — and the reading checked structure
+  and logic, but not the nullability type of every expression on a
+  nullable local. The line above it (`file?.name ?: ""`) had the safe
+  call; the line three below did not. One missing `?.` per function is
+  exactly what this class of review misses.
+- **Fix:** early return for the no-model case (behaviour-identical UI +
+  log), then a smart-cast non-null `file` for the load and the success
+  branch. The CI build is the compile proof; stated as such, not hidden.
+- **Prevention:** when Kotlin/Java code cannot be compiled in the
+  environment, the pre-commit review walks EVERY member access on
+  nullable-typed locals in the changed function (and the functions it
+  calls into), not just the lines that changed. If a local is `T?` and
+  the compiler has no explicit `x == null` guard in scope, that access
+  is a compile error until it is guarded — regardless of what the
+  runtime logic guarantees.
+
+## 2026-10-25 — five gate scripts committed without the exec bit; they showed up as 666 on a umask-000 checkout
+- **Symptom:** user reported some code files showing `666` permissions
+  locally. Repo audit: 5 of 12 `tools/*.sh` gate scripts were 100644 in
+  git despite `#!/usr/bin/env bash` — on any checkout with umask 000
+  they materialise as `-rw-rw-rw-` (666) and cannot be run directly
+  (`./tools/foo.sh` → Permission denied). The 755/644 split across the
+  script set was accidental, not a convention.
+- **Cause:** the scripts were added over several sessions by different
+  authors (human and agent) with whatever umask the machine had at
+  commit time. Git only stores the exec bit, so "how the file looked on
+  the author's machine" became the repo state.
+- **Fix:** all five are now 100755 in git; the set is uniform (12/12
+  shebang scripts executable). JS/Python tools stay 644 on purpose
+  (invoked through `node`/`python3`, never directly). A shebang scan
+  (`git ls-files | xargs grep -l '^#!'`) over the tracked tree found no
+  further executable-missing files.
+- **Prevention:** a file's git mode is part of its API. When touching
+  scripts in a PR, run the shebang scan and make the set consistent;
+  and remember that a user's 666/644 on a non-exec file is their umask,
+  not something the repo can change — only the exec bit is committable.

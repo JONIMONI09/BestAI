@@ -3,6 +3,37 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — CI fix round (post-PR, same run)
+
+### Fixed
+
+- **`android/.../MainActivity.kt` — `selectEngine()` nullable receiver (CI
+  compile error, `MainActivity.kt:987:57`).** The M5 edit passed
+  `file.absolutePath` into `detailFor()` while `file` was still typed
+  `File?`; `result.ok == true` implies a file exists, but the compiler
+  cannot see through a data-derived boolean. Restructured: the no-model
+  case now early-returns (identical UI state and log line as before), and
+  everything after the `file == null` check runs on a smart-cast
+  non-null `file` — `file.name` / `file.absolutePath` compile, and the
+  success/failure UI behaviour is byte-for-byte the same. Not compilable
+  in the audit sandbox (no kotlinc/NDK egress) — verified by reading;
+  the CI build is the compile proof.
+- **Gate scripts missing the executable bit (5 of 12 were 100644):**
+  `android_autostart_negative_test.sh`, `android_crash_check.sh`,
+  `android_header_check.sh`, `ci_release_version_test.sh`,
+  `jni_signature_check.sh` are now 100755 in git. On a checkout whose
+  umask is 000 these files appeared as `-rw-rw-rw-` (666) and could not
+  be executed directly; every shipped script with a shebang now carries
+  the exec bit, so no checkout can produce a non-executable script.
+  All 12 `tools/*.sh` files are 100755; JS/Python tools are deliberately
+  644 (invoked through `node`/`python3`, never directly).
+- **CI `upload-artifact` "No files were found with the provided path:
+  dist/"** — no change needed: the APK job creates `dist/` in the same
+  step that inspects the built APK; that step was skipped because
+  `assembleDebug` failed on the Kotlin error above. The upload runs with
+  `if: always()` + `if-no-files-found: error` on purpose, so a missing
+  APK is always visible. With the compile fixed, `dist/` exists again.
+
 ## 2026-10-25 — full-repository audit run (branch `arena/4a16d961-bestai`)
 
 Six-milestone run: inventory, docs, conversion math, C/JNI hardening audit,

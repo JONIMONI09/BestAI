@@ -967,12 +967,25 @@ class MainActivity : ComponentActivity() {
         if (engine !== hydraEngine) hydraEngine.unload()
 
         val file = modelFile
-        val result = if (file == null) {
-            EngineLoadResult(false, getString(R.string.err_no_model))
-        } else {
-            engine.load(file.absolutePath)
+        if (file == null) {
+            // No model on disk yet. Say so instead of leaving a chat screen
+            // whose Send button silently refuses to work, and keep the
+            // compiler honest: from here on, `file` is non-null, so the
+            // success branch below may use `file.absolutePath` directly.
+            selectedEngine = engine
+            _ui.update {
+                it.copy(
+                    hasModel = false,
+                    selectedEngineId = engine.id,
+                    modelLabel = getString(R.string.err_no_model),
+                    modelDetail = emptyMap()
+                )
+            }
+            log(getString(R.string.log_engine_selected, engine.displayName))
+            return
         }
 
+        val result = engine.load(file.absolutePath)
         selectedEngine = engine
         if (result.ok) {
             _ui.update {
@@ -982,7 +995,7 @@ class MainActivity : ComponentActivity() {
                     modelLabel = if (engine === llamaEngine) {
                         describeGguf(result.detail)
                     } else {
-                        file?.name ?: ""
+                        file.name
                     },
                     modelDetail = detailFor(engine, file.absolutePath, result)
                 )
