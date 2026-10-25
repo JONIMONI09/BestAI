@@ -3,6 +3,85 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — M2: Min-P sampling + repetition penalty (greedy guard keeps the baseline)
+
+Adds controlled randomness to the deterministic decoder without touching
+the greedy path:
+
+- **`include/hydra_model.h`**: new `hydra_sampler_config_t`
+  (`temperature`, `min_p`, `repetition_penalty`, `penalty_window`,
+  `rng_seed`) and `hydra_sample_token()`. `HydraEngine` gains one
+  `uint64_t rng_state` field (zero after load; never read by greedy
+  decode), so a full run is reproducible from (model, start token,
+  config).
+- **`src/hydra_engine.c`**: `hydra_sample_token()` implements the
+  documented two-mode contract:
+  - **Greedy guard** — `temperature <= 0` OR `min_p >= 1` delegates to
+    `hydra_engine_step()`: bit-identical output, which is what keeps
+    the deterministic baseline sequence valid.
+  - **Sampling** — the engine has no native per-vocabulary logits, so
+    the candidate logit is the engine's own quantity:
+    `L(c) = agg_a[0]*c + agg_b[0]*state[0]` (the acc[0] that would be
+    computed if c were fed). Then: repetition penalty over the recent
+    window (positive logits divided, negative multiplied, repeats
+    compound) → numerically stable softmax (max subtracted before
+    exp) → min-p filter (drop `P(c) < min_p * p_max`, renormalize) →
+    seeded xorshift64* CDF walk → state advance through the real
+    `hydra_engine_step(chosen)`, so the state machine is the SAME as
+    greedy mode. Zero heap (one 8 KiB stack array for the vocab cap).
+- **`src/main.c`**: new flags `--temp`, `--min-p`, `--rep-penalty`,
+  `--rep-window`, `--seed` (defaults keep the CLI bit-identical:
+  temp 0 → greedy). `--fast` is ignored with a visible note when
+  sampling is active (sampling advances the full state by contract).
+  The console output shows the active sampler config.
+- **`tests/test_engine.c`**: 32 new checks (all architectures), all
+  expected values hand-computed against an independent Python
+  reference (double softmax + identical xorshift64* stream), not
+  fitted:
+  - greedy guard (temp=0 and min_p=1) bit-identical to the native
+    step over 32 steps,
+  - repetition penalty breaks the repetition loop on a positive logit
+    (argmax 63→62 at pen 4, T=0.001 where the softmax collapses
+    exactly onto the argmax) AND multiplies a negative logit
+    (model with state 14: argmax 7→6, outputs 1→7),
+  - min-p surviving sets verified over fixed seeds: min_p=0.5 →
+    always the argmax token (16 seeds), min_p=0.1 → only tokens
+    {62,63,64} (24 seeds, ≥2 distinct), and the control without the
+    filter reaches the tail (96 seeds),
+  - exact xorshift64* draws for seeds 1/2/555/0 pinned to the
+    hand-computed CDF bins (the seed-0→magic-state degeneracy guard
+    included),
+  - full 64-step seeded reproducibility,
+  - argument negative controls (NULLs, vocab<2 → −3, temp>20 → −4,
+    penalty<1 → −1).
+- **`tools/test_count_baseline.txt`**: x86 81→113, arm 87→119 (the 32
+  new checks compile on every architecture; ARM re-measured on the CI
+  leg).
+
+Measured: `./hydra-test` 113/0 (x86); baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ start_token=42 unchanged;
+`jni-batch-test` 86/0, `large-model-test` 7/0, `gguf_test.py` 40/0.
+
+## 2026-10-25 — M1: agent hygiene (CLAUDE.md bridge, dead artifact removal)
+
+- **`CLAUDE.md`** (new): one-line bridge that loads `@AGENTS.md` first
+  and restates the always-on rules, so Claude Code sessions and the
+  repository's agent system can never drift apart.
+- **`hydra_stone_model_engine.zip`** removed from git (`git rm`):
+  grep over the whole tree shows it is referenced nowhere except
+  session-history text — an old build artifact that bloated every
+  clone. (Resolves the open decision from the 2026-10-25 audit.)
+- Verified (no change needed): `.gitignore` already excludes
+  `.agent_memory/` and `RESEARCH.md`, so the local research mirror and
+  Notion sync notes stay out of the repository.
+- The audit + derivations for this round are recorded in
+  `.agent_memory/RESEARCH.md` (local fallback mirror; Notion "AI
+  Notizen" sync follows at round close).
+- **Not done (deliberate):** the spec title mentions "AGPL-3.0", but
+  the LICENSE file is GPL-3.0 and the spec body never asks for a
+  license change — changing it is a legal decision for the user, not
+  an implementation task. The LICENSE file is untouched.
+
 ## 2026-10-25 — post-merge doc audit (screenshot verification pass)
 
 PR #48 merged (20:04Z, main = afae8c8). Audit of the GitHub README

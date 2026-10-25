@@ -85,6 +85,138 @@
 
 ## Current task
 
+**2026-10-25 — Implementation round: Min-P sampling & repetition penalty,
+AVX2 x86-64 kernel, transformer primitives (RMSNorm/RoPE/SwiGLU),
+streaming ring-buffer KV cache with attention sinks, safetensors import
+with absmean ternarization (spec M1–M6 + verification V).**
+
+Branch `arena/02477850-bestai`, base = main @ dccac28 (post PR #49 merge).
+Invariants: zero fake checkboxes, zero stubs, baseline
+`[471, 386, 385, 386, 385, 386, 385, 386]` (start_token=42, 8 steps)
+untouched, 100% English artefacts, every change logged here and in
+CHANGELOG.md. (No native todo tool in this session — this section is the
+tracker, per the established pattern.)
+
+### Plan (2026-10-25, implementation round)
+
+- [x] **M1 Hygiene.** `CLAUDE.md` bridge (`@AGENTS.md` first line);
+      verify `.gitignore` covers `.agent_memory/` + `RESEARCH.md`;
+      architectural audit + derivations into `.agent_memory/RESEARCH.md`
+      (+ Notion "AI Notizen" sync, connector active); `git rm`
+      `hydra_stone_model_engine.zip` (grep-verified: referenced nowhere).
+      DONE: CLAUDE.md + RESEARCH.md created, zip `git rm`ed; Notion sync
+      at round close. License untouched (legal decision, documented).
+- [x] **M2 Sampling.** `hydra_sampler_config_t` + `hydra_sample_token()`
+      (include/hydra_model.h, src/hydra_engine.c); repetition penalty over
+      a token window; numerically stable softmax; Min-P filter vs p_max;
+      seeded xorshift64*; greedy guard (temp<=0 or min_p>=1) = native
+      engine step (baseline preserved bit-for-bit); CLI flags
+      `--temp`/`--min-p`/`--rep-penalty`; tests: penalty breaks a
+      2-token oscillation, min-p filters the tail, greedy == native,
+      hand-computed seeded sample.
+- [ ] **M3 AVX2.** `src/hydra_simd.h`: `#ifdef __AVX2__` step-time kernel
+      (8 dims per 256-bit lane, int32 math provably exact under the layer
+      cap, widen to int64) + load-time v2-plane unpack kernel
+      (`_mm256_shuffle_epi8` LUT); runtime CPU detection with scalar
+      fallback in `hydra_engine_step()`; Makefile detects x86-64 +
+      compiler `-mavx2` support; parity tests (AVX2 kernel vs scalar
+      reference, random + edge-case matrices) guarded `#ifdef __AVX2__`
+      like the NEON tests.
+- [ ] **M4 Transformer primitives.** `hydra_rmsnorm`, `hydra_rope_inplace`,
+      `hydra_swiglu` (zero-heap, NaN/Inf guards) + `hydra_kv_cache_t`
+      streaming ring buffer with permanently retained attention sinks,
+      O(1) in sequence length; unit tests: hand-computed values +
+      eviction with sinks preserved.
+- [ ] **M5 Safetensors import.** `tools/safetensors_to_hydra.py`
+      (stdlib only): 8-byte LE header length + JSON header with offset
+      validation, F32/F16/BF16 decoding, absmean scale,
+      RoundClip ternarization, **first shipped writer for header
+      version 2** (4 weights/byte); round-trip test inside
+      tools/gguf_test.py (synthetic fixture, independent re-read of the
+      packed bytes, engine run vs reference, negative controls).
+- [ ] **M6 Docs + baseline.** Roadmap checkboxes ONLY for the fully
+      implemented+tested items (min-P, AVX2, safetensors import,
+      streaming KV cache) with exact function references; "Full
+      transformer forward pass" stays UNCHECKED (primitives + KV cache
+      exist, no full pass — zero-fake-checkbox invariant);
+      docs/ARCHITECTURE.md + docs/FORMAT.md (v2 writer note) +
+      docs/GGUF-IMPORT.md if affected; CHANGELOG + this file;
+      tools/test_count_baseline.txt updated in the same commit (R21).
+- [ ] **V Verification.** make clean && make && make test; all
+      python/node tools; all shell guardrail scripts; npm run lint;
+      clean git status; CI (CI + Lint & Security) green on the PR.
+
+### Design decisions (recorded before coding, per R26)
+
+1. **M2 logit definition (honest, no invention):** the engine has no
+   per-vocabulary logits — decode is `acc[0] -> token` (one number).
+   Therefore: greedy mode (temperature <= 0 OR min_p >= 1) calls the
+   native `hydra_engine_step()` — bit-identical to today, which is what
+   keeps the baseline sequence untouched. Sampling mode defines the
+   candidate logit as the accumulator the engine WOULD compute if the
+   candidate c were fed: `L(c) = A[0]*c + B[0]*state[0]` (the same
+   acc[0] driving state and decode); repetition penalty adjusts L(c)
+   for c in the recent window; stable softmax with 1/temperature;
+   min-p filter keeps P(c) >= min_p * p_max, renormalizes; seeded
+   xorshift64* picks; the state then advances with `step(c*)` (seed
+   invariant: next seed = last emitted token, exactly like greedy).
+2. **M3 exactness:** int32 intermediates in the AVX2 kernel are
+   provably exact: |A|,|B| <= layers <= 4096, |token| <= 1023,
+   |state| <= 127 -> |A*t + B*s| <= 4096*1150 = 4,710,400 < INT32_MAX
+   (same bound the NEON kernel documents); widen to int64 afterwards.
+   Bit-identical to the scalar loop by construction (same integer
+   ops); parity tests are the proof, kernel-level like test_neon_*.
+3. **M5 pipeline** mirrors tools/gguf_to_hydra.py (A/B tensor
+   selection, gamma = 1/mean|W|, threshold mean/2, fold-to-dim,
+   normalise to peak 127, layers = peak) so both importers produce
+   comparable models; the ONLY difference is the output packing
+   (v2, 4 weights/byte) and the container being .safetensors.
+
+### M1+M2 results & errors (2026-10-25, logged per R2/R3)
+
+**Measured:** `./hydra-test` 113/0 (x86, was 81; +32 sampler checks,
+both architectures per tools/test_count_baseline.txt); baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 UNCHANGED;
+`jni-batch-test` 86/0, `large-model-test` 7/0, `gguf_test.py` 40/0;
+count check x86 ok at 113.
+
+**Errors found & fixed (all in this session, per R3):**
+
+1. **Segfault (exit 139) in the new test suite.** `static const
+   uint16_t two_by_63 = {63, 63};` compiles as a SCALAR in C (second
+   initializer element ignored, warning only) — passing that scalar
+   where a `const uint16_t *` is expected turns the value 63 into a
+   pointer. Lesson: array initializers in C need the `[2]` declaration;
+   the "warning" here was actually the crash.
+2. **`(double *)&sampler.temperature` near-miss in main.c.** Writing a
+   double through a reinterpreted float* corrupts the next struct
+   field and misencodes the value. Caught in self-review before the
+   first build; fixed with a local `double v` temp.
+3. **Prefill/step token mod:** `hydra_engine_step()` mods
+   `token_in % vocab`, so a prefill token >= vocab does NOT drive the
+   state the way its face value suggests — the first negative-logit
+   test design (prefill [10,5] for state 10) silently produced state
+   2. Re-derived with the mod included: prefill [7,0,7,0] on the
+   (A0=1,B0=−1) model drives state 14 via s' = t − s.
+4. **2-bit ternary codes are NOT nibbles.** v1 packing uses
+   `packed & 0x03` (w1) and `(packed >> 2) & 0x03` (w2) — byte 0x21
+   decodes to w2=0, not w2=−1. The (w1=+1, w2=−1) byte is 0x09.
+   Caught when the debug model printed `B0=0` instead of −1.
+5. **Test-local logic bugs:** (a) the distinct-value counter loop
+   `for (i=0; i<8 && seen[i]; ++i)` can never enter while `seen[]` is
+   empty; replaced with a bitmask popcount. (b) `cfg.min_p` was left
+   at 0.5 from the previous block inside the min_p=0.1 seed loop.
+   (c) popcount via `((mask&1)+(mask&2)+(mask&4))` is wrong (a single
+   high bit already sums >= 2) — use `(mask&b) != 0` per bit.
+
+**Design notes that bit the tests (kept for M3/M5):** the engine's
+decode `out = (acc0 mod V + c + 1) mod V` is injective in the chosen
+candidate c only for ODD V (or A0+1 coprime to V) — min-P/CDF tests
+therefore use V=65/V=5, and the penalty tests verify the (A0,B0,s0)
+combination makes the two candidate outputs distinguishable.
+
+## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
+
 **2026-10-25 — Full-repository audit, Claude-skills adherence, 6-milestone
 deepening run (adversarial verification, zero deletions).** User instruction:
 analyse and document everything, follow every `.claude/skills/*` rule, find
