@@ -14,6 +14,10 @@ on:
 
 permissions:
   contents: read
+  # The Android lint job publishes its failure report as a PR comment
+  # (the log-download and artifact hosts are unreachable by API-only
+  # clients, so the comment is the only machine-readable copy).
+  issues: write
 
 jobs:
   # ---------- C: Compiler + Analyzer ----------
@@ -409,6 +413,58 @@ jobs:
           fi
           cat /tmp/lint-report.md
           cat /tmp/lint-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # Annotations are the API-readable copy of the findings: posting
+          # a PR comment, which the repository token policy can
+          # refuse (and has), but workflow commands always land
+          # in the check-run's annotations, which the API serves
+          # even when the log-download and artifact hosts are
+          # unreachable.
+          if [ -f "$REPORT" ]; then
+            WS="${GITHUB_WORKSPACE%/}" python3 - "$REPORT" << 'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          ws = os.environ.get("WS", "")
+          level = {"Error": "error", "Fatal": "error", "Warning": "warning"}
+          shown = 0
+          total = 0
+          for issue in root.iter("issue"):
+              if issue.get("severity") == "Ignore":
+                  continue
+              total += 1
+              if shown >= 40:
+                  continue
+              sev = level.get(issue.get("severity", ""), "warning")
+              loc = issue.find("location")
+              where = ""
+              if loc is not None and loc.get("file"):
+                  path = loc.get("file")
+                  if ws and path.startswith(ws + "/"):
+                      path = path[len(ws) + 1:]
+                  where = " file=" + path
+                  if loc.get("line"):
+                      where += ",line=" + loc.get("line")
+              message = " ".join(
+                  [issue.get("id", "lint"), issue.get("message", "")]).replace("\n", " ")
+              print("::{}{}::{}".format(sev, where, message))
+              shown += 1
+          if total > shown:
+              print("::warning::{} more finding(s) not annotated (cap 40); "
+                    "full list in the step summary".format(total - shown))
+          PY
+          else
+            # Same one-annotation pattern as the APK build job:
+            # compiler error lines plus a short tail of the gradle
+            # log, readable through the check-run annotations API.
+            { grep -E "^e: |error:|> Task .* FAILED|BUILD FAILED" \
+                "$RUNNER_TEMP/gradle-lint.log" | head -30 | sed 's/^/  /';
+              echo "  --- tail ---";
+              tail -10 "$RUNNER_TEMP/gradle-lint.log" | sed 's/^/  /'; } \
+              | tr '\n' ' ' \
+              | sed 's/^/::error::gradle died before the lint analysis: /'
+          fi
           PR="${PR_NUMBER:-}"
           if [ -z "$PR" ]; then
             PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \

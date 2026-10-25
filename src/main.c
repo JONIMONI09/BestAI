@@ -1,6 +1,7 @@
 #include "hydra_model.h"
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,11 @@ static void usage(const char *argv0, FILE *out)
     fprintf(out, "  --prompt LIST    Komma-getrennte Token-IDs als Prefill vor der Generierung\n");
     fprintf(out, "  --bench [N]      Benchmark: N Schritte (Default 10000), JSON auf stdout\n");
     fprintf(out, "  --fast           Token-only Fast Path, nur Dimension 0\n");
+    fprintf(out, "  --temp F         Sampler-Temperatur (Standard 0 = greedy); > 0 aktiviert Sampling\n");
+    fprintf(out, "  --min-p F        Min-P-Filter in [0,1] (Standard 0); P(c) < min-p*p_max wird verworfen\n");
+    fprintf(out, "  --rep-penalty F  Wiederholungs-Strafe, >= 1.0 (Standard 1.0 = aus)\n");
+    fprintf(out, "  --rep-window N   Fenster der Wiederholungs-Strafe in Tokens, 0..4096 (Standard 64)\n");
+    fprintf(out, "  --seed N         RNG-Seed fuer den Sampler (Standard 0)\n");
     fprintf(out, "  --help           Diese Hilfe anzeigen\n");
     fprintf(out, "\n");
     fprintf(out, "Beispiel: %s models/starter.hydra 123 32 --json\n", argv0);
@@ -55,6 +61,22 @@ static int parse_long_arg(const char *arg, long *out)
     errno = 0;
     long v = strtol(arg, &end, 10);
     if (end == arg || *end != '\0' || errno == ERANGE || v < 0) return -1;
+    *out = v;
+    return 0;
+}
+
+/* Sampler flag values are floats; the parser rejects garbage, signs of
+ * infinity/NaN, and out-of-range values the same way parse_long_arg
+ * rejects bad integers. Range rules are enforced by the caller because
+ * they are sampler semantics (temperature <= 0 means "greedy", not an
+ * error). */
+static int parse_float_arg(const char *arg, double *out)
+{
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(arg, &end);
+    if (end == arg || *end != '\0' || errno == ERANGE || !isfinite(v))
+        return -1;
     *out = v;
     return 0;
 }
@@ -278,11 +300,75 @@ int main(int argc, char **argv)
     uint16_t prompt[MAX_PROMPT];
     size_t prompt_n = 0;
 
+    /* Sampler: defaults are the greedy guard (temperature 0, min_p 0),
+     * so a plain invocation is bit-identical to the pre-sampling CLI.
+     * Sampling activates only when temperature > 0 AND min_p < 1. */
+    hydra_sampler_config_t sampler;
+    sampler.temperature = 0.0f;
+    sampler.min_p = 0.0f;
+    sampler.repetition_penalty = 1.0f;
+    sampler.penalty_window = 64;
+    sampler.rng_seed = 0;
+    int sampler_set = 0; /* any --temp/--min-p/--rep-penalty/--rep-window/--seed seen */
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
         } else if (strcmp(argv[i], "--fast") == 0) {
             fast_mode = 1;
+        } else if (strcmp(argv[i], "--temp") == 0) {
+            double v;
+            if (i + 1 >= argc || parse_float_arg(argv[i + 1], &v) != 0) {
+                fprintf(stderr, "[Hydra] --temp erwartet eine Fließkomma-Zahl (0 = greedy)\n");
+                return 1;
+            }
+            sampler.temperature = (float)v;
+            sampler_set = 1;
+            ++i;
+        } else if (strcmp(argv[i], "--min-p") == 0) {
+            double v;
+            if (i + 1 >= argc || parse_float_arg(argv[i + 1], &v) != 0) {
+                fprintf(stderr, "[Hydra] --min-p erwartet eine Fließkomma-Zahl in [0,1]\n");
+                return 1;
+            }
+            if (v < 0.0 || v > 1.0) {
+                fprintf(stderr, "[Hydra] --min-p muss in [0,1] liegen\n");
+                return 1;
+            }
+            sampler.min_p = (float)v;
+            sampler_set = 1;
+            ++i;
+        } else if (strcmp(argv[i], "--rep-penalty") == 0) {
+            double v;
+            if (i + 1 >= argc || parse_float_arg(argv[i + 1], &v) != 0) {
+                fprintf(stderr, "[Hydra] --rep-penalty erwartet eine Zahl >= 1.0 (1.0 = aus)\n");
+                return 1;
+            }
+            if (v < 1.0) {
+                fprintf(stderr, "[Hydra] --rep-penalty muss >= 1.0 sein\n");
+                return 1;
+            }
+            sampler.repetition_penalty = (float)v;
+            sampler_set = 1;
+            ++i;
+        } else if (strcmp(argv[i], "--rep-window") == 0) {
+            long w;
+            if (i + 1 >= argc || parse_long_arg(argv[i + 1], &w) != 0 || w > 4096) {
+                fprintf(stderr, "[Hydra] --rep-window erwartet eine Ganzzahl 0..4096\n");
+                return 1;
+            }
+            sampler.penalty_window = (uint16_t)w;
+            sampler_set = 1;
+            ++i;
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            long s;
+            if (i + 1 >= argc || parse_long_arg(argv[i + 1], &s) != 0 || s > 4294967295L) {
+                fprintf(stderr, "[Hydra] --seed erwartet eine Ganzzahl 0..4294967295\n");
+                return 1;
+            }
+            sampler.rng_seed = (uint32_t)s;
+            sampler_set = 1;
+            ++i;
         } else if (strcmp(argv[i], "--bench") == 0) {
             bench_mode = 1;
             /* Optionales N direkt nach --bench; ein Following-Token wie
@@ -391,12 +477,39 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Sampling is active only when the greedy guard is NOT hit:
+     * temperature > 0 AND min_p < 1. Otherwise hydra_sample_token()
+     * would just delegate to the native step, so the loop keeps the
+     * original call shape for the default (greedy) invocation. */
+    const int sampling_enabled =
+        sampler.temperature > 0.0f && sampler.min_p < 1.0f;
+    if (sampling_enabled && fast_mode) {
+        /* --fast only exists for the greedy path: sampling advances
+         * the full state through hydra_engine_step() by contract, so
+         * the fast path is ignored. Say so instead of being quiet. */
+        fprintf(stderr,
+                "[Hydra] Hinweis: --fast wird ignoriert, weil Sampling aktiv ist "
+                "(temp=%g, min-p=%g)\n",
+                (double)sampler.temperature, (double)sampler.min_p);
+    }
+
     double t0 = now_ms();
     for (long s = 0; s < steps; ++s) {
         uint16_t next = 0;
-        const int step_rc = fast_mode
-            ? hydra_engine_step_fast(&engine, current, &next)
-            : hydra_engine_step(&engine, current, &next);
+        int step_rc;
+        if (sampling_enabled) {
+            /* Recent window = the last penalty_window generated tokens
+             * (tokens[0..s-1]); the start token is included once it has
+             * been superseded by a generated token. */
+            size_t nrec = (size_t)s;
+            if (nrec > sampler.penalty_window) nrec = sampler.penalty_window;
+            step_rc = hydra_sample_token(&engine, current, &sampler,
+                                         tokens + (s - nrec), nrec, &next);
+        } else if (fast_mode) {
+            step_rc = hydra_engine_step_fast(&engine, current, &next);
+        } else {
+            step_rc = hydra_engine_step(&engine, current, &next);
+        }
         if (step_rc != 0) {
             free(tokens);
             hydra_engine_unload(&engine);
@@ -418,6 +531,13 @@ int main(int argc, char **argv)
             printf("[Prompt]: ");
             for (size_t p = 0; p < prompt_n; ++p) printf("%u ", (unsigned)prompt[p]);
             printf("\n");
+        }
+        if (sampler_set || sampling_enabled) {
+            printf("[Sampler]: temp=%.4g min-p=%.4g rep-penalty=%.4g rep-window=%u seed=%u%s\n",
+                   (double)sampler.temperature, (double)sampler.min_p,
+                   (double)sampler.repetition_penalty,
+                   (unsigned)sampler.penalty_window, (unsigned)sampler.rng_seed,
+                   sampling_enabled ? "" : " (greedy guard aktiv)");
         }
         printf("[Tokens]: ");
         for (long s = 0; s < steps; ++s) {

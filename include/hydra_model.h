@@ -69,6 +69,12 @@ typedef struct {
     size_t weights_bytes;
     long resident_kb_after_load;
     long rss_kb_before_load;
+
+    /* RNG state for hydra_sample_token() (xorshift64*). Zero after
+     * hydra_engine_load(); the sampler lazily initializes it from the
+     * sampler config's rng_seed on the first draw. Greedy decoding
+     * never touches it, so the deterministic baseline is unaffected. */
+    uint64_t rng_state;
 } HydraEngine;
 
 /* Engine-Funktionen */
@@ -110,5 +116,131 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
  * n == 0 ist ein gültiges No-Op. */
 int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n);
 int hydra_verify_axiom(float humanity_factor, float proposed_score, float *safe_score);
+
+/* ---------------------------------------------------------------------
+ * Sampling (min-p + repetition penalty)
+ *
+ * The engine's decode is ONE accumulator (acc[0]) mapped to a token, so
+ * there is no native per-vocabulary logit vector. hydra_sample_token()
+ * therefore works in two documented modes:
+ *
+ *   1. GREEDY GUARD: temperature <= 0 OR min_p >= 1 delegates to
+ *      hydra_engine_step() and returns bit-identical results. This is
+ *      the path the deterministic baseline sequence runs on, and it
+ *      stays bit-identical no matter what the other fields say.
+ *
+ *   2. SAMPLING: for every candidate token c the logit is the value of
+ *      that same acc[0] the engine would compute if c were fed next,
+ *      L(c) = agg_a[0] * c + agg_b[0] * state[0]. Then, in order:
+ *        a) repetition penalty over the recent window — positive logits
+ *           divided by the penalty, negative ones multiplied by it
+ *           (the sign-preserving canonical form; repeats compound);
+ *        b) numerically stable softmax with scale 1/temperature
+ *           (max subtracted before exp, so no overflow for the vocab
+ *           cap of 1024);
+ *        c) min-p filter: drop every probability P(c) < min_p * p_max,
+ *           renormalize the survivors (p_max itself always survives);
+ *        d) seeded xorshift64* CDF walk over the renormalized mass.
+ *      The chosen candidate then advances the real state through
+ *      hydra_engine_step(chosen), so the engine's state machine is the
+ *      SAME as in greedy mode — only the candidate differs.
+ *
+ * recent_tokens is in chronological order; the window reads the last
+ * penalty_window entries. The RNG state lives in the engine, so a full
+ * run is reproducible from (model, start token, sampler config).
+ * ------------------------------------------------------------------- */
+typedef struct hydra_sampler_config {
+    float temperature;        /* <= 0: greedy guard (native step)     */
+    float min_p;              /* keep P(c) >= min_p * p_max; >= 1:    */
+                              /*   greedy guard                        */
+    float repetition_penalty; /* 1.0 = off; > 1 punishes repeats      */
+    uint16_t penalty_window;  /* recent tokens the penalty reads (0 =
+                                 penalty disabled regardless)          */
+    uint32_t rng_seed;        /* seed for the xorshift64* stream      */
+} hydra_sampler_config_t;
+
+/* Returns 0 on success, -1 on invalid arguments, -3 if the vocabulary
+ * is too small to sample (vocab < 2), -4 if the temperature is outside
+ * the numerically safe range (0 < temperature > 20). */
+int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
+                       const hydra_sampler_config_t *cfg,
+                       const uint16_t *recent_tokens, size_t recent_len,
+                       uint16_t *token_out);
+
+/* -------------------------------------------------------------------
+ * M4: Transformer primitives (float, zero-heap, guarded) and the
+ * streaming KV cache. These are the building blocks a real
+ * transformer head needs (RMSNorm on layernorm, RoPE on q/k, SwiGLU
+ * in the feed-forward) and they bridge to the ternary engine: their
+ * float outputs quantize into the engine's int8 state world (see the
+ * swiglu bridge test in tests/test_engine.c). Every function is
+ * R14-guarded: invalid arguments or non-finite input return -1 and
+ * leave the output UNMODIFIED (checked before any store).
+ * ------------------------------------------------------------------- */
+
+/* RMSNorm: out[i] = x[i] / sqrt(mean_j(x[j]^2) + eps) * w[i].
+ * In-place safe (out may alias x). dim 1..4096, eps > 0.
+ * Returns 0 on success, -1 on invalid arguments or any non-finite
+ * x[i]/w[i] (out left unmodified). */
+int hydra_rmsnorm(const float *x, const float *w, size_t dim,
+                  float eps, float *out);
+
+/* Rotary position embedding (in-place, pairs (x[2i], x[2i+1])):
+ *   freq_i  = 1 / pow(theta_base, 2i / dim)
+ *   angle   = pos * freq_i
+ *   x'[2i]   =  x[2i]*cos(angle) - x[2i+1]*sin(angle)
+ *   x'[2i+1] =  x[2i]*sin(angle) + x[2i+1]*cos(angle)
+ * dim even, 2..8192; theta_base > 0 finite; pos any uint32.
+ * Returns 0 on success, -1 on invalid arguments or non-finite x
+ * (x left unmodified). */
+int hydra_rope_inplace(float *x, size_t dim, uint32_t pos, double theta_base);
+
+/* SwiGLU: out[i] = g[i] * sigmoid(g[i]) * u[i]  (= SiLU(g) * u).
+ * dim 1..4096. Returns 0 on success, -1 on invalid arguments or any
+ * non-finite g[i]/u[i] (out left unmodified). */
+int hydra_swiglu(const float *g, const float *u, size_t dim, float *out);
+
+/* Streaming KV cache: fixed capacity, zero-heap (the caller provides
+ * the k/v storage), O(1) memory, O(1) per append and per lookup.
+ *
+ * The first num_sinks appends land in permanent SINK slots
+ * (streaming-LLM attention sinks) that are never evicted. The
+ * remaining capacity - num_sinks slots form a CIRCULAR WINDOW that
+ * overwrites its oldest non-sink entry once full, so the resident
+ * set is always: sinks (append order) + the last (capacity - sinks)
+ * tokens. */
+typedef struct hydra_kv_cache {
+    float *k;            /* capacity * dim floats (caller storage)  */
+    float *v;            /* capacity * dim floats (caller storage)  */
+    uint32_t dim;        /* key/value vector length                 */
+    uint32_t capacity;   /* total slots (sinks + window)            */
+    uint32_t num_sinks;  /* permanent sink slots (<= capacity)      */
+    uint32_t count;      /* total appends since init                */
+} hydra_kv_cache_t;
+
+/* Initialize on caller-provided storage. num_sinks <= capacity.
+ * Returns 0 on success, -1 on invalid arguments (cache left zeroed). */
+int hydra_kv_cache_init(hydra_kv_cache_t *c, float *k, float *v,
+                        uint32_t dim, uint32_t capacity, uint32_t num_sinks);
+
+/* Append one token's key and value (dim floats each). O(1).
+ * Returns 0 on success, -1 on invalid arguments or non-finite k/v
+ * (nothing is written, count unchanged). */
+int hydra_kv_cache_append(hydra_kv_cache_t *c, const float *k, const float *v);
+
+/* Resident token count: min(count, capacity). */
+uint32_t hydra_kv_cache_size(const hydra_kv_cache_t *c);
+
+/* Copy resident token i (0 = oldest resident = first sink; then
+ * window tokens oldest -> newest) into k_out/v_out (dim floats each).
+ * Returns 0 on success, -1 if i >= hydra_kv_cache_size(c). */
+int hydra_kv_cache_get(const hydra_kv_cache_t *c, uint32_t i,
+                       float *k_out, float *v_out);
+
+/* Copy sink i (0..num_sinks-1, in append order) into k_out/v_out.
+ * Returns 0 on success, -1 if the sink is not filled yet or i is
+ * out of range. */
+int hydra_kv_cache_sink(const hydra_kv_cache_t *c, uint32_t i,
+                        float *k_out, float *v_out);
 
 #endif /* HYDRA_MODEL_H */

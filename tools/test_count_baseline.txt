@@ -19,6 +19,36 @@
 # dim%4 / weights_len negative controls). x86 re-measured at 81 in this
 # session; ARM is 77 + 10 = 87 because all ten are compiled on every
 # architecture — re-measure on the ARM CI leg to confirm.
+#
+# 2026-10-25 (implementation round): +32 architecture-independent checks
+# (sampler suite: greedy guard bit-parity vs native step, repetition
+# penalty positive AND negative branches with hand-computed argmax shifts,
+# min-p surviving sets {62,63,64}/{64} verified over fixed seeds, the exact
+# xorshift64* CDF walk against an independent reference, seeded
+# reproducibility, and argument negative controls). x86 re-measured at 113;
+# ARM is 87 + 32 = 119 because all thirty-two compile on every
+# architecture — re-measure on the ARM CI leg to confirm.
+#
+# 2026-10-25 (implementation round, M3): +8 x86-ONLY checks (AVX2 parity
+# suite: runtime probe, step-kernel vs scalar reference over 11 dims with
+# LCG-random matrices + layer-cap extremes, v2 plane unpack vs an
+# independent scalar reference + the 4-code table sweep). These compile
+# only into -mavx2 builds (Makefile adds -mavx2 on x86-64 hosts with a
+# compiler probe) and print SKIP on non-AVX2 x86 CPUs, so they raise the
+# x86 number to 121 (re-measured on an AVX2 CPU; both this sandbox and
+# the ubuntu-latest CI runner have AVX2) and leave ARM at 119.
+#
+# 2026-10-25 (implementation round, M4): +21 architecture-independent
+# checks (transformer primitives + streaming KV cache: RMSNorm
+# hand-computed values, per-dim weights, scale invariance, NaN/arg
+# guards with unmodified-output verification; RoPE identity,
+# hand-computed rotation, norm preservation, guards; SwiGLU
+# hand-computed silu(1), both tails without overflow, the 256-sample
+# float->int8 engine-clamp bridge, guards; KV cache init/fill,
+# resident order, oldest-window-token eviction, multi-round window
+# slide, sink permanence, OOB/NaN-partial/degenerate-init controls).
+# x86 re-measured at 142, ARM = 119 + 21 = 140 (re-measure on the ARM
+# CI leg).
 
-x86: 81
-arm: 87
+x86: 142
+arm: 140

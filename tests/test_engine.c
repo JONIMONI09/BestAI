@@ -1203,6 +1203,739 @@ static void test_axiom(void)
     CHECK(hydra_verify_axiom(1.0f, 1.0f, NULL) == -1, "NULL-Score-Pointer abgelehnt");
 }
 
+/* ---------------------------------------------------------------------
+ * Sampler (min-p + repetition penalty) — tests for hydra_sample_token().
+ *
+ * The engine has no native per-vocabulary logits; the sampler probes
+ * L(c) = agg_a[0]*c + agg_b[0]*state[0] (the acc[0] the engine would
+ * compute if c were fed). Every model below is built so that the
+ * chosen candidate c can be RECOVERED from the emitted token:
+ *   out = (acc0 mod V + c + 1) mod V  with  acc0 = A0*c + B0*s0
+ * which is injective in c for the (A0, B0, s0, V) combinations used
+ * here — so an assertion on the output token is an assertion on the
+ * sampled candidate. All expected values were hand-computed
+ * (reference implementation: Python double-precision softmax + the
+ * identical xorshift64* stream), not fitted to the engine's output.
+ * ------------------------------------------------------------------- */
+
+/* Build a one-dimensional v1 model (dim=1) with L layers of w1=+1,
+ * w2=0 (byte 0x01): agg_a[0] = L, agg_b[0] = 0, L(c) = L*c. */
+static int make_v1_model(const char *path, uint16_t vocab, uint32_t layers,
+                         uint8_t weight_byte)
+{
+    /* open() with an explicit 0644 instead of fopen("wb"): fopen would
+     * create a missing file with its internal 0666 mode (world-writable
+     * under a permissive umask), which the CodeQL gate rejects. The
+     * callers pass mkstemp paths, but this function must be safe for any
+     * path its signature allows. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); return -1; }
+    wr_header(f, vocab, 1u, layers, (uint32_t)sizeof(HydraModelHeader), layers);
+    for (uint32_t l = 0; l < layers; ++l) fputc(weight_byte, f);
+    fclose(f);
+    return 0;
+}
+
+static const uint16_t two_by_63[2] = {63, 63};
+
+/* One-shot sample on a freshly loaded model (state starts at zero),
+ * token_in = 0 (the probe does not depend on it). */
+static int sample_once(uint16_t vocab, uint32_t layers, uint8_t wbyte,
+                       const hydra_sampler_config_t *cfg,
+                       const uint16_t *recent, size_t nrec, uint16_t *out)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    if (make_v1_model(path, vocab, layers, wbyte) != 0) { unlink(path); return -1; }
+    HydraEngine e;
+    if (hydra_engine_load(&e, path) != 0) { unlink(path); return -2; }
+    int rc = hydra_sample_token(&e, 0, cfg, recent, nrec, out);
+    hydra_engine_unload(&e);
+    unlink(path);
+    return rc;
+}
+
+static void test_sampler_greedy_guard(void)
+{
+    /* temperature <= 0 and min_p >= 1 must produce BIT-IDENTICAL
+     * sequences to the native hydra_engine_step() — that is what keeps
+     * the deterministic baseline sequence valid after sampling exists. */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 64, 1, 0x01) == 0, "Sampler: Testmodell (V=64) wird geschrieben");
+
+    HydraEngine a, b, c;
+    CHECK(hydra_engine_load(&a, path) == 0, "Sampler: Modell laedt (Engine A)");
+    CHECK(hydra_engine_load(&b, path) == 0, "Sampler: Modell laedt (Engine B, temp=0)");
+    CHECK(hydra_engine_load(&c, path) == 0, "Sampler: Modell laedt (Engine C, min_p=1)");
+
+    hydra_sampler_config_t cfg0, cfg1;
+    cfg0.temperature = 0.0f; cfg0.min_p = 0.0f;
+    cfg0.repetition_penalty = 1.0f; cfg0.penalty_window = 8; cfg0.rng_seed = 99;
+    cfg1 = cfg0; cfg1.temperature = 1.0f; cfg1.min_p = 1.0f;
+
+    int same0 = 1, same1 = 1;
+    uint16_t ta = 5, tb = 5, tc = 5;
+    for (int s = 0; s < 32; ++s) {
+        uint16_t oa, ob, oc;
+        if (hydra_engine_step(&a, ta, &oa) != 0 ||
+            hydra_sample_token(&b, tb, &cfg0, &tb, (size_t)(s > 0 ? 1 : 0), &ob) != 0 ||
+            hydra_sample_token(&c, tc, &cfg1, &tc, (size_t)(s > 0 ? 1 : 0), &oc) != 0) {
+            same0 = same1 = 0;
+            break;
+        }
+        if (oa != ob) same0 = 0;
+        if (oa != oc) same1 = 0;
+        ta = oa; tb = ob; tc = oc;
+    }
+    CHECK(same0, "Sampler: temp=0 (greedy guard) bit-identisch zum nativen step (32 Steps)");
+    CHECK(same1, "Sampler: min_p=1 (greedy guard) bit-identisch zum nativen step (32 Steps)");
+    hydra_engine_unload(&a);
+    hydra_engine_unload(&b);
+    hydra_engine_unload(&c);
+    unlink(path);
+}
+
+static void test_sampler_repetition_penalty(void)
+{
+    /* Model V=64, w1=+1: L(c) = c, argmax at 63. Window = {63, 63}
+     * (the token that keeps being emitted — the repetition loop).
+     * At T=0.001 the softmax collapses onto the argmax with weight
+     * exactly 1.0 (exp(-1030) underflows), so each one-shot sample is
+     * deterministic and isolates the penalty's effect:
+     *   pen=1.0: L(63)=63 stays the max        -> c=63 -> out 63
+     *   pen=4.0: L(63)=63/4/4=3.9375 < L(62)=62 -> c=62 -> out 61
+     * i.e. the penalty moves the emitted token off the repeated one. */
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 0.001f; cfg.min_p = 0.0f;
+    cfg.penalty_window = 2; cfg.rng_seed = 1;
+
+    uint16_t out = 0;
+    cfg.repetition_penalty = 1.0f;
+    CHECK(sample_once(64, 1, 0x01, &cfg, two_by_63, 2, &out) == 0,
+          "Sampler: Penalty-Testmodell (V=64) laeuft ohne Penalty");
+    CHECK(out == 63, "Sampler: ohne Penalty wird der wiederholte Token 63 ausgespielt");
+
+    cfg.repetition_penalty = 4.0f;
+    CHECK(sample_once(64, 1, 0x01, &cfg, two_by_63, 2, &out) == 0,
+          "Sampler: Penalty-Testmodell (V=64) laeuft mit Penalty 4.0");
+    CHECK(out == 61, "Sampler: Penalty bricht die Wiederholung (63 -> 62, out 63 -> 61)");
+
+    /* Negative-logit branch: model V=8, w1=+1, w2=-1 (A0=1, B0=-1).
+     * Prefill [7,0,7,0]: prefill processes all but the last token and
+     * step() mods token_in by vocab, so the state recurrence
+     * s' = t - s runs 7 -> 7 -> -7 -> 14. L(c) = c - 14 =
+     * [-14..-7], argmax c=7 with a NEGATIVE logit (-7). Pen(4)
+     * MULTIPLIES it to -28, moving the argmax to c=6:
+     *   pen=1.0: c=7 -> out 1
+     *   pen=4.0: c=6 -> out 7
+     * (At T=0.001 both softmaxes collapse exactly onto the argmax:
+     * the second-best weight is exp(-1000) = 0.0 in double.) */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 8, 1, 0x09) == 0, "Sampler: Negativ-Testmodell (V=8) wird geschrieben");
+    HydraEngine e;
+    const uint16_t pre[4] = {7, 0, 7, 0};
+    int ok = hydra_engine_load(&e, path) == 0;
+    if (ok) ok = hydra_engine_prefill(&e, pre, 4) == 0;
+    CHECK(ok, "Sampler: Negativ-Testmodell laedt und prefillt (state=14)");
+    if (ok) {
+        cfg.repetition_penalty = 1.0f;
+        uint16_t recent0 = 7;
+        uint16_t o = 0;
+        ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, &o) == 0 && o == 1;
+        CHECK(ok, "Sampler: negatives Logit ohne Penalty -> c=7 (out 1)");
+        hydra_engine_unload(&e);
+        ok = hydra_engine_load(&e, path) == 0;
+        if (ok) ok = hydra_engine_prefill(&e, pre, 4) == 0;
+        if (ok) {
+            cfg.repetition_penalty = 4.0f;
+            uint16_t o2 = 0;
+            ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, &o2) == 0 && o2 == 7;
+            CHECK(ok, "Sampler: negatives Logit WIRD mit Penalty multipliziert (c=7 -> 6, out 1 -> 7)");
+            hydra_engine_unload(&e);
+        } else {
+            CHECK(0, "Sampler: Reload fuer Negativ-Beriff fehlgeschlagen");
+        }
+    }
+    unlink(path);
+}
+
+static void test_sampler_min_p(void)
+{
+    /* Model V=65, w1=+1: L(c) = c, p(c) proportional to e^c, p_max at
+     * c=64. Hand-computed surviving sets (threshold min_p * p_max):
+     *   min_p=0.1 -> keep {62, 63, 64}  (e^(c-64) >= 0.1  <=>  c >= 61.7)
+     *   min_p=0.5 -> keep {64}          (e^(c-64) >= 0.5  <=>  c >= 63.3)
+     * With out = (2c+1) mod 65 (injective for odd V):
+     *   keep {62,63,64} -> out {60, 62, 64},  keep {64} -> out 64. */
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.5f;
+    cfg.repetition_penalty = 1.0f; cfg.penalty_window = 0; cfg.rng_seed = 0;
+
+    int all64 = 1;
+    for (uint32_t s = 1; s <= 16; ++s) {
+        uint16_t out = 0;
+        cfg.rng_seed = s;
+        if (sample_once(65, 1, 0x01, &cfg, NULL, 0, &out) != 0 || out != 64) all64 = 0;
+    }
+    CHECK(all64, "Sampler: min_p=0.5 filtert alles bis auf p_max (16 Seeds -> immer 64)");
+
+    cfg.min_p = 0.1f;
+    int in_set = 1, mask = 0;
+    for (uint32_t s = 1; s <= 24; ++s) {
+        uint16_t out = 999;
+        cfg.rng_seed = s;
+        if (sample_once(65, 1, 0x01, &cfg, NULL, 0, &out) != 0) { in_set = 0; continue; }
+        if (out != 60 && out != 62 && out != 64) in_set = 0;
+        if (out == 60) mask |= 1;
+        if (out == 62) mask |= 2;
+        if (out == 64) mask |= 4;
+    }
+    CHECK(in_set, "Sampler: min_p=0.1 behaelt genau {62,63,64} (24 Seeds -> out nur 60/62/64)");
+    const int n_seen = ((mask & 1) != 0) + ((mask & 2) != 0) + ((mask & 4) != 0);
+    CHECK(n_seen >= 2, "Sampler: min_p=0.1 sampelt innerhalb des ueberlebenden Sets (>=2 Werte)");
+
+    /* Control: without the filter the tail IS reachable — at least one
+     * of 96 fixed seeds must land outside {60,62,64}. */
+    cfg.min_p = 0.0f;
+    int tail_seen = 0;
+    for (uint32_t s = 1; s <= 96; ++s) {
+        uint16_t out = 999;
+        cfg.rng_seed = s;
+        if (sample_once(65, 1, 0x01, &cfg, NULL, 0, &out) == 0 &&
+            out != 60 && out != 62 && out != 64) tail_seen = 1;
+    }
+    CHECK(tail_seen, "Sampler: ohne min_p ist der schwache Schwanz erreichbar (96 Seeds)");
+}
+
+static void test_sampler_rng_hand_computed(void)
+{
+    /* Model V=5, w1=+1: L(c) = c, p proportional to e^c:
+     *   p = [0.011656, 0.031685, 0.086129, 0.234121, 0.636409]
+     *   CDF = [0.011656, 0.043341, 0.129470, 0.363591, 1.0]
+     * xorshift64* draws (independent reference implementation):
+     *   seed 1   -> u=0.280835 -> c=3 -> out (2c+1) mod 5 = 2
+     *   seed 2   -> u=0.561670 -> c=4 -> out 4
+     *   seed 555 -> u=0.044097 -> c=2 -> out 0
+     *   seed 0   -> magic state -> u=0.052791 -> c=2 -> out 0
+     * These pin the exact RNG stream AND the CDF walk. */
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.0f;
+    cfg.repetition_penalty = 1.0f; cfg.penalty_window = 0;
+
+    uint16_t out = 0;
+    cfg.rng_seed = 1;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 2,
+          "Sampler: Seed 1 -> xorshift64* u=0.280835 -> c=3 -> out 2 (handgerechnet)");
+    cfg.rng_seed = 2;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 4,
+          "Sampler: Seed 2 -> u=0.561670 -> c=4 -> out 4 (handgerechnet)");
+    cfg.rng_seed = 555;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 0,
+          "Sampler: Seed 555 -> u=0.044097 -> c=2 -> out 0 (handgerechnet)");
+    cfg.rng_seed = 0;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 0,
+          "Sampler: Seed 0 wird auf Magic-State gemappt (u=0.052791 -> out 0, kein Degenerat)");
+}
+
+static void test_sampler_reproducible(void)
+{
+    /* Two fresh engines, identical model/config/seed and identical
+     * recent-window history -> identical 64-step sequences. */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 64, 1, 0x01) == 0, "Sampler: Repro-Modell wird geschrieben");
+
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.2f;
+    cfg.repetition_penalty = 1.5f; cfg.penalty_window = 8; cfg.rng_seed = 7;
+
+    int ok = 1;
+    uint16_t seq1[64] = {0}, seq2[64] = {0};
+    HydraEngine e1, e2;
+    if (hydra_engine_load(&e1, path) != 0 || hydra_engine_load(&e2, path) != 0) ok = 0;
+    if (ok) {
+        uint16_t t1 = 5, t2 = 5;
+        for (int s = 0; s < 64 && ok; ++s) {
+            size_t n = (size_t)(s > 8 ? 8 : s);
+            uint16_t o1, o2;
+            if (hydra_sample_token(&e1, t1, &cfg, seq1 + (s - n), n, &o1) != 0 ||
+                hydra_sample_token(&e2, t2, &cfg, seq2 + (s - n), n, &o2) != 0) {
+                ok = 0; break;
+            }
+            seq1[s] = o1; seq2[s] = o2;
+            if (o1 != o2) ok = 0;
+            t1 = o1; t2 = o2;
+        }
+    }
+    hydra_engine_unload(&e1);
+    hydra_engine_unload(&e2);
+    unlink(path);
+    CHECK(ok, "Sampler: identisches Setup + Seed -> bit-identische 64-Step-Sequenz");
+}
+
+static void test_sampler_invalid(void)
+{
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.0f;
+    cfg.repetition_penalty = 1.0f; cfg.penalty_window = 1; cfg.rng_seed = 1;
+    uint16_t out = 0;
+
+    CHECK(hydra_sample_token(NULL, 0, &cfg, NULL, 0, &out) == -1, "Sampler: NULL-Engine wird abgelehnt");
+    HydraEngine dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    CHECK(hydra_sample_token(&dummy, 0, NULL, NULL, 0, &out) == -1, "Sampler: NULL-Konfig wird abgelehnt");
+    CHECK(hydra_sample_token(&dummy, 0, &cfg, NULL, 0, NULL) == -1, "Sampler: NULL-Ausgabe wird abgelehnt");
+
+    /* vocab=1 cannot sample (needs a distribution with >= 2 members). */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 1, 1, 0x01) == 0, "Sampler: V=1-Modell wird geschrieben");
+    HydraEngine e;
+    int ok = hydra_engine_load(&e, path) == 0;
+    if (ok) {
+        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, &out) == -3,
+              "Sampler: Vokabular < 2 wird mit -3 abgelehnt");
+        hydra_engine_unload(&e);
+    } else {
+        CHECK(0, "Sampler: V=1-Modell laedt");
+    }
+    unlink(path);
+
+    /* temperature out of the numerically safe range. */
+    char path2[64];
+    tmp_path_new(path2, sizeof(path2));
+    CHECK(make_v1_model(path2, 16, 1, 0x01) == 0, "Sampler: V=16-Modell wird geschrieben");
+    ok = hydra_engine_load(&e, path2) == 0;
+    if (ok) {
+        cfg.temperature = 25.0f;
+        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, &out) == -4,
+              "Sampler: temperature > 20 wird mit -4 abgelehnt (exp-Overflow-Schutz)");
+        cfg.temperature = 1.0f;
+        cfg.repetition_penalty = 0.5f;
+        uint16_t one = 3;
+        CHECK(hydra_sample_token(&e, 0, &cfg, &one, 1, &out) == -1,
+              "Sampler: penalty < 1.0 wird abgelehnt (kein Discounting)");
+        hydra_engine_unload(&e);
+    } else {
+        CHECK(0, "Sampler: V=16-Modell laedt");
+    }
+    unlink(path2);
+}
+
+/* ---------------------------------------------------------------------
+ * M3: AVX2 kernels vs scalar reference (parity tests, same pattern as
+ * the NEON comparison). Compiled only into -mavx2 builds; when such a
+ * build runs on a CPU without AVX2 the tests print SKIP (the engine
+ * itself falls back to scalar via hydra_simd_has_avx2()).
+ * ------------------------------------------------------------------- */
+#if defined(__AVX2__)
+#include "../src/hydra_simd.h"
+
+static void test_avx2_step_kernel(void)
+{
+    if (!hydra_simd_has_avx2()) {
+        printf("SKIP: AVX2 step kernel (build is -mavx2, CPU lacks AVX2)\n");
+        return;
+    }
+    CHECK(hydra_simd_has_avx2(), "AVX2: runtime CPU probe reports AVX2");
+
+    /* Random matrices (platform-fixed LCG, R22) over dims that hit
+     * every SIMD/tail combination: below one chunk (8), mid-chunk
+     * tails (7, 9, 15, 17, 31, 33, 63) and full chunks (16, 32, 64). */
+    static const size_t dims[] = {8, 7, 9, 15, 16, 17, 31, 32, 33, 63, 64};
+    int all_match = 1;
+    for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
+        const size_t dim = dims[di];
+        int32_t a[HYDRA_EMBED_DIM], b[HYDRA_EMBED_DIM];
+        int8_t state[HYDRA_EMBED_DIM];
+        int64_t ref[HYDRA_EMBED_DIM] = {0};
+        int64_t avx[HYDRA_EMBED_DIM] = {0};
+        int32_t token;
+
+        for (size_t i = 0; i < dim; ++i) {
+            a[i] = (int32_t)(lcg_byte() % 8193u) - 4096;   /* [-4096, 4096] */
+            b[i] = (int32_t)(lcg_byte() % 8193u) - 4096;
+            state[i] = (int8_t)((int32_t)(lcg_byte() % 255u) - 127);
+        }
+        token = (int32_t)(lcg_byte() % 1024u);
+
+        for (size_t i = 0; i < dim; ++i)
+            ref[i] = (int64_t)a[i] * token
+                   + (int64_t)b[i] * (int32_t)state[i];
+        for (size_t i = 0; i + 8 <= dim; i += 8)
+            hydra_avx2_accumulate_agg(avx + i, a + i, b + i, state + i, token);
+        for (size_t i = dim - (dim % 8); i < dim; ++i)
+            avx[i] = (int64_t)a[i] * token
+                   + (int64_t)b[i] * (int32_t)state[i];
+        if (memcmp(ref, avx, dim * sizeof(int64_t)) != 0) all_match = 0;
+    }
+    CHECK(all_match,
+          "AVX2 step kernel == scalar reference (11 dims, random A/B/state/token, LCG seed)");
+
+    /* Extreme values at the exact layer-cap bound:
+     * |4096*1023 + (-4096)*127| = 3,673,024 — the worst case the loader
+     * admits, hand-computed; the int32 lanes must hold it exactly. */
+    const size_t dim = 8;
+    int32_t a[8], b[8];
+    int8_t state[8];
+    int64_t avx[8] = {0};
+    for (size_t i = 0; i < dim; ++i) {
+        a[i] = 4096; b[i] = -4096; state[i] = 127;
+    }
+    hydra_avx2_accumulate_agg(avx, a, b, state, 1023);
+    const int64_t expected = (int64_t)4096 * 1023 + (int64_t)(-4096) * 127;
+    int exact = 1;
+    for (size_t i = 0; i < dim; ++i)
+        if (avx[i] != expected) exact = 0;
+    CHECK(exact, "AVX2 step kernel: layer-cap extremes (A=4096, t=1023, B=-4096, s=127) exakt");
+}
+
+/* Independent scalar reference of the v2 plane unpack (4 weights per
+ * byte, weight j at bits 2j..2j+1): the SAME code table as the engine
+ * (00=0, 01=+1, 10=-1, 11=0), written from docs/FORMAT.md, not from
+ * hydra_build_aggregation_v1_1. */
+static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
+{
+    static const int8_t map[4] = {0, 1, -1, 0};
+    for (size_t i = 0; i < dim / 4; ++i) {
+        const uint8_t byte = plane[i];
+        for (int j = 0; j < 4; ++j)
+            agg[i * 4 + j] += map[(byte >> (2 * j)) & 0x03];
+    }
+}
+
+static void test_avx2_v2_unpack(void)
+{
+    if (!hydra_simd_has_avx2()) {
+        printf("SKIP: AVX2 v2 unpack (build is -mavx2, CPU lacks AVX2)\n");
+        return;
+    }
+
+    /* Random planes over 3 layers (the multi-layer ADD path of the
+     * kernel) at dim=64 (the engine's supported AVX2 case, 16-byte
+     * planes). */
+    {
+        const size_t dim = 64;
+        int32_t ref[HYDRA_EMBED_DIM] = {0};
+        int32_t avx[HYDRA_EMBED_DIM] = {0};
+        uint8_t plane_a[16], plane_b[16];
+        for (uint32_t l = 0; l < 3; ++l) {
+            for (size_t i = 0; i < dim / 4; ++i) {
+                plane_a[i] = lcg_byte();
+                plane_b[i] = lcg_byte();
+            }
+            ref_unpack_v2_plane(ref, plane_a, dim);
+            hydra_avx2_unpack_v2_plane(avx, plane_a, dim);
+            ref_unpack_v2_plane(ref, plane_b, dim);
+            hydra_avx2_unpack_v2_plane(avx, plane_b, dim);
+        }
+        CHECK(memcmp(ref, avx, dim * sizeof(int32_t)) == 0,
+              "AVX2 v2 unpack == scalar reference (dim 64, 3 random layers)");
+    }
+
+    /* All-code sweep: every 2-bit code repeated in all 4 slots of a
+     * byte must sum to 4 * map(code) per dimension — the code table
+     * itself, pinned per code. */
+    for (int code = 0; code < 4; ++code) {
+        const size_t dim = 64;
+        int32_t ref[HYDRA_EMBED_DIM] = {0};
+        int32_t avx[HYDRA_EMBED_DIM] = {0};
+        uint8_t plane[16];
+        const uint8_t byte = (uint8_t)(code | (code << 2) | (code << 4) | (code << 6));
+        for (size_t i = 0; i < dim / 4; ++i) plane[i] = byte;
+        ref_unpack_v2_plane(ref, plane, dim);
+        hydra_avx2_unpack_v2_plane(avx, plane, dim);
+        const int8_t map[4] = {0, 1, -1, 0};
+        int ok = (memcmp(ref, avx, dim * sizeof(int32_t)) == 0);
+        for (size_t i = 0; ok && i < dim; ++i)
+            if (avx[i] != map[code]) ok = 0;
+        if (code == 1)
+            CHECK(ok, "AVX2 v2 unpack: code 01 -> +1 in all 4 slots/dim, Tafel exakt");
+        else if (code == 2)
+            CHECK(ok, "AVX2 v2 unpack: code 10 -> -1 in all 4 slots/dim, Tafel exakt");
+        else if (code == 0)
+            CHECK(ok, "AVX2 v2 unpack: code 00 -> 0 in all 4 slots/dim, Tafel exakt");
+        else
+            CHECK(ok, "AVX2 v2 unpack: code 11 (reserved) -> 0 in all 4 slots/dim, Tafel exakt");
+    }
+}
+#endif /* __AVX2__ */
+
+/* -------------------------------------------------------------------
+ * M4: Transformer primitives (RMSNorm, RoPE, SwiGLU) + streaming KV
+ * cache. All expectations are hand-computed (R25: negative controls
+ * for every guard; R22: fixed LCG seed for the random inputs).
+ * ------------------------------------------------------------------- */
+
+/* LCG float in [-1, 1), 22-bit precision, fixed seed (R22). */
+static float lcg_float(void)
+{
+    static uint32_t st = 0x4D4E4F5Eu; /* "M4NO" */
+    st = st * 1664525u + 1013904223u;
+    const int32_t s = (int32_t)(st >> 10) - 0x200000; /* [-2^21, 2^21) */
+    return (float)s / 2097152.0f;                     /* [-1, 1) */
+}
+
+static int float_near(float a, float b, float tol)
+{
+    float d = a - b;
+    if (d < 0.0f) d = -d;
+    return d <= tol;
+}
+
+static void test_rmsnorm(void)
+{
+    /* Hand-computed: x=[1,2,3,4], w=1, eps=1e-6.
+     * mean(x^2) = (1+4+9+16)/4 = 7.5
+     * out[i] = x[i] / sqrt(7.5 + 1e-6) */
+    const float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float w1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float out[4] = {0};
+    const double inv = 1.0 / sqrt(7.5 + 1e-6);
+    CHECK(hydra_rmsnorm(x, w1, 4, 1e-6f, out) == 0 &&
+          float_near(out[0], (float)(inv * 1.0), 1e-5f) &&
+          float_near(out[1], (float)(inv * 2.0), 1e-5f) &&
+          float_near(out[2], (float)(inv * 3.0), 1e-5f) &&
+          float_near(out[3], (float)(inv * 4.0), 1e-5f),
+          "RMSNorm: hand-computed y = x/sqrt(mean(x^2)+eps) * w");
+
+    /* With weights w=[1,2,1,2]: multiplied per-dim. */
+    const float w2[4] = {1.0f, 2.0f, 1.0f, 2.0f};
+    float out2[4] = {0};
+    CHECK(hydra_rmsnorm(x, w2, 4, 1e-6f, out2) == 0 &&
+          float_near(out2[0], (float)(inv * 1.0 * 1.0), 1e-5f) &&
+          float_near(out2[1], (float)(inv * 2.0 * 2.0), 1e-5f),
+          "RMSNorm: weight vector applied per dimension");
+
+    /* Scale invariance (w=1): rmsnorm(10x) == rmsnorm(x) exactly
+     * (the normalization cancels the input scale). */
+    const float x10[4] = {10.0f, 20.0f, 30.0f, 40.0f};
+    float out10[4] = {0};
+    CHECK(hydra_rmsnorm(x10, w1, 4, 1e-6f, out10) == 0 &&
+          float_near(out10[0], out[0], 1e-4f) &&
+          float_near(out10[3], out[3], 1e-4f),
+          "RMSNorm: scale-invariant (rmsnorm(10x) == rmsnorm(x))");
+
+    /* NaN guard (negative control): -1 AND output unmodified. */
+    const float xbad[4] = {1.0f, 2.0f, NAN, 4.0f};
+    float sentinel[4] = {-999.0f, -999.0f, -999.0f, -999.0f};
+    CHECK(hydra_rmsnorm(xbad, w1, 4, 1e-6f, sentinel) == -1 &&
+          sentinel[0] == -999.0f && sentinel[2] == -999.0f,
+          "RMSNorm: NaN input -> -1, output unmodified");
+
+    /* Argument guards (negative controls). */
+    float tmp[1] = {0};
+    CHECK(hydra_rmsnorm(x, w1, 0, 1e-6f, tmp) == -1 &&
+          hydra_rmsnorm(x, w1, 4, 0.0f, tmp) == -1 &&
+          hydra_rmsnorm(NULL, w1, 4, 1e-6f, tmp) == -1,
+          "RMSNorm: invalid args (dim=0, eps=0, NULL) -> -1");
+}
+
+static void test_rope(void)
+{
+    /* pos=0 -> identity, bit-exact. */
+    float x0[4] = {1.0f, -2.0f, 3.0f, -4.0f};
+    CHECK(hydra_rope_inplace(x0, 4, 0, 10000.0) == 0 &&
+          x0[0] == 1.0f && x0[1] == -2.0f && x0[3] == -4.0f,
+          "RoPE: pos=0 is the identity (bit-exact)");
+
+    /* dim=2, x=[1,0], pos=1, theta=1.0: freq=1, angle=1 rad
+     * -> [cos(1), sin(1)] hand-computed. */
+    float x1[2] = {1.0f, 0.0f};
+    CHECK(hydra_rope_inplace(x1, 2, 1, 1.0) == 0 &&
+          float_near(x1[0], (float)cos(1.0), 1e-5f) &&
+          float_near(x1[1], (float)sin(1.0), 1e-5f),
+          "RoPE: hand-computed rotation (dim=2, pos=1, theta=1)");
+
+    /* Norm preservation: |x'| == |x| (rotation is orthogonal),
+     * random input, standard theta=10000. */
+    float xr[8];
+    double n0 = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        xr[i] = lcg_float() * 3.0f;
+        n0 += (double)xr[i] * xr[i];
+    }
+    int rc = hydra_rope_inplace(xr, 8, 7, 10000.0);
+    double n1 = 0.0;
+    for (int i = 0; i < 8; ++i)
+        n1 += (double)xr[i] * xr[i];
+    CHECK(rc == 0 && float_near((float)sqrt(n1), (float)sqrt(n0), 1e-3f),
+          "RoPE: preserves vector norm (orthogonal rotation)");
+
+    /* Guards (negative controls): odd dim, theta=0, NaN unmodified. */
+    float xn[3] = {1.0f, 2.0f, 3.0f};
+    float xbad[2] = {1.0f, NAN};
+    CHECK(hydra_rope_inplace(xn, 3, 1, 10000.0) == -1 &&
+          hydra_rope_inplace(xn, 2, 1, 0.0) == -1 &&
+          hydra_rope_inplace(xbad, 2, 1, 10000.0) == -1 &&
+          xbad[0] == 1.0f && isnan(xbad[1]),
+          "RoPE: invalid args (odd dim, theta=0, NaN) -> -1, unmodified");
+}
+
+static void test_swiglu(void)
+{
+    /* g=0 -> silu(0)=0 -> out=0 regardless of u. */
+    const float g0[1] = {0.0f};
+    const float u5[1] = {5.0f};
+    float o0[1] = {77.0f};
+    CHECK(hydra_swiglu(g0, u5, 1, o0) == 0 && o0[0] == 0.0f,
+          "SwiGLU: g=0 -> 0 (silu(0)=0)");
+
+    /* Hand-computed: g=[1], u=[2] -> 2 * 1 * sigmoid(1)
+     * sigmoid(1) = 1/(1+exp(-1)) = 0.7310585786...
+     * out = 1.4621171573... */
+    const float g1[1] = {1.0f};
+    const float u2[1] = {2.0f};
+    float o1[1] = {0};
+    CHECK(hydra_swiglu(g1, u2, 1, o1) == 0 &&
+          float_near(o1[0], (float)(2.0 * 0.7310585786300049), 1e-6f),
+          "SwiGLU: hand-computed silu(1)*2");
+
+    /* Tails: g=+100 -> silu ~ 100 (sigmoid ~ 1); g=-100 -> silu ~ 0.
+     * No overflow either way (safe sigmoid). */
+    const float gp[1] = {100.0f};
+    const float gn[1] = {-100.0f};
+    float op[1] = {0}, on[1] = {0};
+    int tp = hydra_swiglu(gp, u5, 1, op);
+    int tn = hydra_swiglu(gn, u5, 1, on);
+    float an = on[0];
+    if (an < 0.0f) an = -an;
+    CHECK(tp == 0 && float_near(op[0], 500.0f, 0.01f) && tn == 0 && an < 1e-30f,
+          "SwiGLU: tails (g=+100 -> ~100*u, g=-100 -> ~0, no overflow)");
+
+    /* Bridge to the ternary engine (R14): the float SwiGLU output is
+     * the value a feed-forward block feeds back into the engine's
+     * int8 state world. Quantize with the SAME clamp the engine uses
+     * (v>127 -> 127, v<-127 -> -127, hydra_engine.c) and verify the
+     * result is in-range and idempotent — i.e. the bridge cannot
+     * produce a value the engine rejects or wraps. */
+    int bridge_ok = 1;
+    for (int i = 0; i < 256; ++i) {
+        float g[1] = {lcg_float() * 8.0f};
+        float u[1] = {lcg_float() * 8.0f};
+        float y[1] = {0};
+        if (hydra_swiglu(g, u, 1, y) != 0) { bridge_ok = 0; break; }
+        float v = y[0];
+        if (v > 127.0f) v = 127.0f;
+        else if (v < -127.0f) v = -127.0f;
+        const int8_t q = (int8_t)v;
+        /* Re-clamp the quantized value: must be a fixed point. */
+        float v2 = (float)q;
+        if (v2 > 127.0f) v2 = 127.0f;
+        else if (v2 < -127.0f) v2 = -127.0f;
+        /* q > 127 is impossible for int8_t; q < -127 catches an
+         * out-of-clamp-range quantization (the engine uses [-127,127]). */
+        if ((int8_t)v2 != q || q < -127) { bridge_ok = 0; break; }
+    }
+    CHECK(bridge_ok,
+          "SwiGLU->int8 bridge: 256 random outputs clamp to engine-valid int8, idempotent");
+
+    /* Guards (negative controls). */
+    const float gbad[1] = {NAN};
+    float sentinel[1] = {-999.0f};
+    CHECK(hydra_swiglu(gbad, u2, 1, sentinel) == -1 && sentinel[0] == -999.0f &&
+          hydra_swiglu(g1, NULL, 1, o1) == -1,
+          "SwiGLU: NaN / NULL args -> -1, output unmodified");
+}
+
+static void test_kv_cache(void)
+{
+    /* C=5, S=2, dim=2. Encode token t as k={t,t}, v={-t,t} so every
+     * slot is uniquely identifiable. */
+    const uint32_t C = 5, S = 2, D = 2;
+    static float kbuf[5 * 2], vbuf[5 * 2];
+    hydra_kv_cache_t c;
+
+    CHECK(hydra_kv_cache_init(&c, kbuf, vbuf, D, C, S) == 0 &&
+          hydra_kv_cache_size(&c) == 0,
+          "KV cache: init (C=5, S=2, dim=2), size 0");
+
+    /* Fill to capacity: appends t=0..4. */
+    int fill_ok = 1;
+    for (uint32_t t = 0; t < C; ++t) {
+        float k[2] = {(float)t, (float)t};
+        float v[2] = {-(float)t, (float)t};
+        if (hydra_kv_cache_append(&c, k, v) != 0) { fill_ok = 0; break; }
+    }
+    CHECK(fill_ok && hydra_kv_cache_size(&c) == C,
+          "KV cache: fills to capacity 5, size 5");
+
+    /* Resident = [t0, t1 (sinks), t2, t3, t4 (window, oldest->newest)]. */
+    float kk[2], vv[2];
+    int get_ok = 1;
+    const uint32_t expect[5] = {0, 1, 2, 3, 4};
+    for (uint32_t i = 0; i < C; ++i) {
+        if (hydra_kv_cache_get(&c, i, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)expect[i] || vv[0] != -(float)expect[i]) { get_ok = 0; break; }
+    }
+    CHECK(get_ok, "KV cache: resident order = sinks then window (oldest->newest)");
+
+    /* Append t5: evicts the oldest WINDOW token (t2), never a sink. */
+    {
+        float k[2] = {5.0f, 5.0f};
+        float v[2] = {-5.0f, 5.0f};
+        fill_ok = hydra_kv_cache_append(&c, k, v) == 0;
+    }
+    get_ok = 1;
+    const uint32_t expect2[5] = {0, 1, 3, 4, 5};
+    for (uint32_t i = 0; i < C; ++i) {
+        if (hydra_kv_cache_get(&c, i, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)expect2[i] || vv[0] != -(float)expect2[i]) { get_ok = 0; break; }
+    }
+    CHECK(fill_ok && get_ok && hydra_kv_cache_size(&c) == C,
+          "KV cache: append t5 evicts oldest window token (t2), sink intact");
+
+    /* Append t6..t9: window keeps the LAST 3 (t7,t8,t9); sinks fixed.
+     * Trace (window slots 2,3,4): t5->2, t6->3, t7->4, t8->2, t9->3.
+     * Oldest resident window append = n - W = 10 - 3 = 7. */
+    fill_ok = 1;
+    for (uint32_t t = 6; t <= 9; ++t) {
+        float k[2] = {(float)t, (float)t};
+        float v[2] = {-(float)t, (float)t};
+        if (hydra_kv_cache_append(&c, k, v) != 0) { fill_ok = 0; break; }
+    }
+    get_ok = 1;
+    const uint32_t expect3[5] = {0, 1, 7, 8, 9};
+    for (uint32_t i = 0; i < C; ++i) {
+        if (hydra_kv_cache_get(&c, i, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)expect3[i] || vv[0] != -(float)expect3[i]) { get_ok = 0; break; }
+    }
+    CHECK(fill_ok && get_ok,
+          "KV cache: after t6..t9 resident = [t0,t1,t7,t8,t9] (last 3 window)");
+
+    /* Sinks survive everything (streaming-LLM invariant). */
+    get_ok = 1;
+    for (uint32_t s = 0; s < S; ++s) {
+        if (hydra_kv_cache_sink(&c, s, kk, vv) != 0) { get_ok = 0; break; }
+        if (kk[0] != (float)s || vv[0] != -(float)s) { get_ok = 0; break; }
+    }
+    CHECK(get_ok, "KV cache: sink(0)=t0, sink(1)=t1 after 10 appends (never evicted)");
+
+    /* Negative controls: OOB get, NaN append (no partial write),
+     * sink before filled, degenerate init. */
+    get_ok = 1;
+    if (hydra_kv_cache_get(&c, C, kk, vv) != -1) get_ok = 0;      /* OOB */
+    if (hydra_kv_cache_sink(&c, S, kk, vv) != -1) get_ok = 0;     /* i==S */
+    {
+        const uint32_t before = hydra_kv_cache_size(&c);
+        float kb[2] = {1.0f, NAN};
+        float vb[2] = {1.0f, 1.0f};
+        if (hydra_kv_cache_append(&c, kb, vb) != -1) get_ok = 0;
+        if (hydra_kv_cache_size(&c) != before) get_ok = 0;        /* no partial */
+    }
+    {
+        float kb[2] = {1.0f, 1.0f};
+        float vb[2] = {1.0f, 1.0f};
+        if (hydra_kv_cache_init(&c, kb, vb, D, C, C + 1) != -1) get_ok = 0; /* S>C */
+    }
+    CHECK(get_ok,
+          "KV cache: OOB get, NaN append (no partial), S>capacity all -> -1");
+}
+
 int main(void)
 {
     printf("=== Hydra Engine Unit-Tests ===\n\n");
@@ -1233,6 +1966,20 @@ int main(void)
     test_load_metrics_are_measured();
     test_version_two_format();
     test_axiom();
+#if defined(__AVX2__)
+    test_avx2_step_kernel();
+    test_avx2_v2_unpack();
+#endif
+    test_sampler_greedy_guard();
+    test_sampler_repetition_penalty();
+    test_sampler_min_p();
+    test_sampler_rng_hand_computed();
+    test_sampler_reproducible();
+    test_sampler_invalid();
+    test_rmsnorm();
+    test_rope();
+    test_swiglu();
+    test_kv_cache();
 
     printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

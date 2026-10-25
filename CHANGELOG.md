@@ -3,6 +3,383 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — Android keyboard + adaptive chat layout; full .md audit; local scan helper
+
+**Android UI (fix for "the UI breaks while typing")**
+
+- `android/app/src/main/res/values/themes.xml` +
+  `values-night/themes.xml` (new): `Theme.HydraStone`, a `NoActionBar`
+  platform theme (light + night, `windowLightStatusBar` matching the
+  Compose scheme). The old
+  `Theme.Material.Light.DarkActionBar` drew a second "Hydra-Stone" bar
+  above the Compose `TopAppBar` — the title was doubled and the vertical
+  space was eaten exactly where the keyboard needs it. The manifest now
+  points at the app theme.
+- `MainActivity.onCreate()`: on API 30+ the window goes edge-to-edge
+  (`enableEdgeToEdge()`) with `SOFT_INPUT_ADJUST_NOTHING` — the soft
+  keyboard then arrives as a real `WindowInset` and the composer's
+  `Modifier.imePadding()` lifts the input row by exactly the keyboard's
+  height, whatever it is (split keyboard, emoji row, swipe-up). Below 30
+  the platform delivers no IME insets, so the classic `adjustResize`
+  stays on: the window shrinks and the layout below adapts.
+- `ui/HydraApp.kt`: new `AdaptiveHeaderSplit`, a custom `Layout` that
+  measures the header block (banner, model row, engine status/selector,
+  auto-run) at its natural height up to 45% of the space and hands the
+  rest to the conversation. A plain `weight()` cannot express this — a
+  weighted child never returns its unused share, so the composer would
+  float above the bottom edge. The header is internally scrollable; the
+  conversation `LazyColumn` drops the old fixed `heightIn(min = 120.dp)`
+  floor, which overflowed the window exactly when the window was
+  smallest (keyboard open on a short screen), and gets a relative share
+  instead. The input row is a plain sibling after the weighted split and
+  can no longer be pushed off screen.
+- `tools/android_autostart_check.sh`: the "guaranteed minimum height"
+  check now asserts the new mechanism — the header block is capped at a
+  fraction of the space (grep on the cap EXPRESSION
+  `maxHeight * headerFraction`, not the parameter alone, so a cap in
+  name only fails) plus the remainder hand-over to the content; the
+  nested-scroll check now scopes on `MessageList`.
+  `tools/android_autostart_negative_test.sh` (the CI-side proof that
+  every gate check can fail) is updated to match: the old
+  min-height scenario is replaced by two scenarios, one per new check,
+  each removing the real wiring — all 15 scenarios now turn their
+  check red (15 proved, 0 could not fail).
+
+**Docs**
+
+- `docs/ARCHITECTURE.md`: the SIMD table's NEON row cited a function
+  that does not exist, `hydra_neon_accumulate_chunk()` — the real
+  kernel is `hydra_neon_accumulate_agg()` (16 values per fixed-width
+  chunk, 4 int32 lanes per vector op). Name and wording corrected.
+- `CHANGELOG.md`: the M3 entry sat above M6, violating the
+  "newest entries first" order the file's own header promises.
+  Reordered.
+- All 21 tracked `.md` files audited: no non-English text, no
+  hard-coded test counts in the live documents, every relative link
+  resolves, every `hydra_*` symbol named in a doc exists in the code,
+  every README roadmap `[x]` box cites verifiable code, and the engine
+  still reproduces the quoted deterministic token baseline.
+
+**Local tooling (the script itself is gitignored; the ignore entry is
+committed)**
+
+- `tools/local_scan.py` — a 10-check local scanner (non-English text,
+  hard-coded counts, links, stale phrasings, doc-vs-code symbols,
+  roadmap boxes, quoted baseline, parsed test count, changelog order,
+  self-gitignore). The committed CI gate remains
+  `tools/docs_claim_check.sh`; this is the "scan everything" aid.
+
+### CI follow-up (same day, after the first CI run)
+
+The first CI run on the PR found three defects the sandbox cannot
+reproduce (no Android SDK, no aarch64 toolchain, no CodeQL):
+
+- **Kotlin compile errors in `AdaptiveHeaderSplit`**: the custom
+  `Layout` implementation imported `Constraints` from the wrong package
+  (`androidx.compose.ui`, not `foundation.layout`) and the `Layout`
+  import did not resolve in this Compose set at all. Replaced the whole
+  mechanism with a `BoxWithConstraints` implementation — the cap is
+  read from the incoming constraints in the same measurement pass (no
+  size-callback state, no collapsed first frame), and every API used
+  already resolves in this file (`BoxWithConstraints` sits next to
+  `Box` in the same `foundation.layout` package; the `Dp` arithmetic
+  goes through `maxHeight.value` + the already-imported `.dp`
+  extension, so no new operator import is needed).
+- **aarch64 static link failure** (`undefined reference to
+  sqrtf/pow/sincos/expf/exp`): the "Cross-arch determinism check" step
+  in `.github/workflows/ci.yml` linked `hydra-run-arm` without `-lm`;
+  the M4 float primitives made libm mandatory. `-lm` added (the
+  sibling `hydra-test-arm` line in the same job already had it).
+- **CodeQL (built-in) alert in `tests/test_engine.c`**:
+  `make_v1_model` used `fopen(path, "wb")`, which creates a missing
+  file with the internal 0666 mode (world-writable under a permissive
+  umask). Now `open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644)` + `fdopen`,
+  with the reasoning in a comment.
+- The autostart gate + negative control were updated in the same round:
+  the cap check greps the cap expression
+  (`maxHeight.value * headerFraction`), the remainder check greps the
+  body column's `weight(1f)`, and the two negative scenarios break
+  exactly those wirings. Local proof: gate 32/0, negative control 15
+  proved / 0 could not fail, `hydra-test` 142/0.
+
+### CI follow-up, round 2-4 (same day): API-readable diagnostics + the px/Dp root cause
+
+The second CI run showed that the compile errors had moved, but the
+sandbox cannot read Actions job logs (the log-download and artifact
+hosts are egress-blocked; the check-run output API does not index step
+summaries; PR-comment posting is refused by the repository token
+policy). The two Android jobs now therefore publish their failure from
+the build step itself as a **check-run annotation** — one `::error::`
+line with the Kotlin `e:` compiler lines plus a short gradle log tail
+(lint job: the same, plus per-finding annotations when the lint report
+exists). Annotations are served by the API and need no permissions.
+The lint job also gained `issues:write` (the PR-comment mirror stays
+for when the token policy allows it).
+
+The annotation from run 4 of the round delivered the error text:
+`HydraApp.kt:340:36 Unresolved reference 'value'`. Root cause:
+`BoxWithConstraintsScope.constraints` is the **pixel-based**
+`androidx.compose.ui.unit.Constraints`, whose `maxHeight` is a plain
+`Float` — it has no `.value`. (Verified against the foundation
+1.7.3-era sources, which also show the scope exposing the Dp-converted
+value as its own `maxHeight` property.) The cap now uses that scope
+property: `(maxHeight.value * headerFraction).dp` — no new imports.
+`SOFT_INPUT_ADJUST_NOTHING` (deprecated since API 30, and not what
+edge-to-edge wants — a non-resizing window on API 30+ delivers the IME
+as an inset under the default soft-input mode) was dropped, which
+also cleared the "0 findings" lint gate. The negative-control
+scenario for the cap is re-anchored to the new expression.
+
+Result: **all CI green** (runs 40237612415 "CI" + 40237612492
+"Lint & Security" on commit `5445742`): Android APK build, Android
+lint, neon-test (incl. cross-arch determinism), CodeQL built-in /
+c-cpp / js, sanitizers, docs claim lint, and every other leg pass.
+
+## 2026-10-25 — M6: docs + baseline (roadmap checkboxes only for verified work)
+
+- **`README.md`**: the Roadmap now reflects reality, with **exact
+  function references** on every checked box and no fake checkboxes:
+  - `[x]` Min-P sampling & repetition penalty → `hydra_sample_token()`
+    (`include/hydra_model.h`, `src/hydra_engine.c`), CLI
+    `--temp/--min-p/--rep-penalty` (`src/main.c`), tested in
+    `tests/test_engine.c`.
+  - `[x]` safetensors import → `tools/safetensors_to_hydra.py`,
+    round-trip-gated in `tools/gguf_test.py` (`run_safetensors`).
+  - `[x]` AVX2 kernel for x86 → `src/hydra_simd.h`
+    (`hydra_avx2_accumulate_agg`, `hydra_avx2_unpack_v2_plane`), runtime
+    dispatch + scalar fallback, parity-tested; **AVX-512 explicitly not
+    implemented.**
+  - `[x]` Streaming ring-buffer KV with attention sinks →
+    `hydra_kv_cache_t` + init/append/size/get/sink,
+    eviction-with-sinks-preserved tested.
+  - Still `[ ]`: the full transformer forward pass (the M4 primitives exist
+    and are tested but are not yet wired into a forward pass) and the
+    `.hydra2` sparse-MoE container (nothing implemented). The NEON/AVX2
+    honesty note is updated (x86 is no longer "purely scalar").
+- **`docs/ARCHITECTURE.md`**: Components table gains `src/hydra_simd.h`,
+  `tools/gguf_to_hydra.py`, `tools/safetensors_to_hydra.py` and the sampler
+  + primitives in the API/engine rows; the SIMD Strategy table now lists the
+  active AVX2 path (8 dims/256-bit iteration, runtime dispatch, plain-build
+  scalar) with the int32-exactness bound; a new "Transformer Primitives and
+  Streaming KV Cache (M4)" section documents the four guarded building
+  blocks and the int8 bridge.
+- **`docs/GGUF-IMPORT.md`**: the short version names the safetensors
+  command; a new §10 documents the safetensors container parsing/
+  both-ends offset validation, the F32/F16/BF16 decode set, the absmean
+  ternarisation, the version-2 output (first shipped writer for that
+  packing) and the three-way round-trip verification.
+- **`AGENTS.md`**: the stale hard-coded "38 checks" for `gguf_test.py` is
+  replaced with the repo's own convention — "expect `N checks, 0 failed`
+  (N parsed, never assumed)".
+- **`tools/test_count_baseline.txt`**: unchanged at x86 142 / arm 140 —
+  M5 added no C tests (its checks live in `gguf_test.py`, which is an
+  exit-code gate, not a count-gated binary), so the measured C count is
+  unchanged and the baseline already matches.
+
+## 2026-10-25 — M5: safetensors import -> version-2 .hydra (4 ternary weights/byte)
+
+- **`tools/safetensors_to_hydra.py`** (new, Python standard library only):
+  reads a safetensors container (8-byte LE header length + JSON header +
+  data region), validates every tensor's `data_offsets` at BOTH ends
+  (`start >= 0`, `end > start`, `8+N+end <= file_size`, and the span equals
+  `n_elements * bytes_per_element`) and refuses malformed input by name -
+  a header length past the end, an unparseable header, an unsupported dtype
+  (only F32/F16/BF16), a 3-D tensor, out-of-order offsets or a range that
+  runs past the file end. Decodes F32 (struct), F16 (IEEE binary16 via
+  `<e>`) and BF16 (top 16 bits of an F32).
+  - Ternarises each plane with the b1.58 absmean rule: `gamma = mean|W|`,
+    `W_q = clip(round(W/(gamma+1e-8)))` with half-away-from-zero rounding
+    (the +1e-8 keeps an all-zero tensor finite). The ternary column sums
+    are two counts per column (the threshold form of the rounding), so the
+    ternary matrix is never materialised.
+  - Folds the column sums to the 64-wide state and writes a **version-2**
+    `.hydra` (4 ternary weights per byte, two `dim/4`-byte planes per
+    layer) whose aggregation A/B reproduces the folded sums value for
+    value - the same exactness guarantee as the v1 GGUF converter.
+- **`tools/gguf_test.py`**: a `run_safetensors` round-trip gate (called
+  from `run()`), proven three independent ways:
+  1. **Packing** - `read_hydra_v2` re-derives A/B from the packed bytes
+     with no shared code and compares to the reported A/B (catches a
+     transposed bit order or a swapped plane).
+  2. **Quantisation** - an oracle written from the spec's literal rule
+     (element-wise half-away round-clip, its own decode and fold) must
+     equal the reported A/B (catches a wrong gamma/rounding/threshold).
+  3. **The real engine** - `./hydra-run` on the v2 file is compared to a
+     reference step, plus F32/F16/BF16-of-the-same-weights-convert-
+     identically and six negative controls.
+
+Measured: `gguf_test.py` 40 -> **59 checks, 0 failed** (the 19 new
+safetensors checks; the C count is unchanged, so `test_count_baseline.txt`
+needs no edit); the baseline `[471,386,385,386,385,386,385,386]` @ 42/8 is
+untouched (the starter model is v1 and the v1 path is unchanged).
+
+## 2026-10-25 — M4: Transformer primitives (RMSNorm/RoPE/SwiGLU) + streaming KV cache
+
+- **`include/hydra_model.h` / `src/hydra_engine.c`** (new API, zero-heap,
+  R14-guarded — every function validates args AND checks all input
+  finiteness before any output store, so a -1 return never leaves a
+  partially written result):
+  - `hydra_rmsnorm(x, w, dim, eps, out)` — `y = x/√(mean(x²)+ε)·w`,
+    in-place safe, dim 1..4096.
+  - `hydra_rope_inplace(x, dim, pos, theta_base)` — standard rotary
+    embedding on pairs (x[2i], x[2i+1]) with `freq_i = θ^(-2i/dim)`.
+  - `hydra_swiglu(g, u, dim, out)` — `SiLU(g)·u` with a branch-free-
+    overflow-safe sigmoid (`x≥0: 1/(1+e^-x)`, else `e^x/(1+e^x)` —
+    no Inf on either tail).
+  - `hydra_kv_cache_t` + `init/append/size/get/sink` — streaming
+    attention cache: `num_sinks` permanent sink slots (streaming-LLM
+    attention sinks, never evicted) + a circular window over
+    `capacity - num_sinks` slots that overwrites its oldest entry.
+    Caller-provided storage (zero heap), O(1) memory and O(1) per
+    append/lookup. These are the float building blocks a real
+    transformer head needs; the SwiGLU bridge test proves their
+    outputs quantize into the engine's int8 state world with the
+    engine's own clamp, idempotently.
+- **`tests/test_engine.c`**: 21 new checks (all architectures):
+  RMSNorm hand-computed value + per-dim weights + scale invariance +
+  NaN/arg guards (negative controls, unmodified output verified);
+  RoPE identity at pos=0 (bit-exact) + hand-computed rotation + norm
+  preservation (orthogonality) + guards; SwiGLU hand-computed
+  silu(1)·2 + both tails (g=±100, no overflow) + 256-sample
+  float→int8 engine-clamp bridge + guards; KV cache init/fill,
+  resident order (sinks then window, oldest→newest), eviction of the
+  oldest WINDOW token (sinks intact) after the cache is full, a
+  4-append window slide, sink permanence after 10 appends, and the
+  OOB-get / NaN-append-no-partial-write / sinks>capacity controls.
+- **`tools/test_count_baseline.txt`**: x86 121 → 142, arm 119 → 140
+  (all 21 checks compile on every architecture).
+
+Measured: `./hydra-test` 142/0, zero warnings; baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 unchanged;
+`jni-batch-test` 86/0, `large-model-test` 7/0, `gguf_test.py` 40/0.
+
+## 2026-10-25 — M3: AVX2 x86-64 kernels (step kernel + v2 unpack LUT), runtime dispatch
+
+- **`src/hydra_simd.h`** (new): the two AVX2 kernels, compiled only
+  when the build carries `-mavx2` (`__AVX2__`):
+  - **Step kernel** `hydra_avx2_accumulate_agg` — 8 dims per 256-bit
+    iteration (a 256-bit lane holds 8 int32). The int32 lanes are
+    provably exact: |A|,|B| ≤ 4096 (layer cap), |t| ≤ 1023, |s| ≤ 127
+    → |A·t + B·s| ≤ 4,710,400 < INT32_MAX, so `mullo_epi32` +
+    `add_epi32` cannot wrap, and the `cvtepi32_epi64` widening is a
+    re-interpretation. Bit-identical to the scalar expression by
+    construction (same integer ops); the parity test is the proof.
+  - **v2 plane unpack** `hydra_avx2_unpack_v2_plane` — the 2-bit →
+    signed LUT decode (one `shuffle_epi8` per weight position over a
+    16-entry table, leak-proof masked 16-bit shifts, and the
+    mandatory `& 0x0F` index mask because VPSHUFB zeroes any lane
+    whose index has bit 7 set). Honest scope note: the 4-weights/byte
+    scatter into stride-4 dimension slots stays a small scalar loop —
+    a 4×16 byte transpose is not cleanly expressible with plain AVX2
+    shuffles and the operation runs once at load time, not per token.
+  - `hydra_simd_has_avx2()` — runtime CPUID probe
+    (`__builtin_cpu_supports`), constant 0 in non-AVX2 builds.
+- **`src/hydra_engine.c`**: `hydra_engine_step()` dispatches to the
+  AVX2 kernel (8-dim chunks + scalar tail) when the CPU supports AVX2,
+  otherwise the scalar loop — a `-mavx2` build therefore still runs on
+  non-AVX2 x86 CPUs; a plain build contains no AVX2 instruction at all
+  (no SIGILL risk). The v2 load path uses the unpack kernel for
+  dim=64 (the standard dimension), scalar otherwise. The ARM NEON path
+  is untouched (mutually exclusive architectures).
+- **`Makefile`**: adds `-mavx2` only when `uname -m` is x86_64 AND the
+  compiler accepts the flag (probe compile); the probe artifact is
+  removed in `clean`. Cross-compilation (the ARM CI leg) never matches.
+- **`tests/test_engine.c`**: 8 new x86-only checks (compile-guarded
+  `#ifdef __AVX2__`, runtime SKIP on non-AVX2 CPUs — the NEON test
+  pattern): runtime probe; step kernel vs scalar reference over 11
+  dims (sub-chunk, mid-chunk tails, full chunks) with LCG-random
+  matrices (R22 platform-fixed seed) and the layer-cap extreme
+  (A=4096, t=1023, B=−4096, s=127 → 3,673,024 hand-computed); v2
+  unpack vs an independent scalar reference (3 random layers, dim 64)
+  and the full 4-code table sweep.
+- **`tools/test_count_baseline.txt`**: x86 113 → 121 (the 8 AVX2 checks
+  compile only into `-mavx2` builds), arm unchanged at 119.
+
+Measured (x86-64 sandbox with AVX2, so the SIMD path is live):
+`./hydra-test` 121/0; baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 UNCHANGED on the
+AVX2 build (end-to-end parity); `jni-batch-test` 86/0,
+`large-model-test` 7/0, `gguf_test.py` 40/0; zero warnings.
+
+## 2026-10-25 — M2: Min-P sampling + repetition penalty (greedy guard keeps the baseline)
+
+Adds controlled randomness to the deterministic decoder without touching
+the greedy path:
+
+- **`include/hydra_model.h`**: new `hydra_sampler_config_t`
+  (`temperature`, `min_p`, `repetition_penalty`, `penalty_window`,
+  `rng_seed`) and `hydra_sample_token()`. `HydraEngine` gains one
+  `uint64_t rng_state` field (zero after load; never read by greedy
+  decode), so a full run is reproducible from (model, start token,
+  config).
+- **`src/hydra_engine.c`**: `hydra_sample_token()` implements the
+  documented two-mode contract:
+  - **Greedy guard** — `temperature <= 0` OR `min_p >= 1` delegates to
+    `hydra_engine_step()`: bit-identical output, which is what keeps
+    the deterministic baseline sequence valid.
+  - **Sampling** — the engine has no native per-vocabulary logits, so
+    the candidate logit is the engine's own quantity:
+    `L(c) = agg_a[0]*c + agg_b[0]*state[0]` (the acc[0] that would be
+    computed if c were fed). Then: repetition penalty over the recent
+    window (positive logits divided, negative multiplied, repeats
+    compound) → numerically stable softmax (max subtracted before
+    exp) → min-p filter (drop `P(c) < min_p * p_max`, renormalize) →
+    seeded xorshift64* CDF walk → state advance through the real
+    `hydra_engine_step(chosen)`, so the state machine is the SAME as
+    greedy mode. Zero heap (one 8 KiB stack array for the vocab cap).
+- **`src/main.c`**: new flags `--temp`, `--min-p`, `--rep-penalty`,
+  `--rep-window`, `--seed` (defaults keep the CLI bit-identical:
+  temp 0 → greedy). `--fast` is ignored with a visible note when
+  sampling is active (sampling advances the full state by contract).
+  The console output shows the active sampler config.
+- **`tests/test_engine.c`**: 32 new checks (all architectures), all
+  expected values hand-computed against an independent Python
+  reference (double softmax + identical xorshift64* stream), not
+  fitted:
+  - greedy guard (temp=0 and min_p=1) bit-identical to the native
+    step over 32 steps,
+  - repetition penalty breaks the repetition loop on a positive logit
+    (argmax 63→62 at pen 4, T=0.001 where the softmax collapses
+    exactly onto the argmax) AND multiplies a negative logit
+    (model with state 14: argmax 7→6, outputs 1→7),
+  - min-p surviving sets verified over fixed seeds: min_p=0.5 →
+    always the argmax token (16 seeds), min_p=0.1 → only tokens
+    {62,63,64} (24 seeds, ≥2 distinct), and the control without the
+    filter reaches the tail (96 seeds),
+  - exact xorshift64* draws for seeds 1/2/555/0 pinned to the
+    hand-computed CDF bins (the seed-0→magic-state degeneracy guard
+    included),
+  - full 64-step seeded reproducibility,
+  - argument negative controls (NULLs, vocab<2 → −3, temp>20 → −4,
+    penalty<1 → −1).
+- **`tools/test_count_baseline.txt`**: x86 81→113, arm 87→119 (the 32
+  new checks compile on every architecture; ARM re-measured on the CI
+  leg).
+
+Measured: `./hydra-test` 113/0 (x86); baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ start_token=42 unchanged;
+`jni-batch-test` 86/0, `large-model-test` 7/0, `gguf_test.py` 40/0.
+
+## 2026-10-25 — M1: agent hygiene (CLAUDE.md bridge, dead artifact removal)
+
+- **`CLAUDE.md`** (new): one-line bridge that loads `@AGENTS.md` first
+  and restates the always-on rules, so Claude Code sessions and the
+  repository's agent system can never drift apart.
+- **`hydra_stone_model_engine.zip`** removed from git (`git rm`):
+  grep over the whole tree shows it is referenced nowhere except
+  session-history text — an old build artifact that bloated every
+  clone. (Resolves the open decision from the 2026-10-25 audit.)
+- Verified (no change needed): `.gitignore` already excludes
+  `.agent_memory/` and `RESEARCH.md`, so the local research mirror and
+  Notion sync notes stay out of the repository.
+- The audit + derivations for this round are recorded in
+  `.agent_memory/RESEARCH.md` (local fallback mirror; Notion "AI
+  Notizen" sync follows at round close).
+- **Not done (deliberate):** the spec title mentions "AGPL-3.0", but
+  the LICENSE file is GPL-3.0 and the spec body never asks for a
+  license change — changing it is a legal decision for the user, not
+  an implementation task. The LICENSE file is untouched.
+
 ## 2026-10-25 — post-merge doc audit (screenshot verification pass)
 
 PR #48 merged (20:04Z, main = afae8c8). Audit of the GitHub README

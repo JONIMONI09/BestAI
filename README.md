@@ -163,7 +163,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 - ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86
-  - *Honesty note:* the NEON path is active on ARM builds only. It is **not** merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the NEON kernel **in the same ARM build** and requires bit-identical token sequences *and* state vectors. The x86 path is purely scalar; AVX2 is on the roadmap.
+  - *Honesty note:* the NEON path is active on ARM builds only, and the AVX2 path (`src/hydra_simd.h`) on x86-64 builds. Neither is merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the SIMD kernel **in the same build** and requires bit-identical results; a `-mavx2` build also keeps a runtime CPU check and a scalar fallback, so it still runs (and falls back) on a CPU without AVX2.
 - ✅ **Hardening** — header validation (little-endian decode, layer cap, offset checks), OOB protection, overflow-free accumulation; unit-test count is parsed from the binary and drift-gated in CI (`tools/test_count_check.sh`, baselines in `tools/test_count_baseline.txt`)
 - ✅ **Web console** — desktop UI with live visualization (`make ui`)
 - ✅ **Android** — NDK/JNI build of the same C source. Verified end to end on an API-24 x86_64 emulator with the **signed release APK**: the installed package is byte-identical to the built artifact, `lib/x86_64/libhydra.so` is genuinely mapped into the running process (ELF header `7f 45 4c 46`, `e_machine = EM_X86_64`), and the 32-token output is **bit-identical** to the host C engine. *Not yet verified on physical ARM hardware — no device was available.*
@@ -425,13 +425,13 @@ make ui       # builds hydra-run + the starter model and serves on :8787
 
 ## Roadmap
 
-- [ ] Full transformer forward pass (RMSNorm, RoPE, SwiGLU) on top of the ternary core
-- [ ] Min-P sampling & repetition penalty
-- [ ] safetensors import with automatic absmean ternarization (GGUF is done — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md))
-- [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
-- [x] 4-weights-per-byte packing (2 bits/weight, no wasted byte) — implemented as header version 2 and tested (`docs/FORMAT.md`, "Version 2"; `tests/test_engine.c`, `test_version_two_format`) — a v1.1 file-level optimisation, distinct from the v2 container
+- [ ] Full transformer forward pass on top of the ternary core — the primitives now exist and are tested (M4: `hydra_rmsnorm`, `hydra_rope_inplace`, `hydra_swiglu` and the `hydra_kv_cache_t` sink+window cache in `src/hydra_engine.c`, unit-tested in `tests/test_engine.c`), but they are **not yet wired into a forward pass** over the recurrent core
+- [x] Min-P sampling & repetition penalty — `hydra_sample_token()` (`include/hydra_model.h`, `src/hydra_engine.c`) with a bit-identical greedy guard; CLI `--temp --min-p --rep-penalty` (`src/main.c`); tested in `tests/test_engine.c` (`test_sampler_min_p`, `test_sampler_repetition_penalty`, `test_sampler_greedy_guard`)
+- [x] safetensors import with automatic absmean ternarization — `tools/safetensors_to_hydra.py` (stdlib only) parses/validates the container, decodes F32/F16/BF16, ternarises by absmean and writes a version-2 `.hydra`; round-trip-gated in `tools/gguf_test.py` (`run_safetensors`). GGUF is done too — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md)
+- [x] AVX2 kernel for x86 — `src/hydra_simd.h` (`hydra_avx2_accumulate_agg` step kernel + `hydra_avx2_unpack_v2_plane` LUT), runtime CPU dispatch with a scalar fallback in `src/hydra_engine.c` (a `-mavx2` build still runs on non-AVX2 CPUs; a plain build has no AVX2 instruction); parity-tested in `tests/test_engine.c` (`test_avx2_step_kernel`, `test_avx2_v2_unpack`). **AVX-512 is not implemented.**
+- [x] 4-weights-per-byte packing (2 bits/weight, no wasted byte) — implemented as header version 2 and tested (`docs/FORMAT.md`, "Version 2"; `tests/test_engine.c`, `test_version_two_format`); `tools/safetensors_to_hydra.py` is now the first shipped writer for it — a v1.1 file-level optimisation, distinct from the v2 container
 - [ ] The `.hydra2` sparse-MoE container — the canonical v2 spec is [`docs/FORMAT-V2.md`](docs/FORMAT-V2.md); **no part of it is implemented**, and the aggregated `A[i]/B[i]` container sketched in `docs/ARCHITECTURE.md` is a superseded alternative, see its *Known Structural Redundancy* section
-- [ ] Streaming ring-buffer KV with attention sinks
+- [x] Streaming ring-buffer KV with attention sinks — `hydra_kv_cache_t` + `hydra_kv_cache_init/append/size/get/sink` (`include/hydra_model.h`, `src/hydra_engine.c`): permanent sink slots + a circular window, zero-heap, O(1) per append/lookup; eviction-with-sinks-preserved is tested in `tests/test_engine.c` (`test_kv_cache`)
 
 Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.
 

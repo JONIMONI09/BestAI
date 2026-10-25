@@ -1,5 +1,6 @@
 #include "hydra_model.h"
 #include "hydra_neon.h"
+#include "hydra_simd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,19 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 #endif
+
+/* Runtime AVX2 probe (M3). A -mavx2 build contains AVX2 instructions,
+ * but it must still run on CPUs without AVX2: the caller checks this
+ * once and falls back to the scalar path. In a plain build this is a
+ * constant 0 and the AVX2 code is compiled out entirely. */
+int hydra_simd_has_avx2(void)
+{
+#if defined(__AVX2__)
+    return __builtin_cpu_supports("avx2") != 0;
+#else
+    return 0;
+#endif
+}
 
 /* Explizite Little-Endian-Dekodierung: docs/FORMAT.md definiert das
  * Headerlayout als little-endian, memcpy in native Integer wuerde auf
@@ -185,9 +199,28 @@ static void hydra_build_aggregation(HydraEngine *engine)
         memset(engine->agg_a, 0, sizeof(engine->agg_a));
         memset(engine->agg_b, 0, sizeof(engine->agg_b));
 
+        /* AVX2 load-time unpack (M3): the 2-bit LUT decode of 64 dims
+         * (16 bytes) per iteration, bit-identical to the scalar
+         * accumulation (same integer adds per dimension). Requires
+         * dim % 64 == 0 (the standard dim=64); other dimensions take
+         * the scalar path unchanged. */
+#if defined(__AVX2__)
+        const int use_avx2 = hydra_simd_has_avx2()
+                            && engine->header.dim % 64 == 0;
+#endif
+
         for (uint32_t l = 0; l < engine->header.layers; ++l) {
             const uint8_t* packed_a = w + (l * layer_bytes * 2);
             const uint8_t* packed_b = packed_a + layer_bytes;
+#if defined(__AVX2__)
+            if (use_avx2) {
+                for (size_t d = 0; d < engine->header.dim; d += 64) {
+                    hydra_avx2_unpack_v2_plane(engine->agg_a + d, packed_a + d / 4, 64);
+                    hydra_avx2_unpack_v2_plane(engine->agg_b + d, packed_b + d / 4, 64);
+                }
+                continue;
+            }
+#endif
             hydra_build_aggregation_v1_1(packed_a, packed_b, engine->agg_a, engine->agg_b, engine->header.dim);
         }
         return;
@@ -451,6 +484,28 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
                            + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
         }
     }
+#elif defined(__AVX2__)
+    /* AVX2 step kernel (M3): 8 dims per iteration (a 256-bit lane
+     * holds 8 int32), int32 math is exact under the layer cap (see
+     * src/hydra_simd.h), then widened to int64. Runtime fallback to
+     * the scalar loop when the CPU has no AVX2 (a -mavx2 build must
+     * stay portable). */
+    if (hydra_simd_has_avx2()) {
+        for (size_t i = 0; i + 8 <= dim; i += 8) {
+            hydra_avx2_accumulate_agg(accumulator + i, engine->agg_a + i,
+                                      engine->agg_b + i,
+                                      engine->state_vector + i, token_val);
+        }
+        for (size_t i = dim - (dim % 8); i < dim; ++i) {
+            accumulator[i] = (int64_t)engine->agg_a[i] * token_val
+                           + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
+        }
+    } else {
+        for (size_t i = 0; i < dim; ++i) {
+            accumulator[i] = (int64_t)engine->agg_a[i] * token_val
+                           + (int64_t)engine->agg_b[i] * (int32_t)engine->state_vector[i];
+        }
+    }
 #else
     for (size_t i = 0; i < dim; ++i) {
         accumulator[i] = (int64_t)engine->agg_a[i] * token_val
@@ -517,6 +572,328 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
     if (raw < 0) raw += vocab;
     *token_out = (uint16_t)((raw + (int32_t)token_in + 1) % vocab);
     return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * Sampling (min-p + repetition penalty)
+ *
+ * See include/hydra_model.h for the full contract. Implementation
+ * notes:
+ *   - The candidate logit L(c) = agg_a[0]*c + agg_b[0]*state[0] is the
+ *     acc[0] the engine would compute if c were fed next: the SAME
+ *     integer expression step() evaluates, so the sampler probes the
+ *     engine's own arithmetic instead of inventing a second model.
+ *   - One stack array (HYDRA_MAX_VOCAB doubles = 8 KiB, zero heap)
+ *     carries logits -> penalized logits -> probabilities -> CDF,
+ *     rewritten in place.
+ *   - All intermediate values are bounded: |L(c)| <= 4096*1023 +
+ *     4096*127 < 5e6, so (L - max)/temperature with temperature in
+ *     (0, 20] is > -2.5e5/... and exp() cannot overflow (max maps to
+ *     exp(0) = 1) or underflow the whole distribution (the max
+ *     element always survives).
+ * ------------------------------------------------------------------- */
+/* -------------------------------------------------------------------
+ * M4: Transformer primitives (float, zero-heap, R14-guarded).
+ *
+ * Contract of every function below: all inputs are validated AND all
+ * finiteness is checked BEFORE any output store, so an error return
+ * (-1) always leaves the destination unmodified. No allocation
+ * anywhere — these run on the same zero-heap budget as the engine.
+ * ------------------------------------------------------------------- */
+
+static int hydra_is_finite_float_range(const float *p, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+        if (!isfinite(p[i]))
+            return 0;
+    return 1;
+}
+
+int hydra_rmsnorm(const float *x, const float *w, size_t dim,
+                  float eps, float *out)
+{
+    if (!x || !w || !out || dim < 1 || dim > HYDRA_MAX_LAYERS)
+        return -1;
+    if (!(eps > 0.0f) || !isfinite(eps))
+        return -1;
+    if (!hydra_is_finite_float_range(x, dim))
+        return -1;
+    if (!hydra_is_finite_float_range(w, dim))
+        return -1;
+
+    float ss = 0.0f;
+    for (size_t i = 0; i < dim; ++i)
+        ss += x[i] * x[i];
+    const float inv = 1.0f / sqrtf(ss / (float)dim + eps);
+    for (size_t i = 0; i < dim; ++i)
+        out[i] = x[i] * inv * w[i];
+    return 0;
+}
+
+int hydra_rope_inplace(float *x, size_t dim, uint32_t pos, double theta_base)
+{
+    if (!x || dim < 2 || dim > 8192 || (dim % 2) != 0)
+        return -1;
+    if (!(theta_base > 0.0) || !isfinite(theta_base))
+        return -1;
+    if (!hydra_is_finite_float_range(x, dim))
+        return -1;
+
+    for (size_t i = 0; i < dim / 2; ++i) {
+        const double freq = 1.0 / pow(theta_base, (double)(2 * i) / (double)dim);
+        const double angle = (double)pos * freq;
+        const double c = cos(angle);
+        const double s = sin(angle);
+        const float a = x[2 * i];
+        const float b = x[2 * i + 1];
+        x[2 * i] = (float)(a * c - b * s);
+        x[2 * i + 1] = (float)(a * s + b * c);
+    }
+    return 0;
+}
+
+/* Numerically safe sigmoid: no intermediate overflow on either tail
+ * (x >= 0 uses exp(-x), x < 0 uses exp(x); both arguments stay <= 0). */
+static float hydra_sigmoid(float x)
+{
+    if (x >= 0.0f)
+        return 1.0f / (1.0f + expf(-x));
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
+int hydra_swiglu(const float *g, const float *u, size_t dim, float *out)
+{
+    if (!g || !u || !out || dim < 1 || dim > HYDRA_MAX_LAYERS)
+        return -1;
+    if (!hydra_is_finite_float_range(g, dim))
+        return -1;
+    if (!hydra_is_finite_float_range(u, dim))
+        return -1;
+
+    for (size_t i = 0; i < dim; ++i)
+        out[i] = g[i] * hydra_sigmoid(g[i]) * u[i];
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * M4: Streaming KV cache (sinks + circular window, O(1) memory/time).
+ *
+ * Slot layout for capacity C, sinks S, total appends n:
+ *   - appends t = 0..S-1          -> sink slots 0..S-1 (permanent)
+ *   - appends t >= S              -> window slots
+ *       S + (t - S) mod (C - S)
+ * Resident set (size min(n, C)): the filled sinks in append order,
+ * then the window tokens oldest -> newest, where the oldest resident
+ * window append is max(S, n - (C - S)).
+ * ------------------------------------------------------------------- */
+
+static int hydra_kv_cache_arg_ok(const hydra_kv_cache_t *c)
+{
+    return c && c->k && c->v && c->dim >= 1 && c->dim <= 8192 &&
+           c->capacity >= 1 && c->capacity <= 8192 &&
+           c->num_sinks <= c->capacity && c->count <= c->capacity + (1u << 28);
+}
+
+int hydra_kv_cache_init(hydra_kv_cache_t *c, float *k, float *v,
+                        uint32_t dim, uint32_t capacity, uint32_t num_sinks)
+{
+    if (!c)
+        return -1;
+    c->k = k;
+    c->v = v;
+    c->dim = dim;
+    c->capacity = capacity;
+    c->num_sinks = num_sinks;
+    c->count = 0;
+    return hydra_kv_cache_arg_ok(c) ? 0 : -1;
+}
+
+int hydra_kv_cache_append(hydra_kv_cache_t *c, const float *k, const float *v)
+{
+    if (!hydra_kv_cache_arg_ok(c) || !k || !v)
+        return -1;
+    if (!hydra_is_finite_float_range(k, c->dim))
+        return -1;
+    if (!hydra_is_finite_float_range(v, c->dim))
+        return -1;
+
+    const uint32_t t = c->count;
+    uint32_t slot;
+    if (t < c->num_sinks) {
+        slot = t;                                  /* permanent sink */
+    } else if (c->num_sinks < c->capacity) {
+        slot = c->num_sinks + ((t - c->num_sinks) % (c->capacity - c->num_sinks));
+    } else {
+        return -1;                                 /* degenerate init */
+    }
+    memcpy(c->k + (size_t)slot * c->dim, k, c->dim * sizeof(float));
+    memcpy(c->v + (size_t)slot * c->dim, v, c->dim * sizeof(float));
+    c->count++;
+    return 0;
+}
+
+uint32_t hydra_kv_cache_size(const hydra_kv_cache_t *c)
+{
+    if (!hydra_kv_cache_arg_ok(c))
+        return 0;
+    return c->count < c->capacity ? c->count : c->capacity;
+}
+
+int hydra_kv_cache_get(const hydra_kv_cache_t *c, uint32_t i,
+                       float *k_out, float *v_out)
+{
+    if (!hydra_kv_cache_arg_ok(c) || !k_out || !v_out)
+        return -1;
+    const uint32_t size = hydra_kv_cache_size(c);
+    if (i >= size)
+        return -1;
+
+    uint32_t slot;
+    if (i < c->num_sinks) {
+        slot = i;                                  /* sinks first */
+    } else {
+        const uint32_t window = c->capacity - c->num_sinks;
+        const uint32_t n = c->count;
+        /* Oldest resident window append: S until full, then slides. */
+        const uint32_t oldest = (n > c->capacity) ? (n - window) : c->num_sinks;
+        const uint32_t t = oldest + (i - c->num_sinks);
+        slot = c->num_sinks + ((t - c->num_sinks) % window);
+    }
+    memcpy(k_out, c->k + (size_t)slot * c->dim, c->dim * sizeof(float));
+    memcpy(v_out, c->v + (size_t)slot * c->dim, c->dim * sizeof(float));
+    return 0;
+}
+
+int hydra_kv_cache_sink(const hydra_kv_cache_t *c, uint32_t i,
+                        float *k_out, float *v_out)
+{
+    if (!hydra_kv_cache_arg_ok(c) || !k_out || !v_out)
+        return -1;
+    if (i >= c->num_sinks || i >= c->count)
+        return -1;
+    memcpy(k_out, c->k + (size_t)i * c->dim, c->dim * sizeof(float));
+    memcpy(v_out, c->v + (size_t)i * c->dim, c->dim * sizeof(float));
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * M2: Sampling (greedy guard + repetition penalty + min-p).
+ * ------------------------------------------------------------------- */
+static uint64_t hydra_xorshift64(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
+                       const hydra_sampler_config_t *cfg,
+                       const uint16_t *recent_tokens, size_t recent_len,
+                       uint16_t *token_out)
+{
+    if (!engine || !cfg || !token_out) return -1;
+    if (engine->header.magic != HYDRA_MAGIC) return -2;
+
+    /* Greedy guard: keep the deterministic path bit-identical.
+     * temperature <= 0 or min_p >= 1 means "no sampling": the native
+     * step() runs, which is exactly what the pre-sampling engine did. */
+    if (cfg->temperature <= 0.0f || cfg->min_p >= 1.0f)
+        return hydra_engine_step(engine, token_in, token_out);
+
+    const uint32_t vocab = engine->header.vocab_size;
+    if (vocab < 2) return -3;
+    if (cfg->temperature > 20.0f) return -4;
+    if (cfg->repetition_penalty < 1.0f) return -1; /* no discounting */
+    if (recent_len > 0 && !recent_tokens) return -1;
+
+    const double temp = (double)cfg->temperature;
+    const double A0 = (double)(int32_t)engine->agg_a[0];
+    const double B0 = (double)(int32_t)engine->agg_b[0];
+    const double s0 = (double)(int8_t)engine->state_vector[0];
+
+    double p[HYDRA_MAX_VOCAB];
+    uint32_t c;
+    double m, sum, u, acc;
+
+    /* Pass 1: the probe logits. */
+    for (c = 0; c < vocab; ++c)
+        p[c] = A0 * (double)c + B0 * s0;
+
+    /* Pass 2: repetition penalty over the recent window, most recent
+     * entries last. Positive logits are divided by the penalty,
+     * negative ones multiplied by it (sign-preserving); zero stays
+     * zero, and repeated occurrences compound. */
+    if (cfg->penalty_window > 0 && recent_len > 0) {
+        const size_t w = (size_t)cfg->penalty_window >= recent_len
+                          ? recent_len : (size_t)cfg->penalty_window;
+        const double pen = (double)cfg->repetition_penalty;
+        for (size_t k = 0; k < w; ++k) {
+            const uint16_t t = recent_tokens[recent_len - 1 - k];
+            if (t >= vocab) continue;
+            if (p[t] > 0.0) p[t] /= pen;
+            else if (p[t] < 0.0) p[t] *= pen;
+        }
+    }
+
+    /* Pass 3: numerically stable softmax (max subtracted before exp). */
+    m = p[0];
+    for (c = 1; c < vocab; ++c)
+        if (p[c] > m) m = p[c];
+    sum = 0.0;
+    for (c = 0; c < vocab; ++c) {
+        p[c] = exp((p[c] - m) / temp);
+        sum += p[c];
+    }
+    if (!(sum > 0.0)) return -1; /* cannot happen (exp(0)=1 present) */
+    for (c = 0; c < vocab; ++c)
+        p[c] /= sum;
+
+    /* Pass 4: min-p filter — drop every P(c) < min_p * p_max, then
+     * renormalize. p_max itself always survives (min_p <= 1 here). */
+    m = p[0];
+    for (c = 1; c < vocab; ++c)
+        if (p[c] > m) m = p[c];
+    const double thr = (double)cfg->min_p * m;
+    for (c = 0; c < vocab; ++c)
+        if (p[c] < thr) p[c] = 0.0;
+    sum = 0.0;
+    for (c = 0; c < vocab; ++c)
+        sum += p[c];
+    if (!(sum > 0.0)) {
+        /* Numerically empty (all mass below threshold): fall back to
+         * the unfiltered argmax instead of failing the token. */
+        uint32_t best = 0;
+        for (c = 1; c < vocab; ++c)
+            if (p[c] > p[best]) best = c;
+        return hydra_engine_step(engine, (uint16_t)best, token_out);
+    }
+    for (c = 0; c < vocab; ++c)
+        p[c] /= sum;
+
+    /* Pass 5: seeded xorshift64* CDF walk. The state lives in the
+     * engine, lazily initialized from the config seed (a zero seed
+     * maps to a non-zero constant so the stream is never degenerate). */
+    uint64_t st = engine->rng_state;
+    if (st == 0)
+        st = cfg->rng_seed ? (uint64_t)cfg->rng_seed : 0x9E3779B97F4A7C15ULL;
+    const uint64_t r = hydra_xorshift64(&st);
+    engine->rng_state = st;
+    u = (double)r / 18446744073709551616.0; /* uniform in [0, 1) */
+
+    acc = 0.0;
+    for (c = 0; c < vocab; ++c) {
+        acc += p[c];
+        if (u < acc || c == vocab - 1) break; /* last bin catches the tail */
+    }
+
+    /* Advance the real state with the chosen candidate: the same
+     * state machine as greedy mode, so the seed (token) bookkeeping
+     * and all state dimensions stay consistent with the fast path. */
+    return hydra_engine_step(engine, (uint16_t)c, token_out);
 }
 
 int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)

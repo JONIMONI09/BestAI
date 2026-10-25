@@ -118,9 +118,17 @@ scenario "the transcript is still inside the scrolling column" \
   "the log view is added directly to that scroll container" "$U" \
   's.replace("text = state.log,", "text = \"\",")'
 
-scenario "the conversation keeps a minimum height" \
-  "the log has a guaranteed minimum height" "$U" \
-  's.replace("            .heightIn(min = 120.dp),\n", "")'
+# The old fixed 120dp floor was replaced by the AdaptiveHeaderSplit split:
+# the header is capped at headerFraction of the space, the conversation is
+# measured with the remainder. Both halves get their own scenario - each
+# mutation removes the real wiring, not a comment.
+scenario "the header block is still capped at a fraction of the space" \
+  "the header block is capped at a fraction of the space" "$U" \
+  's.replace("maxHeight.value * headerFraction", "0f")'
+
+scenario "the conversation still gets the space the header does not use" \
+  "the conversation gets the space left over from the header" "$U" \
+  's.replace("Column(modifier = Modifier.weight(1f)) {", "Column() {")'
 
 scenario "the conversation is not nested in a second scroller" \
   "the log is not nested inside a second scroll view" "$U" \

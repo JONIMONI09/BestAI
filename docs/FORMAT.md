@@ -81,11 +81,15 @@ Constraints and bounds (all enforced in `hydra_engine_load`, all tested in
    identical 40-token streams. That parity test is the proof the packing is
    the same model, not just a file the loader likes.
 
-There is no shipped writer for version 2: `tools/make_model.py` and
-`tools/gguf_to_hydra.py` both emit version 1, because the converter's exactness
-guarantee (A/B written as literal layer counts) is expressed in v1's one-byte-
-per-pair layout. Version 2 exists to read files produced elsewhere, and the
-test suite produces its own fixtures for it.
+`tools/make_model.py` and `tools/gguf_to_hydra.py` emit version 1, because
+the converter's exactness guarantee (A/B written as literal layer counts) is
+expressed most directly in v1's one-byte-per-pair layout. **`tools/safetensors_to_hydra.py`
+is the shipped writer for version 2**: it folds the ternary column sums to
+the 64-wide state and writes them as layer sums of ±1 into the two
+`dim/4`-byte planes per layer, so the engine's aggregation reproduces them
+value for value. The test suite also produces its own version-2 fixtures
+(`test_version_two_format` in `tests/test_engine.c`, `run_safetensors` in
+`tools/gguf_test.py`).
 
 ## Reference Writer
 

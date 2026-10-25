@@ -31,6 +31,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import shutil
 import struct
@@ -43,6 +44,7 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
 import gguf_reader  # noqa: E402
 import gguf_to_hydra  # noqa: E402
+import safetensors_to_hydra as st_hydra  # noqa: E402
 
 MAGIC = 0x48594452
 HEADER_SIZE = 24
@@ -235,6 +237,150 @@ def reference_run(a, b, dim, vocab, token_in, steps):
     return tokens, state
 
 
+# ------------------------------------------------ safetensors (M5) fixtures
+
+
+def build_safetensors(path, tensors):
+    """Write a syntactically real safetensors file (8-byte LE header length,
+    JSON header, then the data region). `tensors` is
+    [(name, shape, dtype, values)] with dtype in {F32, F16, BF16}."""
+    head = {}
+    payload = bytearray()
+    for name, shape, dtype, values in tensors:
+        n = 1
+        for d in shape:
+            n *= d
+        assert len(values) == n, 'safetensors fixture size mismatch'
+        start = len(payload)
+        if dtype == 'F32':
+            payload += struct.pack('<%df' % n, *values)
+        elif dtype == 'F16':
+            for v in values:
+                payload += struct.pack('<e', v)
+        elif dtype == 'BF16':
+            for v in values:
+                bits = struct.unpack('<I', struct.pack('<f', v))[0]
+                payload += struct.pack('<H', bits >> 16)
+        else:
+            raise AssertionError('unknown fixture dtype %r' % dtype)
+        end = len(payload)
+        head[name] = {'dtype': dtype, 'shape': shape,
+                      'data_offsets': [start, end]}
+    hdr = json.dumps(head).encode('utf-8')
+    with open(path, 'wb') as fh:
+        fh.write(struct.pack('<Q', len(hdr)))
+        fh.write(hdr)
+        fh.write(bytes(payload))
+    return path
+
+
+def _st_rewrite_header(path, mutate):
+    """Re-serialise a file's JSON header after `mutate(head)` edits it,
+    keeping the data region byte-identical."""
+    raw = open(path, 'rb').read()
+    (hlen,) = struct.unpack_from('<Q', raw, 0)
+    head = json.loads(raw[8:8 + hlen].decode('utf-8'))
+    mutate(head)
+    payload = raw[8 + hlen:]
+    hdr = json.dumps(head).encode('utf-8')
+    with open(path, 'wb') as fh:
+        fh.write(struct.pack('<Q', len(hdr)))
+        fh.write(hdr)
+        fh.write(payload)
+    return path
+
+
+def read_hydra_v2(path):
+    """Independent reader for the version-2 (4 weights/byte) packing.
+
+    It shares no code with the converter's writer, so a transposed bit
+    order, a swapped plane or a wrong plane stride shows up here as a
+    mismatch instead of as a plausible-looking model.
+    """
+    raw = open(path, 'rb').read()
+    magic, version, vocab, dim, layers, offset, length = struct.unpack(
+        '<IHHIIII', raw[:HEADER_SIZE])
+    body = raw[offset:offset + length]
+
+    def value(code):
+        return {0: 0, 1: 1, 2: -1, 3: 0}[code]
+
+    a = [0] * dim
+    b = [0] * dim
+    plane = dim // 4
+    for l in range(layers):
+        for bi in range(plane):
+            pa = body[l * plane * 2 + bi]
+            pb = body[l * plane * 2 + plane + bi]
+            for j in range(4):
+                i = bi * 4 + j
+                a[i] += value((pa >> (2 * j)) & 0x03)
+                b[i] += value((pb >> (2 * j)) & 0x03)
+    return {'magic': magic, 'version': version, 'vocab': vocab, 'dim': dim,
+            'layers': layers, 'weights_len': length, 'A': a, 'B': b,
+            'bytes': len(raw)}
+
+
+def _st_decode(dtype, rawbytes, n):
+    """Decode inline, sharing nothing with the converter's decoders."""
+    if dtype == 'F32':
+        return list(struct.unpack('<%df' % n, rawbytes))
+    if dtype == 'F16':
+        return [t[0] for t in struct.iter_unpack('<e', rawbytes)]
+    if dtype == 'BF16':
+        return [struct.unpack('<f', struct.pack('<I', h << 16))[0]
+                for (h,) in struct.iter_unpack('<H', rawbytes)]
+    raise AssertionError('unknown dtype %r' % dtype)
+
+
+def _st_oracle_plane(raw, base, meta, dim):
+    """Independent quantisation oracle: decode, absmean, element-wise
+    half-away round-clip, column sum, fold to dim. This is the spec's
+    literal rule W_q = clip(round(W/(gamma+1e-8))) written without any of
+    the converter's code - it is the oracle the reported A/B must match.
+    """
+    n = 1
+    for d in meta['shape']:
+        n *= d
+    start, end = meta['data_offsets']
+    vals = _st_decode(meta['dtype'], raw[base + start:base + end], n)
+    gamma = (sum(abs(v) for v in vals) / n) if n else 0.0
+    cols = meta['shape'][1] if len(meta['shape']) > 1 else n
+    csum = [0] * cols
+    if gamma != 0.0:
+        s = gamma + 1e-8
+
+        def rh(x):
+            return math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)
+
+        for i, v in enumerate(vals):
+            q = max(-1, min(1, rh(v / s)))
+            csum[i % cols] += q
+    m = len(csum)
+    if m == dim:
+        folded = list(csum)
+    elif m < dim:
+        folded = list(csum) + [0] * (dim - m)
+    else:
+        folded = [0] * dim
+        for j in range(dim):
+            lo = (m * j) // dim
+            hi = (m * (j + 1)) // dim
+            if hi <= lo:
+                hi = lo + 1
+            folded[j] = sum(csum[lo:hi])
+    return folded
+
+
+def _st_quant_oracle(path, a_name, b_name, dim=64):
+    raw = open(path, 'rb').read()
+    (hlen,) = struct.unpack_from('<Q', raw, 0)
+    head = json.loads(raw[8:8 + hlen].decode('utf-8'))
+    base = 8 + hlen
+    return [_st_oracle_plane(raw, base, head[a_name], dim),
+            _st_oracle_plane(raw, base, head[b_name], dim)]
+
+
 # ------------------------------------------------------------------- cases
 
 
@@ -397,7 +543,213 @@ def run(engine, tmp):
     # the inspector
     ok &= check('the inspector identifies the fixture', _inspect(gguf, 'llama'))
     ok &= check('the inspector refuses a non-GGUF', _inspect_refuses(out))
+
+    # M5: safetensors -> .hydra v2 (4 ternary weights/byte) round trip
+    ok &= run_safetensors(engine, tmp)
     return ok
+
+
+def run_safetensors(engine, tmp):
+    """M5 gate: safetensors -> .hydra v2 (4 ternary weights/byte), proven
+    three ways - an independent byte reader, an independent quantisation
+    oracle, and the real C engine."""
+    ok = True
+
+    a_vals = reference_matrix(6, 16, 211)
+    b_vals = reference_matrix(4, 16, 313)
+    st_in = os.path.join(tmp, 'st_f32.safetensors')
+    build_safetensors(st_in, [
+        ('blk.0.attn_q.weight', [6, 16], 'F32', a_vals),
+        ('blk.0.ffn_q.weight', [4, 16], 'F16', b_vals),
+    ])
+
+    out = os.path.join(tmp, 'st_converted.hydra')
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = st_hydra.main([st_in, '--out', out, '--json'])
+    ok &= check('the converter accepts a real safetensors file', rc == 0)
+    if rc != 0:
+        return ok
+    report = json.loads(buf.getvalue())
+    want = report['aggregation']
+
+    # 1. PACKING: re-derive A/B from the v2 bytes, independently.
+    got = read_hydra_v2(out)
+    ok &= check('v2: the header is version 2 at 4 weights per byte',
+                got['version'] == 2 and got['dim'] == 64
+                and got['weights_len'] == got['layers'] * got['dim'] // 2,
+                str(got))
+    ok &= check('v2: the packed column sums equal the reported A',
+                got['A'] == want['A'],
+                '%s vs %s' % (got['A'][:8], want['A'][:8]))
+    ok &= check('v2: the packed column sums equal the reported B',
+                got['B'] == want['B'],
+                '%s vs %s' % (got['B'][:8], want['B'][:8]))
+    ok &= check('v2: A and B are different vectors (two source tensors)',
+                got['A'] != got['B'])
+    ok &= check('v2: every |A[i]| fits in the layer count',
+                all(abs(v) <= got['layers'] for v in got['A'] + got['B']))
+
+    # 2. QUANTISATION: the reported A/B must equal an independent oracle
+    # (element-wise half-away round-clip, its own decode and fold). This is
+    # the check that catches a wrong gamma, a wrong rounding or a wrong
+    # threshold - invisible to the packing check, which only sees the bytes.
+    oracle = _st_quant_oracle(st_in, 'blk.0.attn_q.weight',
+                              'blk.0.ffn_q.weight')
+    ok &= check('v2: the absmean round-clip matches an independent oracle',
+                [want['A'], want['B']] == oracle,
+                'A %s vs %s' % (want['A'][:8], oracle[0][:8]))
+
+    # 3. ALL THREE DENSE TYPES: F32/F16/BF16 of the same values convert to
+    # the same model. The values are exactly representable in all three, so
+    # any difference is a decoder bug, not rounding.
+    ok &= check('v2: F32/F16/BF16 of the same weights convert identically',
+                _st_all_dense_types(tmp))
+
+    # 4. THE REAL ENGINE
+    if engine:
+        for token, steps in ((0, 16), (7, 32)):
+            proc = subprocess.run([engine, out, str(token), str(steps), '--json'],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                ok &= check('the C engine loads the v2 model (token %d)' % token,
+                            False, proc.stderr[-300:])
+                continue
+            data = json.loads(proc.stdout)
+            ref_tokens, ref_state = reference_run(
+                got['A'], got['B'], got['dim'], got['vocab'], token, steps)
+            ok &= check('the C engine reproduces A*token + B*state on v2 (token %d)'
+                        % token,
+                        data['tokens'] == ref_tokens,
+                        'engine %s vs reference %s'
+                        % (data['tokens'][:8], ref_tokens[:8]))
+            ok &= check('the v2 state vector matches the reference (token %d)' % token,
+                        data['state'] == ref_state)
+    else:
+        print('SKIP: the v2 C engine check needs a built ./hydra-run (--engine)')
+
+    # 5. NEGATIVE CONTROLS
+    ok &= check('a non-safetensors file is refused',
+                _st_fails(out, b'this is not a safetensors file at all'))
+    ok &= check('a truncated safetensors file is refused',
+                _st_truncated(tmp))
+    ok &= check('a header length past the file end is refused',
+                _st_bad_headerlen(tmp))
+    ok &= check('out-of-order data_offsets are refused',
+                _st_oob_offsets(tmp))
+    ok &= check('an unsupported dtype is refused by name',
+                _st_bad_dtype(tmp))
+    ok &= check('a tensor past the end of the file is refused',
+                _st_past_end(tmp))
+
+    # a different source must produce a different model
+    other = os.path.join(tmp, 'st_other.safetensors')
+    build_safetensors(other, [('w', [6, 16], 'F32', reference_matrix(6, 16, 999))])
+    out2 = os.path.join(tmp, 'st_other.hydra')
+    with contextlib.redirect_stdout(io.StringIO()):
+        st_hydra.main([other, '--out', out2])
+    ok &= check('a different source produces a different v2 model',
+                read_hydra_v2(out2)['A'] != got['A'])
+    return ok
+
+
+def _st_all_dense_types(tmp):
+    """F32, F16 and BF16 of identical values must convert to one model.
+
+    Every value below is exactly representable in binary16 (8 mantissa
+    bits) and bfloat16, so the three files hold bit-identical numbers and
+    the resulting .hydra files must be identical too.
+    """
+    vals = [1.0, -1.0, 0.5, -0.5, 2.0, 0.0, -2.0, 0.25,
+            3.0, -3.0, 0.75, -0.75, 4.0, 0.125, -0.125, 1.5,
+            -1.5, 0.375, 2.5, -2.5, 0.625, -0.625, 3.5, -4.0]
+    seen = []
+    for dtype in ('F32', 'F16', 'BF16'):
+        path = os.path.join(tmp, 'st_dtype_%s.st' % dtype)
+        build_safetensors(path, [('w', [4, 6], dtype, vals)])
+        out = os.path.join(tmp, 'st_dtype_%s.hydra' % dtype)
+        with contextlib.redirect_stdout(io.StringIO()):
+            st_hydra.main([path, '--out', out])
+        seen.append(read_hydra_v2(out)['A'])
+    return seen[0] == seen[1] == seen[2] and any(v != 0 for v in seen[0])
+
+
+def _st_fails(out, src):
+    """The converter must exit non-zero with a clean message, no traceback.
+
+    `src` is either raw bytes to write to a junk file or an existing path.
+    """
+    if isinstance(src, bytes):
+        path = os.path.join(os.path.dirname(out), 'junk.st')
+        with open(path, 'wb') as fh:
+            fh.write(src)
+    else:
+        path = src
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = st_hydra.main([path, '--out', out])
+    except st_hydra.SafetensorsError:
+        return True
+    if rc == 0:
+        return False
+    msg = err.getvalue()
+    return 'Traceback' not in msg and len(msg.strip()) > 0
+
+
+def _st_truncated(tmp):
+    path = os.path.join(tmp, 'st_trunc.st')
+    build_safetensors(path, [('w', [4, 4], 'F32', reference_matrix(4, 4, 55))])
+    blob = open(path, 'rb').read()
+    with open(path, 'wb') as fh:
+        fh.write(blob[:len(blob) // 2])
+    return _st_fails(os.path.join(tmp, 'st_trunc.hydra'), path)
+
+
+def _st_bad_headerlen(tmp):
+    path = os.path.join(tmp, 'st_hdrlen.st')
+    build_safetensors(path, [('w', [2, 2], 'F32', [1.0, 2.0, 3.0, 4.0])])
+    blob = open(path, 'rb').read()
+    with open(path, 'wb') as fh:
+        fh.write(struct.pack('<Q', 0xFFFFFFFFFFFFFFFF))
+        fh.write(blob[8:])
+    return _st_fails(os.path.join(tmp, 'st_hdrlen.hydra'), path)
+
+
+def _st_oob_offsets(tmp):
+    path = os.path.join(tmp, 'st_oob.st')
+    build_safetensors(path, [('w', [2, 2], 'F32', [1.0, 2.0, 3.0, 4.0])])
+    _st_rewrite_header(path, lambda head: head['w'].__setitem__(
+        'data_offsets', [10, 5]))   # end < start
+    return _st_fails(os.path.join(tmp, 'st_oob.hydra'), path)
+
+
+def _st_bad_dtype(tmp):
+    path = os.path.join(tmp, 'st_dtype.st')
+    # A valid shape and in-range offsets, but a dtype the converter does not
+    # decode: it must be refused BY NAME, not by a crash on the payload.
+    payload = struct.pack('<4f', 1.0, 2.0, 3.0, 4.0)
+    head = json.dumps({'w': {'dtype': 'Q8_0', 'shape': [2, 2],
+                             'data_offsets': [0, 16]}}).encode('utf-8')
+    with open(path, 'wb') as fh:
+        fh.write(struct.pack('<Q', len(head)))
+        fh.write(head)
+        fh.write(payload)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = st_hydra.main([path, '--out', os.path.join(tmp, 'st_dtype.hydra')])
+    return rc != 0 and 'Q8_0' in err.getvalue() and 'Traceback' not in err.getvalue()
+
+
+def _st_past_end(tmp):
+    path = os.path.join(tmp, 'st_past.st')
+    build_safetensors(path, [('w', [2, 2], 'F32', [1.0, 2.0, 3.0, 4.0])])
+    blob = open(path, 'rb').read()
+    # Cut the payload short: the header still declares the full range, so the
+    # tensor now runs past the end of the file.
+    with open(path, 'wb') as fh:
+        fh.write(blob[:len(blob) - 8])
+    return _st_fails(os.path.join(tmp, 'st_past.hydra'), path)
 
 
 def _bf16_matches():

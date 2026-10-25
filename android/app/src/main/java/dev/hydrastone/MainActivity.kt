@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -139,6 +140,26 @@ class MainActivity : ComponentActivity() {
         CrashHandler.appContext = applicationContext
         CrashHandler.install()
 
+        /* Keyboard and system bars, chosen by API level.
+         *
+         * API 30+: the window draws edge-to-edge. On this API level a
+         * non-resizing window means the soft keyboard is delivered as a
+         * real WindowInset instead of resizing the window, so the
+         * composer's Modifier.imePadding() lifts the input row by
+         * exactly the keyboard's height, whatever it is (split keyboard,
+         * emoji row, swipe-up). The default soft-input mode is kept on
+         * purpose: it is the source of those insets, and the deprecated
+         * ADJUST_NOTHING constant is not what edge-to-edge wants.
+         *
+         * Below 30: the platform delivers no IME insets, so the classic
+         * adjustResize stays on: the window shrinks when the keyboard
+         * opens, and the adaptive ChatTab header (capped, internally
+         * scrollable) scrolls instead of pushing the composer off screen.
+         */
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            enableEdgeToEdge()
+        }
+
         /* Compose owns the layout now.
          *
          * The programmatic-Views version had one ScrollView around a vertical
@@ -146,9 +167,10 @@ class MainActivity : ComponentActivity() {
          * its remaining children out BELOW the bottom edge instead of making
          * them reachable - the token log went with them, so the app ran the
          * engine and showed nothing, which is indistinguishable from "it does
-         * not run". The Scaffold below keeps the property that matters: every
-         * control stays reachable, and the conversation keeps a guaranteed
-         * minimum height so it is readable on a short screen. */
+         * not run". The Scaffold below keeps the property that matters:
+         * every control stays reachable, and the chat's adaptive
+         * header/content split keeps the composer on screen at any
+         * window height (see AdaptiveHeaderSplit in ui/HydraApp.kt). */
         setContent {
             HydraTheme {
                 val state by ui.collectAsState()
