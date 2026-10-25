@@ -134,7 +134,7 @@ tracker, per the established pattern.)
       version 2** (4 weights/byte); round-trip test inside
       tools/gguf_test.py (synthetic fixture, independent re-read of the
       packed bytes, engine run vs reference, negative controls).
-- [ ] **M6 Docs + baseline.** Roadmap checkboxes ONLY for the fully
+- [x] **M6 Docs + baseline.** Roadmap checkboxes ONLY for the fully
       implemented+tested items (min-P, AVX2, safetensors import,
       streaming KV cache) with exact function references; "Full
       transformer forward pass" stays UNCHECKED (primitives + KV cache
@@ -307,6 +307,27 @@ the v1 GGUF converter), so `sum_l w1[l][i] == A[i]` by construction.
 The first shipped WRITER for the v2 format is this tool; the engine's
 v2 reader (and, on AVX2 builds, the AVX2 unpack kernel) has now had its
 first end-to-end file-level exercise.
+
+### M6 results (2026-10-25, logged per R2/R3)
+
+**Done:** README Roadmap now has exact function references on every checked
+box and no fake checkboxes (min-p, AVX2, safetensors, KV-cache are `[x]`;
+"full transformer forward pass" and the `.hydra2` MoE container stay `[ ]` —
+the primitives exist and are tested but no forward pass is wired). The
+NEON/AVX2 honesty note no longer says x86 is purely scalar.
+`docs/ARCHITECTURE.md` gains the Components rows (`src/hydra_simd.h`, the
+two converters, the sampler + primitives), the active-AVX2 SIMD table row
+with the int32-exactness bound, and a new M4 primitives + KV-cache section.
+`docs/GGUF-IMPORT.md` gains §10 (safetensors parsing, both-ends offset
+validation, the F32/F16/BF16 set, the v2 output, the three-way verification).
+`docs/FORMAT.md` no longer claims "no shipped writer for version 2" —
+`tools/safetensors_to_hydra.py` is that writer now. `AGENTS.md`'s stale
+hard-coded "38 checks" is replaced with "N checks, 0 failed (N parsed, never
+assumed)". `tools/test_count_baseline.txt` is unchanged (x86 142 / arm 140):
+M5 added no C tests, so the measured C count is unchanged.
+
+**Measured:** docs_claim_check all banned claims absent; zero CJK in the six
+audited docs; test count 142/0 x86 matches baseline.
 
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 

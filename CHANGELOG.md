@@ -51,6 +51,47 @@ Measured (x86-64 sandbox with AVX2, so the SIMD path is live):
 AVX2 build (end-to-end parity); `jni-batch-test` 86/0,
 `large-model-test` 7/0, `gguf_test.py` 40/0; zero warnings.
 
+## 2026-10-25 — M6: docs + baseline (roadmap checkboxes only for verified work)
+
+- **`README.md`**: the Roadmap now reflects reality, with **exact
+  function references** on every checked box and no fake checkboxes:
+  - `[x]` Min-P sampling & repetition penalty → `hydra_sample_token()`
+    (`include/hydra_model.h`, `src/hydra_engine.c`), CLI
+    `--temp/--min-p/--rep-penalty` (`src/main.c`), tested in
+    `tests/test_engine.c`.
+  - `[x]` safetensors import → `tools/safetensors_to_hydra.py`,
+    round-trip-gated in `tools/gguf_test.py` (`run_safetensors`).
+  - `[x]` AVX2 kernel for x86 → `src/hydra_simd.h`
+    (`hydra_avx2_accumulate_agg`, `hydra_avx2_unpack_v2_plane`), runtime
+    dispatch + scalar fallback, parity-tested; **AVX-512 explicitly not
+    implemented.**
+  - `[x]` Streaming ring-buffer KV with attention sinks →
+    `hydra_kv_cache_t` + init/append/size/get/sink,
+    eviction-with-sinks-preserved tested.
+  - Still `[ ]`: the full transformer forward pass (the M4 primitives exist
+    and are tested but are not yet wired into a forward pass) and the
+    `.hydra2` sparse-MoE container (nothing implemented). The NEON/AVX2
+    honesty note is updated (x86 is no longer "purely scalar").
+- **`docs/ARCHITECTURE.md`**: Components table gains `src/hydra_simd.h`,
+  `tools/gguf_to_hydra.py`, `tools/safetensors_to_hydra.py` and the sampler
+  + primitives in the API/engine rows; the SIMD Strategy table now lists the
+  active AVX2 path (8 dims/256-bit iteration, runtime dispatch, plain-build
+  scalar) with the int32-exactness bound; a new "Transformer Primitives and
+  Streaming KV Cache (M4)" section documents the four guarded building
+  blocks and the int8 bridge.
+- **`docs/GGUF-IMPORT.md`**: the short version names the safetensors
+  command; a new §10 documents the safetensors container parsing/
+  both-ends offset validation, the F32/F16/BF16 decode set, the absmean
+  ternarisation, the version-2 output (first shipped writer for that
+  packing) and the three-way round-trip verification.
+- **`AGENTS.md`**: the stale hard-coded "38 checks" for `gguf_test.py` is
+  replaced with the repo's own convention — "expect `N checks, 0 failed`
+  (N parsed, never assumed)".
+- **`tools/test_count_baseline.txt`**: unchanged at x86 142 / arm 140 —
+  M5 added no C tests (its checks live in `gguf_test.py`, which is an
+  exit-code gate, not a count-gated binary), so the measured C count is
+  unchanged and the baseline already matches.
+
 ## 2026-10-25 — M5: safetensors import -> version-2 .hydra (4 ternary weights/byte)
 
 - **`tools/safetensors_to_hydra.py`** (new, Python standard library only):

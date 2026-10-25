@@ -155,7 +155,7 @@ make test-run                              # RUNS them (test-run, not test)
 bash tools/test_count_check.sh ./hydra-test x86   # parsed count vs reviewed baseline (R21)
 
 # 2. Python pipeline
-python3 tools/gguf_test.py --engine ./hydra-run   # 38 checks incl. 12 negative controls
+python3 tools/gguf_test.py --engine ./hydra-run   # expect "N checks, 0 failed" (N parsed, never assumed)
 python3 tools/gguf_speed.py                        # converter throughput (host-labelled)
 python3 tools/string_format_check.py               # format-string/specifier contract
 bash tools/string_format_negative_test.sh          # the gate must be able to fail (R25)

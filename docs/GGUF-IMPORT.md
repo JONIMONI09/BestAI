@@ -13,15 +13,20 @@ Read this before assuming a converted file is "your model, but ternary".
 # read-only: what is in this file?
 python3 tools/gguf_inspect.py model.gguf
 
-# convert
+# convert a GGUF -> .hydra (version 1, 2 ternary weights per byte)
 python3 tools/gguf_to_hydra.py model.gguf --out models/converted.hydra
+
+# convert a safetensors file -> .hydra (version 2, 4 ternary weights per byte)
+python3 tools/safetensors_to_hydra.py model.safetensors --out models/converted.hydra
 
 # or through the web console
 POST /api/models/import?name=model.gguf
 ```
 
 Python **standard library only** — no numpy, no torch, no pip install. The
-converter streams, so it does not have to hold the whole tensor in memory.
+GGUF converter streams, so it does not have to hold the whole tensor in
+memory. The safetensors path is a second, independent converter (§10) that
+emits the version-2 packing.
 
 ---
 
@@ -286,3 +291,61 @@ round-trip against itself; it would not survive the engine.
 - **`A`/`B` are column sums.** Column sums discard the per-row structure that
   attention depends on. That is inherent to what the format stores, not a
   limitation of the fold implementation.
+
+---
+
+## 10. safetensors import (version-2 `.hydra`)
+
+`tools/safetensors_to_hydra.py` is a second, independent converter for the
+`safetensors` container (the format Hugging Face ships). It shares the
+engine's absmean ternarisation and the same honesty rule as the GGUF path:
+the result is a projection into the recurrent core, not the source network.
+
+```bash
+python3 tools/safetensors_to_hydra.py model.safetensors --out m.hydra
+python3 tools/safetensors_to_hydra.py model.safetensors --out m.hydra --json
+```
+
+### Container parsing and validation
+
+A safetensors file is `[8-byte LE u64 N][N bytes of JSON header][data
+region]`. The JSON maps each tensor name to `{dtype, shape,
+data_offsets:[start, end]}`, where the offsets are **relative to the data
+region** (absolute range `[8+N+start, 8+N+end)`). Every tensor is validated
+at **both** ends before any decode: `start >= 0`, `end > start`,
+`8+N+end <= file_size`, and `end − start == n_elements × bytes_per_element`.
+A header length past the file end, an unparseable header, a 3-D tensor,
+out-of-order offsets, a span that disagrees with the shape, or a range that
+runs past the file end is refused with a message that names the field and
+the bound — never a generic "invalid file".
+
+### Float types
+
+`F32` (struct), `F16` (IEEE binary16) and `BF16` (the top 16 bits of an F32)
+are decoded. Every other dtype (`Q8_0`, `F64`, …) is refused **by name**, not
+guessed. This is a deliberate, smaller supported set than the GGUF reader
+(which also decodes `Q8_0`); safetensors models are expected to export dense
+floats.
+
+### Ternarisation and the version-2 output
+
+Each chosen plane is ternarised with the same b1.58 absmean rule as §3
+(`gamma = mean|W|`, `W_q = clip(round(W/(gamma+1e-8)))`, half-away-from-zero;
+the `+1e-8` keeps an all-zero tensor finite). The ternary column sums are two
+counts per column (the threshold form of the rounding), so the ternary matrix
+is never materialised. The column sums are folded to the 64-wide state and
+written as a **version-2** `.hydra` — 4 ternary weights per byte, two
+`dim/4`-byte planes per layer (`docs/FORMAT.md`, "Version 2"). The writer
+stores the folded sums as layer sums of `±1`, so `sum_l w1[l][i] == A[i]`
+value for value — the first shipped writer for the version-2 packing.
+
+### Verification
+
+`tools/gguf_test.py` gates the path end to end (`run_safetensors`), proven
+three independent ways: an independent byte reader re-derives `A`/`B` from
+the packed bytes; an oracle written from the literal round-clip rule must
+equal the reported `A`/`B`; and the real `./hydra-run` on the version-2 file
+matches a reference step. F32/F16/BF16 of the same weights convert
+identically, and a set of malformed inputs (truncation, header length,
+out-of-order offsets, unsupported dtype, past-the-end range) must each be
+refused.

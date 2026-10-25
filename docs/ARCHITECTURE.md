@@ -19,12 +19,15 @@
 
 | File | Purpose |
 |---|---|
-| `include/hydra_model.h` | Public API, header struct, defines |
-| `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate |
-| `src/main.c` | CLI entry point (`--json` mode for machine-readable output) |
+| `include/hydra_model.h` | Public API, header struct, defines; also the sampler config (`hydra_sampler_config_t`), the transformer primitives (`hydra_rmsnorm`/`hydra_rope_inplace`/`hydra_swiglu`) and the streaming `hydra_kv_cache_t` |
+| `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate, the min-p/repetition-penalty sampler, and the zero-heap transformer primitives + KV cache |
+| `src/main.c` | CLI entry point (`--json` mode, `--temp`/`--min-p`/`--rep-penalty`/`--rep-window`/`--seed`) |
 | `src/hydra_neon.h` | NEON SIMD kernel — **actively integrated**: `step()` uses it on ARM in 16-lane chunks; bit-identical scalar fallback for remainders and x86 (proven by a same-build comparison test) |
+| `src/hydra_simd.h` | AVX2 kernel — **actively integrated** on x86-64 `-mavx2` builds: `hydra_avx2_accumulate_agg` (step) + `hydra_avx2_unpack_v2_plane` (load-time v2 LUT), runtime CPU dispatch with scalar fallback (proven by `test_avx2_step_kernel` / `test_avx2_v2_unpack`) |
 | `tools/make_model.py` | Test model generator (reference implementation of the format) |
-| `tests/test_engine.c` | unit tests (hand-computed cases, NEON-vs-scalar, seeded roundtrips, security regressions). The count is architecture-dependent and drift-gated: see `tools/test_count_baseline.txt` |
+| `tools/gguf_to_hydra.py` | GGUF → `.hydra` (v1) converter, absmean ternarisation |
+| `tools/safetensors_to_hydra.py` | safetensors → `.hydra` (version 2, 4 ternary weights/byte) converter, stdlib only |
+| `tests/test_engine.c` | unit tests (hand-computed cases, NEON-vs-scalar, AVX2-vs-scalar, sampler suite, transformer primitives + KV cache, security regressions). The count is architecture-dependent and drift-gated: see `tools/test_count_baseline.txt` |
 | `server.js` | Web console server (Node, zero npm dependencies) |
 | `public/` | Hydra-Stone Console frontend (plain HTML/CSS/JS) |
 
@@ -73,21 +76,64 @@ y_i = Σ_j w_ij · x_j   →   y_i = Σ_{w=+1} x_j  −  Σ_{w=−1} x_j
 
 No FP32/FP16 multiplication in the inner loop → maximum ALU throughput even without an FPU (runs on FPU-less ARMv7-A).
 
+## Transformer Primitives and Streaming KV Cache (M4)
+
+The recurrent core above is not a transformer. To make a real transformer
+head viable over the same engine, four zero-heap, R14-guarded building
+blocks were added (`include/hydra_model.h` API, `src/hydra_engine.c`
+implementation). Every one validates its arguments **and** checks all input
+finiteness before any output store, so an error return never leaves a
+partially written result — the same safety posture as the loader.
+
+- `hydra_rmsnorm(x, w, dim, eps, out)` — `y = x/√(mean(x²)+ε)·w`, in-place
+  safe, `dim` 1..4096.
+- `hydra_rope_inplace(x, dim, pos, theta_base)` — standard rotary embedding
+  on `(x[2i], x[2i+1])` pairs with `freq_i = θ^(−2i/dim)`.
+- `hydra_swiglu(g, u, dim, out)` — `SiLU(g)·u` with an overflow-safe sigmoid
+  (branch on the sign of `x` so `exp` never overflows on either tail).
+- `hydra_kv_cache_t` + `hydra_kv_cache_init/append/size/get/sink` — a
+  streaming attention cache: `num_sinks` **permanent sink slots**
+  (streaming-LLM attention sinks, never evicted) plus a circular window
+  over `capacity − num_sinks` slots that overwrites its oldest entry.
+  Caller-provided storage (zero heap), O(1) memory, O(1) per append and
+  lookup.
+
+These are float building blocks; they are not yet wired into a forward pass
+over the ternary core (that is the remaining roadmap item). The **bridge to
+the engine's int8 state world** is itself tested: the SwiGLU output is
+quantised through the engine's own `±127` clamp and shown to be in-range and
+idempotent, so a feed-forward block's output can feed the recurrent state
+without the engine rejecting or wrapping it. The KV cache's eviction is
+tested to preserve sinks while sliding the window (see `test_kv_cache`).
+
 ## SIMD Strategy (Honest Assessment)
 
 | Platform | Path in `hydra_engine_step()` | Status |
 |---|---|---|
 | ARM64/ARMv7-A with NEON | `hydra_neon_accumulate_chunk()` — 16 lanes per chunk | **active**, proven bit-identical to the scalar reference by `test_neon_matches_scalar` in the same build |
 | ARM, `dim % 16 != 0` | NEON for multiples of 16, scalar for the remainder | active |
-| x86 / x86-64 | purely **scalar** | no SIMD — AVX2 on the roadmap |
+| x86-64, `-mavx2` build, CPU has AVX2 | `hydra_avx2_accumulate_agg()` — 8 dims per 256-bit iteration (a `__m256i` holds 8 int32), int32 math exact under the layer cap | **active**, proven bit-identical by `test_avx2_step_kernel` in the same build |
+| x86-64, `-mavx2` build, CPU lacks AVX2 | runtime `hydra_simd_has_avx2()` check → scalar fallback | active (portable by design) |
+| x86, plain (non-`-mavx2`) build | purely **scalar** | no AVX2 instruction in the binary at all |
 
-Both paths are **bit-identical**, and that claim is now *tested* rather than asserted: on ARM the suite runs a scalar reference implementation of `step()` over the same model in the same binary and compares token sequences **and** state vectors. Confirmed empirically on three targets — host x86-64 (scalar), ARM64/NEON under qemu, and the x86_64 Android emulator — which all emit `[471, 386, 385, 386, 385, 386, 385, 386]` for `models/starter.hydra` with `start_token=42` and 8 steps.
+All three paths are **bit-identical**, and that claim is *tested* rather than
+asserted: on ARM the suite runs a scalar reference implementation of `step()`
+in the same binary and compares token sequences and state vectors, and on
+x86-64 the AVX2 kernel is compared element-for-element against the scalar
+reference over LCG-random matrices and the layer-cap extremes. Confirmed
+empirically on three targets — host x86-64 (AVX2 where present), ARM64/NEON
+under qemu, and the x86_64 Android emulator — which all emit
+`[471, 386, 385, 386, 385, 386, 385, 386]` for `models/starter.hydra` with
+`start_token=42` and 8 steps. The baseline is re-verified on the AVX2 build
+specifically, so the SIMD path is the one that is proven end to end.
 
 Note that the sequence is *not* a constant cycle. `B[0] != 0` in the shipped starter model, so the recurrent state genuinely contributes to `acc[0]` and the output varies. An earlier starter model had `B[0] == 0`, which made it state-blind: it looped `471, 42, 471, 42` forever and `--prompt` could have no observable effect. `tools/make_model.py` now guarantees `A[0] != 0` and `B[0] != 0` by construction and asserts it.
 
 NEON overflow analysis: `|w| ≤ 1`, `|token| ≤ 1023`, `|state| ≤ 127` → per-lane product ≤ 1150, safely within int16; accumulation happens in an `int64_t` array, which cannot overflow for any layer count the loader accepts.
 
-**Performance implication:** on x86, the ternary arithmetic is currently *not* SIMD-accelerated — the speed advantage there comes exclusively from the compact storage format (less memory bandwidth, more cache hits) and the absence of FP multiplication. Genuine SIMD acceleration on x86 requires the AVX2 kernel (roadmap).
+AVX2 overflow analysis: the step kernel accumulates in **int32** lanes, and that is provably exact, not a matter of luck. The loader caps `|A[i]|,|B[i]| ≤ layers ≤ 4096`, and `|token| ≤ 1023`, `|state| ≤ 127`, so the worst-case lane is `|4096·1023 + 4096·(−127)| = 4,710,400 < INT32_MAX` — no wraparound is possible, and the `cvtepi32_epi64` widening to the `int64_t` accumulator is a pure re-interpretation. The parity test is the proof, the bound is the reason it can pass.
+
+**Performance implication:** on x86-64 with AVX2, the step is now SIMD-accelerated (8 dims per iteration for the 64-dim standard model) *and* the storage is compact (less memory bandwidth, more cache hits) and FP-multiplication-free. The v2 plane unpack is also SIMD-decoded at load time (`hydra_avx2_unpack_v2_plane`); the 4-weights/byte scatter to stride-4 dimensions stays a small scalar loop there — a 4×16 byte transpose is not cleanly expressible with plain AVX2 shuffles, and it runs once at load, not per token. AVX-512 is not implemented.
 
 ## Known Structural Redundancy: the Layer Loop Is Algebraically Free
 
