@@ -455,8 +455,15 @@ jobs:
                     "full list in the step summary".format(total - shown))
           PY
           else
-            { echo "::error::gradle died before the lint analysis; last 40 lines:";
-              tail -40 "$RUNNER_TEMP/gradle-lint.log" | sed 's/^/      /'; }
+            # Same one-annotation pattern as the APK build job:
+            # compiler error lines plus a short tail of the gradle
+            # log, readable through the check-run annotations API.
+            { grep -E "^e: |error:|> Task .* FAILED|BUILD FAILED" \
+                "$RUNNER_TEMP/gradle-lint.log" | head -30 | sed 's/^/  /';
+              echo "  --- tail ---";
+              tail -10 "$RUNNER_TEMP/gradle-lint.log" | sed 's/^/  /'; } \
+              | tr '\n' ' ' \
+              | sed 's/^/::error::gradle died before the lint analysis: /'
           fi
           PR="${PR_NUMBER:-}"
           if [ -z "$PR" ]; then

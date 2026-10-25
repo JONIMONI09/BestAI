@@ -497,6 +497,19 @@ jobs:
           set -e
           echo "--- last 30 lines of the gradle output ---"
           tail -30 "$RUNNER_TEMP/gradle-build.log"
+          if [ "$rc" -ne 0 ]; then
+            # API-readable copy of the failure (job logs live on hosts
+            # that API-only clients cannot reach, and the follow-up
+            # publish step is not reliable enough to carry the
+            # diagnosis): one annotation with the compiler error lines
+            # plus a short tail of the gradle log.
+            { grep -E "^e: |error:|> Task .* FAILED|BUILD FAILED" \
+                "$RUNNER_TEMP/gradle-build.log" | head -30 | sed 's/^/  /';
+              echo "  --- tail ---";
+              tail -10 "$RUNNER_TEMP/gradle-build.log" | sed 's/^/  /'; } \
+              | tr '\n' ' ' \
+              | sed 's/^/::error::gradle build failed: /'
+          fi
           [ "$rc" -eq 0 ]
 
       - name: Publish build log if the build failed
