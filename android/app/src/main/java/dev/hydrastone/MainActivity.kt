@@ -14,6 +14,7 @@ import androidx.compose.runtime.getValue
 import dev.hydrastone.ui.HydraApp
 import dev.hydrastone.ui.MainActions
 import dev.hydrastone.ui.MainUiState
+import dev.hydrastone.ui.RunStats
 import dev.hydrastone.ui.Tab
 import dev.hydrastone.ui.theme.HydraTheme
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -319,9 +320,48 @@ class MainActivity : ComponentActivity() {
         return true
     }
 
-    /** Loads the model into the currently selected engine. */
+    /**
+     * Loads the model into the currently selected engine and publishes the
+     * load result's facts (quantisation, RAM footprint) to the chat header.
+     */
     private fun loadIntoSelectedEngine(path: String) {
-        selectedEngine.load(path)
+        val result = selectedEngine.load(path)
+        _ui.update { it.copy(modelDetail = detailFor(selectedEngine, path, result)) }
+        if (!result.ok) {
+            // A failed load must be visible on the log surface: otherwise
+            // the Send button silently refuses to work with no message.
+            log(getString(R.string.log_error, result.error ?: "load failed"))
+        }
+    }
+
+    /**
+     * The model facts the chat header shows, already human-readable.
+     *
+     * The raw numbers live in the engine's load result (llama.cpp reports
+     * its OWN state size, not a formula we invented), and the formatting
+     * belongs here - the only place that has both the file on disk and the
+     * engine's metadata - so the Compose layer renders text and does no
+     * byte arithmetic.
+     */
+    private fun detailFor(engine: EngineInterface, path: String, result: EngineLoadResult): Map<String, String> {
+        if (!result.ok) return emptyMap()
+        return when (engine.id) {
+            "llama" -> linkedMapOf(
+                "quant" to (result.detail["quant"] ?: "unknown"),
+                "weights" to formatBytes(result.detail["size_bytes"]?.toLongOrNull() ?: 0L),
+                "state" to formatBytes(result.detail["state_bytes"]?.toLongOrNull() ?: 0L)
+            )
+            else -> {
+                // v1 .hydra: the file size IS the weight footprint - the
+                // engine mmaps the file and never copies it, so on-disk and
+                // mapped are the same number.
+                linkedMapOf(
+                    "format" to (result.detail["format"] ?: ".hydra"),
+                    "weights" to formatBytes(File(path).length()),
+                    "vocab" to (result.detail["vocab"] ?: "?")
+                )
+            }
+        }
     }
 
     /** Sends whatever is in the composer. The engine, not the UI, is paged. */
@@ -377,6 +417,7 @@ class MainActivity : ComponentActivity() {
 
         val t0 = SystemClock.elapsedRealtime()
         Thread {
+            var liveTokens = 0
             selectedEngine.generate(
                 prompt,
                 MAX_STEPS,
@@ -392,10 +433,28 @@ class MainActivity : ComponentActivity() {
                         // model rather than a composable that is going away.
                         chat.onToken(tokenId, text)
                         syncChat()
+                        // Live tok/s: the rate so far, updated per token.
+                        // The row above the composer shows it while the run
+                        // is in flight and the totals when it ends.
+                        liveTokens += 1
+                        val elapsed = SystemClock.elapsedRealtime() - t0
+                        _ui.update {
+                            it.copy(lastRun = RunStats(liveTokens, elapsed, false, live = true))
+                        }
                     }
 
                     override fun onComplete(summary: GenerationSummary) {
                         val wall = SystemClock.elapsedRealtime() - t0
+                        _ui.update {
+                            it.copy(
+                                lastRun = RunStats(
+                                    summary.generatedTokens,
+                                    wall,
+                                    summary.cancelled,
+                                    live = false
+                                )
+                            )
+                        }
                         if (summary.cancelled) {
                             // A cancelled run is reported as cancelled, never
                             // as a failure: the user asked for it, and the
@@ -847,6 +906,16 @@ class MainActivity : ComponentActivity() {
                         loadIntoSelectedEngine(target.absolutePath)
                         log(getString(R.string.log_import_restored, target.name))
                     } else {
+                        // Nothing usable on disk: the screen has to say so,
+                        // not just the log - and the previous model's facts
+                        // must go with the model.
+                        _ui.update {
+                            it.copy(
+                                hasModel = false,
+                                modelLabel = getString(R.string.err_no_model),
+                                modelDetail = emptyMap()
+                            )
+                        }
                         log(getString(R.string.log_import_restore_failed, target.name))
                     }
                     return@Thread
@@ -859,7 +928,8 @@ class MainActivity : ComponentActivity() {
                     it.copy(
                         hasModel = true,
                         selectedEngineId = llamaEngine.id,
-                        modelLabel = describeGguf(result.detail)
+                        modelLabel = describeGguf(result.detail),
+                        modelDetail = detailFor(llamaEngine, target.absolutePath, result)
                     )
                 }
                 chat.clear()
@@ -897,12 +967,25 @@ class MainActivity : ComponentActivity() {
         if (engine !== hydraEngine) hydraEngine.unload()
 
         val file = modelFile
-        val result = if (file == null) {
-            EngineLoadResult(false, getString(R.string.err_no_model))
-        } else {
-            engine.load(file.absolutePath)
+        if (file == null) {
+            // No model on disk yet. Say so instead of leaving a chat screen
+            // whose Send button silently refuses to work, and keep the
+            // compiler honest: from here on, `file` is non-null, so the
+            // success branch below may use `file.absolutePath` directly.
+            selectedEngine = engine
+            _ui.update {
+                it.copy(
+                    hasModel = false,
+                    selectedEngineId = engine.id,
+                    modelLabel = getString(R.string.err_no_model),
+                    modelDetail = emptyMap()
+                )
+            }
+            log(getString(R.string.log_engine_selected, engine.displayName))
+            return
         }
 
+        val result = engine.load(file.absolutePath)
         selectedEngine = engine
         if (result.ok) {
             _ui.update {
@@ -912,20 +995,24 @@ class MainActivity : ComponentActivity() {
                     modelLabel = if (engine === llamaEngine) {
                         describeGguf(result.detail)
                     } else {
-                        file?.name ?: ""
-                    }
+                        file.name
+                    },
+                    modelDetail = detailFor(engine, file.absolutePath, result)
                 )
             }
             chat.clear()
             syncChat()
         } else {
             // Say what happened instead of leaving a chat screen whose Send
-            // button silently refuses to work.
+            // button silently refuses to work. The previous engine's model
+            // facts must not linger either: a footprint row for an engine
+            // that no longer has a model would be a lie on screen.
             _ui.update {
                 it.copy(
                     hasModel = false,
                     selectedEngineId = engine.id,
-                    modelLabel = result.error ?: getString(R.string.err_engine_model_mismatch)
+                    modelLabel = result.error ?: getString(R.string.err_engine_model_mismatch),
+                    modelDetail = emptyMap()
                 )
             }
         }

@@ -85,6 +85,166 @@
 
 ## Current task
 
+**2026-10-25 — Full-repository audit, Claude-skills adherence, 6-milestone
+deepening run (adversarial verification, zero deletions).** User instruction:
+analyse and document everything, follow every `.claude/skills/*` rule, find
+bugs or "lies" (unverifiable claims), never delete what works, and make the
+whole verification matrix pass. Artefacts in English (R31); conversation may
+stay German. Milestones M1–M6, verification V.
+
+### Plan (2026-10-25)
+
+- [x] **M0. Baseline (before any change).** All gates run and recorded:
+      `make all && make test` builds clean; `./hydra-test` 71/0 (x86);
+      `./jni-batch-test` 86/0; `./large-model-test` 7/0;
+      `python3 tools/gguf_test.py --engine ./hydra-run` 38/0;
+      `node --test tools/server_test.js` 37/0; console-train, contrast,
+      string-format, all bash guard scripts green. Environment repairs:
+      pyyaml installed (PEP 668 -> `--break-system-packages` in sandbox),
+      llama.cpp submodule initialised at the pinned v0.5.0 commit
+      (`llama_pin_check` 5/0, negative test 7 proved,
+      `ci_release_version_test` green). `jni_signature_check` SKIPs without
+      javac; ARM/NEON parity gate **blocked, not measured** (no aarch64
+      cross toolchain or qemu in this container) — stated, never hidden (R32).
+- [x] **M1.** File inventory + live audit of GitHub Issues #46/#44 +
+      git-ignored agent brain (`.agent_memory/`, `RESEARCH.md`).
+      DONE: full inventory in `RESEARCH.md` §1 (timestamped); #46 audited
+      (scorecard claims unverified -> F-6; "~1.06 KiB" disproven by
+      measurement -> F-15); #44 audited (random-LUT proposal rejected per
+      R5/R6 -> F-5, nothing implemented); `.gitignore` now excludes
+      `.agent_memory/` and `RESEARCH.md` (verified via `git status`).
+- [x] **M2.** Canonical root `AGENTS.md` + Notion "AI Notizen" documentation
+      (local mirror `.agent_memory/NOTION_AI_NOTES.md`).
+      DONE: `AGENTS.md` committed (architecture map, skill bindings, exact
+      verification commands, doc-location table). Notion page created
+      ("📝 AI Notizen — Hydra-Stone (BestAI) Technical Documentation",
+      under the "AI-TRAINING" parent — top-level page creation is not
+      possible via the API); content filled at M6 close; local mirror
+      `.agent_memory/NOTION_AI_NOTES.md` written the same day (git-ignored).
+- [x] **M3.** Mathematical audit of the GGUF -> .hydra conversion
+      (absmean gamma, ternary projection, packing, shapes, vocab metadata);
+      fix only what is actually wrong; proof in `RESEARCH.md` and
+      `docs/GGUF-IMPORT.md`.
+      DONE: threshold `mean*0.5` proven the reference rule (RESEARCH.md §4,
+      literature: b1.58 absmean, CAT-Q, TernaryLM); converter fixed (F-3:
+      `pick_vocab` dropped the vocab count in the report — fixed + 2
+      regression checks); the v2 (header version 2) loader path existed
+      undocumented/untested (F-1) — now implemented guards (`dim % 4` -> -8,
+      version-aware `weights_len` bounds) + 10 new checks in
+      `test_version_two_format` (falsifiability proved: corrupting one packed
+      bit fails exactly 4 checks); trainer pair search implemented (F-4)
+      with A/B evidence (RESEARCH.md §5: official corpus 18.2% -> 9.1%,
+      alt3 27.3% -> 36.4% proving the lockup break). `gguf_test.py` 40/0.
+- [x] **M4.** C engine / JNI / dual-engine hardening audit (leaks, file
+      descriptors, overflow, JNI local refs, thread safety, gpu_bench
+      consistency).
+      DONE: NO code changes needed — `hydra_jni.c` clean (fd discipline,
+      local-ref management, `DeleteLocalRef` in loops); `llama_jni.cpp`
+      clean (`token_to_piece(…, true)` special-flag matches pinned v0.5.0
+      examples, verified against the submodule source); `gpu_bench` is
+      exemplary (NOT MEASURED separation, checksum gate); overflow PoC
+      already covered by `test_large_model.c` (7/0). All findings recorded
+      in RESEARCH.md; nothing "fixed" that was not broken (no deletions,
+      no churn).
+- [x] **M5.** Android UI/UX: active-engine status, tok/s telemetry, RAM
+      display, atomic-switch ergonomics; `android_autostart_check`,
+      `android_crash_check` and `contrast_check` must stay green.
+      DONE: bug found and fixed — `HydraEngine.kt` lost the cancel state
+      (second summary built from a phantom `"tokens"` key; cancelled runs
+      reported as errors) -> single completion summary from the native
+      JSON (key `"emitted"`), cancelled => no error (F-14). UI now always
+      shows the active engine (`.hydra` vs `.gguf`), live tok/s + latency +
+      RAM footprint (`EngineStatusRow`/`RunTelemetryRow` in `HydraApp.kt`,
+      `RunStats` updated per token in `MainActivity.onToken`), model detail
+      lines (llama: quant/weights/state as reported by llama.cpp itself;
+      hydra: format/weights/vocab), failed loads logged, stale detail
+      cleared on import-restore failure. Gates: autostart 31/0,
+      autostart-negative 14 proved, crash 25, header 22, contrast 17 pairs
+      — all green. Kotlin NOT compiled in this sandbox (no NDK egress):
+      stated as blocked, never claimed verified (R32).
+- [x] **M6.** Docs + `CHANGELOG.md` + session sync (English, R31); README
+      audited against `docs_claim_check.sh`.
+      DONE: README density table + "honest framing" paragraph + v1
+      footprint line + roadmap item corrected (F-16: the "2 bits/weight"
+      claim was wrong — v1 is 4 bits of file per weight, v2 2 bits;
+      corrected in README.md, docs/FORMAT.md, docs/GGUF-IMPORT.md,
+      docs/ARCHITECTURE.md, server.js comment); "~1.06 KiB" memory claim
+      replaced with the measured 656 B context / 576 B step data (F-15);
+      `CHANGELOG.md` created; this file closed out below; `errors.md`
+      appended (env gaps + the F-14 class + the F-16 class); RESEARCH.md
+      gained F-14/F-15/F-16; `docs_claim_check.sh` green.
+- [x] **V.** Full verification matrix re-run until 100% green; git hygiene:
+      `RESEARCH.md` and `.agent_memory/` ignored, tracked changes clean.
+      DONE (see "Final verification (V)" table at the end of this section).
+      PR opened from `arena/4a16d961-bestai`; NOT merged — merge is the
+      user's explicit decision (R17).
+
+### Final verification (V), 2026-10-25, x86-64 sandbox, post-M6
+
+| Gate | Result | Note |
+|---|---|---|
+| `make clean && make && make test` | PASS | build clean |
+| `./hydra-test` | **81 / 0** | baseline updated 71 -> 81 (+10 v2 checks), x86 |
+| `tools/test_count_check.sh` | PASS | "81 matches baseline" (R21: parsed, not hardcoded) |
+| `./jni-batch-test` | 86 / 0 | |
+| `./large-model-test` | 7 / 0 | overflow PoC |
+| `python3 tools/gguf_test.py --engine ./hydra-run` | **40 / 0** | (+2 vocab-report checks) |
+| `python3 tools/gguf_speed.py` | PASS | benchmark runs, report printed |
+| `node --test tools/server_test.js` | 37 / 0 | |
+| `node tools/console_train_test.js` | PASS | 0.0% -> 9.1%, 80 moves |
+| `node tools/contrast_check.js` | 17 pairs, WCAG AA | |
+| `python3 tools/string_format_check.py` | ok (37 entries) | |
+| `tools/jni_signature_check.sh` | SKIP | no `javac` in sandbox (stated, R32) |
+| `tools/android_header_check.sh` | 22 / 0 | |
+| `tools/android_autostart_check.sh` | 31 / 0 | |
+| `tools/android_autostart_negative_test.sh` | 14 proved | |
+| `tools/android_crash_check.sh` | 25 / 0 | |
+| `tools/llama_pin_check.sh` | 5 / 0 | |
+| `tools/llama_pin_negative_test.sh` | 7 proved | |
+| `tools/docs_claim_check.sh` | ok | after F-15/F-16 corrections |
+| `npm run lint` | clean | |
+| ARM/NEON parity, APK build, device run | **blocked, not measured** | no aarch64 cross toolchain / qemu / NDK egress in this container; CI legs re-measure (arm baseline 87 derived, CI re-measures) |
+
+Git hygiene: `git status` shows only tracked changes; `RESEARCH.md` and
+`.agent_memory/` are ignored (proven by `git check-ignore`).
+
+### Commits of this run (branch `arena/4a16d961-bestai`, base 46f2531)
+
+- `1eaef54` — M1: `.gitignore` += `.agent_memory/`, `RESEARCH.md`; `RESEARCH.md` created (git-ignored): inventory, baseline, findings F-1..F-13, ternary research, issue audit.
+- `202fef6` — M3: v2 guard + version-aware bounds in `src/hydra_engine.c`; +10 checks `test_version_two_format`; `gguf_to_hydra.py` pick_vocab fix + 2 regression checks; `hydra_train.js` pair search; FORMAT.md "Version 2" + disambiguation + threshold proof.
+- `c477a52` — M5: `HydraEngine.kt` cancel-state fix; `HydraApp.kt`/`MainActivity.kt` engine status, live telemetry, model detail; `strings.xml` +4.
+- (M6 commit) — README/FORMAT/GGUF-IMPORT/ARCHITECTURE/server.js density corrections (F-15/F-16), `CHANGELOG.md`, session close-out, `errors.md` append, RESEARCH.md F-14..F-16.
+
+### CI fix round (2026-10-25, after the PR opened)
+
+- [x] CI failed on `compileDebugKotlin`: `MainActivity.kt:987:57` — the
+      M5 `selectEngine()` edit called `file.absolutePath` on a nullable
+      `File?` (the compiler cannot infer `result.ok ⇒ file != null`).
+      Fixed with an early return for the no-model case (same UI state +
+      log line as before); the rest of the function now runs on a
+      smart-cast non-null `file`. Not compilable in the sandbox (no
+      kotlinc) — verified by reading; CI is the compile proof.
+- [x] User-reported 666 permissions: 5 of 12 gate scripts were committed
+      100644 despite `#!/usr/bin/env bash` (on a umask-000 checkout they
+      show up as `-rw-rw-rw-` and cannot run directly). All five are now
+      100755 in git; every shipped shebang script has the exec bit.
+- [x] CI `dist/` upload error was the downstream of the Kotlin failure
+      (the APK-inspection step creates `dist/`); no workflow change.
+- [x] Committed and pushed; PR #47 updated.
+
+### Session close (2026-10-25)
+
+Everything the spec asked for is either done and verified or explicitly
+marked blocked-with-reason (R32). No working code was deleted; no claim was
+left unmeasured where a measurement was possible. Open items handed to the
+user: (1) merge decision on the PR (R17); (2) `hydra_stone_model_engine.zip`
+tracked but unreferenced — keep or remove (F-12); (3) issue #44 decision
+(close as won't-fix per F-5, or scope a real task); (4) Notion page location
+(created under "AI-TRAINING" because the API cannot create top-level pages —
+user may move it).
+
+### Superseded current task (2026-10-03, all steps done above it)
+
 **Adversarial doc-audit (2 external prompts) + v2 planning for a Snapdragon 8
 Elite / Android 15 tablet.** Two prompts overlap: they assert 12 doc defects,
 some code gaps (Q8_0, import 429 guard), and a 6-phase v2 sparse-expert plan.

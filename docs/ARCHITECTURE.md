@@ -59,7 +59,7 @@ buffers, not the file. So:
 
 ## Ternary Math
 
-Weights: `W ∈ {-1, 0, +1}`, 2 bits per weight, two weights per byte (`w1` in bits 0–1, `w2` in bits 2–3; upper 4 bits reserved). One byte covers one `(layer, dim)` pair, so `weights_len = layers × dim` bytes.
+Weights: `W ∈ {-1, 0, +1}`, two weights per byte (v1: `w1` in bits 0–1, `w2` in bits 2–3; upper 4 bits reserved → 4 bits per weight; header version 2 packs 4 weights per byte → 2 bits per weight). One byte covers one `(layer, dim)` pair, so `weights_len = layers × dim` bytes (v1).
 
 ```
 00 = 0    01 = +1    10 = -1    11 = reserved (treated as 0)

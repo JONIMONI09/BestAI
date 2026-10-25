@@ -131,6 +131,15 @@ static long hydra_resident_kb(void)
  * hydra_build_aggregation_v1_1
  * 2026 Integer-Only Load-Time Aggregation (v1.1 Format: 4 weights/byte)
  * Decodes packed ternary weights and pre-sums them into 32-bit aggregation arrays.
+ *
+ * Layout of one layer's payload (see docs/FORMAT.md, "version 2"):
+ *     [ dim/4 bytes: plane w1, 4 weights per byte, w_j at bits 2j..2j+1 ]
+ *     [ dim/4 bytes: plane w2, same packing ]
+ * Code 00 = 0, 01 = +1, 10 = -1, 11 = 0 (same code table as v1).
+ *
+ * Precondition, enforced by hydra_engine_load(): dim % 4 == 0. Without it,
+ * hidden_size / 4 below would drop the last hidden_size % 4 dimensions from
+ * the aggregation. The caller therefore never sees a truncated sum.
  */
 static void hydra_build_aggregation_v1_1(
     const uint8_t* packed_weights_a,
@@ -286,6 +295,17 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
                 engine->header.dim, engine->header.vocab_size);
         rc = -8; goto fail;
     }
+    /* Version 2 packs 4 ternary weights per byte (two planes of dim/4 bytes
+     * per layer), so dim must be a multiple of 4. The check above accepts
+     * 1..64; without this guard a v2 model with dim % 4 != 0 would be
+     * truncated by `dim / 4` in hydra_build_aggregation() and the leftover
+     * dimensions would silently carry an aggregation of zero instead of their
+     * real weights. Refused, not rounded (rules.md R11, R14). */
+    if (engine->header.version == 2 && engine->header.dim % 4 != 0) {
+        fprintf(stderr, "[Hydra] Version 2 needs dim %% 4 == 0, got dim=%u\n",
+                engine->header.dim);
+        rc = -8; goto fail;
+    }
     /* Sicherheits-Check 1: Layer-Cap. Ohne diese Grenze signed-overflowt
      * der Akkumulator in step() (PoC: layers=16909321, dim=1, alle
      * Gewichte +1, Token 127 -> 2^31 Ueberschreitung bei ~16,9 MB Datei).
@@ -311,13 +331,27 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
         }
     }
 
-    /* Sicherheits-Check 4: step() liest layers*dim Bytes — dieser Bereich muss
-     * durch weights_len abgedeckt sein, sonst OOB-Read hinter dem mmap
-     * (PoC-bestaetigt: crafted Header konnte bis 4 GiB hinter Dateiende lesen). */
+    /* Sicherheits-Check 4: die Aggregation liest exakt so viele Bytes wie das
+     * Format verlangt — dieser Bereich muss durch weights_len abgedeckt sein,
+     * sonst OOB-Read hinter dem mmap (PoC-bestaetigt: crafted Header konnte
+     * bis 4 GiB hinter Dateiende lesen).
+     * v1 (2 weights/byte)   : layers * dim      Bytes
+     * v2 (4 weights/byte)   : layers * dim / 2  Bytes
+     * The check validates the ACTUAL read size per version: applying the v1
+     * size to a v2 file would reject a minimal-but-valid v2 model (one that
+     * declares exactly the bytes it uses), while a v1 file keeps its exact
+     * former behaviour. */
     {
-        uint64_t needed_pairs = (uint64_t)engine->header.layers * engine->header.dim;
+        uint64_t needed_pairs;
+        if (engine->header.version == 2) {
+            /* dim % 4 == 0 is guaranteed by the guard above, so dim / 2 is
+             * exact: two planes of dim/4 bytes each, per layer. */
+            needed_pairs = (uint64_t)engine->header.layers * (engine->header.dim / 2);
+        } else {
+            needed_pairs = (uint64_t)engine->header.layers * engine->header.dim;
+        }
         if (needed_pairs > (uint64_t)engine->header.weights_len) {
-            fprintf(stderr, "[Hydra] layers*dim (%llu) > weights_len (%u) — Format inkonsistent\n",
+            fprintf(stderr, "[Hydra] required weights (%llu) > weights_len (%u) — Format inkonsistent\n",
                     (unsigned long long)needed_pairs, engine->header.weights_len);
             rc = -10; goto fail;
         }

@@ -321,6 +321,23 @@ def run(engine, tmp):
     ok &= check('the U+2581 space mark is stripped',
                 'world' in json.load(open(vocab_out)))
 
+    # --vocab override: the report must state how much of the REQUESTED count
+    # did not fit the 1024 cap, not the whole request (regression check for
+    # the old code, which reported droppedAboveMax == the raw override and
+    # even reported a drop when the kept count was clamped ABOVE the request).
+    out_ovr = os.path.join(tmp, 'override.hydra')
+    buf_ovr = io.StringIO()
+    with contextlib.redirect_stdout(buf_ovr):
+        rc_ovr = gguf_to_hydra.main([gguf, '--out', out_ovr, '--json', '--vocab', '5000'])
+    ok &= check('a --vocab override is accepted', rc_ovr == 0)
+    if rc_ovr == 0:
+        rep_ovr = json.loads(buf_ovr.getvalue())
+        ok &= check('--vocab 5000 keeps 1024 ids and reports 3976 dropped',
+                    rep_ovr['header']['vocab'] == 1024
+                    and rep_ovr['vocabulary']['droppedAboveMax'] == 3976
+                    and rep_ovr['vocabulary']['entries'] == 0,
+                    str(rep_ovr['vocabulary']))
+
     # the converter's own constants must not drift from the format
     ok &= check('the converter mirrors the engine constants',
                 gguf_to_hydra.MAGIC == 0x48594452 and gguf_to_hydra.VERSION == 1

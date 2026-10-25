@@ -13,6 +13,12 @@
 #
 # When tests are deliberately added or removed, update the matching line in the
 # SAME commit, so the drift is reviewable rather than silent.
+#
+# 2026-10-25: +10 architecture-independent checks (version-2 format test:
+# hand-computed aggregates, v1<->v2 parity over a 40-token stream, and the
+# dim%4 / weights_len negative controls). x86 re-measured at 81 in this
+# session; ARM is 77 + 10 = 87 because all ten are compiled on every
+# architecture — re-measure on the ARM CI leg to confirm.
 
-x86: 71
-arm: 77
+x86: 81
+arm: 87

@@ -310,9 +310,9 @@ function analyseHydraFile(absPath, sizeArg) {
       headerFields: 'uint32 (weights_offset, weights_len)',
       maxWeightsBytesInHeader: 0xffffffff,
       /* One byte per (layer, dim) pair, holding w1 in bits 0-1 and w2 in
-       * bits 2-3: 4 used bits = 2 ternary weights = 2 bits per weight.
-       * So a shape of dim x layers occupies dim * layers BYTES, with the
-       * upper 4 bits of each byte reserved. */
+       * bits 2-3: two 2-bit codes = 2 ternary weights, i.e. 4 code bits
+       * (4 bits of file per weight). So a shape of dim x layers occupies
+       * dim * layers BYTES, with the upper 4 bits of each byte reserved. */
       maxWeightsBytesForShape: MAX_DIM * trainer.MAX_LAYERS,
     },
   };

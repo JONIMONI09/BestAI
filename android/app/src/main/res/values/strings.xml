@@ -6,6 +6,11 @@
     <string name="action_benchmark">Benchmark (ns/token)</string>
     <string name="action_auto_run">Run automatically on start</string>
     <string name="label_model">model</string>
+    <string name="label_engine">engine</string>
+    <!-- Live telemetry row above the composer (RunTelemetryRow). -->
+    <string name="run_live">generating: %1$d tokens · %2$s tok/s</string>
+    <string name="run_done">last run: %1$d tokens in %2$d ms · %3$s tok/s</string>
+    <string name="run_done_cancelled">last run: stopped by you after %1$d tokens · %2$s tok/s</string>
     <plurals name="log_bench_start">
         <item quantity="one">[Hydra] benchmark: %1$d step, three passes…</item>
         <item quantity="other">[Hydra] benchmark: %1$d steps, three passes…</item>

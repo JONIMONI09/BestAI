@@ -10,6 +10,16 @@
 > magics, different version fields and different file extensions
 > (`.hydra` vs `.hydra2`). A v1 loader must refuse a v2 file loudly, not read
 > it partially.
+>
+> **Disambiguation, because the name "version 2" is used two ways here.**
+> This document's v2 is the `.hydra2` container: magic `HYDRA2\0\0`, a
+> 128-byte header, sparse-MoE. The v1 loader in `src/hydra_engine.c`
+> separately accepts a `version == 2` value inside the ordinary 24-byte
+> `HYDR` header — a 4-weights-per-byte packing variant of the v1 format
+> (documented in `docs/FORMAT.md`, "Version 2"). That is NOT this container:
+> different magic, different header, no experts, no streaming. Statements in
+> this document that "no v2 loader exists" refer to this container, and they
+> remain true.
 
 ## Roadmap status — this is THE canonical v2 spec
 

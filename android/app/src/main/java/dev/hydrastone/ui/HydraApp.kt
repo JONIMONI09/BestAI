@@ -80,6 +80,24 @@ data class EngineInfo(
 )
 
 /**
+ * Telemetry of the most recent (or still running) generation.
+ *
+ * [live] is true while the run is in flight: the row then shows the rate so
+ * far instead of a finished run's totals. [tokensPerSecond] is derived, not
+ * stored: a rate that is stored separately from its inputs is a second thing
+ * that can disagree with them.
+ */
+data class RunStats(
+    val tokens: Int,
+    val elapsedMs: Long,
+    val cancelled: Boolean,
+    val live: Boolean = false
+) {
+    val tokensPerSecond: Double
+        get() = if (elapsedMs > 0) tokens * 1000.0 / elapsedMs else 0.0
+}
+
+/**
  * Everything the shell renders, as one value.
  *
  * A single immutable state object means the whole screen is a function of it, so
@@ -98,7 +116,20 @@ data class MainUiState(
     val lastTurnCancelled: Boolean = false,
     /** True while the benchmark thread is alive. Disables the benchmark button. */
     val isBenchmarking: Boolean = false,
-    val log: String = ""
+    val log: String = "",
+    /**
+     * Telemetry of the current or most recent run. Null before the first
+     * finished run (a live run starts it).
+     */
+    val lastRun: RunStats? = null,
+    /**
+     * Human-readable model facts from the engine's load result, e.g.
+     * "quant" -> "Q8_0", "weights" -> "1.2 MB", "state" -> "3.4 MB".
+     * The values are already formatted by the owner (MainActivity), which
+     * is the only place that knows the raw numbers - the UI renders them,
+     * it does not re-derive them.
+     */
+    val modelDetail: Map<String, String> = emptyMap()
 ) {
     /** Convenience for the banner and the model row. */
     val selectedEngine: EngineInfo?
@@ -229,8 +260,13 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
         }
         ModelRow(
             modelLabel = state.modelLabel,
+            modelDetail = state.modelDetail,
             onImportModel = actions.onImportModel
         )
+        // The active engine is always named, even when there is only one to
+        // choose: a chip that only appears when a choice exists cannot tell
+        // the user which engine is producing the text they are reading.
+        EngineStatusRow(state)
         if (state.engines.size > 1) {
             EngineSelector(state, actions)
         }
@@ -244,9 +280,85 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
             MessageList(state.chatMessages, state.lastTurnCancelled)
         }
 
+        // Live tok/s and the finished run's totals, pinned above the
+        // composer so they survive a long conversation: the number the user
+        // asked for ("how fast is this?") is not something to hunt for in
+        // the log.
+        RunTelemetryRow(state)
         InputRow(state, actions)
     }
 }
+
+/**
+ * The engine that is actually loaded, always visible.
+ *
+ * The experimental qualifier is part of [EngineInfo.displayName]
+ * ("Hydra v1 (experimental)"), so this row and the banner never drift apart:
+ * there is one place that names the engine, not two.
+ */
+@Composable
+private fun EngineStatusRow(state: MainUiState) {
+    val engine = state.selectedEngine ?: return
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = stringResource(R.string.label_engine),
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(end = 8.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        AssistChip(
+            onClick = {},
+            label = { Text(engine.displayName) }
+        )
+    }
+}
+
+/**
+ * Telemetry row: while a run is live it shows the tokens-so-far and the
+ * running rate; when the run finishes it shows the totals and, for a
+ * cancelled run, says it was stopped by the user (cancelled is not an
+ * error, and the string says so instead of letting a red error do it).
+ */
+@Composable
+private fun RunTelemetryRow(state: MainUiState) {
+    val run = state.lastRun ?: return
+    val text = if (run.live) {
+        stringResource(R.string.run_live, run.tokens, formatRate(run.tokensPerSecond))
+    } else if (run.cancelled) {
+        stringResource(R.string.run_done_cancelled, run.tokens, formatRate(run.tokensPerSecond))
+    } else {
+        stringResource(R.string.run_done, run.tokens, run.elapsedMs, formatRate(run.tokensPerSecond))
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (run.live) {
+            CircularProgressIndicator(
+                strokeWidth = 2.dp,
+                modifier = Modifier
+                    .padding(end = 8.dp)
+                    .heightIn(min = 14.dp)
+            )
+        }
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+/** One decimal place is the resolution a rate needs; more implies a
+ * precision the measurement does not have. */
+private fun formatRate(tokensPerSecond: Double): String =
+    String.format(java.util.Locale.ROOT, "%.1f", tokensPerSecond)
 
 /**
  * Stated permanently, not once. A user who switches to the experimental engine
@@ -280,6 +392,7 @@ private fun SurfaceTintedCard(
 @Composable
 private fun ModelRow(
     modelLabel: String,
+    modelDetail: Map<String, String>,
     onImportModel: () -> Unit
 ) {
     Row(
@@ -291,6 +404,16 @@ private fun ModelRow(
                 text = "${stringResource(R.string.label_model)}: $modelLabel",
                 style = MaterialTheme.typography.bodySmall
             )
+            // The RAM footprint the user asked for: the engine's own
+            // load-time numbers (llama.cpp reports its own state size),
+            // formatted by the owner, rendered here as plain text.
+            if (modelDetail.isNotEmpty()) {
+                Text(
+                    text = modelDetail.entries.joinToString(" · ") { (k, v) -> "$k $v" },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
         FilledTonalButton(onClick = onImportModel) {
             Text(stringResource(R.string.action_import_model))

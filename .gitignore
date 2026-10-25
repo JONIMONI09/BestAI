@@ -39,6 +39,12 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# Local agent workspace (session research, mirrors of external notes).
+# Deliberately never committed: it is working memory, not a deliverable, and
+# a mirror of a Notion page in git would drift from the original.
+.agent_memory/
+RESEARCH.md
 # Console artefacts (generated models, vocabularies)
 models/trained/
 models/vocab/
