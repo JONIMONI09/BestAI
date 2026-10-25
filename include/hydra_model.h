@@ -69,6 +69,12 @@ typedef struct {
     size_t weights_bytes;
     long resident_kb_after_load;
     long rss_kb_before_load;
+
+    /* RNG state for hydra_sample_token() (xorshift64*). Zero after
+     * hydra_engine_load(); the sampler lazily initializes it from the
+     * sampler config's rng_seed on the first draw. Greedy decoding
+     * never touches it, so the deterministic baseline is unaffected. */
+    uint64_t rng_state;
 } HydraEngine;
 
 /* Engine-Funktionen */
@@ -110,5 +116,55 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
  * n == 0 ist ein gültiges No-Op. */
 int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n);
 int hydra_verify_axiom(float humanity_factor, float proposed_score, float *safe_score);
+
+/* ---------------------------------------------------------------------
+ * Sampling (min-p + repetition penalty)
+ *
+ * The engine's decode is ONE accumulator (acc[0]) mapped to a token, so
+ * there is no native per-vocabulary logit vector. hydra_sample_token()
+ * therefore works in two documented modes:
+ *
+ *   1. GREEDY GUARD: temperature <= 0 OR min_p >= 1 delegates to
+ *      hydra_engine_step() and returns bit-identical results. This is
+ *      the path the deterministic baseline sequence runs on, and it
+ *      stays bit-identical no matter what the other fields say.
+ *
+ *   2. SAMPLING: for every candidate token c the logit is the value of
+ *      that same acc[0] the engine would compute if c were fed next,
+ *      L(c) = agg_a[0] * c + agg_b[0] * state[0]. Then, in order:
+ *        a) repetition penalty over the recent window — positive logits
+ *           divided by the penalty, negative ones multiplied by it
+ *           (the sign-preserving canonical form; repeats compound);
+ *        b) numerically stable softmax with scale 1/temperature
+ *           (max subtracted before exp, so no overflow for the vocab
+ *           cap of 1024);
+ *        c) min-p filter: drop every probability P(c) < min_p * p_max,
+ *           renormalize the survivors (p_max itself always survives);
+ *        d) seeded xorshift64* CDF walk over the renormalized mass.
+ *      The chosen candidate then advances the real state through
+ *      hydra_engine_step(chosen), so the engine's state machine is the
+ *      SAME as in greedy mode — only the candidate differs.
+ *
+ * recent_tokens is in chronological order; the window reads the last
+ * penalty_window entries. The RNG state lives in the engine, so a full
+ * run is reproducible from (model, start token, sampler config).
+ * ------------------------------------------------------------------- */
+typedef struct hydra_sampler_config {
+    float temperature;        /* <= 0: greedy guard (native step)     */
+    float min_p;              /* keep P(c) >= min_p * p_max; >= 1:    */
+                              /*   greedy guard                        */
+    float repetition_penalty; /* 1.0 = off; > 1 punishes repeats      */
+    uint16_t penalty_window;  /* recent tokens the penalty reads (0 =
+                                 penalty disabled regardless)          */
+    uint32_t rng_seed;        /* seed for the xorshift64* stream      */
+} hydra_sampler_config_t;
+
+/* Returns 0 on success, -1 on invalid arguments, -3 if the vocabulary
+ * is too small to sample (vocab < 2), -4 if the temperature is outside
+ * the numerically safe range (0 < temperature > 20). */
+int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
+                       const hydra_sampler_config_t *cfg,
+                       const uint16_t *recent_tokens, size_t recent_len,
+                       uint16_t *token_out);
 
 #endif /* HYDRA_MODEL_H */

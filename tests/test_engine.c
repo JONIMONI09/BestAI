@@ -1203,6 +1203,322 @@ static void test_axiom(void)
     CHECK(hydra_verify_axiom(1.0f, 1.0f, NULL) == -1, "NULL-Score-Pointer abgelehnt");
 }
 
+/* ---------------------------------------------------------------------
+ * Sampler (min-p + repetition penalty) — tests for hydra_sample_token().
+ *
+ * The engine has no native per-vocabulary logits; the sampler probes
+ * L(c) = agg_a[0]*c + agg_b[0]*state[0] (the acc[0] the engine would
+ * compute if c were fed). Every model below is built so that the
+ * chosen candidate c can be RECOVERED from the emitted token:
+ *   out = (acc0 mod V + c + 1) mod V  with  acc0 = A0*c + B0*s0
+ * which is injective in c for the (A0, B0, s0, V) combinations used
+ * here — so an assertion on the output token is an assertion on the
+ * sampled candidate. All expected values were hand-computed
+ * (reference implementation: Python double-precision softmax + the
+ * identical xorshift64* stream), not fitted to the engine's output.
+ * ------------------------------------------------------------------- */
+
+/* Build a one-dimensional v1 model (dim=1) with L layers of w1=+1,
+ * w2=0 (byte 0x01): agg_a[0] = L, agg_b[0] = 0, L(c) = L*c. */
+static int make_v1_model(const char *path, uint16_t vocab, uint32_t layers,
+                         uint8_t weight_byte)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    wr_header(f, vocab, 1u, layers, (uint32_t)sizeof(HydraModelHeader), layers);
+    for (uint32_t l = 0; l < layers; ++l) fputc(weight_byte, f);
+    fclose(f);
+    return 0;
+}
+
+static const uint16_t two_by_63[2] = {63, 63};
+
+/* One-shot sample on a freshly loaded model (state starts at zero),
+ * token_in = 0 (the probe does not depend on it). */
+static int sample_once(uint16_t vocab, uint32_t layers, uint8_t wbyte,
+                       const hydra_sampler_config_t *cfg,
+                       const uint16_t *recent, size_t nrec, uint16_t *out)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    if (make_v1_model(path, vocab, layers, wbyte) != 0) { unlink(path); return -1; }
+    HydraEngine e;
+    if (hydra_engine_load(&e, path) != 0) { unlink(path); return -2; }
+    int rc = hydra_sample_token(&e, 0, cfg, recent, nrec, out);
+    hydra_engine_unload(&e);
+    unlink(path);
+    return rc;
+}
+
+static void test_sampler_greedy_guard(void)
+{
+    /* temperature <= 0 and min_p >= 1 must produce BIT-IDENTICAL
+     * sequences to the native hydra_engine_step() — that is what keeps
+     * the deterministic baseline sequence valid after sampling exists. */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 64, 1, 0x01) == 0, "Sampler: Testmodell (V=64) wird geschrieben");
+
+    HydraEngine a, b, c;
+    CHECK(hydra_engine_load(&a, path) == 0, "Sampler: Modell laedt (Engine A)");
+    CHECK(hydra_engine_load(&b, path) == 0, "Sampler: Modell laedt (Engine B, temp=0)");
+    CHECK(hydra_engine_load(&c, path) == 0, "Sampler: Modell laedt (Engine C, min_p=1)");
+
+    hydra_sampler_config_t cfg0, cfg1;
+    cfg0.temperature = 0.0f; cfg0.min_p = 0.0f;
+    cfg0.repetition_penalty = 1.0f; cfg0.penalty_window = 8; cfg0.rng_seed = 99;
+    cfg1 = cfg0; cfg1.temperature = 1.0f; cfg1.min_p = 1.0f;
+
+    int same0 = 1, same1 = 1;
+    uint16_t ta = 5, tb = 5, tc = 5;
+    for (int s = 0; s < 32; ++s) {
+        uint16_t oa, ob, oc;
+        if (hydra_engine_step(&a, ta, &oa) != 0 ||
+            hydra_sample_token(&b, tb, &cfg0, &tb, (size_t)(s > 0 ? 1 : 0), &ob) != 0 ||
+            hydra_sample_token(&c, tc, &cfg1, &tc, (size_t)(s > 0 ? 1 : 0), &oc) != 0) {
+            same0 = same1 = 0;
+            break;
+        }
+        if (oa != ob) same0 = 0;
+        if (oa != oc) same1 = 0;
+        ta = oa; tb = ob; tc = oc;
+    }
+    CHECK(same0, "Sampler: temp=0 (greedy guard) bit-identisch zum nativen step (32 Steps)");
+    CHECK(same1, "Sampler: min_p=1 (greedy guard) bit-identisch zum nativen step (32 Steps)");
+    hydra_engine_unload(&a);
+    hydra_engine_unload(&b);
+    hydra_engine_unload(&c);
+    unlink(path);
+}
+
+static void test_sampler_repetition_penalty(void)
+{
+    /* Model V=64, w1=+1: L(c) = c, argmax at 63. Window = {63, 63}
+     * (the token that keeps being emitted — the repetition loop).
+     * At T=0.001 the softmax collapses onto the argmax with weight
+     * exactly 1.0 (exp(-1030) underflows), so each one-shot sample is
+     * deterministic and isolates the penalty's effect:
+     *   pen=1.0: L(63)=63 stays the max        -> c=63 -> out 63
+     *   pen=4.0: L(63)=63/4/4=3.9375 < L(62)=62 -> c=62 -> out 61
+     * i.e. the penalty moves the emitted token off the repeated one. */
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 0.001f; cfg.min_p = 0.0f;
+    cfg.penalty_window = 2; cfg.rng_seed = 1;
+
+    uint16_t out = 0;
+    cfg.repetition_penalty = 1.0f;
+    CHECK(sample_once(64, 1, 0x01, &cfg, two_by_63, 2, &out) == 0,
+          "Sampler: Penalty-Testmodell (V=64) laeuft ohne Penalty");
+    CHECK(out == 63, "Sampler: ohne Penalty wird der wiederholte Token 63 ausgespielt");
+
+    cfg.repetition_penalty = 4.0f;
+    CHECK(sample_once(64, 1, 0x01, &cfg, two_by_63, 2, &out) == 0,
+          "Sampler: Penalty-Testmodell (V=64) laeuft mit Penalty 4.0");
+    CHECK(out == 61, "Sampler: Penalty bricht die Wiederholung (63 -> 62, out 63 -> 61)");
+
+    /* Negative-logit branch: model V=8, w1=+1, w2=-1 (A0=1, B0=-1).
+     * Prefill [7,0,7,0]: prefill processes all but the last token and
+     * step() mods token_in by vocab, so the state recurrence
+     * s' = t - s runs 7 -> 7 -> -7 -> 14. L(c) = c - 14 =
+     * [-14..-7], argmax c=7 with a NEGATIVE logit (-7). Pen(4)
+     * MULTIPLIES it to -28, moving the argmax to c=6:
+     *   pen=1.0: c=7 -> out 1
+     *   pen=4.0: c=6 -> out 7
+     * (At T=0.001 both softmaxes collapse exactly onto the argmax:
+     * the second-best weight is exp(-1000) = 0.0 in double.) */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 8, 1, 0x09) == 0, "Sampler: Negativ-Testmodell (V=8) wird geschrieben");
+    HydraEngine e;
+    const uint16_t pre[4] = {7, 0, 7, 0};
+    int ok = hydra_engine_load(&e, path) == 0;
+    if (ok) ok = hydra_engine_prefill(&e, pre, 4) == 0;
+    CHECK(ok, "Sampler: Negativ-Testmodell laedt und prefillt (state=14)");
+    if (ok) {
+        cfg.repetition_penalty = 1.0f;
+        uint16_t recent0 = 7;
+        uint16_t o = 0;
+        ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, &o) == 0 && o == 1;
+        CHECK(ok, "Sampler: negatives Logit ohne Penalty -> c=7 (out 1)");
+        hydra_engine_unload(&e);
+        ok = hydra_engine_load(&e, path) == 0;
+        if (ok) ok = hydra_engine_prefill(&e, pre, 4) == 0;
+        if (ok) {
+            cfg.repetition_penalty = 4.0f;
+            uint16_t o2 = 0;
+            ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, &o2) == 0 && o2 == 7;
+            CHECK(ok, "Sampler: negatives Logit WIRD mit Penalty multipliziert (c=7 -> 6, out 1 -> 7)");
+            hydra_engine_unload(&e);
+        } else {
+            CHECK(0, "Sampler: Reload fuer Negativ-Beriff fehlgeschlagen");
+        }
+    }
+    unlink(path);
+}
+
+static void test_sampler_min_p(void)
+{
+    /* Model V=65, w1=+1: L(c) = c, p(c) proportional to e^c, p_max at
+     * c=64. Hand-computed surviving sets (threshold min_p * p_max):
+     *   min_p=0.1 -> keep {62, 63, 64}  (e^(c-64) >= 0.1  <=>  c >= 61.7)
+     *   min_p=0.5 -> keep {64}          (e^(c-64) >= 0.5  <=>  c >= 63.3)
+     * With out = (2c+1) mod 65 (injective for odd V):
+     *   keep {62,63,64} -> out {60, 62, 64},  keep {64} -> out 64. */
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.5f;
+    cfg.repetition_penalty = 1.0f; cfg.penalty_window = 0; cfg.rng_seed = 0;
+
+    int all64 = 1;
+    for (uint32_t s = 1; s <= 16; ++s) {
+        uint16_t out = 0;
+        cfg.rng_seed = s;
+        if (sample_once(65, 1, 0x01, &cfg, NULL, 0, &out) != 0 || out != 64) all64 = 0;
+    }
+    CHECK(all64, "Sampler: min_p=0.5 filtert alles bis auf p_max (16 Seeds -> immer 64)");
+
+    cfg.min_p = 0.1f;
+    int in_set = 1, mask = 0;
+    for (uint32_t s = 1; s <= 24; ++s) {
+        uint16_t out = 999;
+        cfg.rng_seed = s;
+        if (sample_once(65, 1, 0x01, &cfg, NULL, 0, &out) != 0) { in_set = 0; continue; }
+        if (out != 60 && out != 62 && out != 64) in_set = 0;
+        if (out == 60) mask |= 1;
+        if (out == 62) mask |= 2;
+        if (out == 64) mask |= 4;
+    }
+    CHECK(in_set, "Sampler: min_p=0.1 behaelt genau {62,63,64} (24 Seeds -> out nur 60/62/64)");
+    const int n_seen = ((mask & 1) != 0) + ((mask & 2) != 0) + ((mask & 4) != 0);
+    CHECK(n_seen >= 2, "Sampler: min_p=0.1 sampelt innerhalb des ueberlebenden Sets (>=2 Werte)");
+
+    /* Control: without the filter the tail IS reachable — at least one
+     * of 96 fixed seeds must land outside {60,62,64}. */
+    cfg.min_p = 0.0f;
+    int tail_seen = 0;
+    for (uint32_t s = 1; s <= 96; ++s) {
+        uint16_t out = 999;
+        cfg.rng_seed = s;
+        if (sample_once(65, 1, 0x01, &cfg, NULL, 0, &out) == 0 &&
+            out != 60 && out != 62 && out != 64) tail_seen = 1;
+    }
+    CHECK(tail_seen, "Sampler: ohne min_p ist der schwache Schwanz erreichbar (96 Seeds)");
+}
+
+static void test_sampler_rng_hand_computed(void)
+{
+    /* Model V=5, w1=+1: L(c) = c, p proportional to e^c:
+     *   p = [0.011656, 0.031685, 0.086129, 0.234121, 0.636409]
+     *   CDF = [0.011656, 0.043341, 0.129470, 0.363591, 1.0]
+     * xorshift64* draws (independent reference implementation):
+     *   seed 1   -> u=0.280835 -> c=3 -> out (2c+1) mod 5 = 2
+     *   seed 2   -> u=0.561670 -> c=4 -> out 4
+     *   seed 555 -> u=0.044097 -> c=2 -> out 0
+     *   seed 0   -> magic state -> u=0.052791 -> c=2 -> out 0
+     * These pin the exact RNG stream AND the CDF walk. */
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.0f;
+    cfg.repetition_penalty = 1.0f; cfg.penalty_window = 0;
+
+    uint16_t out = 0;
+    cfg.rng_seed = 1;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 2,
+          "Sampler: Seed 1 -> xorshift64* u=0.280835 -> c=3 -> out 2 (handgerechnet)");
+    cfg.rng_seed = 2;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 4,
+          "Sampler: Seed 2 -> u=0.561670 -> c=4 -> out 4 (handgerechnet)");
+    cfg.rng_seed = 555;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 0,
+          "Sampler: Seed 555 -> u=0.044097 -> c=2 -> out 0 (handgerechnet)");
+    cfg.rng_seed = 0;
+    CHECK(sample_once(5, 1, 0x01, &cfg, NULL, 0, &out) == 0 && out == 0,
+          "Sampler: Seed 0 wird auf Magic-State gemappt (u=0.052791 -> out 0, kein Degenerat)");
+}
+
+static void test_sampler_reproducible(void)
+{
+    /* Two fresh engines, identical model/config/seed and identical
+     * recent-window history -> identical 64-step sequences. */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 64, 1, 0x01) == 0, "Sampler: Repro-Modell wird geschrieben");
+
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.2f;
+    cfg.repetition_penalty = 1.5f; cfg.penalty_window = 8; cfg.rng_seed = 7;
+
+    int ok = 1;
+    uint16_t seq1[64] = {0}, seq2[64] = {0};
+    HydraEngine e1, e2;
+    if (hydra_engine_load(&e1, path) != 0 || hydra_engine_load(&e2, path) != 0) ok = 0;
+    if (ok) {
+        uint16_t t1 = 5, t2 = 5;
+        for (int s = 0; s < 64 && ok; ++s) {
+            size_t n = (size_t)(s > 8 ? 8 : s);
+            uint16_t o1, o2;
+            if (hydra_sample_token(&e1, t1, &cfg, seq1 + (s - n), n, &o1) != 0 ||
+                hydra_sample_token(&e2, t2, &cfg, seq2 + (s - n), n, &o2) != 0) {
+                ok = 0; break;
+            }
+            seq1[s] = o1; seq2[s] = o2;
+            if (o1 != o2) ok = 0;
+            t1 = o1; t2 = o2;
+        }
+    }
+    hydra_engine_unload(&e1);
+    hydra_engine_unload(&e2);
+    unlink(path);
+    CHECK(ok, "Sampler: identisches Setup + Seed -> bit-identische 64-Step-Sequenz");
+}
+
+static void test_sampler_invalid(void)
+{
+    hydra_sampler_config_t cfg;
+    cfg.temperature = 1.0f; cfg.min_p = 0.0f;
+    cfg.repetition_penalty = 1.0f; cfg.penalty_window = 1; cfg.rng_seed = 1;
+    uint16_t out = 0;
+
+    CHECK(hydra_sample_token(NULL, 0, &cfg, NULL, 0, &out) == -1, "Sampler: NULL-Engine wird abgelehnt");
+    HydraEngine dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    CHECK(hydra_sample_token(&dummy, 0, NULL, NULL, 0, &out) == -1, "Sampler: NULL-Konfig wird abgelehnt");
+    CHECK(hydra_sample_token(&dummy, 0, &cfg, NULL, 0, NULL) == -1, "Sampler: NULL-Ausgabe wird abgelehnt");
+
+    /* vocab=1 cannot sample (needs a distribution with >= 2 members). */
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    CHECK(make_v1_model(path, 1, 1, 0x01) == 0, "Sampler: V=1-Modell wird geschrieben");
+    HydraEngine e;
+    int ok = hydra_engine_load(&e, path) == 0;
+    if (ok) {
+        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, &out) == -3,
+              "Sampler: Vokabular < 2 wird mit -3 abgelehnt");
+        hydra_engine_unload(&e);
+    } else {
+        CHECK(0, "Sampler: V=1-Modell laedt");
+    }
+    unlink(path);
+
+    /* temperature out of the numerically safe range. */
+    char path2[64];
+    tmp_path_new(path2, sizeof(path2));
+    CHECK(make_v1_model(path2, 16, 1, 0x01) == 0, "Sampler: V=16-Modell wird geschrieben");
+    ok = hydra_engine_load(&e, path2) == 0;
+    if (ok) {
+        cfg.temperature = 25.0f;
+        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, &out) == -4,
+              "Sampler: temperature > 20 wird mit -4 abgelehnt (exp-Overflow-Schutz)");
+        cfg.temperature = 1.0f;
+        cfg.repetition_penalty = 0.5f;
+        uint16_t one = 3;
+        CHECK(hydra_sample_token(&e, 0, &cfg, &one, 1, &out) == -1,
+              "Sampler: penalty < 1.0 wird abgelehnt (kein Discounting)");
+        hydra_engine_unload(&e);
+    } else {
+        CHECK(0, "Sampler: V=16-Modell laedt");
+    }
+    unlink(path2);
+}
+
 int main(void)
 {
     printf("=== Hydra Engine Unit-Tests ===\n\n");
@@ -1233,6 +1549,12 @@ int main(void)
     test_load_metrics_are_measured();
     test_version_two_format();
     test_axiom();
+    test_sampler_greedy_guard();
+    test_sampler_repetition_penalty();
+    test_sampler_min_p();
+    test_sampler_rng_hand_computed();
+    test_sampler_reproducible();
+    test_sampler_invalid();
 
     printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

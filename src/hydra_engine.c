@@ -519,6 +519,140 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
     return 0;
 }
 
+/* ---------------------------------------------------------------------
+ * Sampling (min-p + repetition penalty)
+ *
+ * See include/hydra_model.h for the full contract. Implementation
+ * notes:
+ *   - The candidate logit L(c) = agg_a[0]*c + agg_b[0]*state[0] is the
+ *     acc[0] the engine would compute if c were fed next: the SAME
+ *     integer expression step() evaluates, so the sampler probes the
+ *     engine's own arithmetic instead of inventing a second model.
+ *   - One stack array (HYDRA_MAX_VOCAB doubles = 8 KiB, zero heap)
+ *     carries logits -> penalized logits -> probabilities -> CDF,
+ *     rewritten in place.
+ *   - All intermediate values are bounded: |L(c)| <= 4096*1023 +
+ *     4096*127 < 5e6, so (L - max)/temperature with temperature in
+ *     (0, 20] is > -2.5e5/... and exp() cannot overflow (max maps to
+ *     exp(0) = 1) or underflow the whole distribution (the max
+ *     element always survives).
+ * ------------------------------------------------------------------- */
+static uint64_t hydra_xorshift64(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
+                       const hydra_sampler_config_t *cfg,
+                       const uint16_t *recent_tokens, size_t recent_len,
+                       uint16_t *token_out)
+{
+    if (!engine || !cfg || !token_out) return -1;
+    if (engine->header.magic != HYDRA_MAGIC) return -2;
+
+    /* Greedy guard: keep the deterministic path bit-identical.
+     * temperature <= 0 or min_p >= 1 means "no sampling": the native
+     * step() runs, which is exactly what the pre-sampling engine did. */
+    if (cfg->temperature <= 0.0f || cfg->min_p >= 1.0f)
+        return hydra_engine_step(engine, token_in, token_out);
+
+    const uint32_t vocab = engine->header.vocab_size;
+    if (vocab < 2) return -3;
+    if (cfg->temperature > 20.0f) return -4;
+    if (cfg->repetition_penalty < 1.0f) return -1; /* no discounting */
+    if (recent_len > 0 && !recent_tokens) return -1;
+
+    const double temp = (double)cfg->temperature;
+    const double A0 = (double)(int32_t)engine->agg_a[0];
+    const double B0 = (double)(int32_t)engine->agg_b[0];
+    const double s0 = (double)(int8_t)engine->state_vector[0];
+
+    double p[HYDRA_MAX_VOCAB];
+    uint32_t c;
+    double m, sum, u, acc;
+
+    /* Pass 1: the probe logits. */
+    for (c = 0; c < vocab; ++c)
+        p[c] = A0 * (double)c + B0 * s0;
+
+    /* Pass 2: repetition penalty over the recent window, most recent
+     * entries last. Positive logits are divided by the penalty,
+     * negative ones multiplied by it (sign-preserving); zero stays
+     * zero, and repeated occurrences compound. */
+    if (cfg->penalty_window > 0 && recent_len > 0) {
+        const size_t w = (size_t)cfg->penalty_window >= recent_len
+                          ? recent_len : (size_t)cfg->penalty_window;
+        const double pen = (double)cfg->repetition_penalty;
+        for (size_t k = 0; k < w; ++k) {
+            const uint16_t t = recent_tokens[recent_len - 1 - k];
+            if (t >= vocab) continue;
+            if (p[t] > 0.0) p[t] /= pen;
+            else if (p[t] < 0.0) p[t] *= pen;
+        }
+    }
+
+    /* Pass 3: numerically stable softmax (max subtracted before exp). */
+    m = p[0];
+    for (c = 1; c < vocab; ++c)
+        if (p[c] > m) m = p[c];
+    sum = 0.0;
+    for (c = 0; c < vocab; ++c) {
+        p[c] = exp((p[c] - m) / temp);
+        sum += p[c];
+    }
+    if (!(sum > 0.0)) return -1; /* cannot happen (exp(0)=1 present) */
+    for (c = 0; c < vocab; ++c)
+        p[c] /= sum;
+
+    /* Pass 4: min-p filter — drop every P(c) < min_p * p_max, then
+     * renormalize. p_max itself always survives (min_p <= 1 here). */
+    m = p[0];
+    for (c = 1; c < vocab; ++c)
+        if (p[c] > m) m = p[c];
+    const double thr = (double)cfg->min_p * m;
+    for (c = 0; c < vocab; ++c)
+        if (p[c] < thr) p[c] = 0.0;
+    sum = 0.0;
+    for (c = 0; c < vocab; ++c)
+        sum += p[c];
+    if (!(sum > 0.0)) {
+        /* Numerically empty (all mass below threshold): fall back to
+         * the unfiltered argmax instead of failing the token. */
+        uint32_t best = 0;
+        for (c = 1; c < vocab; ++c)
+            if (p[c] > p[best]) best = c;
+        return hydra_engine_step(engine, (uint16_t)best, token_out);
+    }
+    for (c = 0; c < vocab; ++c)
+        p[c] /= sum;
+
+    /* Pass 5: seeded xorshift64* CDF walk. The state lives in the
+     * engine, lazily initialized from the config seed (a zero seed
+     * maps to a non-zero constant so the stream is never degenerate). */
+    uint64_t st = engine->rng_state;
+    if (st == 0)
+        st = cfg->rng_seed ? (uint64_t)cfg->rng_seed : 0x9E3779B97F4A7C15ULL;
+    const uint64_t r = hydra_xorshift64(&st);
+    engine->rng_state = st;
+    u = (double)r / 18446744073709551616.0; /* uniform in [0, 1) */
+
+    acc = 0.0;
+    for (c = 0; c < vocab; ++c) {
+        acc += p[c];
+        if (u < acc || c == vocab - 1) break; /* last bin catches the tail */
+    }
+
+    /* Advance the real state with the chosen candidate: the same
+     * state machine as greedy mode, so the seed (token) bookkeeping
+     * and all state dimensions stay consistent with the fast path. */
+    return hydra_engine_step(engine, (uint16_t)c, token_out);
+}
+
 int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)
 {
     if (!engine || (n > 0 && !tokens)) return -1;
