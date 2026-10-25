@@ -513,6 +513,13 @@ jobs:
             echo '```'
           } > /tmp/build-report.md
           cat /tmp/build-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # Annotations are the API-readable copy (PR comments need
+          # issues:write, which the repository token policy can refuse):
+          # every compiler error line becomes its own check-run
+          # annotation, capped at 40.
+          { echo "::error::gradle build failed; compiler errors:";
+            grep -E "^e: |^> *A failure|error:|FAILED$" "$RUNNER_TEMP/gradle-build.log" \
+              | head -40 | sed 's/^/      /'; }
           PR="${PR_NUMBER:-}"
           if [ -z "$PR" ]; then
             PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
