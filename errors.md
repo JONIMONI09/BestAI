@@ -1683,3 +1683,29 @@
   API the repo already compiles against. The failure signature to
   remember: CI build red AND lint "no report" at the same time = the
   compiler died before lint analysis, not a lint finding.
+
+## 2026-10-25 — docs contradicted the LICENSE file (MIT vs GPL-3.0) and cited a section that never existed
+- **Symptom:** post-merge doc audit (screenshot of the GitHub README):
+  the repo's license file is the full GPL-3.0 text (GitHub's own header
+  shows "GPL-3.0 license"), yet README.md said "MIT — see LICENSE" in
+  two places (License section + project-structure tree) and
+  package.json carried "license": "MIT". Separately, the roadmap
+  pointed readers to a "*Roadmap status* section" of
+  docs/ARCHITECTURE.md — a section that never existed in that file's
+  history (`git log -S` confirms it was only ever written in the
+  README, never in the target).
+- **Cause:** license/cross-reference strings were never verified
+  against the artifact they describe; the license string was probably
+  carried over from the project's origin and the section name was
+  invented while writing the roadmap instead of copied from the
+  heading.
+- **Fix:** all three license references now say GPL-3.0 (the LICENSE
+  file itself is untouched — changing it would be a legal decision for
+  the user, not a doc fix). The roadmap reference now names the actual
+  section ("Known Structural Redundancy"), where the superseded
+  aggregated A[i]/B[i] design is documented (line 106).
+- **Prevention:** a doc audit must check the *identity* claims, not
+  only the performance ones: every "see <file> § <section>" reference
+  resolved against the real heading, and the license string compared
+  against the actual LICENSE file (one grep, one diff — cheaper than
+  discovering the contradiction on the repo's landing page).

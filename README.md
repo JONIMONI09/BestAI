@@ -345,7 +345,7 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── errors.md                  Every bug: symptom / cause / fix / prevention
 ├── rules.md                   Standing working rules
 ├── session.md                 Live session plan and history
-└── LICENSE                    MIT
+└── LICENSE                    GPL-3.0
 ```
 
 ## The Math in 60 Seconds
@@ -430,11 +430,11 @@ make ui       # builds hydra-run + the starter model and serves on :8787
 - [ ] safetensors import with automatic absmean ternarization (GGUF is done — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md))
 - [ ] AVX2/AVX-512 LUT kernel for x86 (current x86 path: purely scalar)
 - [x] 4-weights-per-byte packing (2 bits/weight, no wasted byte) — implemented as header version 2 and tested (`docs/FORMAT.md`, "Version 2"; `tests/test_engine.c`, `test_version_two_format`) — a v1.1 file-level optimisation, distinct from the v2 container
-- [ ] The `.hydra2` sparse-MoE container — the canonical v2 spec is [`docs/FORMAT-V2.md`](docs/FORMAT-V2.md); **no part of it is implemented**, and the aggregated `A[i]/B[i]` container sketched in `docs/ARCHITECTURE.md` is a superseded alternative, see its *Roadmap status* section
+- [ ] The `.hydra2` sparse-MoE container — the canonical v2 spec is [`docs/FORMAT-V2.md`](docs/FORMAT-V2.md); **no part of it is implemented**, and the aggregated `A[i]/B[i]` container sketched in `docs/ARCHITECTURE.md` is a superseded alternative, see its *Known Structural Redundancy* section
 - [ ] Streaming ring-buffer KV with attention sinks
 
 Contributions welcome — see `docs/FORMAT.md` for the binary spec and dive in.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE).
