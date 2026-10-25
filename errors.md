@@ -1659,3 +1659,27 @@
   enumerate ALL ways the job can fail upstream, and make sure every
   class produces a published payload — including the class where the
   usual diagnostic artifact was never created.
+
+## 2026-10-25 — "LocalResources" does not exist; inventing a library API broke the build
+- **Symptom:** after switching the plurals call sites to
+  `LocalResources.current.getQuantityString(...)`, EVERYTHING that
+  touches the Kotlin compile went red at once: the CI "Build debug and
+  release APK" step (twice, identical trees) and the Android-lint
+  gradle step — which died so early that no lint report file was ever
+  written (a 46-second job, check step failing with "no report").
+- **Cause:** `androidx.compose.ui.platform.LocalResources` does not
+  exist in this Compose version (BOM 2024.09.03). The reference was an
+  unverified assumption carried in from the previous round's fix plan,
+  and the code comment even asserted it. The canonical Compose way to
+  reach the app Resources is `LocalContext.current.resources`
+  (LocalContext is already used in this codebase — Theme.kt).
+- **Fix:** import `androidx.compose.ui.platform.LocalContext` and use
+  `LocalContext.current.resources.getQuantityString(R.plurals…, …)`.
+  No other change: the resources, the plurals, and the call style stay.
+- **Prevention:** when a fix introduces a NEW library API reference
+  (not already used anywhere in the repo), verify it exists in the
+  pinned version before shipping — grep the repo for prior usage, and
+  if there is none, treat the reference as unverified and prefer the
+  API the repo already compiles against. The failure signature to
+  remember: CI build red AND lint "no report" at the same time = the
+  compiler died before lint analysis, not a lint finding.

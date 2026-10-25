@@ -430,7 +430,13 @@ jobs:
         if: failure()
         with:
           name: android-lint-report
-          path: android/app/build/reports/lint-results-debug.txt
+          # The lint report when it exists, plus the published diagnostic
+          # payload and the gradle log — everything needed to diagnose a
+          # red lint job from a single artifact.
+          path: |
+            android/app/build/reports/lint-results-debug.txt
+            /tmp/lint-report.md
+            ${{ runner.temp }}/gradle-lint.log
           if-no-files-found: ignore
 
   # ---------- Semgrep (Sicherheitsregeln) ----------

@@ -48,7 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalResources
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -329,10 +329,12 @@ private fun RunTelemetryRow(state: MainUiState) {
     // getQuantityString, not stringResource: in this Compose version the
     // stringResource(id, vararg) overload wins over the plurals overload in
     // overload resolution, which lint then rejects as ResourceType
-    // ("expected resource of type string"). Resources.getQuantityString has
-    // a single unambiguous signature and the @PluralsRes parameter, and it
-    // is the same pattern MainActivity already uses for its plurals.
-    val resources = LocalResources.current
+    // ("expected resource of type string"). Resources.getQuantityString
+    // has a single unambiguous signature with the @PluralsRes parameter
+    // (the same call style MainActivity uses for its plurals), and
+    // LocalContext.current.resources is the canonical Compose way to
+    // reach the app Resources (there is no LocalResources).
+    val resources = LocalContext.current.resources
     val text = if (run.live) {
         resources.getQuantityString(R.plurals.run_live, run.tokens, run.tokens, formatRate(run.tokensPerSecond))
     } else if (run.cancelled) {

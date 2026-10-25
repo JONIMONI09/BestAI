@@ -326,9 +326,27 @@ der jeweils eingetretenen Klasse (Lint-Report ODER Gradle-Log-Tail
 PR-Comment). Der CI-APK-Build-Job bekommt dasselbe (Capture +
 Publish + job-separierte issues:write). YAML validiert (3 Dateien).
 Ab dem nächsten fehlgeschlagenen Run ist jeder Android-Fehler per API
-lesbar — egal welche Fehlerklasse. **Offen:** 05dbbfe-Runs abwarten
-(posten ggf. den ersten echten PR-Comment-Report); definitorischer
-Fix der Lint-/Build-Funde; grüner Run; Merge durch den Nutzer.
+lesbar — egal welche Fehlerklasse. Commit 9608e4d, gepusht.
+Nebenbefund: der 9608e4d-Lint-Job lief nur 46 Sekunden und starb vor
+der Lint-Analyse (kein Report) — der Footprint eines Compile-Fehlers.
+
+**Runde 6 (jetzt):** WURZELURACHE: `androidx.compose.ui.platform.
+LocalResources` existiert in dieser Compose-Version (BOM 2024.09.03)
+NICHT — die Runde-2-Reparatur hat eine Library-API referenziert, die
+es nicht gibt (ungedruckte Annahme, nicht einmal im Repo verwendet;
+Theme.kt nutzt LocalContext). Ein Compile-Fehler erklärt alles
+Gleichzeitig: CI-Build-Step rot (199221c + b53d738, gleicher Code),
+Lint-Job "kein Report" (stirbt vor der Analyse), 46-Sekunden-Job.
+Fix: `import androidx.compose.ui.platform.LocalContext` +
+`val resources = LocalContext.current.resources` — dieselbe
+Resources-Klasse, kanonischer Compose-Zugriff, API die das Repo schon
+kompiliert. Sonst nichts geändert (Plurals, Call-Stil, Workflow).
+Fehler-Artifact in lint.yml bekommt zusätzlich /tmp/lint-report.md +
+gradle-lint.log. Doku: errors.md (nicht-existierende API +
+Fehler-Fingerprint "CI rot + Lint ohne Report = Compiler, nicht
+Lint-Finding"), CHANGELOG + session.md. **Offen:** nächster Run grün
+(CI + Lint & Security); Merge durch den Nutzer; Release auf main
+nach Merge.
 
 ### Session close (2026-10-25)
 

@@ -65,8 +65,16 @@ All notable changes to this project, per change, are recorded here and in
   got the same capture-and-publish treatment (plus job-level
   issues:write). From the next failed run onward, every Android
   failure in CI, Lint & Security, and Release is readable via the API.
-  The actual findings of the current red runs will arrive as a PR
-  comment and are fixed in the following round.
+  the lint failure artifact now also bundles the diagnostic payload
+  and the gradle log. **Round 6 — root cause found and fixed:** all
+  the red runs since 199221c (CI build step twice, Android lint "no
+  report") were one single Kotlin compile error: the round-2 fix used
+  `androidx.compose.ui.platform.LocalResources`, which does not exist
+  in this Compose version (BOM 2024.09.03) — an unverified API
+  assumption, used nowhere else in the repo. Call sites now use
+  `LocalContext.current.resources` (LocalContext is already used in
+  this codebase, e.g. Theme.kt); everything else (the plurals
+  resources, the getQuantityString call style) is unchanged.
 
 ## 2026-10-25 — CI fix round (post-PR, same run)
 
