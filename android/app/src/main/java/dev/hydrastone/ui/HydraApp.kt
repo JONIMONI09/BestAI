@@ -334,10 +334,12 @@ private fun AdaptiveHeaderSplit(
     body: @Composable () -> Unit
 ) {
     BoxWithConstraints(modifier = modifier) {
-        // maxHeight.value is the Dp as a plain Float; the .dp extension
-        // (already imported) turns the scaled value back into a Dp.
+        // maxHeight (the scope property, not constraints.maxHeight!) is
+        // the incoming maximum height already converted to Dp; the scope's
+        // constraints are pixel-based (ui.unit.Constraints), so scaling
+        // goes through the plain Float: value * fraction, then .dp.
         val cap: Dp = if (constraints.hasBoundedHeight) {
-            (constraints.maxHeight.value * headerFraction).dp
+            (maxHeight.value * headerFraction).dp
         } else {
             Dp.Unspecified
         }

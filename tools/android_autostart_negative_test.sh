@@ -124,7 +124,7 @@ scenario "the transcript is still inside the scrolling column" \
 # mutation removes the real wiring, not a comment.
 scenario "the header block is still capped at a fraction of the space" \
   "the header block is capped at a fraction of the space" "$U" \
-  's.replace("constraints.maxHeight.value * headerFraction", "0f")'
+  's.replace("maxHeight.value * headerFraction", "0f")'
 
 scenario "the conversation still gets the space the header does not use" \
   "the conversation gets the space left over from the header" "$U" \
