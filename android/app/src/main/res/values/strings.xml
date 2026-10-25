@@ -7,10 +7,21 @@
     <string name="action_auto_run">Run automatically on start</string>
     <string name="label_model">model</string>
     <string name="label_engine">engine</string>
-    <!-- Live telemetry row above the composer (RunTelemetryRow). -->
-    <string name="run_live">generating: %1$d tokens · %2$s tok/s</string>
-    <string name="run_done">last run: %1$d tokens in %2$d ms · %3$s tok/s</string>
-    <string name="run_done_cancelled">last run: stopped by you after %1$d tokens · %2$s tok/s</string>
+    <!-- Live telemetry row above the composer (RunTelemetryRow). Plurals,
+         not plain strings: the token count is a quantity (lint gate
+         requires zero findings; see log_size/log_running above). -->
+    <plurals name="run_live">
+        <item quantity="one">generating: %1$d token · %2$s tok/s</item>
+        <item quantity="other">generating: %1$d tokens · %2$s tok/s</item>
+    </plurals>
+    <plurals name="run_done">
+        <item quantity="one">last run: %1$d token in %2$d ms · %3$s tok/s</item>
+        <item quantity="other">last run: %1$d tokens in %2$d ms · %3$s tok/s</item>
+    </plurals>
+    <plurals name="run_done_cancelled">
+        <item quantity="one">last run: stopped by you after %1$d token · %2$s tok/s</item>
+        <item quantity="other">last run: stopped by you after %1$d tokens · %2$s tok/s</item>
+    </plurals>
     <plurals name="log_bench_start">
         <item quantity="one">[Hydra] benchmark: %1$d step, three passes…</item>
         <item quantity="other">[Hydra] benchmark: %1$d steps, three passes…</item>

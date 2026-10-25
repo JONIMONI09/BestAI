@@ -448,6 +448,14 @@ jobs:
     name: Android APK build
     needs: lint
     runs-on: ubuntu-latest
+    # issues: write is only needed for this job: when the gradle build
+    # fails, the publish step posts the log tail as a PR comment (job
+    # logs are only readable in the Actions UI, not by API-only
+    # clients). The repo token defaults to read-only, so the write
+    # permission must be declared.
+    permissions:
+      contents: read
+      issues: write
     steps:
       # submodules: true is REQUIRED, not an optimisation. The native build
       # does add_subdirectory(llama), so without it the APK job sees an empty
@@ -472,8 +480,47 @@ jobs:
       # Without a keystore secret (every pull request) the release build
       # falls back to the debug key, so this job always produces an APK.
       - name: Build debug and release APK (Kotlin + NDK C via CMake)
+        id: apk-build
         working-directory: android
-        run: $GRADLE_BIN assembleDebug assembleRelease --no-daemon
+        run: |
+          # All output goes to a file, not just to the job log: on
+          # failure the next step publishes the tail as a PR comment +
+          # step summary, because job logs live on hosts that
+          # API-only clients cannot reach.
+          set +e
+          $GRADLE_BIN assembleDebug assembleRelease --no-daemon \
+            > "$RUNNER_TEMP/gradle-build.log" 2>&1
+          rc=$?
+          set -e
+          echo "--- last 30 lines of the gradle output ---"
+          tail -30 "$RUNNER_TEMP/gradle-build.log"
+          [ "$rc" -eq 0 ]
+
+      - name: Publish build log if the build failed
+        if: steps.apk-build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "### Android APK build log (tail, commit $(git rev-parse --short HEAD))"
+            echo
+            echo '```'
+            tail -200 "$RUNNER_TEMP/gradle-build.log"
+            echo '```'
+          } > /tmp/build-report.md
+          cat /tmp/build-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          PR="${PR_NUMBER:-}"
+          if [ -z "$PR" ]; then
+            PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                     --jq '.[0].number // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$PR" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+              -f body="$(cat /tmp/build-report.md)" >/dev/null 2>&1 \
+              || echo "::warning::could not post the build log as PR comment (check job permissions: issues write)"
+          fi
+          exit 1
 
       - name: Verify signature, ABIs and asset
         run: |

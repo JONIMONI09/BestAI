@@ -1533,3 +1533,153 @@
   scripts in a PR, run the shebang scan and make the set consistent;
   and remember that a user's 666/644 on a non-exec file is their umask,
   not something the repo can change — only the exec bit is committable.
+
+## 2026-10-25 — three new quantity strings ignored the repo's plurals convention and turned the lint gate red
+- **Symptom:** after the #47 merge, the "Android lint" job (Lint &
+  Security) and the "Android Lint must be error-free" step (Release)
+  failed with "Android Lint reported findings". The gate greps
+  lint-results-debug.txt for "No issues found", so even a warning fails
+  it. Compile, APK build and APK verification were all green — only
+  lint was red.
+- **Cause:** the M5 telemetry strings (`run_live`, `run_done`,
+  `run_done_cancelled`) were plain `<string>` resources containing
+  "%1$d tokens". A quantity inside a plain string is exactly what
+  PluralsCandidate (and ImpliedQuantity) flag. The repo already had a
+  convention for this: every quantity string is a `<plurals>`
+  (`log_size`, `log_running`, `log_bench_start`), and no non-plural
+  `%d` string existed anywhere — a one-minute grep of strings.xml would
+  have shown it. Instead the new strings were written from the needs
+  of the code, not from the shape of the file they were added to.
+  (Secondary constraint: the job logs and the lint-report artifact are
+  on hosts outside this sandbox's egress, so the report could not be
+  read — the finding class was inferred from the diff + conventions,
+  which worked because the repo's convention made the candidate
+  unique.)
+- **Fix:** the three strings became `<plurals>` (one/other, `%1$d`
+  positional — byte-identical style to the existing entries) and the
+  three `stringResource` call sites in HydraApp.kt use the plurals form
+  (quantity first, then the format args). XML validated, call sites
+  checked, no other `R.string.run_*` references remain.
+- **Prevention:** before adding ANY string resource, grep the existing
+  strings.xml for the same category (quantities → plurals, format
+  args, the repo's positional-arg style) and match it. A green gate
+  that has been green for months is a statement about the conventions
+  of the file, not just about its current contents.
+
+## 2026-10-25 — the plurals fix itself tripped a second wall: Compose stringResource overload resolution
+- **Symptom:** after converting the three telemetry strings to
+  `<plurals>` and calling `stringResource(R.plurals.X, quantity, args...)`,
+  CI's lint failed with three ERROR-level findings: "Expected resource of
+  type string [ResourceType]" at each call. The build compiled fine —
+  the wrong overload simply accepts any Int.
+- **Cause:** `stringResource(@StringRes Int, vararg Any)` and
+  `stringResource(@PluralsRes Int, Int, vararg Any)` are both applicable
+  to a 4-argument call; in this Compose version (BOM 2024.09.03) the
+  compiler resolved to the STRING overload, and lint's ResourceType check
+  then rejected an R.plurals id passed to a @StringRes parameter. So the
+  first fix (plurals — which the previous report's 0-warnings count
+  confirmed it had achieved) was right, but the call style it implied
+  was not unambiguous on this toolchain. Two consecutive lint runs were
+  needed to learn this: run 1 proved the warnings were gone, run 2
+  exposed the overload trap.
+- **Fix:** `LocalResources.current.getQuantityString(R.plurals.X,
+  quantity, args...)` — one unambiguous signature, a @PluralsRes
+  parameter (lint-clean), and the exact pattern MainActivity already uses
+  for its plurals. No change to the strings themselves (they stay
+  plurals).
+- **Prevention:** when a call crosses into a library API with several
+  overloads distinguished only by resource-type annotations
+  (@StringRes/@PluralsRes/@ArrayRes), do not rely on Kotlin overload
+  resolution to pick the annotated one — call the platform API with the
+  explicit type, or verify with the real compiler/lint before shipping.
+  And: a red gate whose report you cannot read is a two-round
+  investigation by necessity; the new lint.yml step now posts the full
+  report as a PR comment + step summary on failure, so round one becomes
+  round zero for API-only clients.
+
+## 2026-10-25 — diagnostic step placed after the very step that aborts on the same failure
+- **Symptom:** after adding a "publish the lint report as PR comment /
+  step summary" step to the Android lint job, the next run still left
+  the report unreadable: the job failed in the `gradle lintDebug` step
+  (it aborts on error-level findings) and the publishing step was
+  skipped entirely. The mirror could never run, because it sat behind
+  the step that dies first.
+- **Cause:** gate and diagnostics must not share a failure point.
+  `gradle lintDebug` exits non-zero on errors, so any step after it is
+  skipped on exactly the runs where the report is needed.
+- **Fix:** the gradle step no longer fails the job (it captures the
+  non-zero exit with a `|| echo` note); the dedicated check step reads
+  the report (which gradle writes before aborting), publishes it (step
+  summary always, PR comment via issues API — PR number from the event,
+  or resolved from the commit SHA via `/commits/{sha}/pulls` so push
+  runs that update a PR are covered too), and fails the job itself.
+  Applied to both lint.yml and release.yml (same pattern).
+- **Prevention:** when adding diagnostics to a CI job, ask "on which
+  step does this job die, and does my diagnostic step run before or
+  after it?" If the gate can abort before the diagnostics, make the
+  gate non-fatal and centralize the failure in the diagnostic step.
+
+## 2026-10-25 — workflow token lacks issues:write; the "self-publishing" step 403s silently
+- **Symptom:** the lint check step now ran and published the report
+  (step summary written, gate correctly failing), but the PR comment
+  never appeared on the PR.
+- **Cause:** lint.yml declares `permissions: contents: read` at the
+  workflow level. The job token therefore has no issues:write, and
+  `gh api …/issues/N/comments` failed with 403 — swallowed by the
+  defensive `|| true` that is supposed to keep a comment failure from
+  masking the real lint failure. A defensive swallow that also hides
+  "the feature itself is broken" is a double-edged sword.
+- **Fix:** job-level `permissions: {contents: read, issues: write}` on
+  the android-lint job (lint.yml) and the build-android job
+  (release.yml) — job level overrides the workflow level and scopes the
+  write to exactly the job that needs it.
+- **Prevention:** when a workflow step calls an API with the default
+  token, check the permissions block first (contents: read is the
+  common default here). And when a diagnostic feature adds a silent
+  fallback (`|| true`), log a distinct marker on the fallback path
+  (e.g. `echo "::warning::could not post the PR comment: $?"`) so the
+  fallback itself is visible in annotations.
+
+## 2026-10-25 — "report missing" is a second failure class that diagnostics must cover
+- **Symptom:** while making lint failures readable via API, it turned
+  out the publish step only had a payload for ONE failure class:
+  "report exists but contains findings". The other class — gradle
+  dying before the lint analysis (e.g. a Kotlin compile error, which
+  produces NO report file) — would have failed the job with an empty
+  "report missing" message and left the actual error in the UI-only
+  log again.
+- **Fix:** the gradle steps in lint.yml and ci.yml capture their full
+  output to a file; the check/publish step builds the payload from
+  whichever failure class occurred — the lint report when it exists,
+  the tail of the gradle log (150–200 lines) when it does not — and
+  publishes it as step summary + PR comment in both cases. The CI
+  "Android APK build" job got the same treatment (capture, tail
+  publish, job-level issues:write).
+- **Prevention:** when writing a "publish the diagnostic" step, first
+  enumerate ALL ways the job can fail upstream, and make sure every
+  class produces a published payload — including the class where the
+  usual diagnostic artifact was never created.
+
+## 2026-10-25 — "LocalResources" does not exist; inventing a library API broke the build
+- **Symptom:** after switching the plurals call sites to
+  `LocalResources.current.getQuantityString(...)`, EVERYTHING that
+  touches the Kotlin compile went red at once: the CI "Build debug and
+  release APK" step (twice, identical trees) and the Android-lint
+  gradle step — which died so early that no lint report file was ever
+  written (a 46-second job, check step failing with "no report").
+- **Cause:** `androidx.compose.ui.platform.LocalResources` does not
+  exist in this Compose version (BOM 2024.09.03). The reference was an
+  unverified assumption carried in from the previous round's fix plan,
+  and the code comment even asserted it. The canonical Compose way to
+  reach the app Resources is `LocalContext.current.resources`
+  (LocalContext is already used in this codebase — Theme.kt).
+- **Fix:** import `androidx.compose.ui.platform.LocalContext` and use
+  `LocalContext.current.resources.getQuantityString(R.plurals…, …)`.
+  No other change: the resources, the plurals, and the call style stay.
+- **Prevention:** when a fix introduces a NEW library API reference
+  (not already used anywhere in the repo), verify it exists in the
+  pinned version before shipping — grep the repo for prior usage, and
+  if there is none, treat the reference as unverified and prefer the
+  API the repo already compiles against. The failure signature to
+  remember: CI build red AND lint "no report" at the same time = the
+  compiler died before lint analysis, not a lint finding.

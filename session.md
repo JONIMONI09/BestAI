@@ -232,6 +232,122 @@ Git hygiene: `git status` shows only tracked changes; `RESEARCH.md` and
       (the APK-inspection step creates `dist/`); no workflow change.
 - [x] Committed and pushed; PR #47 updated.
 
+### Round 2026-10-25 (post-merge: CI red on lint)
+
+PR #47 merged by the user at 18:31 (23baf2b). Post-merge CI: **CI green**
+(Kotlin fix verified — full gradle build + APK verification passed on
+both the PR head and main), but **Lint & Security** and **Release**
+failed on the Android-lint gate. Job logs/artifacts are unreachable from
+this sandbox (results-receiver + Azure blob not in egress), so the
+findings were inferred from the diff and the repo's own conventions:
+three M5 telemetry strings were plain `<string>` resources with `%1$d
+tokens` — a quantity — while every existing quantity string in the repo
+is a `<plurals>` (log_size, log_running, log_bench_start), and the gate
+fails on ANY finding. Fixed by converting to `<plurals>` (one/other,
+matching the existing style) and updating the three `stringResource`
+call sites in HydraApp.kt. Committed on the new session branch
+`arena/6bf4fc8e-bestai`, pushed, **PR #48** opened (R17: merge is the
+user's).
+
+**CI round 1 (db85ccd):** CI green (7m32s), Lint & Security red — with a
+different finding than inferred: **"3 errors, 0 warnings"**. The
+PluralsCandidate warnings are gone (conversion was right), but each
+`stringResource(R.plurals…, …)` call raised ERROR `ResourceType`
+("Expected resource of type string") at HydraApp.kt:329/331/333: in this
+Compose version (BOM 2024.09.03) overload resolution picks the
+`stringResource(@StringRes Int, vararg Any)` overload, and lint rejects
+an R.plurals id at a @StringRes parameter. The report itself was
+unreadable from this sandbox (log/artifact hosts outside egress) — the
+user pasted it, and asked to make such reports retrievable going forward.
+
+**Round 2 (this commit):** (a) call sites switched to
+`LocalResources.current.getQuantityString(R.plurals…, …)` — one
+unambiguous signature, @PluralsRes parameter, same pattern MainActivity
+already uses; the strings stay plurals. (b) `lint.yml` now mirrors the
+full report on failure as a **PR comment** (pull-request runs) and
+**step summary** (always) — the report lands where API-only clients can
+read it; an in-sandbox fetch script is impossible (egress blocks the log
+hosts), so CI-side mirroring is the workable form of the user's request.
+errors.md: overload trap + two-round principle; CHANGELOG updated.
+Committed as 199221c on top of db85ccd (push).
+
+**CI round 2 (199221c):** Lint & Security red — but EARLIER than
+expected: the `gradle lintDebug` step itself (which sits before the
+report step) aborted, so the publishing step was skipped and the report
+was again UI-only (no PR comment). The actual findings of 199221c are
+still unknown — the tree is verified consistent (plurals in
+strings.xml + getQuantityString call sites), so either the overload fix
+was insufficient or a different error-level finding appeared. Side
+finding: the sandbox snapshot had restored strings.xml to the pre-db85ccd
+version while HydraApp.kt kept the db85ccd state; a blind commit would
+have shipped a dangling R.plurals reference (compile error). Caught,
+recovered with `git reset --soft` + `git restore --source=HEAD`; the
+pushed 199221c contains the correct plurals.
+
+**Round 3 (this commit):** workflow restructure in **lint.yml AND
+release.yml**: (1) the `gradle lintDebug` step is no longer fatal
+(`|| echo` — gradle writes the report before aborting anyway); (2) the
+check step verifies the report exists, and on findings publishes step
+summary + PR comment (PR number from the event, or resolved from the
+commit SHA via `/commits/{sha}/pulls`, which also covers push runs that
+update a PR) and fails the job itself. YAML validated. Committed as
+b53d738, pushed.
+
+**CI round 3 (b53d738):** Lint & Security rot — aber der neue Ablauf
+lief: gradle-Step success (non-fatal), Check-Step failure (Gate als
+einziger Failure-Punkt ok). PR-Comment fehlte trotzdem: lint.yml hat
+`permissions: contents: read` auf Workflow-Ebene → issues-API-Call
+403, vom `|| true` verschluckt (genau die Falle, die der
+Fallback-Dämpfer abfangen soll, deckt jetzt die Funktion selbst).
+Der CI-Run auf 199221c (CI workflow) war ebenfalls rot — Code-Tree
+ist verifiziert konsistent, also entweder transiente Infra oder ein
+echter Compile-Fehler; der b53d738-Run klärt das.
+
+**Runde 4 (jetzt):** job-separierte Permissions `issues: write`
+(überschreibt das Workflow-Level, scoped auf die zwei Android-Jobs)
++ `::warning::`-Marker auf dem Comment-Fallback-Pfad (eine gebrochene
+Spiegelung wird dann in den Annotations sichtbar). errors.md:
+Permission-403-Eintrag. Nächster fehlgeschlagener Run postet den
+Report als PR-Comment → tatsächliche Lint-Funde lesen → definitorischer
+Fix. Commit 05dbbfe, gepusht. Nebenbefund aus der Analyse: CI (ci.yml)
+ist auf 199221c UND b53d738 am Gradle-Build-Step rot (db85ccd war
+grün) — gleicher Code in beiden → verdächtigster Kandidat ist der
+HydraApp.kt-Änderung von Runde 2, aber ein Compile-Fehler vs.
+Infrastrukturfehler war aus der Sandbox nicht unterscheidbar (Logs
+UI-only).
+
+**Runde 5 (jetzt):** schließt die letzte Diagnose-Lücke:
+"Report fehlt" ist eine zweite Fehlerklasse (gradle stirbt vor der
+Lint-Analyse, z.B. bei Kotlin-Compile-Fehlern → keine Report-Datei).
+Die gradle-Steps in **ci.yml und lint.yml** loggen jetzt die volle
+Ausgabe in eine Datei; der Check-/Publish-Step baut das Payload aus
+der jeweils eingetretenen Klasse (Lint-Report ODER Gradle-Log-Tail
+150–200 Zeilen) und publiziert es in beiden Fällen (Step-Summary +
+PR-Comment). Der CI-APK-Build-Job bekommt dasselbe (Capture +
+Publish + job-separierte issues:write). YAML validiert (3 Dateien).
+Ab dem nächsten fehlgeschlagenen Run ist jeder Android-Fehler per API
+lesbar — egal welche Fehlerklasse. Commit 9608e4d, gepusht.
+Nebenbefund: der 9608e4d-Lint-Job lief nur 46 Sekunden und starb vor
+der Lint-Analyse (kein Report) — der Footprint eines Compile-Fehlers.
+
+**Runde 6 (jetzt):** WURZELURACHE: `androidx.compose.ui.platform.
+LocalResources` existiert in dieser Compose-Version (BOM 2024.09.03)
+NICHT — die Runde-2-Reparatur hat eine Library-API referenziert, die
+es nicht gibt (ungedruckte Annahme, nicht einmal im Repo verwendet;
+Theme.kt nutzt LocalContext). Ein Compile-Fehler erklärt alles
+Gleichzeitig: CI-Build-Step rot (199221c + b53d738, gleicher Code),
+Lint-Job "kein Report" (stirbt vor der Analyse), 46-Sekunden-Job.
+Fix: `import androidx.compose.ui.platform.LocalContext` +
+`val resources = LocalContext.current.resources` — dieselbe
+Resources-Klasse, kanonischer Compose-Zugriff, API die das Repo schon
+kompiliert. Sonst nichts geändert (Plurals, Call-Stil, Workflow).
+Fehler-Artifact in lint.yml bekommt zusätzlich /tmp/lint-report.md +
+gradle-lint.log. Doku: errors.md (nicht-existierende API +
+Fehler-Fingerprint "CI rot + Lint ohne Report = Compiler, nicht
+Lint-Finding"), CHANGELOG + session.md. **Offen:** nächster Run grün
+(CI + Lint & Security); Merge durch den Nutzer; Release auf main
+nach Merge.
+
 ### Session close (2026-10-25)
 
 Everything the spec asked for is either done and verified or explicitly

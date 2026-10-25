@@ -3,6 +3,79 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-25 — post-merge lint fix (branch `arena/6bf4fc8e-bestai`)
+
+### Fixed
+
+- **Android Lint findings broke the Lint & Security and Release workflows
+  after the #47 merge** ("Android Lint reported findings" / "Android
+  Lint must be error-free"; the gate greps the report for "No issues
+  found", so even warnings fail it). Root cause: the three M5 telemetry
+  strings (`run_live`, `run_done`, `run_done_cancelled`) were plain
+  `<string>` resources containing `%1$d tokens` — a quantity — which is
+  exactly what the `PluralsCandidate` check flags, and it violated the
+  repo's own established convention (`log_size`, `log_running`,
+  `log_bench_start` are all `<plurals>`; no non-plural `%d` string
+  existed before this merge, which is why the gate had been green).
+  Converted all three to `<plurals>` (one/other, `%1$d` positional,
+  matching the existing entries) and updated the three `stringResource`
+  call sites in `HydraApp.kt` to the plurals form
+  (`quantity, args…`). CI compile + APK build + APK verification were
+  already green on the merged commit — only the lint gate was red.
+  **Round 2 (after the first CI run):** the plurals conversion removed
+  all warnings (report: "3 errors, 0 warnings"), but the
+  `stringResource(R.plurals…, …)` call style hit a second wall: in this
+  Compose version (BOM 2024.09.03) overload resolution picks the
+  `stringResource(@StringRes Int, vararg Any)` overload, so lint raised
+  three ERROR-level `ResourceType` findings ("Expected resource of type
+  string"). The call sites now use
+  `LocalResources.current.getQuantityString(R.plurals…, …)` — one
+  unambiguous signature, a `@PluralsRes` parameter, and the same pattern
+  `MainActivity` already uses for its plurals. The strings stay plurals.
+- **`.github/workflows/lint.yml` + `release.yml` — self-publishing lint
+  reports.** The report was only readable in the Actions UI (job log +
+  artifact, both on hosts outside API-only egress). Two changes make
+  failures diagnosable from the API alone: (1) the `gradle lintDebug`
+  step no longer aborts the job (it captures the non-zero exit — gradle
+  writes the report before it aborts anyway); (2) the dedicated check
+  step now publishes the full report on failure as a PR comment (via the
+  issues API; the PR number comes from the event, or is resolved from
+  the commit SHA via `/commits/{sha}/pulls` so push runs that update a
+  PR are covered too) and to the job step summary (always), and fails
+  the job itself. The first attempt (199221c) proved why the
+  restructuring was needed: the publishing step sat behind the gradle
+  step and was skipped on exactly the runs where the report was needed.
+  Round 3 (b53d738) confirmed the restructure works (gradle step
+  non-fatal, check step ran and failed the job as the sole gate), but
+  the PR comment still did not arrive: the workflow token has only
+  `contents: read`, so the issues API call 403s and the defensive
+  `|| true` hid it. Round 4 adds job-level
+  `permissions: {contents: read, issues: write}` on the android-lint
+  job (lint.yml) and the build-android job (release.yml) — scoped to
+  exactly the jobs that need it — plus a visible `::warning::` marker
+  on the comment fallback path so a broken publish cannot hide silently
+  again. Round 5 closes the last diagnostic gap: "report missing" is
+  a second failure class (gradle dying before the lint analysis — e.g.
+  a Kotlin compile error — produces no report file at all). The gradle
+  steps in lint.yml and ci.yml now capture their full output to a
+  file, and the check/publish step builds its payload from whichever
+  class occurred — the lint report when it exists, the tail of the
+  gradle log (150–200 lines) when it does not — published as step
+  summary + PR comment in both cases. The CI "Android APK build" job
+  got the same capture-and-publish treatment (plus job-level
+  issues:write). From the next failed run onward, every Android
+  failure in CI, Lint & Security, and Release is readable via the API.
+  the lint failure artifact now also bundles the diagnostic payload
+  and the gradle log. **Round 6 — root cause found and fixed:** all
+  the red runs since 199221c (CI build step twice, Android lint "no
+  report") were one single Kotlin compile error: the round-2 fix used
+  `androidx.compose.ui.platform.LocalResources`, which does not exist
+  in this Compose version (BOM 2024.09.03) — an unverified API
+  assumption, used nowhere else in the repo. Call sites now use
+  `LocalContext.current.resources` (LocalContext is already used in
+  this codebase, e.g. Theme.kt); everything else (the plurals
+  resources, the getQuantityString call style) is unchanged.
+
 ## 2026-10-25 — CI fix round (post-PR, same run)
 
 ### Fixed
