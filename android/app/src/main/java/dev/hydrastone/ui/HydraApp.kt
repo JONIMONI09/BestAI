@@ -4,7 +4,8 @@ import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Constraints
+import androidx.compose.foundation.layout.Layout
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -256,30 +257,45 @@ private fun PlaceholderTab(
 @Composable
 private fun ChatTab(state: MainUiState, actions: MainActions) {
     Column(modifier = Modifier.fillMaxSize()) {
-        if (state.engineIsExperimental) {
-            ExperimentalBanner()
-        }
-        ModelRow(
-            modelLabel = state.modelLabel,
-            modelDetail = state.modelDetail,
-            onImportModel = actions.onImportModel
+        // The rows above the conversation share the space with it through
+        // AdaptiveHeaderSplit: the header keeps its natural height while it
+        // fits, and scrolls internally once it hits its share. That is what
+        // keeps the composer visible when the keyboard shrinks the window -
+        // the header gives up space first, the input row never moves off
+        // screen.
+        AdaptiveHeaderSplit(
+            modifier = Modifier.weight(1f),
+            header = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    if (state.engineIsExperimental) {
+                        ExperimentalBanner()
+                    }
+                    ModelRow(
+                        modelLabel = state.modelLabel,
+                        modelDetail = state.modelDetail,
+                        onImportModel = actions.onImportModel
+                    )
+                    // The active engine is always named, even when there is
+                    // only one to choose: a chip that only appears when a
+                    // choice exists cannot tell the user which engine is
+                    // producing the text they are reading.
+                    EngineStatusRow(state)
+                    if (state.engines.size > 1) {
+                        EngineSelector(state, actions)
+                    }
+                    HorizontalDivider()
+                    AutoRunRow(state.autoRun, actions.onAutoRunChanged)
+                    HorizontalDivider()
+                }
+            },
+            body = {
+                if (state.chatMessages.isEmpty()) {
+                    EmptyChat()
+                } else {
+                    MessageList(state.chatMessages, state.lastTurnCancelled)
+                }
+            }
         )
-        // The active engine is always named, even when there is only one to
-        // choose: a chip that only appears when a choice exists cannot tell
-        // the user which engine is producing the text they are reading.
-        EngineStatusRow(state)
-        if (state.engines.size > 1) {
-            EngineSelector(state, actions)
-        }
-        HorizontalDivider()
-        AutoRunRow(state.autoRun, actions.onAutoRunChanged)
-        HorizontalDivider()
-
-        if (state.chatMessages.isEmpty()) {
-            EmptyChat()
-        } else {
-            MessageList(state.chatMessages, state.lastTurnCancelled)
-        }
 
         // Live tok/s and the finished run's totals, pinned above the
         // composer so they survive a long conversation: the number the user
@@ -287,6 +303,76 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
         // the log.
         RunTelemetryRow(state)
         InputRow(state, actions)
+    }
+}
+
+/**
+ * Splits the vertical space between a header block and its content.
+ *
+ * The header gets its natural height while it fits within
+ * [headerFraction] of the space, and scrolls internally beyond that. The
+ * content gets everything that is left. A plain Column with weight()
+ * cannot express this: a weighted child that does not use its full share
+ * does not give the space back, so the composer would float above the
+ * bottom edge instead of the conversation filling the screen.
+ *
+ * The split is relative, not fixed dp, so it stays sane when the window
+ * shrinks: with the keyboard open (the window resizes below API 30, and
+ * the IME inset eats the bottom on 30+), the header gives up space first
+ * and the input row never gets pushed off screen.
+ */
+@Composable
+private fun AdaptiveHeaderSplit(
+    modifier: Modifier = Modifier,
+    headerFraction: Float = 0.45f,
+    header: @Composable () -> Unit,
+    body: @Composable () -> Unit
+) {
+    Layout(modifier = modifier, content = {
+        header()
+        body()
+    }) { measurables, constraints ->
+        val bounded = constraints.hasBoundedHeight
+        val cap = if (bounded) {
+            (constraints.maxHeight * headerFraction).toInt().coerceAtLeast(0)
+        } else {
+            Int.MAX_VALUE
+        }
+        val headerPlaceable = measurables[0].measure(
+            Constraints(
+                minWidth = constraints.minWidth,
+                maxWidth = constraints.maxWidth,
+                minHeight = 0,
+                maxHeight = cap
+            )
+        )
+        val rest = if (bounded) {
+            (constraints.maxHeight - headerPlaceable.height).coerceAtLeast(0)
+        } else {
+            Int.MAX_VALUE
+        }
+        val contentPlaceable = measurables[1].measure(
+            Constraints(
+                minWidth = constraints.minWidth,
+                maxWidth = constraints.maxWidth,
+                minHeight = 0,
+                maxHeight = rest
+            )
+        )
+        val width = maxOf(
+            constraints.minWidth,
+            headerPlaceable.width,
+            contentPlaceable.width
+        )
+        val height = if (bounded) {
+            constraints.maxHeight
+        } else {
+            headerPlaceable.height + contentPlaceable.height
+        }
+        layout(width, height) {
+            headerPlaceable.place(0, 0)
+            contentPlaceable.place(0, headerPlaceable.height)
+        }
     }
 }
 
@@ -503,14 +589,14 @@ private fun EmptyChat() {
  * identity and the list rebuilds instead of updating one item.
  */
 @Composable
-private fun ColumnScope.MessageList(messages: List<ChatMessage>, lastTurnCancelled: Boolean) {
+private fun MessageList(messages: List<ChatMessage>, lastTurnCancelled: Boolean) {
+    // No weight and no minimum height: AdaptiveHeaderSplit measures this
+    // list with exactly the height the screen has left, and a LazyColumn
+    // fills a bounded constraint. A fixed minimum would overflow the
+    // window exactly when the window is smallest - keyboard open on a
+    // short screen - and push the composer off screen.
     LazyColumn(
-        modifier = Modifier
-            .fillMaxWidth()
-            .weight(1f)
-            // A guaranteed minimum height keeps the conversation readable on a
-            // short screen instead of collapsing to nothing when it is empty.
-            .heightIn(min = 120.dp),
+        modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
@@ -582,8 +668,12 @@ private fun InputRow(state: MainUiState, actions: MainActions) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            // imePadding lifts the row above the soft keyboard; without it the
-            // keyboard covers the send button on a short screen.
+            // On API 30+ the window is edge-to-edge with ADJUST_NOTHING
+            // (see MainActivity), so the IME inset is what lifts this row:
+            // imePadding() adds exactly the keyboard's height, whatever it
+            // is (split keyboard, emoji row, swipe-up). Below 30 the
+            // platform resizes the window instead (adjustResize) and this
+            // modifier is a no-op.
             .imePadding()
             .navigationBarsPadding()
             .padding(horizontal = 16.dp, vertical = 8.dp),

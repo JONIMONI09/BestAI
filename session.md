@@ -329,6 +329,92 @@ M5 added no C tests, so the measured C count is unchanged.
 **Measured:** docs_claim_check all banned claims absent; zero CJK in the six
 audited docs; test count 142/0 x86 matches baseline.
 
+### Android keyboard fix + full .md audit (2026-10-25, follow-up round)
+
+**User request (screenshot of the broken chat UI):** the app UI breaks
+while typing — the available space must be checked intelligently so the
+keyboard pushes the content down; check the normal README plus all other
+.md files; create a LOCAL scan script that is gitignored; "scanne alles,
+dann PR".
+
+**Diagnosis (verified in code, not guessed):**
+- `Theme.Material.Light.DarkActionBar` (platform theme, manifest) draws a
+  second "Hydra-Stone" bar above the Compose `TopAppBar` — doubled title,
+  wasted vertical space.
+- No `enableEdgeToEdge()` anywhere; classic `adjustResize`. When the
+  keyboard opens the window shrinks, but the fixed header rows (banner,
+  model row, engine status, selector, auto-run) plus the `LazyColumn`
+  with `heightIn(min = 120.dp)` plus the input row overflow — the
+  composer gets pushed off/under the keyboard. The existing
+  `imePadding()` on `InputRow` is a no-op in this configuration (with
+  `adjustResize` + windowed content the IME inset reports 0), and its
+  comment claimed otherwise.
+
+**Fix:**
+- New `Theme.HydraStone` (values + values-night, `NoActionBar`,
+  `windowLightStatusBar` per mode) — manifest updated.
+- `MainActivity.onCreate()`: API 30+ → `enableEdgeToEdge()` +
+  `SOFT_INPUT_ADJUST_NOTHING` (IME arrives as a real inset; the
+  `imePadding()` on the composer is now the mechanism, and the comment
+  says so); below 30 → classic `adjustResize` (no IME insets on the
+  platform, the adaptive layout absorbs the resize).
+- `AdaptiveHeaderSplit` (custom `Layout` in `ui/HydraApp.kt`): the header
+  block gets its natural height up to 45% of the space, scrolls
+  internally beyond that, the conversation gets the remainder. A plain
+  `weight()` cannot do this — a weighted child never returns its unused
+  share (the composer would float above the bottom edge). `MessageList`
+  loses the fixed 120dp floor (it overflowed the window exactly when the
+  window was smallest) and the `ColumnScope` receiver / `weight(1f)`
+  that came with it.
+- `tools/android_autostart_check.sh`: the old "guaranteed minimum
+  height" grep (scoped on `ColumnScope.MessageList`) is replaced by two
+  checks scoped on `AdaptiveHeaderSplit` (headerFraction cap; remainder
+  hand-over). Negative control verified: renamed `headerFraction` in a
+  copy of the tree → the check fails, exit 1.
+
+**Full .md audit (21 tracked files, via the new local scanner):**
+- 1 real doc bug found and fixed: `docs/ARCHITECTURE.md` SIMD table
+  named `hydra_neon_accumulate_chunk()` — the kernel is
+  `hydra_neon_accumulate_agg()` (src/hydra_neon.h); name + wording
+  corrected.
+- 1 real doc bug found and fixed: CHANGELOG.md M3 entry sat above M6,
+  violating its own "Newest entries first" header — reordered.
+- Everything else verified clean: non-English text (none; Greek
+  mathematical notation is allowed as English technical writing),
+  hard-coded test counts in the live docs (none), relative links (all
+  resolve), doc-vs-code `hydra_*` symbols (all resolve; `hydra_v2_reader`
+  is the documented specification-only exception, `hydra_test` the AVD
+  name), README roadmap `[x]` boxes (all cite verifiable code), quoted
+  deterministic baseline (engine reproduces it right now), changelog
+  order (newest-first).
+- `FORMAT-V2.md` examined and CONFIRMED CORRECT: its "no v2 loader"
+  statement is about the `.hydra2` sparse-MoE container (still
+  spec-only), a different v2 than the 4-weights/byte packing that M5
+  implemented — the disambiguation block in the file says exactly this.
+
+**Local tooling:** `tools/local_scan.py` created (10 checks, stdlib,
+parses everything at run time, missing binaries → skip not fail) and
+gitignored via a committed `.gitignore` entry. It found both bugs above
+on its first run (the scanner itself had three false-positive classes —
+Greek letters as math notation, quoted historical counts, JSON baseline
+spacing — fixed in the scanner, not by weakening a doc).
+
+**Gate (all bash, per the standing 5-part matrix):** make clean/make 0
+warnings; hydra-test 142/0 + large-model 7/0; gguf_test 59/0;
+gguf_speed ok; string_format_check 35/0/4; server_test ok;
+console_train_test pass; contrast_check 17 AA; jni_signature_check SKIP
+(no javac in sandbox, env-only); android_header_check 22/0;
+android_autostart_check 32/0; android_crash_check 25/0;
+llama_pin_check 5/0 (7fe450e v0.5.0); docs_claim_check all absent;
+test_count_check ok (142, x86 baseline); npm run lint 0; git status
+clean apart from the intended changes.
+
+**Not verifiable in this sandbox:** the Android app itself (no SDK, no
+emulator) — CI runs the Gradle build + lint; the edge-to-edge/IME
+behaviour needs a device check by the user after the merge.
+
+**Next:** commit, push, open PR (R17: user merges).
+
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 
 **2026-10-25 — Full-repository audit, Claude-skills adherence, 6-milestone

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- No platform ActionBar: the Compose TopAppBar is the only bar.
+         The old Theme.Material.Light.DarkActionBar drew a second
+         "Hydra-Stone" bar above the TopAppBar, doubling the title and
+         eating vertical space exactly where the keyboard needs it. -->
+    <style name="Theme.HydraStone" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- Light content: dark status-bar icons. -->
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

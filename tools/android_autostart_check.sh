@@ -131,20 +131,38 @@ else
       "state.log is not rendered inside the scrolling column"
 fi
 
-# Also scoped: `heightIn(min = ` appears on the progress indicator too, so an
-# unscoped grep passes even when the conversation itself has lost its floor.
-if awk '/private fun ColumnScope\.MessageList/,/^}/' "$UI" \
-     | grep -Eq 'heightIn\(min = [0-9]'; then
-  ok "the log has a guaranteed minimum height"
+# The fixed heightIn(min = 120.dp) floor is gone on purpose: it overflowed
+# the window exactly when the window was smallest (keyboard open on a short
+# screen) and pushed the composer off screen. The floor is now relative -
+# AdaptiveHeaderSplit caps the header block at headerFraction of the space
+# and measures the conversation with the remainder, so the conversation
+# always keeps (1 - headerFraction) of the space above the composer, and
+# the composer itself is a plain sibling after the weighted split.
+#
+# Also scoped: 'headerFraction' and the remainder expression would match
+# any comment anywhere in the file, so the awk window is what asserts they
+# live inside the split's measurement logic.
+if awk '/private fun AdaptiveHeaderSplit/,/^}/' "$UI" \
+     | grep -Eq 'headerFraction'; then
+  ok "the header block is capped at a fraction of the space"
 else
-  bad "the log has a guaranteed minimum height" \
-      "the conversation has no heightIn(min = ...) floor"
+  bad "the header block is capped at a fraction of the space" \
+      "AdaptiveHeaderSplit no longer caps the header with headerFraction"
+fi
+if awk '/private fun AdaptiveHeaderSplit/,/^}/' "$UI" \
+     | grep -Eq 'maxHeight - headerPlaceable\.height'; then
+  ok "the conversation gets the space left over from the header"
+else
+  bad "the conversation gets the space left over from the header" \
+      "the split no longer hands the remainder to the content"
 fi
 
 # Two same-direction scroll containers fight each other and the outer one
 # cannot reach the inner content. In Views that was ScrollView-in-ScrollView;
-# in Compose it is a LazyColumn placed inside a verticalScroll column.
-if awk '/private fun ColumnScope\.MessageList/,/^}/' "$UI" \
+# in Compose it is a LazyColumn placed inside a verticalScroll column. The
+# adaptive header IS scrollable - that is the point - but the transcript
+# must not be inside it.
+if awk '/private fun MessageList/,/^}/' "$UI" \
      | grep -Eq 'verticalScroll\('; then
   bad "the log is not nested inside a second scroll view" \
       "the conversation LazyColumn is nested inside a verticalScroll column"

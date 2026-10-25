@@ -5,8 +5,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -138,6 +140,25 @@ class MainActivity : ComponentActivity() {
          * caught and shown with a copy button. */
         CrashHandler.appContext = applicationContext
         CrashHandler.install()
+
+        /* Keyboard and system bars, chosen by API level.
+         *
+         * API 30+: the window draws edge-to-edge and the soft keyboard
+         * arrives as a real WindowInset. The composer's
+         * Modifier.imePadding() then lifts the input row exactly onto the
+         * keyboard, whatever its height (split keyboard, emoji row,
+         * swipe-up). The window must NOT also resize (ADJUST_NOTHING),
+         * or the row would be lifted twice.
+         *
+         * Below 30: the platform delivers no IME insets, so the classic
+         * adjustResize stays on: the window shrinks when the keyboard
+         * opens, and the adaptive ChatTab header (capped, internally
+         * scrollable) scrolls instead of pushing the composer off screen.
+         */
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            enableEdgeToEdge()
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        }
 
         /* Compose owns the layout now.
          *

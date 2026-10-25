@@ -110,7 +110,7 @@ tested to preserve sinks while sliding the window (see `test_kv_cache`).
 
 | Platform | Path in `hydra_engine_step()` | Status |
 |---|---|---|
-| ARM64/ARMv7-A with NEON | `hydra_neon_accumulate_chunk()` — 16 lanes per chunk | **active**, proven bit-identical to the scalar reference by `test_neon_matches_scalar` in the same build |
+| ARM64/ARMv7-A with NEON | `hydra_neon_accumulate_agg()` — 16 values per fixed-width chunk (4 int32 lanes per vector op) | **active**, proven bit-identical to the scalar reference by `test_neon_matches_scalar` in the same build |
 | ARM, `dim % 16 != 0` | NEON for multiples of 16, scalar for the remainder | active |
 | x86-64, `-mavx2` build, CPU has AVX2 | `hydra_avx2_accumulate_agg()` — 8 dims per 256-bit iteration (a `__m256i` holds 8 int32), int32 math exact under the layer cap | **active**, proven bit-identical by `test_avx2_step_kernel` in the same build |
 | x86-64, `-mavx2` build, CPU lacks AVX2 | runtime `hydra_simd_has_avx2()` check → scalar fallback | active (portable by design) |

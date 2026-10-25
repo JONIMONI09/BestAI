@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark variant: the Compose surface follows the system dark theme,
+         so the status-bar icons must be light. -->
+    <style name="Theme.HydraStone" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

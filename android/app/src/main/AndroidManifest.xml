@@ -5,7 +5,7 @@
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:theme="@android:style/Theme.Material.Light.DarkActionBar"
+        android:theme="@style/Theme.HydraStone"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules">
         <!-- Kein android:screenOrientation: eine fixe Orientierung erzeugt
