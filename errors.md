@@ -1618,3 +1618,24 @@
   step does this job die, and does my diagnostic step run before or
   after it?" If the gate can abort before the diagnostics, make the
   gate non-fatal and centralize the failure in the diagnostic step.
+
+## 2026-10-25 — workflow token lacks issues:write; the "self-publishing" step 403s silently
+- **Symptom:** the lint check step now ran and published the report
+  (step summary written, gate correctly failing), but the PR comment
+  never appeared on the PR.
+- **Cause:** lint.yml declares `permissions: contents: read` at the
+  workflow level. The job token therefore has no issues:write, and
+  `gh api …/issues/N/comments` failed with 403 — swallowed by the
+  defensive `|| true` that is supposed to keep a comment failure from
+  masking the real lint failure. A defensive swallow that also hides
+  "the feature itself is broken" is a double-edged sword.
+- **Fix:** job-level `permissions: {contents: read, issues: write}` on
+  the android-lint job (lint.yml) and the build-android job
+  (release.yml) — job level overrides the workflow level and scopes the
+  write to exactly the job that needs it.
+- **Prevention:** when a workflow step calls an API with the default
+  token, check the permissions block first (contents: read is the
+  common default here). And when a diagnostic feature adds a silent
+  fallback (`|| true`), log a distinct marker on the fallback path
+  (e.g. `echo "::warning::could not post the PR comment: $?"`) so the
+  fallback itself is visible in annotations.

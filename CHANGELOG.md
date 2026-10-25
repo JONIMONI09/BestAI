@@ -45,8 +45,18 @@ All notable changes to this project, per change, are recorded here and in
   the job itself. The first attempt (199221c) proved why the
   restructuring was needed: the publishing step sat behind the gradle
   step and was skipped on exactly the runs where the report was needed.
-  The actual findings of that run will arrive as a PR comment on the
-  next failed run and are fixed in the following round.
+  Round 3 (b53d738) confirmed the restructure works (gradle step
+  non-fatal, check step ran and failed the job as the sole gate), but
+  the PR comment still did not arrive: the workflow token has only
+  `contents: read`, so the issues API call 403s and the defensive
+  `|| true` hid it. Round 4 adds job-level
+  `permissions: {contents: read, issues: write}` on the android-lint
+  job (lint.yml) and the build-android job (release.yml) — scoped to
+  exactly the jobs that need it — plus a visible `::warning::` marker
+  on the comment fallback path so a broken publish cannot hide silently
+  again. The actual lint findings of the current red runs will arrive
+  as a PR comment on the next failed run and are fixed in the
+  following round.
 
 ## 2026-10-25 — CI fix round (post-PR, same run)
 

@@ -296,6 +296,13 @@ jobs:
   android-lint:
     name: Android lint
     runs-on: ubuntu-latest
+    # issues: write is only needed for this job: when lint has findings,
+    # the check step publishes the report as a PR comment. The workflow
+    # token defaults to contents: read only, which 403s on the issues
+    # API — without this, the report silently never arrives.
+    permissions:
+      contents: read
+      issues: write
     steps:
       # submodules: true ist Pflicht, keine Optimierung: der native Build
       # ruft add_subdirectory(llama) auf. Ohne Submodul sieht der Job ein
@@ -384,7 +391,8 @@ jobs:
             fi
             if [ -n "$PR" ]; then
               gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 || true
+                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 \
+                || echo "::warning::could not post the lint report as PR comment (check job permissions: issues write)"
             fi
             echo "::error::Android Lint reported findings"
             exit 1

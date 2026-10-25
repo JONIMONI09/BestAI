@@ -283,6 +283,13 @@ jobs:
 
   build-android:
     name: Android APK
+    # issues: write is only needed for this job: if the lint step finds
+    # issues it publishes the report as a PR comment when the run is
+    # attached to one (push/tag runs only get the step summary). Same
+    # reason as in lint.yml: the default token is contents: read only.
+    permissions:
+      contents: read
+      issues: write
     needs: version
     runs-on: ubuntu-latest
     steps:
@@ -398,7 +405,8 @@ jobs:
             fi
             if [ -n "$PR" ]; then
               gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 || true
+                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 \
+                || echo "::warning::could not post the lint report as PR comment (check job permissions: issues write)"
             fi
             echo "::error::Android Lint reported findings"
             exit 1

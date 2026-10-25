@@ -290,10 +290,27 @@ release.yml**: (1) the `gradle lintDebug` step is no longer fatal
 check step verifies the report exists, and on findings publishes step
 summary + PR comment (PR number from the event, or resolved from the
 commit SHA via `/commits/{sha}/pulls`, which also covers push runs that
-update a PR) and fails the job itself. YAML validated. The next failed
-run will therefore be readable via the API (PR comment) — read the
-report, fix the actual finding, done. **Open:** round-4 CI green; user
-merge; main-branch Release after merge.
+update a PR) and fails the job itself. YAML validated. Committed as
+b53d738, pushed.
+
+**CI round 3 (b53d738):** Lint & Security rot — aber der neue Ablauf
+lief: gradle-Step success (non-fatal), Check-Step failure (Gate als
+einziger Failure-Punkt ok). PR-Comment fehlte trotzdem: lint.yml hat
+`permissions: contents: read` auf Workflow-Ebene → issues-API-Call
+403, vom `|| true` verschluckt (genau die Falle, die der
+Fallback-Dämpfer abfangen soll, deckt jetzt die Funktion selbst).
+Der CI-Run auf 199221c (CI workflow) war ebenfalls rot — Code-Tree
+ist verifiziert konsistent, also entweder transiente Infra oder ein
+echter Compile-Fehler; der b53d738-Run klärt das.
+
+**Runde 4 (jetzt):** job-separierte Permissions `issues: write`
+(überschreibt das Workflow-Level, scoped auf die zwei Android-Jobs)
++ `::warning::`-Marker auf dem Comment-Fallback-Pfad (eine gebrochene
+Spiegelung wird dann in den Annotations sichtbar). errors.md:
+Permission-403-Eintrag. Nächster fehlgeschlagener Run postet den
+Report als PR-Comment → tatsächliche Lint-Funde lesen → definitorischer
+Fix. **Offen:** grüner Run (CI + Lint & Security); Merge durch den
+Nutzer; Release auf main nach Merge.
 
 ### Session close (2026-10-25)
 
