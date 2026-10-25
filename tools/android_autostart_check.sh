@@ -142,21 +142,25 @@ fi
 # Also scoped: the patterns below would match any comment anywhere in the
 # file, so the awk window is what asserts they live inside the split's
 # measurement logic. And the first one greps the CAP EXPRESSION
-# (maxHeight * headerFraction), not the parameter alone: a parameter that
-# nothing multiplies is a cap in name only.
+# (maxHeight.value * headerFraction), not the parameter alone: a parameter
+# that nothing multiplies is a cap in name only.
 if awk '/private fun AdaptiveHeaderSplit/,/^}/' "$UI" \
-     | grep -Eq 'maxHeight \* headerFraction'; then
+     | grep -Eq 'maxHeight\.value \* headerFraction'; then
   ok "the header block is capped at a fraction of the space"
 else
   bad "the header block is capped at a fraction of the space" \
       "AdaptiveHeaderSplit no longer computes a cap from headerFraction"
 fi
+# The remainder hand-over is the body column's weight(1f): it is the only
+# weighted child of the inner column, so it takes everything the capped
+# header did not use. Grep that weight, scoped to the split - a body
+# column without it would wrap and leave a gap above the composer.
 if awk '/private fun AdaptiveHeaderSplit/,/^}/' "$UI" \
-     | grep -Eq 'maxHeight - headerPlaceable\.height'; then
+     | grep -Eq 'Modifier\.weight\(1f\)'; then
   ok "the conversation gets the space left over from the header"
 else
   bad "the conversation gets the space left over from the header" \
-      "the split no longer hands the remainder to the content"
+      "the split no longer hands the remainder to the body (weight(1f) gone)"
 fi
 
 # Two same-direction scroll containers fight each other and the outer one

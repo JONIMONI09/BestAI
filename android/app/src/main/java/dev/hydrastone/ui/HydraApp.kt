@@ -3,9 +3,8 @@ package dev.hydrastone.ui
 import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Constraints
-import androidx.compose.foundation.layout.Layout
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -53,6 +52,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import dev.hydrastone.ChatMessage
 import dev.hydrastone.ChatState
@@ -307,19 +307,24 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
 }
 
 /**
- * Splits the vertical space between a header block and its content.
+ * Splits the vertical space between a header block and its body.
  *
  * The header gets its natural height while it fits within
  * [headerFraction] of the space, and scrolls internally beyond that. The
- * content gets everything that is left. A plain Column with weight()
- * cannot express this: a weighted child that does not use its full share
- * does not give the space back, so the composer would float above the
- * bottom edge instead of the conversation filling the screen.
+ * body gets everything that is left (it is the only weighted child of the
+ * inner column, so it takes 100% of what the header did not use - no gap
+ * can form above the composer).
  *
  * The split is relative, not fixed dp, so it stays sane when the window
  * shrinks: with the keyboard open (the window resizes below API 30, and
  * the IME inset eats the bottom on 30+), the header gives up space first
  * and the input row never gets pushed off screen.
+ *
+ * BoxWithConstraints instead of a custom Layout: the cap is read from the
+ * incoming constraints in the same measurement pass, so there is no
+ * size-callback state and no collapsed first frame. BoxWithConstraints
+ * sits next to Box in the same foundation.layout package, both already
+ * used by this file.
  */
 @Composable
 private fun AdaptiveHeaderSplit(
@@ -328,50 +333,28 @@ private fun AdaptiveHeaderSplit(
     header: @Composable () -> Unit,
     body: @Composable () -> Unit
 ) {
-    Layout(modifier = modifier, content = {
-        header()
-        body()
-    }) { measurables, constraints ->
-        val bounded = constraints.hasBoundedHeight
-        val cap = if (bounded) {
-            (constraints.maxHeight * headerFraction).toInt().coerceAtLeast(0)
+    BoxWithConstraints(modifier = modifier) {
+        // maxHeight.value is the Dp as a plain Float; the .dp extension
+        // (already imported) turns the scaled value back into a Dp.
+        val cap: Dp = if (constraints.hasBoundedHeight) {
+            (constraints.maxHeight.value * headerFraction).dp
         } else {
-            Int.MAX_VALUE
+            Dp.Unspecified
         }
-        val headerPlaceable = measurables[0].measure(
-            Constraints(
-                minWidth = constraints.minWidth,
-                maxWidth = constraints.maxWidth,
-                minHeight = 0,
-                maxHeight = cap
-            )
-        )
-        val rest = if (bounded) {
-            (constraints.maxHeight - headerPlaceable.height).coerceAtLeast(0)
-        } else {
-            Int.MAX_VALUE
-        }
-        val contentPlaceable = measurables[1].measure(
-            Constraints(
-                minWidth = constraints.minWidth,
-                maxWidth = constraints.maxWidth,
-                minHeight = 0,
-                maxHeight = rest
-            )
-        )
-        val width = maxOf(
-            constraints.minWidth,
-            headerPlaceable.width,
-            contentPlaceable.width
-        )
-        val height = if (bounded) {
-            constraints.maxHeight
-        } else {
-            headerPlaceable.height + contentPlaceable.height
-        }
-        layout(width, height) {
-            headerPlaceable.place(0, 0)
-            contentPlaceable.place(0, headerPlaceable.height)
+        Column(Modifier.fillMaxSize()) {
+            // Natural height while it fits in the cap; scrolls internally
+            // once it would take more of the space.
+            Column(
+                modifier = Modifier
+                    .heightIn(max = cap)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                header()
+            }
+            // Everything the header did not take.
+            Column(modifier = Modifier.weight(1f)) {
+                body()
+            }
         }
     }
 }

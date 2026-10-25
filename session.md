@@ -423,6 +423,26 @@ behaviour needs a device check by the user after the merge.
 
 **Next:** commit, push, open PR (R17: user merges).
 
+**CI follow-up (first CI run, user pasted the logs):** three defects
+the sandbox cannot reproduce — and the lesson is now standing: ALWAYS
+check CI after pushing (`gh pr checks` + annotations via API), because
+the Android SDK, the aarch64 toolchain, and CodeQL only exist there.
+1. Kotlin compile errors: the custom `Layout` approach did not
+   compile — `Constraints` lives in `androidx.compose.ui`, and the
+   `Layout` import did not resolve in this pinned Compose set
+   (foundation 1.7.x via BOM 2024.09.03, transitive via material3).
+   Replaced with `BoxWithConstraints` (same package as the already-
+   compiling `Box`, constraints read in the same measurement pass,
+   cap via `maxHeight.value * fraction` + the imported `.dp` extension
+   so no Dp operator import is needed). Gate + negative control
+   updated to the new wiring (cap expression grep; body weight(1f)
+   grep); local proof 32/0 + 15/15.
+2. aarch64 `hydra-run-arm` link without `-lm` (M4 float primitives)
+   in the ci.yml determinism step — fixed.
+3. Built-in CodeQL: `fopen(path, "wb")` in `make_v1_model` (0666
+   world-writable under permissive umask) — replaced with explicit
+   `open(..., 0644)` + `fdopen`.
+
 ## Previous task (2026-10-25 audit — completed, merged as PR #47/#48/#49)
 
 **2026-10-25 — Full-repository audit, Claude-skills adherence, 6-milestone

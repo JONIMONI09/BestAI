@@ -69,6 +69,39 @@ committed)**
   self-gitignore). The committed CI gate remains
   `tools/docs_claim_check.sh`; this is the "scan everything" aid.
 
+### CI follow-up (same day, after the first CI run)
+
+The first CI run on the PR found three defects the sandbox cannot
+reproduce (no Android SDK, no aarch64 toolchain, no CodeQL):
+
+- **Kotlin compile errors in `AdaptiveHeaderSplit`**: the custom
+  `Layout` implementation imported `Constraints` from the wrong package
+  (`androidx.compose.ui`, not `foundation.layout`) and the `Layout`
+  import did not resolve in this Compose set at all. Replaced the whole
+  mechanism with a `BoxWithConstraints` implementation — the cap is
+  read from the incoming constraints in the same measurement pass (no
+  size-callback state, no collapsed first frame), and every API used
+  already resolves in this file (`BoxWithConstraints` sits next to
+  `Box` in the same `foundation.layout` package; the `Dp` arithmetic
+  goes through `maxHeight.value` + the already-imported `.dp`
+  extension, so no new operator import is needed).
+- **aarch64 static link failure** (`undefined reference to
+  sqrtf/pow/sincos/expf/exp`): the "Cross-arch determinism check" step
+  in `.github/workflows/ci.yml` linked `hydra-run-arm` without `-lm`;
+  the M4 float primitives made libm mandatory. `-lm` added (the
+  sibling `hydra-test-arm` line in the same job already had it).
+- **CodeQL (built-in) alert in `tests/test_engine.c`**:
+  `make_v1_model` used `fopen(path, "wb")`, which creates a missing
+  file with the internal 0666 mode (world-writable under a permissive
+  umask). Now `open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644)` + `fdopen`,
+  with the reasoning in a comment.
+- The autostart gate + negative control were updated in the same round:
+  the cap check greps the cap expression
+  (`maxHeight.value * headerFraction`), the remainder check greps the
+  body column's `weight(1f)`, and the two negative scenarios break
+  exactly those wirings. Local proof: gate 32/0, negative control 15
+  proved / 0 could not fail, `hydra-test` 142/0.
+
 ## 2026-10-25 — M6: docs + baseline (roadmap checkboxes only for verified work)
 
 - **`README.md`**: the Roadmap now reflects reality, with **exact

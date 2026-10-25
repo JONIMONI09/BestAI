@@ -147,8 +147,11 @@ jobs:
           make all
           python3 tools/make_model.py parity.hydra
           ./hydra-run parity.hydra 42 8 --json 2>/dev/null > /tmp/x86.json
+          # -lm: the M4 float primitives (RMSNorm/RoPE/SwiGLU) and the M2
+          # sampler link against libm; a static aarch64 build does not
+          # pull it in implicitly.
           aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
-              src/hydra_engine.c src/main.c -o hydra-run-arm
+              src/hydra_engine.c src/main.c -lm -o hydra-run-arm
           qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
               2>/dev/null > /tmp/arm.json
           python3 - << 'EOF'

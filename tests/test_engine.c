@@ -1223,8 +1223,15 @@ static void test_axiom(void)
 static int make_v1_model(const char *path, uint16_t vocab, uint32_t layers,
                          uint8_t weight_byte)
 {
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
+    /* open() with an explicit 0644 instead of fopen("wb"): fopen would
+     * create a missing file with its internal 0666 mode (world-writable
+     * under a permissive umask), which the CodeQL gate rejects. The
+     * callers pass mkstemp paths, but this function must be safe for any
+     * path its signature allows. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); return -1; }
     wr_header(f, vocab, 1u, layers, (uint32_t)sizeof(HydraModelHeader), layers);
     for (uint32_t l = 0; l < layers; ++l) fputc(weight_byte, f);
     fclose(f);
