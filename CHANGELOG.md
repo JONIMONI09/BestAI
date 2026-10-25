@@ -54,9 +54,19 @@ All notable changes to this project, per change, are recorded here and in
   job (lint.yml) and the build-android job (release.yml) — scoped to
   exactly the jobs that need it — plus a visible `::warning::` marker
   on the comment fallback path so a broken publish cannot hide silently
-  again. The actual lint findings of the current red runs will arrive
-  as a PR comment on the next failed run and are fixed in the
-  following round.
+  again. Round 5 closes the last diagnostic gap: "report missing" is
+  a second failure class (gradle dying before the lint analysis — e.g.
+  a Kotlin compile error — produces no report file at all). The gradle
+  steps in lint.yml and ci.yml now capture their full output to a
+  file, and the check/publish step builds its payload from whichever
+  class occurred — the lint report when it exists, the tail of the
+  gradle log (150–200 lines) when it does not — published as step
+  summary + PR comment in both cases. The CI "Android APK build" job
+  got the same capture-and-publish treatment (plus job-level
+  issues:write). From the next failed run onward, every Android
+  failure in CI, Lint & Security, and Release is readable via the API.
+  The actual findings of the current red runs will arrive as a PR
+  comment and are fixed in the following round.
 
 ## 2026-10-25 — CI fix round (post-PR, same run)
 

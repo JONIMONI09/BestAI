@@ -352,10 +352,20 @@ jobs:
           # error-level findings but has already written the report.
           # If this step failed the job itself, the next step would be
           # skipped and the report would stay in the UI-only job log.
-          # The next step reads the report, publishes it where API-only
-          # clients can read it, and fails the job itself.
+          # The next step reads the report (or the gradle log tail, if
+          # gradle died before the analysis — e.g. a compile error),
+          # publishes it where API-only clients can read it, and fails
+          # the job itself.
+          set +e
           /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q \
-            || echo "gradle lintDebug reported findings; the next step publishes the report"
+            > "$RUNNER_TEMP/gradle-lint.log" 2>&1
+          rc=$?
+          set -e
+          # The step itself stays green on any rc: the check step is the
+          # single failure point, so its diagnostics always run.
+          echo "gradle lintDebug exit code: $rc"
+          echo "--- last 15 lines of the gradle output ---"
+          tail -15 "$RUNNER_TEMP/gradle-lint.log"
 
       - name: Check the lint report for warnings/errors
         env:
@@ -363,40 +373,54 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REPORT=android/app/build/reports/lint-results-debug.txt
-          if [ ! -f "$REPORT" ]; then
-            echo "::error::Android Lint report missing: $REPORT"
-            exit 1
-          fi
-          cat "$REPORT"
-          if ! grep -q "No issues found" "$REPORT"; then
-            # The report above is also in the job log, but the log is only
-            # readable in the Actions UI: log-download and artifact hosts
-            # are not reachable by API-only clients. Publish the report
-            # where the API can see it: step summary always, PR comment
-            # when the run belongs to a pull request (the number is
-            # resolved from the commit SHA when the event itself does
-            # not carry one, so push runs that update a PR are covered).
+          # The job log is only readable in the Actions UI (log-download
+          # and artifact hosts are unreachable by API-only clients). So
+          # on any failure the diagnostic is published where the API can
+          # see it: step summary always, PR comment when the run belongs
+          # to a pull request (the number is resolved from the commit
+          # SHA when the event itself does not carry one, so push runs
+          # that update a PR are covered too).
+          FAILED=0
+          if [ -f "$REPORT" ] && grep -q "No issues found" "$REPORT"; then
+            cat "$REPORT"
+          else
+            FAILED=1
             {
               echo "### Android Lint report ($(git rev-parse --short HEAD))"
-              echo
-              echo '```'
-              cat "$REPORT"
-              echo '```'
+              if [ -f "$REPORT" ]; then
+                echo
+                echo '```'
+                cat "$REPORT"
+                echo '```'
+              else
+                echo
+                echo "No report file at \\\`$REPORT\\\` - gradle died before"
+                echo "the lint analysis (compile error or toolchain"
+                echo "failure). Tail of the gradle output:"
+                echo
+                echo '```'
+                tail -150 "$RUNNER_TEMP/gradle-lint.log"
+                echo '```'
+              fi
             } > /tmp/lint-report.md
-            cat /tmp/lint-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            PR="${PR_NUMBER:-}"
-            if [ -z "$PR" ]; then
-              PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
-                       --jq '.[0].number // empty' 2>/dev/null || true)"
-            fi
-            if [ -n "$PR" ]; then
-              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-                -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 \
-                || echo "::warning::could not post the lint report as PR comment (check job permissions: issues write)"
-            fi
-            echo "::error::Android Lint reported findings"
-            exit 1
           fi
+          if [ "$FAILED" -eq 0 ]; then
+            exit 0
+          fi
+          cat /tmp/lint-report.md
+          cat /tmp/lint-report.md >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          PR="${PR_NUMBER:-}"
+          if [ -z "$PR" ]; then
+            PR="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                     --jq '.[0].number // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$PR" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+              -f body="$(cat /tmp/lint-report.md)" >/dev/null 2>&1 \
+              || echo "::warning::could not post the lint report as PR comment (check job permissions: issues write)"
+          fi
+          echo "::error::Android Lint reported findings (or gradle failed before the analysis)"
+          exit 1
 
       - name: Kotlin-/C-Kompilierung (NDK clang ist strenger als Host-gcc)
         working-directory: android

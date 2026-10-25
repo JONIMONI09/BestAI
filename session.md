@@ -309,8 +309,26 @@ echter Compile-Fehler; der b53d738-Run klärt das.
 Spiegelung wird dann in den Annotations sichtbar). errors.md:
 Permission-403-Eintrag. Nächster fehlgeschlagener Run postet den
 Report als PR-Comment → tatsächliche Lint-Funde lesen → definitorischer
-Fix. **Offen:** grüner Run (CI + Lint & Security); Merge durch den
-Nutzer; Release auf main nach Merge.
+Fix. Commit 05dbbfe, gepusht. Nebenbefund aus der Analyse: CI (ci.yml)
+ist auf 199221c UND b53d738 am Gradle-Build-Step rot (db85ccd war
+grün) — gleicher Code in beiden → verdächtigster Kandidat ist der
+HydraApp.kt-Änderung von Runde 2, aber ein Compile-Fehler vs.
+Infrastrukturfehler war aus der Sandbox nicht unterscheidbar (Logs
+UI-only).
+
+**Runde 5 (jetzt):** schließt die letzte Diagnose-Lücke:
+"Report fehlt" ist eine zweite Fehlerklasse (gradle stirbt vor der
+Lint-Analyse, z.B. bei Kotlin-Compile-Fehlern → keine Report-Datei).
+Die gradle-Steps in **ci.yml und lint.yml** loggen jetzt die volle
+Ausgabe in eine Datei; der Check-/Publish-Step baut das Payload aus
+der jeweils eingetretenen Klasse (Lint-Report ODER Gradle-Log-Tail
+150–200 Zeilen) und publiziert es in beiden Fällen (Step-Summary +
+PR-Comment). Der CI-APK-Build-Job bekommt dasselbe (Capture +
+Publish + job-separierte issues:write). YAML validiert (3 Dateien).
+Ab dem nächsten fehlgeschlagenen Run ist jeder Android-Fehler per API
+lesbar — egal welche Fehlerklasse. **Offen:** 05dbbfe-Runs abwarten
+(posten ggf. den ersten echten PR-Comment-Report); definitorischer
+Fix der Lint-/Build-Funde; grüner Run; Merge durch den Nutzer.
 
 ### Session close (2026-10-25)
 

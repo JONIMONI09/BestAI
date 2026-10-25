@@ -1639,3 +1639,23 @@
   fallback (`|| true`), log a distinct marker on the fallback path
   (e.g. `echo "::warning::could not post the PR comment: $?"`) so the
   fallback itself is visible in annotations.
+
+## 2026-10-25 — "report missing" is a second failure class that diagnostics must cover
+- **Symptom:** while making lint failures readable via API, it turned
+  out the publish step only had a payload for ONE failure class:
+  "report exists but contains findings". The other class — gradle
+  dying before the lint analysis (e.g. a Kotlin compile error, which
+  produces NO report file) — would have failed the job with an empty
+  "report missing" message and left the actual error in the UI-only
+  log again.
+- **Fix:** the gradle steps in lint.yml and ci.yml capture their full
+  output to a file; the check/publish step builds the payload from
+  whichever failure class occurred — the lint report when it exists,
+  the tail of the gradle log (150–200 lines) when it does not — and
+  publishes it as step summary + PR comment in both cases. The CI
+  "Android APK build" job got the same treatment (capture, tail
+  publish, job-level issues:write).
+- **Prevention:** when writing a "publish the diagnostic" step, first
+  enumerate ALL ways the job can fail upstream, and make sure every
+  class produces a published payload — including the class where the
+  usual diagnostic artifact was never created.
