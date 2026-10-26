@@ -772,6 +772,7 @@ private fun InputRow(state: MainUiState, actions: MainActions) {
 private fun SettingsTab(state: MainUiState, actions: MainActions) {
     val settings = state.settings
     val llamaActive = state.selectedEngineId == "llama"
+    val hydraActive = state.selectedEngineId == "hydra"
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -818,18 +819,17 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold
         )
-        // The sampling controls configure a sampler, and the v1 engine does
-        // not have one: it is deterministic by construction. Showing the
-        // sliders with an honest note beats hiding them (the user cannot
-        // tell which engine they would apply to) or showing them enabled
-        // (values that change nothing would be a lie).
-        if (!llamaActive) {
-            Text(
-                text = stringResource(R.string.settings_llama_only),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
+        // Per-engine sampler inventory, stated instead of implied by
+        // greying: the llama.cpp sampler chain takes topK/topP, the
+        // Hydra C sampler (hydra_sample_token) takes temperature, minP
+        // and repetitionPenalty. No slider is ever enabled for an engine
+        // that would ignore it - that would be a control that changes
+        // nothing, which this UI does not ship.
+        Text(
+            text = stringResource(R.string.settings_llama_only),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
 
         // Thinking mode and the system prompt are prompt-level features:
         // they only take effect on engines that understand text, which is
@@ -867,7 +867,9 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
             start = 0f, end = 2f,
             step = 0.05f,
             format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
-            enabled = llamaActive,
+            // Both engines: llama's sampler chain and the Hydra C sampler
+            // (0 = the Hydra engine's deterministic baseline).
+            enabled = llamaActive || hydraActive,
             onCommit = { actions.onSettingsChanged(settings.copy(temperature = it)) }
         )
         SettingSlider(
@@ -894,8 +896,21 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
             start = 0f, end = 0.5f,
             step = 0.01f,
             format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
-            enabled = llamaActive,
+            // Both engines: llama's min-p chain sampler and the Hydra
+            // C sampler's min-p filter.
+            enabled = llamaActive || hydraActive,
             onCommit = { actions.onSettingsChanged(settings.copy(minP = it)) }
+        )
+        SettingSlider(
+            label = stringResource(R.string.setting_rep_penalty),
+            value = settings.repetitionPenalty,
+            start = 1f, end = 3f,
+            step = 0.05f,
+            format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
+            // Hydra only: the pinned llama.cpp (v0.5.0) has no
+            // repetition-penalty chain sampler (see GenerationParams).
+            enabled = hydraActive,
+            onCommit = { actions.onSettingsChanged(settings.copy(repetitionPenalty = it)) }
         )
         SettingSlider(
             label = stringResource(R.string.setting_max_tokens),

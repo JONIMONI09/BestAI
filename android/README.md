@@ -13,7 +13,7 @@ android/
 ├── app/src/main/cpp/llama_jni.cpp    JNI bridge for the Llama engine: load .gguf, parameterized sampler chain, stream tokens
 ├── app/src/main/java/dev/hydrastone/
 │   ├── EngineInterface.kt            the common engine API (generate with GenerationParams) both engines implement
-│   ├── HydraEngine.kt                the bundled deterministic engine (ignores sampling params — documented)
+│   ├── HydraEngine.kt                the bundled engine: runs through `runInferenceSampled` (the C sampler via JNI) — Settings temperature/min-p/rep-penalty apply, fixed seed; temperature 0 is the bit-identical greedy baseline
 │   ├── HydraBridge.kt                `external fun` bindings for hydra_jni + batched token callback
 │   ├── LlamaEngine.kt / LlamaBridge.kt   the imported-GGUF engine (temperature/top-k/min-p/rep-penalty/max-tokens)
 │   ├── MainActivity.kt               hosts the Compose UI; settings persistence; auto-run; engine selection
@@ -49,7 +49,7 @@ cd android
 gradle assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The APK contains `libhydra.so` (the deterministic engine) and
+The APK contains `libhydra.so` (the bundled engine) and
 `libllama_jni.so` (the imported-GGUF engine, linked against the pinned
 llama.cpp submodule) for `arm64-v8a`, `armeabi-v7a` (the legacy 32-bit
 target from the original spec) and `x86_64` (emulators), plus the
@@ -94,13 +94,21 @@ to run again. With the default Hydra engine, on launch the app:
 
 1. Copies `starter.hydra` from assets to internal storage (so the C loader
    can mmap a real file),
-2. calls `HydraBridge.runInference(path, token, steps, callback)`,
+2. calls `HydraBridge.runInferenceSampled(path, token, steps, callback,
+   temperature, minP, repPenalty, seed)` — the C sampler
+   (`hydra_sample_token`) running natively, with a **fixed seed** so the
+   sampled stream is reproducible run over run,
 3. streams each generated token back to the UI via a JNI callback,
 4. prints a JSON summary: `{"ok":true,"steps":32,"emitted":32,"elapsed_us":…, "dim":64,"vocab":512,"layers":4,"axiom_allowed":true}`
 
-With the Llama engine selected (after importing a `.gguf` via the Models
-tab) the same run UI streams tokens from `LlamaBridge` instead, and the
-Settings-tab sampling parameters apply.
+With the default Settings (temperature 0.7, min-p 0.05) the run is
+**sampled**; sliding the temperature to 0 switches it back to the
+deterministic greedy baseline, which is bit-identical to the pre-sampler
+`runInference` path (the greedy guard is proven by
+`tests/test_engine.c`). The Settings-tab sampling parameters apply to
+**both** engines: with the Llama engine selected (after importing a
+`.gguf` via the Models tab) the same run UI streams tokens from
+`LlamaBridge` instead.
 
 Every one of those lines is also mirrored to logcat under the tag `Hydra`, so a
 launch can be verified with `adb logcat` alone:

@@ -99,3 +99,28 @@
 25. **(2026-10-26)** "PR #62 was ist damit?" — the superseded PR #62
     (red leftover of the #59-merge incident; its red = the stage-2 API
     error fixed by merged PR #64) must be closed.
+
+## Full-read, linters, and the transformer prompt (2026-10-26 evening, round 8)
+
+26. **(2026-10-26)** "session.md kann bleiben … soll NICHT in gitignor
+    rein, soll für alle lesbar sein!" — `session.md` is NOT optimized or
+    rewritten by doc-audit passes (its content stays as written), and it
+    must remain COMMITTED and readable by everyone: never add it (or any
+    `.agents/` file) to `.gitignore`. Local scratch (`.agent_memory/`)
+    may be ignored; repo memory may not.
+27. **(2026-10-26)** "habe ein prompt erstellt lassen … lese alle dateien,
+    alle .md dateien, als erstes, und dann bitte optimieren (außer
+    session.md …)" — before working, read ALL Markdown files in every
+    folder; afterwards optimize every .md file except `session.md`. The
+    pasted Principal-Architect prompt (transformer attention, .hydra2
+    sparse-MoE, Android sampler, CLAUDE.md fix, roadmap completion) is
+    the work plan — executed "intelligent": claims in it are verified
+    against the live tree first (R26); its audit was partly stale
+    (the v3 per-layer path already shipped in round 4; what is genuinely
+    missing is attention).
+28. **(2026-10-26)** "Finde Fehler und toten Code, lade über python
+    weitere Linter und so herunter" — actively hunt bugs and dead code;
+    install additional linters via pip (the reachable package channels)
+    and run them for real; fix what they find. Standing: "KEINE Stubs
+    oder Fake" — no stubs, no fake results, no fake checkboxes (this is
+    directive 10 restated for this round).

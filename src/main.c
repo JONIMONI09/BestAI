@@ -225,8 +225,11 @@ static double bench_run(const char *model_path, const BenchRequest *req,
     uint16_t tok = req->start_token;
     for (long i = 0; i < e.header.layers; ++i) {
         uint16_t n = 0;
-        if (e.header.version == 3) {
-            if (hydra_engine_step_tf(&e, tok, &n, NULL) != 0) { hydra_engine_unload(&e); return -1.0; }
+        if (e.header.version >= 3) {
+            const int rc = (e.header.version == 4)
+                ? hydra_transformer_forward_step(&e, tok, &n, NULL)
+                : hydra_engine_step_tf(&e, tok, &n, NULL);
+            if (rc != 0) { hydra_engine_unload(&e); return -1.0; }
         }
         else if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
         else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
@@ -240,8 +243,11 @@ static double bench_run(const char *model_path, const BenchRequest *req,
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (long s = 0; s < req->steps; ++s) {
         uint16_t n = 0;
-        if (e.header.version == 3) {
-            if (hydra_engine_step_tf(&e, tok, &n, NULL) != 0) { hydra_engine_unload(&e); return -1.0; }
+        if (e.header.version >= 3) {
+            const int rc = (e.header.version == 4)
+                ? hydra_transformer_forward_step(&e, tok, &n, NULL)
+                : hydra_engine_step_tf(&e, tok, &n, NULL);
+            if (rc != 0) { hydra_engine_unload(&e); return -1.0; }
         }
         else if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
         else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
@@ -278,8 +284,8 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
     if (ns_full < 0) { fprintf(stderr, "[Hydra] Bench: Modell konnte nicht geladen werden\n"); return 1; }
     uint16_t sink_fast = 0;
     double ns_fast = -1.0;
-    if (h->version == 3) {
-        /* v3 has no aggregated legacy path to compare against: the
+    if (h->version >= 3) {
+        /* v3/v4 have no aggregated legacy path to compare against: the
          * per-layer non-linear pass is the ONLY path, so the fast
          * benchmark is reported as not applicable (0.0) instead of
          * measuring a different algorithm. */
@@ -308,8 +314,8 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
     if (full_stats.rss_kb_before_load >= 0 && full_stats.resident_kb_after_load >= 0) {
         rss_delta = full_stats.resident_kb_after_load - full_stats.rss_kb_before_load;
     }
-    const char *bench_note = (h->version == 3)
-        ? "v3 per-layer pass; ns_per_token_fast=0 means the legacy fast path does not exist for v3 models; JNI callback costs are NOT included here"
+    const char *bench_note = (h->version >= 3)
+        ? "v3/v4 per-layer pass; ns_per_token_fast=0 means the legacy fast path does not exist for v3/v4 models; JNI callback costs are NOT included here"
         : "JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device";
     printf("{\"mode\":\"bench\",\"engine\":\"cpu\",\"model\":\"%s\","
            "\"version\":%u,\"dim\":%u,\"layers\":%u,\"vocab\":%u,\"steps\":%ld,"
@@ -528,7 +534,7 @@ int main(int argc, char **argv)
      * original call shape for the default (greedy) invocation. */
     const int sampling_enabled =
         sampler.temperature > 0.0f && sampler.min_p < 1.0f;
-    if (sampling_enabled && fast_mode && engine.header.version != 3) {
+    if (sampling_enabled && fast_mode && engine.header.version < 3) {
         /* --fast only exists for the greedy path: sampling advances
          * the full state through hydra_engine_step() by contract, so
          * the fast path is ignored. Say so instead of being quiet. */
@@ -538,37 +544,59 @@ int main(int argc, char **argv)
                 (double)sampler.temperature, (double)sampler.min_p);
     }
 
-    /* Version 3: the CLI owns the KV storage the engine appends to
-     * (the engine itself stays zero-heap; see hydra_engine_step_tf).
+    /* Version 3/4: the CLI owns the KV storage the engine appends to
+     * (the engine itself stays zero-heap; see hydra_engine_step_tf /
+     * hydra_transformer_forward_step).
      * 512-slot ring + 1 permanent sink covers the CLI's max of 256
-     * steps; sinks keep the first transformed state resident for the
-     * whole run (attention-sink residual, see docs/ARCHITECTURE.md). */
+     * steps; sinks keep the first state resident for the whole run
+     * (v3: attention-sink residual; v4: the attended sink, see
+     * docs/ARCHITECTURE.md). */
     int v3 = (engine.header.version == 3);
-    float *v3_k = NULL, *v3_v = NULL;
-    hydra_kv_cache_t v3cache;
-    hydra_kv_cache_t *v3_kv = NULL;
-    if (v3) {
+    int v4 = (engine.header.version == 4);
+    /* Number of KV caches: 1 for v3 (a single shared ring), `layers`
+     * for v4 (one cache per layer, because every layer has its own
+     * Wq/Wk/Wv and attends to its own memory), 0 for v1/v2. */
+    const uint32_t n_kv =
+        (uint32_t)(v4 ? engine.header.layers : (v3 ? 1u : 0u));
+    float *kv_k = NULL, *kv_v = NULL;
+    hydra_kv_cache_t *kv_arr = NULL;
+    if (n_kv > 0) {
         const uint32_t cap = 512, nsink = 1, dimf = engine.header.dim;
-        v3_k = (float *)malloc(((size_t)cap + nsink) * (size_t)dimf * sizeof(float));
-        v3_v = (float *)malloc(((size_t)cap + nsink) * (size_t)dimf * sizeof(float));
-        if (!v3_k || !v3_v ||
-            hydra_kv_cache_init(&v3cache, v3_k, v3_v, dimf, cap, nsink) != 0) {
-            fprintf(stderr, "[Hydra] v3: KV-Initialisierung fehlgeschlagen\n");
-            free(v3_k); free(v3_v); free(tokens);
+        const size_t per = (size_t)(cap + nsink) * (size_t)dimf * sizeof(float);
+        kv_k = (float *)malloc(per * (size_t)n_kv);
+        kv_v = (float *)malloc(per * (size_t)n_kv);
+        kv_arr = (hydra_kv_cache_t *)calloc(n_kv, sizeof(hydra_kv_cache_t));
+        if (!kv_k || !kv_v || !kv_arr) {
+            fprintf(stderr, "[Hydra] v3/v4: KV-Initialisierung fehlgeschlagen\n");
+            free(kv_k); free(kv_v); free(kv_arr); free(tokens);
             hydra_engine_unload(&engine);
             return 1;
         }
-        v3_kv = &v3cache;
+        for (uint32_t l = 0; l < n_kv; ++l) {
+            if (hydra_kv_cache_init(&kv_arr[l],
+                    kv_k + (size_t)l * (size_t)(cap + nsink) * (size_t)dimf,
+                    kv_v + (size_t)l * (size_t)(cap + nsink) * (size_t)dimf,
+                    dimf, cap, nsink) != 0) {
+                fprintf(stderr, "[Hydra] v3/v4: KV-Initialisierung fehlgeschlagen\n");
+                free(kv_k); free(kv_v); free(kv_arr); free(tokens);
+                hydra_engine_unload(&engine);
+                return 1;
+            }
+        }
         if (fast_mode) {
             /* v3 has no aggregated legacy path at all: --fast is not
              * applicable, the per-layer pass is the model. Say so,
              * then run the real thing instead of failing silently. */
             fprintf(stderr,
-                "[Hydra] Hinweis: --fast ist bei v3-Modellen nicht anwendbar "
+                "[Hydra] Hinweis: --fast ist bei v3/v4-Modellen nicht anwendbar "
                 "(kein Aggregat-Legacy-Pfad); es laeuft der volle per-layer pass\n");
             fast_mode = 0;
         }
     }
+    /* The two views the loop below dispatches on: v3 uses the single
+     * shared ring, v4 the per-layer array. Both NULL for v1/v2. */
+    hydra_kv_cache_t *v3_kv = (v3 ? &kv_arr[0] : NULL);
+    hydra_kv_cache_t *v4_kvs = (v4 ? kv_arr : NULL);
 
     double t0 = now_ms();
     for (long s = 0; s < steps; ++s) {
@@ -584,7 +612,9 @@ int main(int argc, char **argv)
             if (nrec > sampler.penalty_window) nrec = sampler.penalty_window;
             step_rc = hydra_sample_token(&engine, current, &sampler,
                                          tokens + (s - nrec), nrec,
-                                         v3_kv, &next);
+                                         v3_kv, v4_kvs, &next);
+        } else if (v4) {
+            step_rc = hydra_transformer_forward_step(&engine, current, &next, v4_kvs);
         } else if (v3) {
             step_rc = hydra_engine_step_tf(&engine, current, &next, v3_kv);
         } else if (fast_mode) {
@@ -593,6 +623,7 @@ int main(int argc, char **argv)
             step_rc = hydra_engine_step(&engine, current, &next);
         }
         if (step_rc != 0) {
+            free(kv_k); free(kv_v); free(kv_arr);
             free(tokens);
             hydra_engine_unload(&engine);
             return 1;
@@ -637,8 +668,9 @@ int main(int argc, char **argv)
                ok, (double)safe_val);
     }
 
-    free(v3_k);
-    free(v3_v);
+    free(kv_k);
+    free(kv_v);
+    free(kv_arr);
     free(tokens);
     hydra_engine_unload(&engine);
     return 0;

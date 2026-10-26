@@ -1,7 +1,9 @@
 #include <jni.h>
 #include <android/log.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
+#include <math.h>
 #include "hydra_model.h"
 #include "hydra_batch.h"
 
@@ -299,6 +301,271 @@ Java_dev_hydrastone_HydraBridge_runInference(
              blocks_count,
              allowed ? "true" : "false");
     LOGI("inference done: %s", buf);
+    return (*env)->NewStringUTF(env, buf);
+}
+
+/*
+ * Runs inference with the C SAMPLER (hydra_sample_token) exposed to the
+ * app. Deliberate SIBLING of runInference(), not a shared refactor of it:
+ * the default (greedy) path of runInference() must stay bit-identical to
+ * the pre-sampler baseline that tools/jni_signature_check.sh and the
+ * deterministic engine tests pin, so that function is untouched.
+ *
+ * What is new here (and only here):
+ *   - the step callback is hydra_sampled_step() (src/hydra_engine.c),
+ *     the ONE dispatch the CLI and the host tests use:
+ *       sampling on  -> hydra_sample_token() + recent-token window,
+ *       greedy, v3   -> hydra_engine_step_tf() + caller-owned KV cache,
+ *       greedy, v1/v2-> hydra_engine_step() (the pre-sampler baseline);
+ *   - version-3 models run through this method at all: runInference()
+ *     still uses hydra_engine_step(), which refuses v3 (rc -14). The KV
+ *     ring (cap = steps + 4, one sink) is allocated like the CLI does,
+ *     advanced by every step, and freed before the answer is built;
+ *   - the sampler parameters arrive as primitive JNI args (no new
+ *     callback/interface shape) and are validated here, mirroring the
+ *     engine's own ranges: temperature 0..20 (0 = greedy guard),
+ *     min_p 0..1 (1 = greedy guard), repetition_penalty >= 1.0,
+ *     NaN/inf rejected up front (a NaN parameter must produce an error
+ *     string, not a silent greedy run);
+ *   - the penalty window is fixed at 64, the CLI default, and the RNG
+ *     seed is passed through (0 maps to the engine's non-zero
+ *     fallback constant, so it is reproducible, never degenerate).
+ *
+ * Greedy compatibility: with temperature <= 0 (or min_p >= 1) the
+ * engine's greedy guard delegates to the native step, so the token
+ * stream of this method with greedy settings is bit-identical to
+ * runInference() on v1/v2 and to the CLI's v3 run. tests/test_engine.c
+ * pins that property on the host (test_jni_sampled_*).
+ *
+ * Kotlin declares this as `external fun runInferenceSampled(...)`; see
+ * tools/jni_signature_check.sh, which derives the symbol from the
+ * Kotlin source and fails if the two drift apart.
+ */
+JNIEXPORT jstring JNICALL
+Java_dev_hydrastone_HydraBridge_runInferenceSampled(
+        JNIEnv *env, jclass clazz,
+        jstring modelPath, jintArray prompt, jint steps, jobject callback,
+        jfloat temperature, jfloat minP, jfloat repPenalty, jint seed)
+{
+    (void)clazz;
+
+    if (steps < 1) {
+        LOGE("runInferenceSampled rejected: steps=%d (must be >= 1)",
+             (int)steps);
+        return (*env)->NewStringUTF(env,
+            "{\"ok\":false,\"error\":\"steps must be >= 1\"}");
+    }
+    if (steps > 256) steps = 256;
+
+    const float temp = (float)temperature;
+    const float mp = (float)minP;
+    const float rp = (float)repPenalty;
+    if (!isfinite(temp) || temp < 0.0f || temp > 20.0f) {
+        return (*env)->NewStringUTF(env,
+            "{\"ok\":false,\"error\":\"temperature out of range (0..20, 0 = greedy)\"}");
+    }
+    if (!isfinite(mp) || mp < 0.0f || mp > 1.0f) {
+        return (*env)->NewStringUTF(env,
+            "{\"ok\":false,\"error\":\"min-p out of range (0..1)\"}");
+    }
+    if (!isfinite(rp) || rp < 1.0f) {
+        return (*env)->NewStringUTF(env,
+            "{\"ok\":false,\"error\":\"repetition-penalty must be >= 1.0\"}");
+    }
+
+    /* A cancel pressed between two runs must not kill this one. */
+    g_cancel_requested = 0;
+
+    const char *path = (*env)->GetStringUTFChars(env, modelPath, NULL);
+    if (!path) {
+        return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"path null\"}");
+    }
+
+    /* Prompt copy + range check: same rules as runInference() - a
+     * negative or > 65535 token would be a silently wrong seed. */
+    uint16_t prompt_buf[256];
+    size_t prompt_n = 0;
+    if (prompt != NULL) {
+        jsize plen = (*env)->GetArrayLength(env, prompt);
+        if (plen > (jsize)(sizeof(prompt_buf) / sizeof(prompt_buf[0]))) {
+            LOGE("prompt too long: %d tokens (max %zu)", (int)plen,
+                 sizeof(prompt_buf) / sizeof(prompt_buf[0]));
+            (*env)->ReleaseStringUTFChars(env, modelPath, path);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"prompt too long\"}");
+        }
+        for (jsize i = 0; i < plen; ++i) {
+            jint v = 0;
+            (*env)->GetIntArrayRegion(env, prompt, i, 1, &v);
+            if (v < 0 || v > 65535) {
+                LOGE("prompt token %d out of range: %d", (int)i, (int)v);
+                (*env)->ReleaseStringUTFChars(env, modelPath, path);
+                return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"prompt token out of range\"}");
+            }
+            prompt_buf[prompt_n++] = (uint16_t)v;
+        }
+    }
+
+    HydraEngine engine;
+    int rc = hydra_engine_load(&engine, path);
+    (*env)->ReleaseStringUTFChars(env, modelPath, path);
+    if (rc != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"load rc=%d\"}", rc);
+        LOGE("hydra_engine_load failed rc=%d", rc);
+        return (*env)->NewStringUTF(env, buf);
+    }
+
+    long t0 = clock();
+    const unsigned dim = engine.header.dim;
+    const unsigned vocab = engine.header.vocab_size;
+    const unsigned layers = engine.header.layers;
+
+    /* Version 3/4: the caller owns the KV storage (the engine stays
+     * zero-heap). v3 uses one shared ring; v4 one cache PER LAYER
+     * (every layer has its own Wq/Wk/Wv and attends to its own
+     * memory). cap = steps + 4 + one sink covers the whole run,
+     * exactly like the CLI does with 512 for its 256-step max. */
+    const uint32_t n_kv =
+        (uint32_t)((engine.header.version == 4) ? layers
+                        : (engine.header.version == 3) ? 1u : 0u);
+    float *kv_k = NULL, *kv_v = NULL;
+    hydra_kv_cache_t *kv_arr = NULL;
+    hydra_kv_cache_t *kv = NULL;
+    hydra_kv_cache_t *kv_layers = NULL;
+    if (n_kv > 0) {
+        const uint32_t cap = (uint32_t)steps + 4, nsink = 1;
+        const size_t per = ((size_t)cap + nsink) * (size_t)dim * sizeof(float);
+        kv_k = (float *)malloc(per * (size_t)n_kv);
+        kv_v = (float *)malloc(per * (size_t)n_kv);
+        kv_arr = (hydra_kv_cache_t *)calloc(n_kv, sizeof(hydra_kv_cache_t));
+        if (!kv_k || !kv_v || !kv_arr) {
+            free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env,
+                "{\"ok\":false,\"error\":\"kv cache init failed\"}");
+        }
+        for (uint32_t l = 0; l < n_kv; ++l) {
+            if (hydra_kv_cache_init(&kv_arr[l],
+                    kv_k + (size_t)l * ((size_t)cap + nsink) * (size_t)dim,
+                    kv_v + (size_t)l * ((size_t)cap + nsink) * (size_t)dim,
+                    dim, cap, nsink) != 0) {
+                free(kv_k); free(kv_v); free(kv_arr);
+                hydra_engine_unload(&engine);
+                return (*env)->NewStringUTF(env,
+                    "{\"ok\":false,\"error\":\"kv cache init failed\"}");
+            }
+        }
+        kv = (engine.header.version == 3) ? &kv_arr[0] : NULL;
+        kv_layers = (engine.header.version == 4) ? kv_arr : NULL;
+    }
+
+    /* The generated-token log hydra_sampled_step() reads back for the
+     * repetition penalty: capacity = steps, so gen[s] always fits. */
+    uint16_t *gen = (uint16_t *)malloc((size_t)steps * sizeof(uint16_t));
+    if (!gen) {
+        free(kv_k); free(kv_v); free(kv_arr);
+        hydra_engine_unload(&engine);
+        return (*env)->NewStringUTF(env,
+            "{\"ok\":false,\"error\":\"alloc failed\"}");
+    }
+
+    /* Prefill + seed: same semantics as runInference() - the last
+     * prompt token is the seed, out-of-vocab values are modularised
+     * (documented engine semantics), not rejected. */
+    if (prompt_n > 0) {
+        if (hydra_engine_prefill(&engine, prompt_buf, prompt_n) != 0) {
+            free(gen); free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"prefill failed\"}");
+        }
+    }
+    uint16_t tok = prompt_n > 0 ? prompt_buf[prompt_n - 1] : 0u;
+    if (tok >= vocab) tok = (uint16_t)(tok % vocab);
+
+    hydra_sampled_step_ctx_t step_ctx;
+    step_ctx.engine = &engine;
+    step_ctx.tok = tok;
+    step_ctx.cfg.temperature = temp;
+    step_ctx.cfg.min_p = mp;
+    step_ctx.cfg.repetition_penalty = rp;
+    step_ctx.cfg.penalty_window = 64; /* CLI default; 0 would disable it */
+    step_ctx.cfg.rng_seed = (uint32_t)seed;
+    step_ctx.gen = gen;
+    step_ctx.s = 0;
+    step_ctx.kv = kv;
+    step_ctx.kv_layers = kv_layers;
+
+    EmitCtx emit_ctx;
+    emit_ctx.env = env;
+    emit_ctx.callback = callback;
+
+    int blocks_count = 0;
+    int tokens_total = 0;
+    {
+        HydraBatch batch;
+        int blocks = 0, total = 0;
+
+        rc = hydra_run_steps(&batch, (int)steps, hydra_sampled_step,
+                             &step_ctx, jni_emit, &emit_ctx, &blocks, &total);
+        if (rc == HYDRA_RUN_STEP_ERR && g_cancel_requested) {
+            free(gen); free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            LOGI("sampled inference cancelled after %d step(s), %d block(s)",
+                 total, blocks);
+            return (*env)->NewStringUTF(env,
+                "{\"ok\":false,\"cancelled\":true,\"error\":\"cancelled by the user\"}");
+        }
+        if (rc == HYDRA_RUN_BAD_STEPS) {
+            free(gen); free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env,
+                "{\"ok\":false,\"error\":\"steps must be >= 1\"}");
+        }
+        if (rc == HYDRA_RUN_STEP_ERR) {
+            free(gen); free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"step failed\"}");
+        }
+        if (rc == HYDRA_RUN_EMIT_ERR) {
+            free(gen); free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"callback failed\"}");
+        }
+        blocks_count = blocks;
+        tokens_total = total;
+    }
+    long elapsed_us = (clock() - t0) * 1000000L / CLOCKS_PER_SEC;
+
+    uint32_t kv_count = 0;
+    for (uint32_t l = 0; l < n_kv; ++l)
+        kv_count += hydra_kv_cache_size(&kv_arr[l]);
+    const int sampling_on = (temp > 0.0f && mp < 1.0f);
+    const int version = engine.header.version; /* read BEFORE unload: it memset's */
+
+    /* Axiom gate starter (mirrors the CLI smoke test) */
+    float safe = 0.0f;
+    int allowed = hydra_verify_axiom(1.0f, 99.5f, &safe);
+
+    free(gen);
+    free(kv_k);
+    free(kv_v);
+    free(kv_arr);
+    hydra_engine_unload(&engine);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"steps\":%d,\"emitted\":%d,\"elapsed_us\":%ld,"
+             "\"dim\":%u,\"vocab\":%u,\"layers\":%u,\"prompt\":%zu,\"batches\":%d,"
+             "\"version\":%d,\"kv_count\":%u,"
+             "\"sampling\":{\"mode\":\"%s\",\"temperature\":%.6g,\"min_p\":%.6g,"
+             "\"repetition_penalty\":%.6g,\"penalty_window\":64,\"seed\":%u},"
+             "\"axiom_allowed\":%s}",
+             (int)steps, tokens_total, elapsed_us, dim, vocab, layers, prompt_n,
+             blocks_count, version, kv_count,
+             sampling_on ? "sampled" : "greedy",
+             (double)temp, (double)mp, (double)rp, (unsigned)step_ctx.cfg.rng_seed,
+             allowed ? "true" : "false");
+    LOGI("sampled inference done: %s", buf);
     return (*env)->NewStringUTF(env, buf);
 }
 

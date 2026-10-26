@@ -40,21 +40,27 @@ data class EngineLoadResult(
  * run: nothing about an existing conversation changes just because the tab
  * now exists.
  *
- * The pinned llama.cpp (v0.5.0) has no repetition-penalty chain sampler, so
- * that control deliberately does not exist here; see the native
- * build_sampler_chain for the pin's sampler inventory.
+ * [repetitionPenalty] exists for the HYDRA engine: its C sampler
+ * (hydra_sample_token, see include/hydra_model.h) supports it with 1.0 =
+ * off. The pinned llama.cpp (v0.5.0) has no repetition-penalty chain
+ * sampler, so LlamaEngine never reads the field - same documented
+ * per-engine rule as topK/topP for the Hydra engine.
  */
 data class GenerationParams(
     val temperature: Float = DEFAULT_TEMPERATURE,
     val topK: Int = DEFAULT_TOP_K,
     val topP: Float = DEFAULT_TOP_P,
-    val minP: Float = DEFAULT_MIN_P
+    val minP: Float = DEFAULT_MIN_P,
+    val repetitionPenalty: Float = DEFAULT_REPETITION_PENALTY
 ) {
     companion object {
         const val DEFAULT_TEMPERATURE = 0.7f
         const val DEFAULT_TOP_K = 40
         const val DEFAULT_TOP_P = 1.0f
         const val DEFAULT_MIN_P = 0.05f
+
+        /** 1.0 = the penalty is disabled (no division, no multiplication). */
+        const val DEFAULT_REPETITION_PENALTY = 1.0f
     }
 }
 
@@ -81,6 +87,7 @@ data class GenerationSettings(
     val topK: Int = GenerationParams.DEFAULT_TOP_K,
     val topP: Float = GenerationParams.DEFAULT_TOP_P,
     val minP: Float = GenerationParams.DEFAULT_MIN_P,
+    val repetitionPenalty: Float = GenerationParams.DEFAULT_REPETITION_PENALTY,
     val maxTokens: Int = 256,
     val contextSize: Int = 2048
 )

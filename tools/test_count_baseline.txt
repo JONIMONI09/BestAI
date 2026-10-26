@@ -77,5 +77,27 @@
 # qemu-aarch64-static leg), so ARM = 140 + 11 = 151 and x86 stays at
 # 142 (re-measure on the ARM CI leg).
 
-x86: 174
-arm: 183
+# 2026-10-26 (M-E + M-F, sampler JNI + format v4 full attention):
+# +45 architecture-independent checks in the main suite. M-E: +12
+# (C sampler exposed through the JNI bridge - temperature/min-p/
+# repetition-penalty parameter plumbing, greedy-default unchanged
+# proof, negative controls). M-F: +33 (format version 4: full
+# per-layer attention on top of v3 - Wq/Wk/Wv ternary planes,
+# pre-norm RMSNorm -> RoPE -> KV cache -> causal scaled dot-product
+# attention -> residual -> SwiGLU FFN -> residual -> W_out logits;
+# tests: loader validation, KV progression, RoPE exact key rotation,
+# hand-computed forward pass, min-p forced case, v1/v2/v3 baseline
+# streams untouched by the new version, CLI dispatch). Both are new
+# functions + a new version value - ADDITIVE, the v1 starter baseline
+# [471 386 385 386 385 386 385 386] re-verified byte-identical.
+# x86 re-measured at 219; ARM = 183 + 45 = 228 because all forty-five
+# compile on every architecture - re-measure on the ARM CI leg.
+#
+# The M-G .hydra2 container suite (tests/test_hydra2_container.c,
+# 120 checks) runs as its own binary `hydra2-test` (like
+# large-model-test / jni-batch-test) and is executed + failure-gated in
+# CI; it is deliberately NOT folded into this one-number-per-arch
+# baseline, which tracks the main suite only.
+
+x86: 219
+arm: 228

@@ -340,3 +340,74 @@
      Windows checkout with `core.symlinks=false` it materialises as a
      text file — nothing breaks, because the canonical skills home is
      `.agents/skills/` (R30).
+- **Round 8 additions (2026-10-26, branch `arena/fe34926d-bestai`):**
+  1. **Linters via pip (owner directive "install additional linters via
+     python"):** the previous round's venvs were wiped with `/tmp`;
+     recreated in seconds, this time in ONE venv:
+     ```bash
+     python3 -m venv /tmp/lintenv2
+     /tmp/lintenv2/bin/pip install --quiet \
+         pyflakes bandit cppcheck clang-tidy pyyaml
+     ```
+     Resulting versions (measured): pyflakes 4.0.3, bandit 1.9.4,
+     cppcheck 2.22.0 (via `cppcheck-wheel`), clang-tidy from the
+     `clang-tidy` PyPI wheel (LLVM 23.1.4). All run locally — nothing
+     deferred to CI. Note: plain `pip install` fails on this Debian 12
+     (PEP 668, externally-managed); the venv is the way. `apt` remains
+     blocked (egress allowlist), so system clang/clang-tidy/flawfinder
+     are still unavailable — the pip wheels cover clang-tidy and
+     cppcheck; **flawfinder has no PyPI package and stays CI-only**
+     (no local replacement found; recorded, not worked around).
+  2. **Local linter results (2026-10-26, all first-party files):**
+     - `pyflakes tools/` → 0 findings (hard gate; now also a CI job,
+       see below).
+     - `bandit -r tools/` → 19 low-severity review-level findings, 0
+       medium/high. Triage (recorded per owner rule "failures need
+       reason + date + solution"): B101 `assert` ×11 — these ARE the
+       gates of the test/fixture scripts (intentional, stdlib-only
+       convention); B404 `import subprocess` ×1 — required by the
+       converter gate; B603 subprocess ×7 — every call uses a STATIC
+       argv list with explicit `shell=False` (added this round to the
+       7 sites in `tools/gguf_test.py`, which also documents intent
+       for the next reviewer). No real findings; no `#nosec`
+       suppressions added (a suppression would delete the review
+       reminder the check exists for).
+     - `cppcheck --enable=warning,performance,portability --std=c99
+       -Iinclude` on all 5 C files → 0 findings.
+     - `clang-tidy` (CI-identical check set) on all 5 C files →
+       findings triaged: 83 `bugprone-signed-bitwise` (the
+       established 2-bit/4-bit unpack pattern; the new v2 file already
+       uses `uint32_t` locals in its hot loops precisely to stay out
+       of this class; the v1 code is baseline-untouchable),
+       24 `easily-swappable-parameters` + 23
+       `implicit-widening-of-multiplication-result` + 4
+       `narrowing/misplaced-widening-cast` + 1 `macro-parentheses`
+       (style, pre-existing), 4 `suspicious-memory-comparison` on
+       `float` (INTENTIONAL bit-pattern comparisons in the tests),
+       4 `UndefinedBinaryOperatorResult` (analyzer cannot size
+       caller-owned int8 arrays / does not track append-before-read on
+       the KV cache — no real defect: ASan+UBSan green on both test
+       binaries), 1 `portability.UnixAPI` (`malloc(n*sizeof(double))`
+       with n ≥ 1 after a successful append — n == 0 unreachable),
+       1 `uninitialized.Assign` (the sampler config pointer — both
+       production call sites, `src/main.c` and `hydra_jni.c`,
+       initialize all five fields; interprocedural gap).
+       FIXED (not suppressed): `clang-analyzer-security.ArrayBound` at
+       the `&c->meta[i]` in `src/hydra_v2_container.c` — the
+       allocator wrapper's minimum-size adjustment made the analyzer
+       join two region states; the `count == 0` case is now a separate
+       branch (finding 1 → 0, same check set, same wheel). And
+       `bugprone-branch-clone` (1 → 0): the F16/BF16 cases merged
+       into one fall-through, which is the clearer code anyway.
+  3. **CI gained a `python-lint` job** (`lint.yml`, 10th job, runs in
+     parallel with the others — no wall-clock cost to the existing
+     jobs): `actions/setup-python@v5` (the ubuntu-latest system Python
+     is PEP-668 managed, so the plain `pip install` used by older
+     workflows would refuse) → `pyflakes tools/` (hard) +
+     `bandit -r tools/ --severity-level medium` (medium+ blocks; the
+     19 low findings above are the documented triage set). YAML
+     validity re-verified with pyyaml (safe_load OK, 10 jobs).
+  4. **Recreate commands for the next session** (after the next `/tmp`
+     wipe): the block in item 1 (one venv, five packages); the gcc
+     gates stay system (`gcc -fanalyzer` is built into Debian 12's
+     gcc 12.2). Zig frontend from round 6/7: same recipe, new venv.

@@ -428,6 +428,16 @@ jobs:
       - name: Large models and 32-bit offset arithmetic
         run: ./large-model-test
 
+      # The .hydra2 sparse-MoE container (docs/FORMAT-V2.md): both-ends
+      # validation (R14), deterministic top-k routing, and pread+CRC expert
+      # streaming. The Python fixture generator (tools/make_model.py --v2)
+      # writes the cross-check file, so the C reader and the Python writer
+      # are verified against each other on every build.
+      - name: Hydra2 container (validation, routing, streaming)
+        run: |
+          python3 tools/make_model.py .hydra2-pyfix.hydra2 --v2
+          ./hydra2-test "$PWD/.hydra2-pyfix.hydra2"
+
       - name: Runtime smoke test
         run: |
           python3 tools/make_model.py smoke.hydra

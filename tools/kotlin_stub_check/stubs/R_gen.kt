@@ -99,6 +99,7 @@ object R {
         const val setting_top_k: Int = 0
         const val setting_top_p: Int = 0
         const val setting_min_p: Int = 0
+        const val setting_rep_penalty: Int = 0
         const val setting_max_tokens: Int = 0
         const val setting_context_size: Int = 0
         const val model_current: Int = 0

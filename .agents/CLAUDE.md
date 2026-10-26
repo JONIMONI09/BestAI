@@ -4,7 +4,11 @@
 
 This file bridges Claude Code to the repository's agent system. The
 single source of truth for agent work is `AGENTS.md` (loaded above);
-this file adds nothing of its own and may not diverge from it.
+this file adds nothing of its own and may not diverge from it. The
+repository root carries a REAL `CLAUDE.md` bridge file (only
+`@AGENTS.md` + `@.agents/CLAUDE.md` imports, no rules of its own) so
+Claude Code discovers the instructions on every OS and version —
+including Windows checkouts where symlinks are disabled.
 
 Rules that always apply, in one line each (details: `rules.md`):
 

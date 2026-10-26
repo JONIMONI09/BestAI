@@ -494,7 +494,7 @@ def run(engine, tmp):
     if engine:
         for token, steps in ((0, 24), (3, 40), (11, 16)):
             proc = subprocess.run([engine, out, str(token), str(steps), '--json'],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, shell=False)
             if proc.returncode != 0:
                 ok &= check('the C engine loads the converted model (token %d)' % token,
                             False, proc.stderr[-300:])
@@ -579,11 +579,14 @@ def run_v3(engine, tmp, gguf):
     magic, version, vocab, d, l, off, wlen = struct.unpack('<IHHIIII', raw[:24])
     lb = dim * dim // 2 + dim // 4 + 2
     ok &= check('v3: the header is version 3 with the v3 body length',
-                version == 3 and d == dim and l == layers and off == 24
+                magic == MAGIC and version == 3
+                and vocab == report['header']['vocab']
+                and d == dim and l == layers and off == 24
                 and wlen == layers * lb + dim * dim // 4
                 and len(raw) == 24 + wlen,
-                'version %d, wlen %d, want %d'
-                % (version, wlen, layers * lb + dim * dim // 4))
+                'magic %#x, version %d, vocab %d, wlen %d, want %d'
+                % (magic, version, vocab, wlen,
+                   layers * lb + dim * dim // 4))
 
     # scale factors must be non-zero (the engine refuses 0) and the W_out
     # block must contain at least one non-zero 2-bit code
@@ -599,7 +602,7 @@ def run_v3(engine, tmp, gguf):
         runs = []
         for _ in range(2):
             proc = subprocess.run([engine, out, '3', '12', '--json'],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, shell=False)
             if proc.returncode != 0:
                 ok &= check('v3: the C engine loads the converted model',
                             False, proc.stderr[-300:])
@@ -703,7 +706,7 @@ def run_safetensors(engine, tmp):
     if engine:
         for token, steps in ((0, 16), (7, 32)):
             proc = subprocess.run([engine, out, str(token), str(steps), '--json'],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, shell=False)
             if proc.returncode != 0:
                 ok &= check('the C engine loads the v2 model (token %d)' % token,
                             False, proc.stderr[-300:])
@@ -764,9 +767,9 @@ def run_safetensors(engine, tmp):
                     and wlen3 == layers3 * lb3 + dim3 * dim3 // 4)
         if engine:
             p1 = subprocess.run([engine, out3, '2', '10', '--json'],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, shell=False)
             p2 = subprocess.run([engine, out3, '2', '10', '--json'],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, shell=False)
             d1 = json.loads(p1.stdout) if p1.returncode == 0 else None
             d2 = json.loads(p2.stdout) if p2.returncode == 0 else None
             ok &= check('v3-st: the C engine runs the converted model',
@@ -884,11 +887,6 @@ def _bf16_matches():
     packed = b''.join(
         struct.pack('<H', struct.unpack('<I', struct.pack('<f', v))[0] >> 16)
         for v in values)
-    # An empty but well-formed GGUF still pads up to general.alignment,
-    # so the synthetic header needs its 8 bytes of padding too.
-    gguf = gguf_reader.GgufFile(
-        struct.pack('<I', gguf_reader.GGUF_MAGIC) + struct.pack('<I', 3)
-        + struct.pack('<Q', 0) + struct.pack('<Q', 0) + bytes(8))
     got = gguf_reader._decode_bf16(packed, len(values))
     return all(abs(a - b) <= abs(b) * 1e-2 for a, b in zip(got, values))
 
@@ -1166,7 +1164,7 @@ def _q8_0_truncated_refused(tmp):
 
 def _inspect(path, arch):
     proc = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'gguf_inspect.py'),
-                           path, '--json'], capture_output=True, text=True)
+                           path, '--json'], capture_output=True, text=True, shell=False)
     data = json.loads(proc.stdout)
     return data.get('ok') and data.get('architecture') == arch and data.get('convertible')
 
@@ -1174,7 +1172,7 @@ def _inspect(path, arch):
 def _inspect_refuses(out):
     junk = os.path.join(os.path.dirname(out), 'junk.gguf')
     proc = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'gguf_inspect.py'),
-                           junk, '--json'], capture_output=True, text=True)
+                           junk, '--json'], capture_output=True, text=True, shell=False)
     return proc.returncode == 1 and 'not a GGUF' in proc.stdout
 
 
