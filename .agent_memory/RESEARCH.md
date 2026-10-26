@@ -20,6 +20,8 @@
 | 2026-10-26 | Code-scanning API access from an Actions token | blocked; workaround channels documented |
 | 2026-10-26 | Sandbox tool inventory + install channels | measured; policy in AGENTS.md §6 |
 | 2026-10-26 | GitHub workflow compiler vs PyYAML (duplicate keys) | zero-job red run; gate 1h shipped |
+| 2026-10-26 | Auto-close target: issues → code-scanning alerts | issue-verify removed; event-driven workflow shipped |
+| 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in Environment.md |
 
 ---
 
@@ -176,3 +178,106 @@ parser. Shipped regression: `tools/workflow_yaml_check.sh` (CI gate 1h)
 PyYAML path (runners) and stdlib indent-scan path (no PyYAML) both
 verified green, including against the fixture. Full account: `errors.md`
 2026-10-26 (duplicate `key:` entry).
+
+## 7. Auto-close target changed: issues -> code-scanning alerts (2026-10-26)
+
+Owner decision (same day, after §3 shipped and closed issue #52
+successfully): CI must react to **code scanning results, not to issues**;
+alerts close themselves autonomously when a fix commit makes the next
+analysis clean; **no results may be hardcoded** in any workflow.
+
+Shipped:
+- **Removed:** `tools/issue_verify.py`, `.github/issue-verifications.yml`
+  (hardcoded issue→gates mapping), `.github/workflows/issue-verify.yml`.
+- **Added:** `.github/workflows/code-scanning.yml` — triggers on
+  `code_scanning_alert` (created); every reported fact (rule id, file,
+  line, message, commit, alert URL) is read at run time from the event
+  payload (zero hardcoded results); delivery = PR comment when the alert's
+  commit belongs to an open same-repo PR (de-duplicated by a
+  `<!-- code-scanning-alert-N -->` marker), otherwise the job summary.
+  Closure is **native GitHub behaviour**: the alert resolves as *fixed*
+  when the next CodeQL/Semgrep analysis no longer reports it — the fix
+  commit closes the alert, autonomously. Local verification: YAML +
+  duplicate-key gate, shellcheck on the run script, jq parsing of a
+  synthetic alert payload. Event delivery itself is verified by GitHub at
+  the first real alert.
+- **CI tier split (same owner rule):** `ci.yml` heavy jobs (neon-test
+  QEMU, build-test, gpu-bench, android-apk) run on **main pushes only**;
+  PRs and feature-branch pushes get the lint-only tier (ci.yml
+  `lint`/`jni-signatures`/`llama-pin` + the full `lint.yml`, which
+  already runs the whole unit suite under ASan+UBSan in its
+  `sanitizers` job). `release.yml` was already main/tag/dispatch only.
+
+## 8. Local lint stack from PyPI wheels (2026-10-26) — the "no deferral" path
+
+Owner rule: stop deferring C++ checks to CI; the sandbox has pip + gcc.
+Verified 2026-10-26 (full detail in `Environment.md`, Arena section):
+`python3 -m venv /tmp/lintenv && /tmp/lintenv/bin/pip install cpplint
+yamllint shellcheck-py cppcheck clang-tidy` installs **pre-built wheels**
+for Cppcheck 2.22.0, clang-tidy (LLVM 23.1.4), ShellCheck 0.11.0,
+yamllint 1.38.0, cpplint 2.0.2 — no apt, no APT egress needed. The strict
+pass (`gcc -std=c99 -Wall -Wextra -Wpedantic -fanalyzer` + `g++
+-fsyntax-only -fanalyzer` + cppcheck `--enable=all` + clang-tidy
+`bugprone/clang-analyzer/cert`) caught six real pre-merge defects that
+day (goto crossing an initializer, missing feature-test macros, uncast
+malloc, C++ `= {0}` warning, three missing final newlines, an unguarded
+cd, dead variables) — all fixed, all suites green. cpplint's remaining
+~180 findings are Google-C++-style noise on a C99 codebase (line length,
+brace style, include order) and were deliberately not "fixed" by
+reformatting the project.
+
+## 9. Local/CI syntax drift: the five-file lesson (2026-10-26, PR #55 first run)
+
+The first CI run of PR #55 failed in gate 1a exactly where the local
+pass had not looked: the ci.yml "Syntax check (gcc, C99 strict,
+-Werror)" step compiles **five** translation units
+(`src/hydra_engine.c src/main.c tests/test_engine.c
+tests/test_jni_batch.c tests/test_large_model.c`) **with**
+`-D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE`, while the local pass had
+compiled two files **without** those flags. The in-file feature-test
+defines (added that day for self-containment) then collided with the
+command-line ones under `-Werror` (`"_DEFAULT_SOURCE" redefined`), and
+the extra test TUs were never locally compiled at all.
+
+Fix + permanent guard:
+- the in-file defines are now `#ifndef`-guarded (self-contained
+  standalone *and* warning-free when the same defines arrive via
+  command line — both modes verified rc=0);
+- new `tools/ci_syntax_mirror_test.sh` extracts the **exact** run block
+  of the 1a/1b steps from ci.yml at run time (indentation-aware awk,
+  nothing hardcoded) and executes it; a vacuous parse (<3 .c files or
+  no command) is a hard failure. Negative control proven: against the
+  pre-fix files it reproduces the CI error verbatim (redefinition →
+  -Werror, rc=1); against the fix it passes.
+- the same test is a step in the ci.yml lint job ("Syntax mirror
+  (local/CI parity)"), so a future edit that makes the CI syntax step
+  unparseable or locally broken fails CI in the same run.
+
+Lesson (recorded per R32): a local gate is only as strong as the exact
+command list and flags of the CI step it mirrors — "compiles locally"
+must mean "with the files and flags CI uses", parsed from the workflow,
+not copied by hand.
+
+Second instance of the same class (same day, same PR): the mirror
+itself failed on CI because ubuntu-latest's default `awk` is **mawk**,
+which rejects the regex literal `/run: \|/` ("missing operand", empty
+output -> the parse guard failed the step), while gawk on the local
+machine tolerated it. The extraction now uses only POSIX-safe
+constructs (field comparison `$1 == "run:" && $2 == "|"`,
+gsub+length whitespace counting, no match()/RSTART, no POSIX classes).
+Lesson: a script that mirrors CI must be tested against CI's
+*interpreter*, not just the local one — and the mirror step in ci.yml
+now guarantees that: it runs in both environments.
+
+Resolution (same day, PR #55, third iteration): with the regex literal
+removed, the remaining suspect was the `-v` pattern
+`"Syntax check \(gcc"` — awk processes C-style escapes in `-v` values,
+so mawk can deliver the pattern backslash-stripped, making the dynamic
+regex an unterminated parenthesis (gawk tolerated it locally). The step
+name is now matched with `index()` (plain string search); the script
+now contains **no backslash escapes, no POSIX character classes, no
+match()/RSTART and no -v-embedded regexes at all**. Result: the mirror
+step passed on CI (`lint` job green, 23 s), the whole PR lint tier is
+green (14 pass / 4 heavy jobs skipped by design), and the heavy jobs
+(neon-test, build-test, gpu-bench, android-apk) now run only on the
+main push after merge.

@@ -145,6 +145,11 @@ optional ARM/NEON gates: `.claude/skills/engine-ci-verify/SKILL.md`.)
 
 ```bash
 # 0. Environment (once per machine)
+#    If a gate's tool is missing in your sandbox: read Environment.md
+#    FIRST - another agent may have recorded a tested install path for
+#    exactly your environment (owner rule 2026-10-26: no silent deferral
+#    of C++/lint checks to CI; try the recorded path before giving up).
+#    Afterward, record your own findings in YOUR section only.
 make clean && make && make test            # builds engine + ALL test binaries
 make test-run                              # RUNS them (test-run, not test)
 
@@ -153,6 +158,24 @@ make test-run                              # RUNS them (test-run, not test)
 ./jni-batch-test                           # expect "86 checks, 0 failed" (count parses from output)
 ./large-model-test                         # 5 GiB sparse model + 32-bit offset refusals
 bash tools/test_count_check.sh ./hydra-test x86   # parsed count vs reviewed baseline (R21)
+
+# 1b. C/C++ static analysis (mandatory locally on any src//include/ change —
+#     owner rule 2026-10-26: do NOT defer this to CI). Tool install paths
+#     per environment: Environment.md (in the Arena sandbox the tested
+#     path is the /tmp/lintenv pip venv: cppcheck 2.22, clang-tidy, ...).
+/tmp/lintenv/bin/cppcheck --enable=all --std=c99 --platform=unix64 \
+    -Iinclude src/hydra_engine.c src/main.c
+/tmp/lintenv/bin/clang-tidy --checks='-*,bugprone-*,clang-analyzer-*,cert-*' \
+    --extra-arg=-Iinclude --header-filter='include/|src/' \
+    src/hydra_engine.c src/main.c
+gcc -std=c99 -fsyntax-only -Wall -Wextra -Wpedantic -fanalyzer \
+    -Iinclude src/hydra_engine.c src/main.c
+g++ -fsyntax-only -Wall -Wextra -Wpedantic -fanalyzer \
+    -Iinclude src/hydra_engine.c src/main.c     # C++ parse must stay error-free
+bash tools/ci_syntax_mirror_test.sh             # the EXACT ci.yml syntax commands
+                                               # (5 TUs incl. tests, -D flags,
+                                               # -Werror) — local may never drift
+                                               # from CI (RESEARCH.md section 9)
 
 # 2. Python pipeline
 python3 tools/gguf_test.py --engine ./hydra-run   # expect "N checks, 0 failed" (N parsed, never assumed)
@@ -177,6 +200,7 @@ bash tools/docs_claim_check.sh             # banned unqualified claims in docs
 bash tools/ci_release_version_test.sh      # release versioning discipline (needs pyyaml)
 bash tools/compose_scroll_check.sh         # crash guard: nested same-axis vertical scrollables in Compose (self-testing, R25)
 bash tools/workflow_yaml_check.sh          # every .github YAML: syntax + duplicate keys (GitHub rejects what PyYAML accepts; self-testing, R25)
+bash tools/ci_syntax_mirror_test.sh        # runs the EXACT ci.yml gcc/clang syntax commands (parsed at run time) so local/CI can't drift apart (self-testing, R25)
 
 # 5. Web console (if UI touched)
 npm ci && npm run lint                     # ESLint (dev-only dependency)
@@ -229,7 +253,8 @@ same tokens). Cross-platform claims require running both platforms.
 | Every error ever hit | `errors.md` |
 | Session-by-session history | `session.md` |
 | Crash root causes, CI decisions, research with follow-ups (permanent record) | `.agent_memory/RESEARCH.md` |
-| Issue→gate auto-close mapping (owner promise: gates are the proof) | `.github/issue-verifications.yml` |
+| Sandbox/tool environments per AI agent (each agent updates its own section only) | `Environment.md` |
+| Code-scanning alert handling (event-driven, nothing hardcoded) | `.github/workflows/code-scanning.yml` |
 
 `.agent_memory/RESEARCH.md` is **in the repository on purpose** (owner
 decision 2026-10-26; the old gitignore rule that kept it local was removed).
@@ -240,6 +265,16 @@ question, method, finding, resolution, pointer to the shipped artifact)
 before the session ends. Do not treat it as scratch and do not delete it.
 
 ## 6. Missing tools — install them, do not give up
+**Environment.md is the shared memory for this.** Before claiming a
+tool is missing, read the section that matches your sandbox: another
+agent may have recorded a *tested* install path (and the exact error
+of every failed one). Afterward you record your own findings — **in
+your own section only, never editing another agent's** — with date,
+exact command, exact error, measured reason and the workaround, if
+any. A check that *can* run locally in your environment **must run
+locally** before it is left to CI; "CI will catch it" is not a
+record. (Owner rule, 2026-10-26.)
+
 
 If a gate needs a tool that is absent, **try to install it** before reporting
 "blocked" (R32 — a "blocked" claim must say what was attempted and why it
@@ -282,17 +317,18 @@ regression test without a pre-fix red run recorded in the section.
 
 - **Feature/fix issues:** GitHub-native — `Closes #N` (or `Fixes #N`) in the
   PR body. This is the default and needs no workflow.
-- **Issues that a PR body cannot close** (bot-style alerts, open-ended "check
-  for problems" requests like #52): add one entry to
-  `.github/issue-verifications.yml` mapping the issue number to the gates
-  that prove it. `.github/workflows/issue-verify.yml` (push → main +
-  `workflow_dispatch`) then runs exactly those gates and closes the issue
-  with an audit comment **only when every gate passes** — the mapping entry
-  is an owner promise that the gates are the actual proof. Never map an
-  issue to a gate that does not verify the issue's claim; a false close is
-  worse than an open issue.
-- Closing policy for bot-authored alerts (edit the one open alert on repeat
-  failure, close only when the failing check ran and passed in the
-  resolving run) follows the 2026 reference pattern documented in
-  RESEARCH.md §3 (amd/gaia PR #5408) and is the convention to extend from
-  if a dedicated alert-bot ever replaces the shared workflow.
+- **Code scanning alerts (the automated channel):** CI reacts to code
+  scanning results — **not to issues** (owner rule 2026-10-26; the earlier
+  issue-mapping workflow was removed for exactly this reason, and
+  **no results may be hardcoded** in any workflow).
+  `.github/workflows/code-scanning.yml` triggers on the
+  `code_scanning_alert` event and delivers the finding where the author
+  can act — PR comment when the alert's commit belongs to an open PR,
+  job summary otherwise. Everything it reports comes from the event
+  payload at run time. The alert **closes itself**: GitHub resolves it as
+  *fixed* when the next analysis (triggered by the fix commit) no longer
+  reports it. No manual closing, no issue, no state to manage.
+- **Open-ended "check for problems" requests** (like GitHub issue #52,
+  auto-closed 2026-10-26 by its proving run): answer them in the
+  conversation/PR with the findings, and let the PR close the issue with
+  `Closes #N`. Do not build new mapping machinery for a one-off request.

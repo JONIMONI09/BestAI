@@ -1,3 +1,19 @@
+/* Feature-test macros: under a strict -std=c99 compile glibc hides
+ * O_CLOEXEC and O_NOFOLLOW behind these. Defining them in the source
+ * file (before any include) keeps the file self-contained: every build
+ * and every C++ parse of this translation unit gets the same symbol
+ * set instead of relying on each consumer adding
+ * -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE. (Guarded with #ifndef so builds that also pass the
+ * defines on the command line - the CI gates do - stay warning-free.
+ * Found by the local
+ * g++ -fanalyzer / gcc -std=c99 -fanalyzer pass, 2026-10-26.) */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include "hydra_model.h"
 #include "hydra_neon.h"
 #include "hydra_simd.h"
@@ -287,6 +303,12 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
     engine->rss_kb_before_load = -1;
 
     double started_ms = hydra_now_ms();
+    double elapsed = 0.0;  /* assigned once, near the bottom: declaring it
+                              here (not next to the assignment) keeps every
+                              `goto fail` from crossing its initializer,
+                              which C forbids nowhere but C++ does - the
+                              file must survive a C++ parse (g++ -fanalyzer
+                              found this, 2026-10-26) */
     long rss_before = hydra_resident_kb();
 
     int rc;
@@ -430,7 +452,7 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
 
     engine->rss_kb_before_load = rss_before;
     engine->resident_kb_after_load = hydra_resident_kb();
-    double elapsed = hydra_now_ms() - started_ms;
+    elapsed = hydra_now_ms() - started_ms;
     engine->load_ms = (elapsed > 0.0) ? elapsed : 0.0;
     return 0;
 
