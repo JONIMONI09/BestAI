@@ -382,4 +382,7 @@ annotations are the source of truth for any remaining findings.
 - [x] all-.md audit + fixes (28→33 files inventoried; 0 broken links; fixed: AGENTS.md §8 dead code-scanning.yml ref (rewritten to verified reality), FORMAT-V2 ↔ HYDRA2-RESEARCH cross-links, root README tree + CI-tier note + skill pointer, .agents/README index (skills table, R33, archive), android/README dual-engine reality (file tree, libs, run flow, tabs), CHANGELOG backfill (rounds 5/6/6-follow-up/7 were missing), RESEARCH-LOG §7 correction (event-triggered workflow could never run — deleted same day), session-workflow skill (R33 step + format template), android-ndk-build description (8 pitfalls), rules/README/AGENTS "32 rules" → 33)
 - [x] errors/user docs (errors.md: R33 root-cause entry + the archive-split incident; user.md: directives 22–25)
 - [x] PR #62 closed (superseded; factual comment records why: its CI red = the stage-2 API error fixed by merged PR #64)
-- [ ] commit + push + PR
+- [x] commit + push + PR: **PR #65** (ec344a9). CI: **15 pass / 4 skipped / 0 fail** (run 40353536462 + 40353536695) — incl. the NEW gate 1j (session-start marker) green on CI, docs-claim green with the archive exclusion + negative control, Android lint green. Main-only tier jobs correctly skipped on the PR.
+
+**Awaiting owner:** merge PR #65. Post-merge: main carries R33 + gate 1j; any session that skips the read protocol will turn the next push red.
+
