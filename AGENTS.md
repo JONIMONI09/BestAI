@@ -11,10 +11,10 @@
 | File | What it binds you to |
 |---|---|
 | `.agents/user.md` | The owner's standing directives (dated, verbatim). Highest priority after safety — read it in every session. |
-| `.agents/rules.md` | 32 standing rules (R1–R32). Highest priority is the session protocol (R1–R4). When rules conflict: safety > correctness > session protocol > documentation > convenience (.agents/rules.md §8). |
-| `.claude/skills/session-workflow/SKILL.md` | Read `.agents/session.md`, `.agents/errors.md`, `.agents/rules.md` BEFORE any code. Update `.agents/session.md` after every completed step. Log every error in `.agents/errors.md` the moment it is hit. A session is not complete without both files updated. |
-| `.claude/skills/engine-ci-verify/SKILL.md` | The local quality gates, in CI-identical order, before any commit touching `src/`, `include/`, `tests/` or `tools/`. |
-| `.claude/skills/android-ndk-build/SKILL.md` | The Android toolchain bootstrap, APK build, no-KVM emulator verification and the 8 known pitfalls. Full long form: `.agents/docs/ANDROID_SKILL.md`. |
+| `.agents/rules.md` | 33 standing rules (R1–R33). Highest priority is the session protocol (R1–R4). When rules conflict: safety > correctness > session protocol > documentation > convenience (.agents/rules.md §8). |
+| `.agents/skills/session-workflow/SKILL.md` | Read `.agents/session.md`, `.agents/errors.md`, `.agents/rules.md` BEFORE any code. Update `.agents/session.md` after every completed step. Log every error in `.agents/errors.md` the moment it is hit. A session is not complete without both files updated. |
+| `.agents/skills/engine-ci-verify/SKILL.md` | The local quality gates, in CI-identical order, before any commit touching `src/`, `include/`, `tests/` or `tools/`. |
+| `.agents/skills/android-ndk-build/SKILL.md` | The Android toolchain bootstrap, APK build, no-KVM emulator verification and the 8 known pitfalls. Full long form: `.agents/docs/ANDROID_SKILL.md`. |
 
 The non-negotiable substance, in one breath: no fake tests (R5), no claimed
 capabilities (R6), prove claims by execution (R7), PoC before and after every
@@ -142,7 +142,7 @@ therefore never has its own math to drift from the engine.
 ## 3. Verification gates (the exact commands)
 
 Run in this order; a red gate stops the session. (Full rationale and the
-optional ARM/NEON gates: `.claude/skills/engine-ci-verify/SKILL.md`.)
+optional ARM/NEON gates: `.agents/skills/engine-ci-verify/SKILL.md`.)
 
 ```bash
 # 0. Environment (once per machine)
@@ -252,12 +252,13 @@ same tokens). Cross-platform claims require running both platforms.
 | Android build/verify (long form) | `.agents/docs/ANDROID_SKILL.md` |
 | Android audit trail | `.agents/docs/ANDROID-AUDIT.md` |
 | Every error ever hit | `.agents/errors.md` |
-| Session-by-session history | `.agents/session.md` |
+| Live session plan (rounds older than the current one: the archive) | `.agents/session.md` + `.agents/docs/SESSION-ARCHIVE.md` |
 | Owner's standing directives | `.agents/user.md` |
 | Index of this folder | `.agents/README.md` |
+| Agent Skills (canonical home; `.claude/skills` is a symlink) | `.agents/skills/*/SKILL.md` |
 | Crash root causes, CI decisions, research with follow-ups (permanent record) | `.agents/docs/RESEARCH-LOG.md` |
 | Sandbox/tool environments per AI agent (each agent updates its own section only) | `.agents/Environment.md` |
-| Code-scanning alert handling (event-driven, nothing hardcoded) | `.github/workflows/code-scanning.yml` |
+| Code-scanning findings (reported by the CodeQL/Semgrep jobs on every PR; no alert-handling workflow exists — see §8) | `Lint & Security` jobs in `.github/workflows/ci.yml` |
 
 `.agents/docs/RESEARCH-LOG.md` is **in the repository on purpose** (owner
 decision 2026-10-26; the old gitignore rule that kept it local was removed).
@@ -320,17 +321,20 @@ regression test without a pre-fix red run recorded in the section.
 
 - **Feature/fix issues:** GitHub-native — `Closes #N` (or `Fixes #N`) in the
   PR body. This is the default and needs no workflow.
-- **Code scanning alerts (the automated channel):** CI reacts to code
-  scanning results — **not to issues** (owner rule 2026-10-26; the earlier
-  issue-mapping workflow was removed for exactly this reason, and
-  **no results may be hardcoded** in any workflow).
-  `.github/workflows/code-scanning.yml` triggers on the
-  `code_scanning_alert` event and delivers the finding where the author
-  can act — PR comment when the alert's commit belongs to an open PR,
-  job summary otherwise. Everything it reports comes from the event
-  payload at run time. The alert **closes itself**: GitHub resolves it as
-  *fixed* when the next analysis (triggered by the fix commit) no longer
-  reports it. No manual closing, no issue, no state to manage.
+- **Code scanning alerts (the automated channel):** CI reports code
+  scanning results — **it never reacts to issues** (owner rule
+  2026-10-26; the earlier issue-mapping workflow was removed for exactly
+  this reason, and **no results may be hardcoded** in any workflow).
+  The CodeQL and Semgrep jobs run on every PR and publish their
+  findings as check-run annotations and check results. **There is no
+  alert-handling workflow — and there cannot be one:**
+  `code_scanning_alert` is a *webhook* event, not a workflow trigger
+  event; any workflow file that names it as a trigger fails GitHub's
+  workflow compile (the run is created with zero jobs, named by the
+  file path — verified 2026-10-26; gate 1i, actionlint, now blocks such
+  files). The alert **closes itself**: GitHub resolves it as *fixed*
+  when the next analysis on the default branch no longer reports it.
+  No manual closing, no issue, no state to manage.
 - **Open-ended "check for problems" requests** (like GitHub issue #52,
   auto-closed 2026-10-26 by its proving run): answer them in the
   conversation/PR with the findings, and let the PR close the issue with

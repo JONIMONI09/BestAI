@@ -16,14 +16,38 @@ complete unless `.agents/session.md` and `.agents/errors.md` are updated.**
 | `.agents/errors.md` | Every error encountered + its fix | **Immediately, every time an error is hit** |
 | `.agents/rules.md` | Standing working rules for the agent | When a new rule is agreed or learned |
 
-## Session start (MANDATORY, before touching any code)
+## Session start (MANDATORY, before touching any code — rules R33)
 
-1. **Read `.agents/session.md`** — what was done last, what is open.
-2. **Read `.agents/errors.md`** — known pitfalls; check whether the current task
-   touches an area with past errors.
-3. **Read `.agents/rules.md`** — refresh the standing rules.
-4. **Write the plan into `.agents/session.md`** (Plan section): task, steps,
-   acceptance criteria. ALWAYS write it, even for small tasks.
+Read, in this order (only the CURRENT round of session.md; the old
+rounds live in `.agents/docs/SESSION-ARCHIVE.md`):
+
+1. **Read `AGENTS.md`** (repo root) — the protocol + the file map.
+2. **Read `.agents/session.md`** — the current round: what is open,
+   what the owner directed.
+3. **Read `.agents/errors.md`** — the top recent entries; check
+   whether the current task touches an area with past errors.
+4. **Read `.agents/rules.md`** — the standing rules (R1–R33).
+5. **Read `.agents/user.md`** — the owner's standing directives
+   (highest priority after safety).
+6. **Read `.agents/Environment.md`** — the section for this AI only
+   (each AI writes only its own section).
+7. **Read the task-relevant SKILL.md** files from `.agents/skills/`.
+
+THEN, **before the first code edit**, write the verifiable marker
+into the current round section of `.agents/session.md`:
+
+```
+**Session start (R33):** <date> (branch ...). Read: <the file list>.
+```
+
+CI gate 1j (`tools/session_start_check.sh`) fails the build when the
+current round section lacks the marker — a skipped read is a red
+check, not a habit (2026 finding: prose-only rules are followed
+probabilistically; only enforcement guarantees it).
+
+8. **Write the plan into `.agents/session.md`** (current round
+   section): task, steps, acceptance criteria. ALWAYS write it, even
+   for small tasks.
 
 ## During work (MANDATORY)
 
@@ -46,20 +70,26 @@ complete unless `.agents/session.md` and `.agents/errors.md` are updated.**
 
 ## Format templates
 
-`.agents/session.md`:
+`.agents/session.md` (current structure):
 
 ```markdown
-# Session — <date>
-## Done (last sessions)
-- ...
-## Current task
-<one sentence>
-## Plan
+# Session Log — Hydra-Stone
+> Protocol: see `.agents/skills/session-workflow/SKILL.md`.
+## Done (previous sessions)
+- ✅ <one line per closed round, newest first>
+## Round <YYYY-MM-DD> (<round title>)     <- newest round LAST
+**Session start (R33):** <date> (branch ...). Read: <file list>.
+<owner directives / context>
+**Plan:**
 - [ ] step 1
 - [ ] step 2
-## Status / Notes
-<what is running, what is blocked, open questions>
+**Progress:**
+- [x] step 1 — result
 ```
+
+Rounds older than the current one are moved verbatim to
+`.agents/docs/SESSION-ARCHIVE.md` (append, never delete) so the live
+file stays small (R33 context-budget finding).
 
 `.agents/errors.md`:
 

@@ -22,12 +22,25 @@ FAIL=0
 # containing a space was split into words, grep failed on the non-existent
 # half, and 2>/dev/null swallowed the error - so the file was skipped and the
 # lint still reported success.
-FILES=("$ROOT"/README.md "$ROOT"/docs/*.md "$ROOT"/.agents/docs/*.md \
+FILES=("$ROOT"/README.md "$ROOT"/docs/*.md \
        "$ROOT"/android/README.md \
        "$ROOT"/tools/gpu_bench/README.md)
+# .agents/docs/* is audited too — except SESSION-ARCHIVE.md. The archive is
+# a VERBATIM historical record (the round logs moved out of session.md on
+# 2026-10-26): it QUOTES past claims — the old audit table names "Zero-RAM"
+# as the finding it caught, and old rounds quote the test counts of their
+# time. This gate polices what the project CURRENTLY claims, not what a
+# dated record says a previous round claimed or caught (same reason
+# CHANGELOG.md is not audited). "Fixing" the archive to satisfy the gate
+# would rewrite history; the archive is append-only.
+for f in "$ROOT"/.agents/docs/*.md; do
+  case "$f" in *SESSION-ARCHIVE.md) ;; *) FILES+=("$f") ;; esac
+done
 # Skill files and .agents/rules.md are audited too: they are where a hard-coded test
-# count survives longest.
-FILES+=("$ROOT"/.agents/rules.md "$ROOT"/.claude/skills/*/SKILL.md)
+# count survives longest. The skills are scanned at their CANONICAL location
+# (.agents/skills/): on a checkout where the .claude/skills symlink is
+# materialised as a text file, only the canonical glob still expands.
+FILES+=("$ROOT"/.agents/rules.md "$ROOT"/.agents/skills/*/SKILL.md)
 
 check() { # id  regex  human-explanation
   local id="$1" re="$2" why="$3" hits
@@ -84,6 +97,29 @@ if [ "$perf_bad" -eq 0 ]; then
 else
   FAIL=1
 fi
+
+# Negative control (R25): prove the detectors can fire. A file carrying
+# each banned pattern must be detected by its regex, and a clean line must
+# not match any of them — a detector that cannot tell the two apart fails
+# the gate (a lint that cannot fail is worthless; see README "Quality Gates").
+NC_RE1='(^|[^a-z-])(zero-ram|zero ram)([^a-z-]|$)'
+NC_RE2='\ball (models|architectures|gguf|formats)\b'
+NC_RE3='\b[0-9]{2,3} (unit )?tests\b|\b[0-9]{2,3} Tests,'
+nc=$(mktemp)
+printf '%s\n' 'The engine is Zero-RAM, supports all models, and has 49 unit tests.' > "$nc"
+for re in "$NC_RE1" "$NC_RE2" "$NC_RE3"; do
+  if ! grep -qEi "$re" "$nc"; then
+    echo "NEGATIVE CONTROL: FAIL — banned pattern not detected: $re" >&2
+    rm -f "$nc"; exit 1
+  fi
+done
+printf '%s\n' 'No banned patterns on this line.' > "$nc"
+if grep -qEi "$NC_RE1|$NC_RE2|$NC_RE3" "$nc"; then
+  echo "NEGATIVE CONTROL: FAIL — clean line matched a banned pattern" >&2
+  rm -f "$nc"; exit 1
+fi
+rm -f "$nc"
+echo "ok    negative control (banned patterns detected, clean line accepted)"
 
 if [ "$FAIL" -eq 0 ]; then
   printf '\nDOC-CLAIM-CHECK: all banned claims absent\n'

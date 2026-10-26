@@ -324,3 +324,19 @@
      runner's, so it is slightly *stricter* — a clean zig result is the
      stronger claim, and a zig-only warning still needs a look before
      pushing.
+- **Round 7 additions (2026-10-26, branch `arena/e28fb029-bestai`):**
+  1. **No new tools were needed.** This round changed docs/skills/
+     workflow only; the new CI gate `tools/session_start_check.sh`
+     (gate 1j, rules R33) is pure bash + grep/sed/awk and runs in this
+     sandbox as-is (`bash tools/session_start_check.sh` → "ok",
+     negative control proven in-gate).
+  2. `/tmp` was wiped again between rounds: `/tmp/lintenv`
+     (shellcheck-py) and `/tmp/al` (actionlint WASM) were recreated on
+     demand with the same recipes; `workflow_lint_check.sh` recreates
+     `/tmp/al` by itself.
+  3. **Symlink in git:** `.claude/skills` is now a relative symlink to
+     `../.agents/skills` (git mv + `ln -s`). Verified on checkout that
+     it resolves (`ls .claude/skills/` lists all 7 skills). On a
+     Windows checkout with `core.symlinks=false` it materialises as a
+     text file — nothing breaks, because the canonical skills home is
+     `.agents/skills/` (R30).

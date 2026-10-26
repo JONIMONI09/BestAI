@@ -1,10 +1,69 @@
 # Error Log — Hydra-Stone
 
-> Protocol: see `.claude/skills/session-workflow/SKILL.md`.
+> Protocol: see `.agents/skills/session-workflow/SKILL.md`.
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
 ---
+
+## 2026-10-26 (round 7) — the "read .agents/ first" rule kept being SKIPPED (process error, now enforced)
+
+- **Symptom:** owner report 2026-10-26: "du liest nie diese vorher" —
+  the read-`.agents/`-before-work rule (user.md item 4, in the repo
+  since 2026-10-26 morning) was repeatedly skipped in practice, even
+  though the rule text existed and was unambiguous.
+- **Cause (2026 research, sources in session.md round 7 + the R33
+  rule):** (a) prose-only rules are followed **probabilistically** —
+  "instructions raise the probability of the behaviour you want; only
+  enforcement guarantees it" (prompt-architects.com, 2026-08); (b)
+  **context dilution** — the root instruction file is loaded on every
+  request and a 2400+ line session.md buries the protocol (the 2026
+  guidance: root files < ~150–200 lines; robitghumare.com,
+  mac.install.guide, blakecrosley.com); (c) arXiv May-2026 study of
+  1650 Claude Code sessions (via qodo.ai): compliance odds drop ~5.6%
+  per additional function in the instruction set, while file
+  position/size had **no** effect — i.e. writing the rule better or
+  moving it does not fix it; only a verifiable artifact + a gate does.
+- **Fix:** rule **R33** (rules.md): mandatory session-start read order
+  + the agent must write `**Session start (R33):** <date> (branch
+  ...). Read: <files>.` into the CURRENT round section of
+  `session.md` BEFORE the first code edit. **Gate 1j**
+  (`tools/session_start_check.sh`, wired into ci.yml after 1i) fails
+  the build when the current round section lacks the marker, with an
+  in-gate negative control (R25). Supporting measure: session.md
+  slimmed (pre-round-6 history → `.agents/docs/SESSION-ARCHIVE.md`,
+  2428 → ~385 live lines) and the skills made canonical + discoverable
+  (`.agents/skills/`, 7 skills).
+- **Prevention:** any future "the rule is being ignored" report must
+  end with (1) the research finding, (2) a verifiable artifact the
+  agent produces, (3) a gate that turns the skip into a red check —
+  never with a stronger sentence in the rule file.
+
+## 2026-10-26 (round 7) — a string-`index()` split orphaned rounds 6–7 of session.md (caught before commit)
+
+- **Symptom:** while slimming session.md, a Python split
+  `s.index('<round-6 heading>')` cut at the wrong position: the
+  written slim file lost the entire round-6 + follow-up + round-7
+  sections (84 lines instead of ~385) and the archive was cut
+  accordingly. The R33 CI gate, run immediately afterwards, would have
+  caught it (marker absent) — it was caught during verification
+  instead.
+- **Cause:** the split located the heading by string search without
+  asserting uniqueness/exactness of the occurrence, and the "current
+  rounds" tail was taken from the same unverified index.
+- **Fix:** rebuilt line-based from `git show HEAD:.agents/session.md`
+  (the committed baseline still contained rounds 1–6; the uncommitted
+  follow-up section was re-typed verbatim from session context) with
+  hard assertions: the heading occurs exactly once at the expected
+  line, no base line may be missing from archive ∪ slim, and the
+  marker/follow-up/round-7 headings must be present in the slim file.
+  `git status` afterwards confirmed no other damage.
+- **Prevention:** when restructuring a file by section, (1) operate on
+  lines, (2) assert the section boundary is unique (`assert occ ==
+  [N]`), (3) assert **content conservation** (every old line survives
+  in exactly one output) BEFORE writing, (4) run the file's own gate
+  (here: `session_start_check.sh`) immediately after. Nothing in this
+  repo may "disappear" from session.md — the archive is append-only.
 
 ## 2026-10-26 (round 6) — Android lint's first findings: `AutoboxingStateCreation` + `PluralsCandidate`
 
@@ -270,7 +329,7 @@
   source.
 - **Prevention:** any test buffer that is passed to a function before
   every element is provably written gets `= {0}` at declaration. The C
-  gate (gate 1c in `.claude/skills/engine-ci-verify/SKILL.md`) runs
+  gate (gate 1c in `.agents/skills/engine-ci-verify/SKILL.md`) runs
   locally on every C change — this one would have been caught in 10
   seconds before the push.
 

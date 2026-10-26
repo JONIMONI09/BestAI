@@ -72,3 +72,30 @@
 21. **(2026-10-25)** Document everything: "Document everything!!! Read all
     the rules etc!" — new gates, new formats, new decisions get a doc
     pointer in the same change.
+
+## Rule adaptation and .agents/ skills (2026-10-26, round 7)
+
+22. **(2026-10-26)** "Passe deine Regeln an, du liest nie diese vorher" —
+    the read-`.agents/`-before-work rule (above, item 4) existed for two
+    days and was still being skipped in practice. The owner directed the
+    RULES to be adapted so the read reliably happens, and the cause to be
+    investigated with 2026 web research. Outcome: rule **R33** in
+    `rules.md` (mandatory session-start read order + a verifiable
+    `**Session start (R33):**` marker written into the current round of
+    `session.md` before the first code edit), enforced by CI **gate 1j**
+    (`tools/session_start_check.sh`). 2026 finding the design rests on:
+    prose-only rules are followed probabilistically; only enforcement
+    guarantees behaviour.
+23. **(2026-10-26)** "in .agents Ordner bitte mit skills füllen, lese
+    dafür die, die auch wirklich in Claude Ordner sind" — `.agents/` must
+    contain the skills, based on the skills that really exist in
+    `.claude/skills/`. Outcome: `.agents/skills/` is the CANONICAL skills
+    home (the 3 real skills moved there via git mv + 4 new ones);
+    `.claude/skills` is a symlink to it for tool discovery.
+24. **(2026-10-26)** "Verbessere alle .MD Dateien, suche alle .MD Dateien,
+    in jedem Ordner" — find and improve EVERY Markdown file in every
+    folder (not a selection of them). The repeatable version of this
+    audit is the `repo-docs-audit` skill in `.agents/skills/`.
+25. **(2026-10-26)** "PR #62 was ist damit?" — the superseded PR #62
+    (red leftover of the #59-merge incident; its red = the stage-2 API
+    error fixed by merged PR #64) must be closed.
