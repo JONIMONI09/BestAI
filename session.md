@@ -142,7 +142,10 @@ decode.
       spellings verify in the CI qemu leg (no cross toolchain in the
       sandbox — no root for apt, no aarch64 gcc).
 - [x] M1b: wired into `hydra_build_aggregation()`'s v2 branch
-      (`use_neon = dim % 64 == 0` under `#if defined(__ARM_NEON)`;
+      (`use_neon = dim % 64 == 0` under `#if defined(HYDRA_NEON_V2_UNPACK)`
+      — originally `__ARM_NEON`, tightened after the Android
+      armeabi-v7a build failed: the kernel's `vqtbl1q_u8` is
+      AArch64-only, so 32-bit ARM takes the scalar v2 decode;
       NO runtime probe — NEON is base ISA on AArch64, a build
       without NEON never defines the macro so the kernel is simply
       absent; per layer: 64-dim chunks for A+B, `continue`; scalar
@@ -167,8 +170,9 @@ decode.
       roadmap line: three bit-identical load paths + parity gates;
       NEON bullet: unpack kernel added), this file,
       `.agent_memory/RESEARCH.md` (new: design, the two caught
-      design errors, shadow proof, CI facts). Notion sync: pending
-      the CI green (recorded there once the qemu leg confirms 151).
+      design errors, shadow proof, CI facts). Notion sync: done
+      2026-10-26 in two steps (initial M1 record, then the close-out
+      confirming CI green 19/19 + the four CI-driven fixes).
 - [x] M1e: full verification matrix GREEN (x86 sandbox; NEON executes
       only in CI): make clean/make/test 0 warnings; hydra-test
       142/0; jni-batch 86/0; large-model 7/0; baseline
@@ -181,9 +185,43 @@ decode.
       test_count_check ok (142, x86 baseline); release-version test
       all cases (via /tmp/yvenv PyYAML); npm run lint 0; git status
       clean apart from the 8 intended files.
-- [ ] M1f: push + PR (R17: user merges) + CI polling until the
+- [x] M1f: push + PR (R17: user merges) + CI polling until the
       **ARM neon-test leg** (qemu-aarch64-static) is green — that
       leg is the only place the NEON kernel executes.
+
+**M1 close-out (2026-10-26): CI fully green — 19/19 checks pass**
+(neon-test, build-test ubuntu+macos, Android lint+APK, lint,
+CodeQL ×3, ASan+UBSan, JNI ×2, Docs/GPU/Release/Semgrep/Web/
+llama-pin). Four CI-driven fixes landed on top of the kernel commit
+(all documented per-change in CHANGELOG.md):
+1. clang-gate: `ref_unpack_v2_plane` gated by
+   `__ARM_NEON || __AVX2__` (later `HYDRA_NEON_V2_UNPACK || __AVX2__`)
+   — the x86 no-AVX2 clang syntax check tripped -Wunused-function
+   (clang diagnoses it in analysis; gcc only in codegen).
+2. Intrinsic portability (reproduced locally with a zig-bundled
+   clang aarch64 toolchain): negative `vshlq_n_u8` immediates are
+   rejected by the AArch64 headers → `vshrq_n_u8(2/4/6)` (identical
+   semantics after the 0x03 mask); unsuffixed `vreinterpretq_s8`
+   does not exist in AArch64 headers of gcc-12 OR clang →
+   `vreinterpretq_s8_u8` (the one spelling both declare).
+3. Test heap overflow caught by the new ASan diagnostic step (macOS
+   unit-test leg): `test_neon_v2_load_matches_scalar` wrote
+   layers×dim/4 bytes into a dim/4 allocation → macOS "Trace/BPT
+   trap" + qemu/glibc "malloc(): corrupted top size". Fixed the
+   allocation; all other test mallocs audited.
+4. Android NDK compiles the engine for armeabi-v7a (32-bit ARM):
+   `vqtbl1q_u8` is AArch64-only → new `HYDRA_NEON_V2_UNPACK` macro
+   (AArch64-only) gates the v2 kernel, the engine wiring, and the
+   two v2 tests; 32-bit ARM uses the scalar v2 decode at load
+   (bit-identical; the step kernel stays dual-ABI). Test counts
+   unchanged: 142 x86 / 151 aarch64+macOS.
+CI workflow now mirrors build/test failures into check-run
+`::error::` annotations (log/blob hosts unreachable from the
+sandbox) and rebuilds the macOS unit-test leg with
+`-fsanitize=address,undefined` on runtime failure — the ASan report
+is what pinned #3 in one cycle. Notion "AI Notizen" page updated
+with the close-out (CI green confirmed). PR #51 awaits the user's
+merge (R17).
 
 ## Previous task (2026-10-25 implementation round + Android keyboard/CI —
 merged as PR #47/#48/#49/#50)
