@@ -44,3 +44,23 @@ Exit 0 + "kotlin stub check: OK (0 errors)" = all Kotlin files type-check.
   (the generator is the one used on 2026-10-26: parse the XML, emit
   `object R { object string { ... } ... }` for every referenced namespace).
 * A new file per package (Kotlin rule: one package per file).
+
+## Known limitations (what this check CANNOT catch)
+
+kotlinc checks types, not Android resource annotations or lint rules.
+The following are enforced only by CI's Android lint job (and must
+therefore stay green before merge — the stub check going green does not
+clear them):
+
+* **ResourceType** — `getString(R.plurals.…)`, `getString(R.drawable.…)`
+  etc. compile here (the stub takes a plain `Int`) but fail lint:
+  `getString` wants `@StringRes`, plurals need
+  `Context.getQuantityString(id, quantity, vararg args)`.
+* **AutoboxingStateCreation / PluralsCandidate / UnusedResources** and
+  the other Compose/resource lint checks.
+* **Compose compiler transforms / `@Composable` call-graph rules** that
+  need the real Compose compiler plugin (the stub carries only the
+  annotation; plain kotlinc does not run the transform).
+
+A green stub check means "the API surface is spelled correctly", not
+"the app is lint-clean".

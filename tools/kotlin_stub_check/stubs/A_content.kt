@@ -6,6 +6,10 @@ open class Context {
     fun getSystemService(name: String): Any? = null
     open fun getString(resId: Int): String = throw UnsupportedOperationException("stub")
     open fun getString(resId: Int, vararg formatArgs: Any?): String = throw UnsupportedOperationException("stub")
+    // NOTE: kotlinc cannot express @StringRes vs @PluralsRes (that is a
+    // lint check, ResourceType). getString(R.plurals.*) compiles here but
+    // fails Android lint on CI - use getQuantityString for plurals.
+    open fun getQuantityString(resId: Int, quantity: Int, vararg formatArgs: Any?): String = throw UnsupportedOperationException("stub")
     fun startActivity(intent: Intent) {}
     open val filesDir: File get() = throw UnsupportedOperationException("stub")
     open val resources: Resources get() = throw UnsupportedOperationException("stub")

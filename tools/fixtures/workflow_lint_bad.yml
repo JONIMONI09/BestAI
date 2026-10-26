@@ -1,0 +1,19 @@
+# Negative-control fixture for tools/workflow_lint_check.sh (Gate 1i).
+#
+# Deliberately INVALID: `code_scanning_alert` is a webhook event, not a
+# workflow trigger event (verified 2026-10-26: not in the GitHub docs'
+# trigger list, rejected by actionlint, and by GitHub's compiler itself -
+# see .agents/errors.md round 6). This exact event caused the repo's
+# phantom zero-job runs on 2026-10-26. The gate MUST flag this file; if
+# it ever passes clean, the gate is broken (negative control failed).
+name: Fixture - invalid trigger event (must fail actionlint)
+
+on:
+  code_scanning_alert:
+    types: [created]
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo this file must never be accepted

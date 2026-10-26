@@ -2350,6 +2350,57 @@ annotations are the source of truth for any remaining findings.
    of the next turn. `/tmp` also wiped — kotlinc reinstalled from the
    Environment.md recipe (~1 min).
 
-**Open:** PR #59 open, branch head 3354a9f. After the next CI round:
-expect all jobs green (Android lint was the only red). Then merge
-prep. If code-scanning phantoms reappear: web-UI deletion by owner.
+**Open (superseded by follow-up 3 below):** PR #59 open, branch head
+3354a9f.
+
+### Round-6 follow-up 3 (fourth CI round + root-cause correction, 2026-10-26 evening)
+
+1. **ROOT CAUSE CORRECTION — the "corrupted GitHub registration" theory
+   was WRONG.** The phantom zero-job runs (0 jobs, same-second failure,
+   run named by the file PATH) were **compile failures of any workflow
+   file naming `on: code_scanning_alert`**: that event is a Webhook
+   event, NOT a GitHub Actions workflow trigger event (not in the
+   current docs trigger list — page runs `check_suite` → `create` with
+   no such section — and actionlint rejects it: `unknown Webhook
+   event`). Proof by causality: the phantom always named the file
+   containing the bad event, and followed it across three commits
+   (`code-scanning.yml` 13:37-13:53 → `code-scanning-alert.yml`
+   13:59-15:11 → `lint.yml` 15:13, the latter after I moved the trigger
+   in — where it again produced the zero-job failure AND the Lint&Sec
+   PR run went missing). The `name` = path display and the 14:12/14:26
+   "auto-retries" were red herrings (no `name:` to show on a
+   compile-failed run; more dispatch attempts of the same broken file).
+   PyYAML/the duplicate-key gate cannot see this: they validate YAML,
+   not the Actions event schema.
+2. **Action:** (a) deleted `.github/workflows/code-scanning-alert.yml`
+   (1b0ace5); (b) reverted the `code_scanning_alert` trigger + alert
+   job out of lint.yml; (c) NEW GATE 1i `tools/workflow_lint_check.sh`
+   = actionlint (npm WASM build, `/tmp/al` self-recreating, one fresh
+   node process per file — the WASM runtime crashes intermittently on
+   multi-file processes) over every workflow file + in-gate negative
+   control `tools/fixtures/workflow_lint_bad.yml` (the invalid trigger
+   event itself; R25). Wired into ci.yml after gate 1h. Code-scanning
+   REACTION stays native: CodeQL/Semgrep jobs report on every PR
+   (annotations + check results) and alerts close themselves as fixed
+   when the next default-branch analysis no longer reports them.
+3. **Android lint round 3 (run 40346890465, 3354a9f):** both original
+   findings cleared; the plurals conversion introduced ONE new finding
+   — `MainActivity.kt:658 ResourceType: Expected resource of type
+   string`: `Context.getString` does not accept `R.plurals.*`
+   (`@StringRes` vs `@PluralsRes` is enforced by LINT, not kotlinc —
+   the stub check cannot express resource annotations and stayed
+   green). Fix: `getQuantityString(R.plurals.log_context_applied,
+   new.contextSize, new.contextSize)`; stub `A_content.kt` gained
+   `getQuantityString`; stub-check README gained a KNOWN-LIMITATIONS
+   section (ResourceType / AutoboxingStateCreation / PluralsCandidate /
+   UnusedResources / Compose transforms are CI-lint-only classes).
+
+**Open:** PR #59 open. The next push carries: lint.yml revert (no bad
+trigger), getQuantityString fix, gate 1i + fixture, docs. Expectation:
+all jobs green (Android lint was the only red; the phantom class is
+eliminated because no workflow file names the unsupported event).
+Merge prep after the green round. NOTE: the two stale workflow
+registrations (ids 396960786 / 397125007) may still be listed in
+Settings → Actions → Workflows; they are harmless without a matching
+file (no file at the path = no dispatch), and this PAT cannot delete
+them (404) — owner can clean them up in the web UI whenever.

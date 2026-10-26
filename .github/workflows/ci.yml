@@ -120,6 +120,17 @@ jobs:
       - name: Workflow YAML (duplicate keys rejected by GitHub)
         run: bash tools/workflow_yaml_check.sh
 
+      # Gate 1i: actionlint over every workflow file. Regression for the
+      # 2026-10-26 phantom zero-job runs: `code_scanning_alert` is a
+      # webhook event, NOT a workflow trigger event - GitHub's compiler
+      # rejects a file that names it (zero-job run, same-second failure,
+      # run named by the file path). actionlint's event/action schema
+      # catches this; PyYAML (gate 1h) validates syntax only. The
+      # script recreates its /tmp setup (ephemeral) and proves its
+      # detector with a negative-control fixture in-gate.
+      - name: Workflow lint (actionlint)
+        run: bash tools/workflow_lint_check.sh
+
       # On any lint failure, upload the captured diagnostics as a
       # workflow artifact so the error text is attached to the run.
       - name: Upload lint error report
