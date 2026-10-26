@@ -1744,4 +1744,5 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       there; no project created (not requested).
 - [x] RESEARCH.md §7 (replacement decision) + §8 (PyPI wheel path) +
       index; CHANGELOG entry written.
-- [ ] Docs final check + local gate suite + commit + PR (R17).
+- [x] Docs final check + local gate suite + commit + PR (R17): commit 445d3c8,
+      PR #55 opened (owner merges per R17).
