@@ -567,6 +567,7 @@ static void test_happy_path(void)
 /* ---- mutations ---------------------------------------------------- */
 
 static void mut_v1magic(fx *f)   { memcpy(f->buf, "HYDR\0\0\0\0", 8); }
+static void mut_ggufmagic(fx *f) { memcpy(f->buf, "GGUF\x03\x00\x00\x00", 8); }
 static void mut_garbage_magic(fx *f) { f->buf[0] = 'X'; }
 static void mut_version_major(fx *f) { p16(f, f->h_vmaj, 3); }
 static void mut_version_minor(fx *f) { p16(f, f->h_vmin, 1); }
@@ -803,6 +804,18 @@ static void test_mutual_v1_v2_refusal(void)
         CHECK(rc == HYDRA2_E_MAGIC, "v2 reader on v1 file");
         CHECK(file_contains(CAPPATH, "v1 .hydra file"),
               "v2 reader did not name the v1 file type");
+    }
+
+    /* v2 reader refuses a GGUF file (llama.cpp's transformer format),
+       naming it: GGUF support is the llama.cpp engine or the offline
+       tools/gguf_to_hydra.py projection, never this container reader
+       (docs/GGUF-IMPORT.md). */
+    if (cap_stderr_begin(CAPPATH) == 0) {
+        int rc = open_mutated(mut_ggufmagic);
+        cap_stderr_end();
+        CHECK(rc == HYDRA2_E_MAGIC, "v2 reader on GGUF file");
+        CHECK(file_contains(CAPPATH, "GGUF"),
+              "v2 reader did not name the GGUF magic");
     }
 
     /* v1 loader refuses a v2 file, naming HYDRA2 (7.2). Build a pristine

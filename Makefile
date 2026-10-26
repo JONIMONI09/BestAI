@@ -76,7 +76,7 @@ gpu-bench: gpu_bench_cpu
 gpu_bench_cpu: tools/gpu_bench/gpu_bench.c
 	$(CC) -O2 -Wall -Wextra -Werror -o gpu_bench_cpu tools/gpu_bench/gpu_bench.c
 
-# Weboberflaeche: Starter-Modell bauen und Server starten (Port via PORT, Default 8787)
+# Web console: build the starter model and start the server (port via PORT, default 8787)
 ui: hydra-run
 	mkdir -p models
 	python3 tools/make_model.py models/starter.hydra

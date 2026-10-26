@@ -4,7 +4,171 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-10-26 (round 10) — the documented smoke recipe never ran llama-cli: `timeout` treated `OMP_NUM_THREADS=1` as the executable (Qodo issue, confirmed)
+
+- **Symptom:** docs/GGUF-IMPORT.md 11.4 said
+  `(sleep 10 | timeout 10 OMP_NUM_THREADS=1 $LLAMA/build/bin/llama-cli
+  …)`. A user running the recipe gets no model run at all — `timeout`
+  executes its first non-option argument AS the command, so it tried
+  to run the literal string `OMP_NUM_THREADS=1`:
+  `timeout: failed to run command 'OMP_NUM_THREADS=1': No such file or
+  directory`. The recipe "worked" in my head because I had always
+  invoked the CLI with `timeout 10 env OMP_NUM_THREADS=1 …` directly.
+- **Cause:** an environment-variable prefix is a SHELL feature (the
+  shell puts VAR=value into the environment of the command it parses);
+  `timeout` is a program that spawns its argv verbatim, so it sees the
+  variable as the executable name. Classic "the command I typed in the
+  shell is not the command the program receives."
+- **Fix:** the recipe now reads
+  `(sleep 10 | timeout 10 env OMP_NUM_THREADS=1 $LLAMA/build/bin/
+  llama-cli …)` — `env` is a real executable that does the assignment
+  for the spawned process — and the fixed line was executed verbatim
+  from a clean cwd and produced the fixture output.
+- **Prevention:** any command that is DOCUMENTED (recipe, README,
+  CI) must be run verbatim from a clean shell at least once after
+  editing; and in general: `timeout`/`setsid`/`execve`-style programs
+  only take real program names as argv[0] — environment variables go
+  through `env`.
+
+## 2026-10-26 (round 10) — GitHub's content API reported LFS model files as plain blobs with their full size (three dead-end tarballs)
+
+- **Symptom:** hunting for a real GGUF to download (the sandbox only
+  reaches github.com/codeload/api.github.com/npm/pypi), the contents
+  API said e.g. `smollm2-135m.gguf size=381566656` with `lfs: null`
+  and a media-host download URL — looked like a plain git blob
+  (codeload would carry it). Every such file extracted from the
+  codeload tarball was a 133/134-byte git-lfs pointer instead:
+  brookcs3/aiGn-cli (364 MB smollm2), GoogleChrome/webai-compute-
+  benchmark (291.5 MB gemma-3-270m), 0624jwjwjw-cmd/2nd5TeamProject
+  (qwen2.5-0.5b), stateforward/emel.cpp (distilgpt2), bitanath/pixy.
+  Five repos, five dead ends.
+- **Cause:** the contents API's `size`/`download_url` fields do not
+  reliably flag LFS objects (the `lfs` sub-object was absent in my
+  queries even when the blob was a pointer), and GitHub's plain-file
+  push limit (100 MB) makes >=100 MB files overwhelmingly LFS — so
+  "big file with a media-host URL" is a prior for LFS, not plain.
+- **Fix:** the codeload tarball is the only source of truth for what
+  actually travels in the archive; extract and check the bytes before
+  believing the API. That test finally found a plain blob:
+  BodhiSearch/BodhiApp's HF-cache `blobs/…` entry
+  (llama-68m-chat-v1.q8_0.gguf, 73 018 688 B, magic 47 47 55 46).
+  Also note the HF-cache layout: the snapshot path is a SYMLINK into
+  `blobs/<sha256>` — extract the blob, not the symlink name.
+- **Prevention:** "is this file downloadable from an allowed host?"
+  is answered by one 30-second codeload extract + `head -c 4`, never
+  by API fields. And: a 133-byte .gguf is a pointer, not a model.
+
 ---
+
+## 2026-10-26 (round 9) — the quantised-type name table silently disagreed with the official ggml_type enum (user-facing mislabel, found by audit)
+
+- **Symptom:** `tools/gguf_reader.py` labelled `ggml_type` 31 as
+  `TQ1_0`, 32 as `TQ2_0`, 34 as `MXFP4`; 35/39/40/41/42 had no entry.
+  A file whose tensors are TQ1_0 (official value 34) would have been
+  refused under the label `MXFP4` — a wrong diagnostic in the message a
+  user reads to fix their import.
+- **Cause:** the table was written from memory of an older enum and
+  never checked against the source of truth. Official enum
+  (ggml-org/ggml `include/ggml.h`, fetched 2026-10-26): `TQ1_0 = 34`,
+  `TQ2_0 = 35`, `MXFP4 = 39`, `NVFP4 = 40`, `Q1_0 = 41`, `Q2_0 = 42`;
+  slots 31–33 and 36–38 are REMOVED (reserved).
+- **Fix:** `tools/gguf_reader.py` table corrected (reserved slots get
+  `ggml_type#N`, no invented names); the converter refusal now names
+  tensor **and** layout (`token_embd.weight (TQ1_0)`); regression gate
+  `run_type_names` in `tools/gguf_test.py` pins all six current names,
+  all six reserved slots, and the message content (CI-gated via
+  `make gguf-test` in `test-run`).
+- **Prevention:** any table that maps external IDs to user-visible
+  names is a living contract — it gets a gate that names each entry,
+  and the source (repo + date) is recorded next to it. See
+  docs/GGUF-IMPORT.md §11.1.
+
+## 2026-10-26 (round 9) — own GGUF writer: string lengths written as u32 instead of the spec's u64 (reader desync, 30-minute debug)
+
+- **Symptom:** `tools/gguf_minimal_llama.py` produced a file our own
+  reader rejected with `GgufError: string length 7308890738324930580`
+  (garbage) — the first KV pair parsed, everything after desynced.
+- **Cause:** GGUF `gguf_string_t` is a **u64** length + bytes; the
+  writer packed u32 lengths for KV keys and tensor names. Every string
+  was 4 bytes too short, so the reader cursor drifted from the second
+  string on.
+- **Fix:** two `struct.pack('<Q', …)` in the writer; self-test green
+  (242 752 B, 21 tensors, arch `llama`, 99 tokens, F16/F32 decode OK).
+- **Prevention:** (1) the spec (ggml-org/ggml `docs/gguf.md`) says the
+  width — check the width in the spec, not in your head; (2) while
+  debugging, `gguf_reader.Reader` IS the oracle — print its cursor
+  (`r.pos`) and stop hand-walking hex with ad-hoc widths (two
+  hand-walk scripts with wrong assumptions prolonged the debug);
+  (3) a new binary-format writer ships with a parse-back test against
+  the repository's own reader — `run_minimal_llama` is that test here.
+
+## 2026-10-26 (round 9) — pinned llama.cpp smoke: five layout/vocab facts, a REPL stdin spin, and an F16 type mismatch (environment traps, all documented)
+
+- **Symptom:** the minimal-llama GGUF was refused/crashed through
+  five sequential errors before it ran: `unknown tokenizer: 'BPE'` →
+  `invalid gguf type for tokenizer.ggml.token_type` →
+  `tensor 'output_norm.weight' not found` → `ffn_gate.weight has wrong
+  shape; expected 64, 0` → then a F32 file "hung" (100% CPU, no
+  output).
+- **Cause (verified against the pin's source, v0.5.0
+  `7fe450e…`):** (1) llama.cpp's vocab loader accepts `llama`/`gpt2`/
+  `bert`/…, not the string `BPE` — a BPE charmap with (possibly empty)
+  merges is `gpt2` (the key must exist; an empty array is legal);
+  (2) `tokenizer.ggml.token_type` must be an **INT32** array
+  (llama-vocab.cpp:2491); (3) the llama arch requires
+  `output_norm.weight`; (4) `expected 64, 0` = missing
+  `llama.feed_forward_length` (n_ff read as 0) **and** in this build
+  ffn_gate/up are `{n_embd, n_ff}` with ffn_down `{n_ff, n_embd}`;
+  (5) the "hang" was not a hang: this build's `llama-cli` always runs
+  its internal REPL, and with **closed stdin** (a bare pipe) the
+  server loop busy-spins printing `> ` prompts — 8.8 M lines in 10 s.
+  With stdin open the same run prints `[ Prompt: 36894.7 t/s |
+  Generation: 6237.0 t/s ]` in under a second. Bonus: the F16 variant
+  of the fixture hits `ggml-cpu binary_op: unsupported types
+  (dst f32, src0 f32, src1 f16)` in the pin — the fixture therefore
+  defaults to `--dtype f32`.
+- **Fix:** all five facts baked into `tools/gguf_minimal_llama.py`
+  with comments citing the pin's source; docs/GGUF-IMPORT.md §11.4
+  records the verified result, the REPL stdin note and the F16
+  mismatch; `run_minimal_llama` + the generator self-test keep it
+  green.
+- **Prevention:** when a pinned binary rejects a generated file, read
+  the pin's source (it is in /tmp/lc) instead of guessing; and always
+  suspect the harness (stdin! pipes! TTY!) before a "hang" — the
+  symptom "100% CPU + prompt flooding" is a harness loop, not the
+  model.
+- **Postscript (2026-10-26, Qodo review of PR #68):** the "empty
+  output text" of the first successful run was explained here and in
+  the docs as "random weights point at special tokens" — that was
+  wrong. The file's token types were reversed (chars labeled
+  UNKNOWN=2, which the BPE detokenizer silently drops; specials
+  labeled NORMAL=1), and the add-bos/padding keys were under
+  `llama.*` instead of the `tokenizer.ggml.*` namespace the pin
+  reads (llama-arch.cpp L394/397 — parsed but ignored). A second
+  class of "silently wrong" defects: the file loaded, the pipeline
+  ran, nothing pointed at the bug — only the output was empty.
+  Lesson: a smoke test that checks "it ran" misses semantic
+  defects; the gate now asserts what the output contains (token
+  types, keys, and the pinned smoke prints real characters:
+  `1'aV+uE~`, prompt 36 082.5 t/s, generation 5 640.6 t/s).
+
+## 2026-10-26 (round 9) — CHANGELOG anchor missed a word ("and in"), then the replacement ate the intro (process error, caught before commit)
+
+- **Symptom:** the scripted round-9 CHANGELOG insertion failed an
+  assert; re-ran with the shorter anchor, which matched — and the
+  replacement then consumed the "All notable changes … Newest entries
+  first." intro, leaving `# Changelog` followed directly by the new
+  heading.
+- **Cause:** the real line 2 ends "…are recorded here and **in**" —
+  the first anchor was missing the word; the second (shorter) anchor
+  started inside the intro, so the intro was inside the matched span
+  and the replacement did not carry it. No check between edit and
+  commit (the usual blind-script trap, round-8 edition).
+- **Fix:** intro restored in a second edit; verified with `head`.
+- **Prevention:** for multi-line markdown anchors, copy the anchor
+  from the file (grep/sed), never retype it; and after ANY
+  replacement of a block that includes a file's leading lines,
+  `head -8` the result before moving on.
 
 ## 2026-10-26 (round 8) — two real bugs in the new v2 container reader, both found by `gcc -fanalyzer` before they could ship
 

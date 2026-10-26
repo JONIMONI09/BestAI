@@ -32,8 +32,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang-tidy clang-tools flawfinder cppcheck
 
-      # Verwendet die in .agents/errors.md dokumentierten POSIX-Feature-Makros,
-      # sonst sind madvise/O_CLOEXEC/clock_gettime unter strict C99 undefiniert.
+      # Uses the POSIX feature macros documented in .agents/errors.md,
+      # otherwise madvise/O_CLOEXEC/clock_gettime are undefined under strict
+      # C99.
       - name: gcc -fanalyzer (GCC static analyzer, C99)
         run: |
           gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
@@ -210,7 +211,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Syntax check der JNI-Bridge gegen echte NDK-Header
+      - name: Syntax check of the JNI bridge against the real NDK headers
         run: |
           SDK=/opt/android-sdk
           NDK=$SDK/ndk/26.3.11579264
@@ -359,10 +360,10 @@ jobs:
       contents: read
       issues: write
     steps:
-      # submodules: true ist Pflicht, keine Optimierung: der native Build
-      # ruft add_subdirectory(llama) auf. Ohne Submodul sieht der Job ein
-      # leeres Verzeichnis und CMake schlaegt fehl - auf main, bei jedem
-      # Release und bei jedem Pull Request, der Android anfasst.
+      # submodules: true is mandatory, not an optimisation: the native build
+      # calls add_subdirectory(llama). Without the submodule the job sees an
+      # empty directory and CMake fails - on main, for every release and for
+      # every pull request that touches Android.
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -542,7 +543,7 @@ jobs:
           echo "::error::Android Lint reported findings (or gradle failed before the analysis)"
           exit 1
 
-      - name: Kotlin-/C-Kompilierung (NDK clang ist strenger als Host-gcc)
+      - name: Kotlin/C compilation (NDK clang is stricter than host gcc)
         working-directory: android
         run: $GRADLE_BIN assembleDebug --no-daemon -q
 
@@ -579,10 +580,10 @@ jobs:
             ${{ runner.temp }}/gradle-lint.log
           if-no-files-found: ignore
 
-  # ---------- Semgrep (Sicherheitsregeln) ----------
-  # Befolgt die offizielle CI-Sample-Konfiguration: image ohne Tag,
-  # `semgrep ci` beendet sich bei Funden selbst mit Exit 1 (ein
-  # the --error flag does not exist). --suppress-errors keeps internal
+  # ---------- Semgrep (security rules) ----------
+  # Follows the official CI sample configuration: untagged image,
+  # `semgrep ci` exits with 1 on its own when it finds issues (the
+  # --error flag does not exist). --suppress-errors keeps internal
   # Semgrep errors from blocking the run, real findings still block.
   semgrep:
     name: Semgrep security rules
@@ -594,7 +595,7 @@ jobs:
       - run: semgrep ci --suppress-errors --quiet
 
   # ---------- CodeQL (C + JavaScript) ----------
-  # CodeQL baut das Projekt mit einem eigenen Datenfluss-Graphen und findet
+  # CodeQL builds the project with its own data-flow graph and finds
   # exactly the bug class this is about: from the HTTP parameter (model
   # file) down to mmap/open() in C. security-extended goes considerably
   # further than the standard query suite.

@@ -136,9 +136,15 @@ is refused, by name:
 
 ```
 no F32/F16/BF16/Q8_0 1-D or 2-D tensor in this file.
-Unsupported quantised tensors: Q4_K, Q4_0, …
+Unsupported quantised tensors: blk.0.ffn_gate.weight (Q4_K), …
 Re-export with llama.cpp --convert-f16 and import again.
 ```
+
+The refusal names every refused tensor **with its layout** (`name
+(TQ1_0)`), not just the name: the type table is audited against the
+official `ggml_type` enum (see §11), and a message that says only
+"token_embd.weight" would force the user to hexdump the file to find
+out which quantisation it has.
 
 Re-export from llama.cpp with `--convert-f16` if you need a file this tool can
 read. Decoding the remaining block formats would mean re-implementing a dozen
@@ -291,6 +297,14 @@ round-trip against itself; it would not survive the engine.
 - **`A`/`B` are column sums.** Column sums discard the per-row structure that
   attention depends on. That is inherent to what the format stores, not a
   limitation of the fold implementation.
+- **The `.hydra2` container is not a GGUF loader** (2026-10-26). GGUF has two
+  supported destinations only: the app's llama.cpp engine (full fidelity) and
+  this offline converter (projection). Dropping a GGUF into the v2 container
+  is refused with the GGUF magic named; the converter never writes `.hydra2`
+  (it emits v1, or `--v3` for the RoPE-capable variant). See §11.
+- **Little-endian only.** The GGUF spec allows big-endian files but provides
+  no way to detect them; the spec says to assume little-endian, which is what
+  the reader does (§11).
 
 ---
 
@@ -349,3 +363,246 @@ matches a reference step. F32/F16/BF16 of the same weights convert
 identically, and a set of malformed inputs (truncation, header length,
 out-of-order offsets, unsupported dtype, past-the-end range) must each be
 refused.
+
+---
+
+## 11. Verification (2026-10-26)
+
+This round re-verified the whole GGUF surface against the official
+sources and closed the gap between "parses" and "actually works".
+
+### The two GGUF paths in this repository
+
+| Path | What it is | Fidelity |
+|---|---|---|
+| **The app's llama.cpp engine** (`android/app/src/main/java/dev/hydrastone/LlamaEngine.kt` → `llama_jni.cpp` → pinned llama.cpp) | full transformer inference: real attention, real vocabulary, real sampling | **full** — any GGUF the pinned build accepts is run as that model |
+| **the offline converter** (`tools/gguf_to_hydra.py`) | projection of the GGUF weights into the 64-dim recurrent `.hydra` core | **seed only** — §2; not the source network |
+
+The app's question "can GGUF models be used, and do they write with
+their full intelligence?" is answered by the llama.cpp engine: it is
+the app's main engine (`isExperimental = false` per
+`LlamaEngine.kt`), loads `.gguf` files imported through the Models
+tab (SAF copy, GGUF magic check, size cap in `MainActivity.kt`), and
+delegates "which architectures work" to llama.cpp's own loader
+instead of re-implementing a support matrix that would drift. The
+conversion path in this document is **not** that answer, and the two
+paths refuse each other's files at the magic boundary (§11.6).
+
+### 11.1 ggml_type enum audit — bug found and fixed
+
+The reader's quantised-name table disagreed with the official
+`ggml_type` enum (ggml-org/ggml, `include/ggml.h`, fetched
+2026-10-26): the table claimed `31 = TQ1_0`, `32 = TQ2_0`,
+`34 = MXFP4`. Officially, `TQ1_0 = 34`, `TQ2_0 = 35`, `MXFP4 = 39`,
+with `NVFP4 = 40`, `Q1_0 = 41`, `Q2_0 = 42` missing from the table
+entirely, and slots `31–33` / `36–38` REMOVED (reserved) — they must
+not be given invented names. Impact: a TQ1_0 file would have been
+refused under the label `MXFP4`. Fixed in `tools/gguf_reader.py`;
+the regression gate `run_type_names` in `tools/gguf_test.py` now
+checks all six current names plus all six reserved slots, and the
+converter refusal names tensor **and** layout
+(`token_embd.weight (TQ1_0)`, §4).
+
+### 11.2 Spec conformance (ggml-org/ggml, `docs/gguf.md`)
+
+Verified against the official GGUF spec on the same date:
+
+- header order (magic `0x46554747` LE, version, tensor_count,
+  kv_count), all 13 metadata value types, tensor info (name,
+  n_dims ≤ 4, dims, ggml_type, offset **relative to the data
+  section**), alignment handling and the end-of-file bound check all
+  match; the reader accepts format version 2–3 and refuses others.
+- the reader is **little-endian only**. The spec allows big-endian
+  GGUF but states there is currently no way to detect it, and says
+  to assume little-endian without further information — exactly what
+  the reader does.
+- the spec caps tensor names at 64 bytes; the reader does not enforce
+  the cap (an overlong name is malformed input but harmless here).
+
+### 11.3 Behavior gate: the converted model actually writes
+
+`run_behavior` in `tools/gguf_test.py` (CI-gated through `make
+gguf-test` inside `test-run`): the converted fixture model must
+return **exactly the requested number of tokens** (the CLI
+contract), produce a **deterministic** stream (two independent
+`./hydra-run` runs, byte-identical) and a **non-degenerate** stream
+(≥2 distinct tokens, not the input token repeated) for all three
+tested (token, steps) pairs. That is the honest ceiling of what a
+projection can prove: the import produces a stable, alive model — it
+does not claim the stream reproduces the source LLM's language.
+
+### 11.4 llama.cpp smoke test (the pin, not a newer build)
+
+`tools/gguf_minimal_llama.py` (standard library only, deterministic
+fixed-seed LCG weights with real signs, 2 layers, 64 dim, 99-token
+BPE vocabulary, **F32** weights by default) writes a structurally
+real `llama`-architecture GGUF — every field llama.cpp's llama
+loader reads is present. The `gguf-test`
+gate keeps the generator alive by requiring this repository's own
+reader to parse it (`run_minimal_llama`). The generation step runs
+against the **pinned** llama.cpp — v0.5.0, commit
+`7fe450e19305b828c199d602c23a8337aaa1f03b`, the same commit the
+app's submodule pins and the CI `llama.cpp pin` check enforces:
+
+```bash
+# from the repository root - the generator lives here, not in the
+# extracted llama.cpp tree:
+python3 tools/gguf_minimal_llama.py --out /tmp/smoke.gguf --seed 7
+# pinned source (the codeload tarball is the no-clone way):
+curl -sL -o /tmp/llama.tar.gz \
+  https://codeload.github.com/ggml-org/llama.cpp/tar.gz/7fe450e19305b828c199d602c23a8337aaa1f03b
+tar xzf /tmp/llama.tar.gz
+LLAMA=llama.cpp-7fe450e19305b828c199d602c23a8337aaa1f03b
+cmake -S $LLAMA -B $LLAMA/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+cmake --build $LLAMA/build --parallel 2 --target llama-cli
+# give the CLI an open stdin, or its REPL loop busy-spins (below);
+# the env var goes through env - timeout would take OMP_NUM_THREADS=1
+# as the command to run:
+(sleep 10 | timeout 10 env OMP_NUM_THREADS=1 \
+  $LLAMA/build/bin/llama-cli -m /tmp/smoke.gguf -p "a" -c 64 -n 8 -t 1 --temp 0)
+```
+
+Result on this machine (2026-10-26, 2 cores, `OMP_NUM_THREADS=1`):
+
+```
+> a
+1'aV+uE~
+
+[ Prompt: 36082.5 t/s | Generation: 5640.6 t/s ]
+```
+
+The pin loads the file our generator wrote, tokenizes, decodes,
+samples **and prints** the generated tokens — the full pipeline
+including detokenization, on a file that needed no download. The
+text is random by construction (random weights), and that is the
+ceiling of a fixture (the generator's docstring says so); repeated
+runs are byte-identical (`-t 1 --temp 0`, fixed seed).
+Full-intelligence GGUF inference in the app is the llama.cpp
+engine's job with a real model file.
+
+Build-specific facts from that run, baked into the generator (all
+regression-covered by `run_minimal_llama` and the generator's own
+self-test):
+
+- `tokenizer.ggml.model` must be a llama.cpp vocab type — `"gpt2"`
+  for a BPE charmap, not `"BPE"` (the loader answers "unknown
+  tokenizer").
+- `tokenizer.ggml.token_type` must be an **INT32** array using the
+  pinned enum (`NORMAL=1`, `CONTROL=3`, …): a char labeled
+  `UNKNOWN` is silently dropped by the BPE detokenizer, so a file
+  with the types mislabeled can never print text — this fixture
+  marks its 95 chars `NORMAL` and its four specials `CONTROL`, like
+  real llama.cpp conversions.
+- the add-bos and padding keys live in the `tokenizer.ggml.*`
+  namespace (`tokenizer.ggml.add_bos_token`,
+  `tokenizer.ggml.padding_token_id`); an architecture-prefixed name
+  is parsed but ignored.
+- the llama arch in this build wants `ffn_gate`/`ffn_up` as
+  `{n_embd, n_ff}`, `ffn_down` as `{n_ff, n_embd}`, plus
+  `output_norm.weight` and `llama.feed_forward_length`.
+
+Two operational notes: this build's `llama-cli` always starts its
+interactive REPL, and with a **closed** stdin (a bare pipe) its
+server loop busy-spins printing `> ` prompts (8.8 M lines in 10 s
+on this box) — run it with stdin open (or timeboxed) to capture the
+one-shot output. And the F16 variant of this fixture (`--dtype
+f16`) reaches a ggml type mismatch in the pinned build (f32
+activations × f16 norm weights in `ggml_mul`); `--dtype f32` (the
+default) is the verified smoke configuration. Real llama.cpp
+conversions are usually quantised, so the fixture proves structure
+and the pipeline — not fidelity.
+
+### 11.5 What this round added to the gates
+
+- `run_behavior` (exact length + determinism + non-degeneracy of the
+  converted model's stream) — `tools/gguf_test.py`.
+- `run_type_names` (ggml_type audit regression) — `tools/gguf_test.py`.
+- `run_minimal_llama` (the generator's file must still parse —
+  including the F32 dtype, the NORMAL/CONTROL token types and the
+  `tokenizer.ggml.*` keys) — `tools/gguf_test.py`.
+- the `.hydra2` reader now names a GGUF magic in its refusal (2 new
+  checks in `tests/test_hydra2_container.c`; the suite is 122
+  checks).
+
+### 11.6 Format boundaries
+
+- `.hydra2` is **not** a GGUF loader; a GGUF dropped in is refused
+  with the GGUF magic named (`src/hydra_v2_container.c`, regression-
+  tested, §11.5).
+- the offline converter never emits `.hydra2`: GGUF import writes
+  v1 (or `--v3`, the RoPE-capable variant), and `.hydra2` fixtures
+  come from `tools/make_model.py --v2`.
+
+### 11.7 Real-model verification (a downloaded model, not the fixture)
+
+2026-10-26: a **real model was downloaded and run through the pinned
+llama.cpp** — the same source (v0.5.0, `7fe450e…`) the app's NDK
+build compiles into `libllama_jni.so`. Model: **llama-68m-chat-v1,
+Q8_0 quant, 73 018 688 bytes (73.0 MB)**, architecture `llama`,
+2 layers, dim 768, context 2048, 32 000 tokens, 21 tensors
+(16 × Q8_0 + 5 × F32), magic bytes `47 47 55 46`. Source (GitHub,
+plain git blob, no LFS): `BodhiSearch/BodhiApp`, HF-cache layout
+`crates/server_core/tests/data/live/huggingface/hub/
+models--afrideva--Llama-68M-Chat-v1-GGUF/snapshots/…/
+llama-68m-chat-v1.q8_0.gguf`.
+
+Download recipe (codeload is the no-clone way; the file travels as a
+plain blob inside the tarball):
+
+```bash
+SHA=$(gh api repos/BodhiSearch/BodhiApp/commits?per_page=1 --jq '.[0].sha')
+curl -sL -o /tmp/bodhi.tar.gz \
+  https://codeload.github.com/BodhiSearch/BodhiApp/tar.gz/$SHA
+tar xzf /tmp/bodhi.tar.gz --wildcards \
+  "*models--afrideva--Llama-68M-Chat-v1-GGUF*blobs*"
+# the snapshot entry is a symlink into blobs/; copy the blob:
+cp <extracted blob> /tmp/llama68m.gguf
+# run the gate + the pinned CLI:
+python3 tools/gguf_test.py --engine ./hydra-run --real-model /tmp/llama68m.gguf
+(sleep 45 | timeout 40 env OMP_NUM_THREADS=2 \
+  /tmp/lc/llama.cpp-7fe450e*/build/bin/llama-cli -m /tmp/llama68m.gguf \
+  -p "The capital of France is" -c 512 -n 64 -t 2 --temp 0)
+```
+
+Measured on this box (2 cores, `OMP_NUM_THREADS=2`, 2026-10-26):
+
+```
+> The capital of France is
+The capital of France is France.<|im_end|>
+
+[ Prompt: 109.4 t/s | Generation: 6.6 t/s ]
+```
+
+plus two further runs (longer prompt, greedy: prompt 172.7 t/s,
+generation 4.4 t/s; sampling `--temp 0.7`: generation 8.2 t/s). The
+68M model is a toy by construction — it writes grammatical but thin
+prose; the point of this section is that the **full pipeline runs on
+a real file**: load, tokenization, transformer decode over all 21
+tensors (Q8_0 dequantized), sampling, detokenization, streaming.
+A 68M model is the largest real writing model this sandbox's network
+policy can deliver: GitHub stores model files ≥100 MB via LFS, and
+the LFS endpoint is not reachable here — larger real models (e.g.
+Gemma-3-270M Q8_0 at 291.5 MB, Qwen2.5-0.5B-Instruct Q4_K_M) are
+reachable from a normal machine and run through the identical
+commands above; the app and the engine place no size or
+architecture restriction of their own (the architecture question is
+delegated to the pinned llama.cpp loader, see the README).
+
+What each tool proved with this file (all regression-covered):
+
+- `tools/gguf_inspect.py` + the reader: v3 header, all 22 metadata
+  keys, the whole tensor directory, all 21 decodable tensors, the
+  32 000-token tokenizer, `convertible: yes`.
+- `tools/gguf_test.py --real-model /tmp/llama68m.gguf` (the new
+  opt-in gate, 6 checks, CI default stays offline): magic, parse,
+  every decodable tensor decodes, the converter projects it to a
+  `.hydra` v3 file (dim 64, 2 layers, vocab 1024, 30 976 tokens
+  dropped — the honest projection, §4), and the C engine runs that
+  projection deterministically (`0 2 0 2 0 2 2 0 2 0 0 0 0 2 2 2`,
+  two runs byte-identical).
+- the pinned llama-cli: the runs above.
+
+Not measured (R32, no device in the sandbox): `libllama_jni.so`
+inside the APK on a real phone or emulator — the Android CI tier
+compiles the exact JNI source, and the x86_64 emulator is the
+documented device-side verification path (`android/README.md`).

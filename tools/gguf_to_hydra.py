@@ -258,8 +258,14 @@ def pick_tensors(gguf, a_name, b_name):
     """
     candidates = gguf.decodable_candidates()
     if not candidates:
-        quantised = gguf.quantised_names()
-        detail = ', '.join(quantised[:6]) if quantised else 'none'
+        # Name each refused tensor WITH its layout: the message must say
+        # which quantisation the file has, not just where it sits, or
+        # the user has to hexdump the file to find out (2026-10-26:
+        # TQ1_0 files were refused as "token_embd.weight" with no type).
+        parts = ['%s (%s)' % (t.name, t.type_name)
+                 for t in gguf.tensors
+                 if not t.is_decodable and t.shape() is not None]
+        detail = ', '.join(parts[:6]) if parts else 'none'
         raise gguf_reader.GgufError(
             'no F32/F16/BF16/Q8_0 1-D or 2-D tensor in this file. '
             'Unsupported quantised tensors: %s. Re-export with '

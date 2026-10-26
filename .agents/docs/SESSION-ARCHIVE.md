@@ -829,92 +829,92 @@ commit SHA via `/commits/{sha}/pulls`, which also covers push runs that
 update a PR) and fails the job itself. YAML validated. Committed as
 b53d738, pushed.
 
-**CI round 3 (b53d738):** Lint & Security rot — aber der neue Ablauf
-lief: gradle-Step success (non-fatal), Check-Step failure (Gate als
-einziger Failure-Punkt ok). PR-Comment fehlte trotzdem: lint.yml hat
-`permissions: contents: read` auf Workflow-Ebene → issues-API-Call
-403, vom `|| true` verschluckt (genau die Falle, die der
-Fallback-Dämpfer abfangen soll, deckt jetzt die Funktion selbst).
-Der CI-Run auf 199221c (CI workflow) war ebenfalls rot — Code-Tree
-ist verifiziert konsistent, also entweder transiente Infra oder ein
-echter Compile-Fehler; der b53d738-Run klärt das.
+**CI round 3 (b53d738):** Lint & Security red — but the new flow
+worked: gradle step success (non-fatal), check step failure (gate as
+the single failure point, as intended). The PR comment was still
+missing: lint.yml carries `permissions: contents: read` at workflow
+level → the issues API call got 403 and was swallowed by `|| true`
+(the exact trap the fallback damper is supposed to catch now exposes
+the function itself). The CI run on 199221c (CI workflow) was red
+too — the code tree is verified consistent, so either transient
+infrastructure or a real compile error; the b53d738 run settles it.
 
-**Runde 4 (jetzt):** job-separierte Permissions `issues: write`
-(überschreibt das Workflow-Level, scoped auf die zwei Android-Jobs)
-+ `::warning::`-Marker auf dem Comment-Fallback-Pfad (eine gebrochene
-Spiegelung wird dann in den Annotations sichtbar). errors.md:
-Permission-403-Eintrag. Nächster fehlgeschlagener Run postet den
-Report als PR-Comment → tatsächliche Lint-Funde lesen → definitorischer
-Fix. Commit 05dbbfe, gepusht. Nebenbefund aus der Analyse: CI (ci.yml)
-ist auf 199221c UND b53d738 am Gradle-Build-Step rot (db85ccd war
-grün) — gleicher Code in beiden → verdächtigster Kandidat ist der
-HydraApp.kt-Änderung von Runde 2, aber ein Compile-Fehler vs.
-Infrastrukturfehler war aus der Sandbox nicht unterscheidbar (Logs
+**Round 4 (now):** job-separated permissions `issues: write`
+(overrides the workflow level, scoped to the two Android jobs) + a
+`::warning::` marker on the comment-fallback path (a broken
+mirroring then becomes visible in the annotations). errors.md:
+permission-403 entry. The next failed run posts the report as a PR
+comment → read the actual lint findings → definitive fix. Commit
+05dbbfe, pushed. Side finding from the analysis: CI (ci.yml) is red
+at the gradle build step on 199221c AND b53d738 (db85ccd was green)
+— same code in both → the most suspicious candidate is the
+HydraApp.kt change of round 2, but a compile error vs. an
+infrastructure error was not distinguishable from the sandbox (logs
 UI-only).
 
-**Runde 5 (jetzt):** schließt die letzte Diagnose-Lücke:
-"Report fehlt" ist eine zweite Fehlerklasse (gradle stirbt vor der
-Lint-Analyse, z.B. bei Kotlin-Compile-Fehlern → keine Report-Datei).
-Die gradle-Steps in **ci.yml und lint.yml** loggen jetzt die volle
-Ausgabe in eine Datei; der Check-/Publish-Step baut das Payload aus
-der jeweils eingetretenen Klasse (Lint-Report ODER Gradle-Log-Tail
-150–200 Zeilen) und publiziert es in beiden Fällen (Step-Summary +
-PR-Comment). Der CI-APK-Build-Job bekommt dasselbe (Capture +
-Publish + job-separierte issues:write). YAML validiert (3 Dateien).
-Ab dem nächsten fehlgeschlagenen Run ist jeder Android-Fehler per API
-lesbar — egal welche Fehlerklasse. Commit 9608e4d, gepusht.
-Nebenbefund: der 9608e4d-Lint-Job lief nur 46 Sekunden und starb vor
-der Lint-Analyse (kein Report) — der Footprint eines Compile-Fehlers.
+**Round 5 (now):** closes the last diagnostic gap: "missing report"
+is a second error class (gradle dies before the lint analysis, e.g.
+on Kotlin compile errors → no report file). The gradle steps in
+**ci.yml and lint.yml** now log the full output to a file; the
+check/publish step builds the payload from whichever class occurred
+(lint report OR gradle log tail, 150–200 lines) and publishes it in
+both cases (step summary + PR comment). The CI APK build job gets
+the same treatment (capture + publish + job-separated issues:write).
+YAML validated (3 files). From the next failed run on, every Android
+error is readable via the API — regardless of the error class.
+Commit 9608e4d, pushed. Side finding: the 9608e4d lint job ran only
+46 seconds and died before the lint analysis (no report) — the
+footprint of a compile error.
 
-**Runde 6 (jetzt):** WURZELURACHE: `androidx.compose.ui.platform.
-LocalResources` existiert in dieser Compose-Version (BOM 2024.09.03)
-NICHT — die Runde-2-Reparatur hat eine Library-API referenziert, die
-es nicht gibt (ungedruckte Annahme, nicht einmal im Repo verwendet;
-Theme.kt nutzt LocalContext). Ein Compile-Fehler erklärt alles
-Gleichzeitig: CI-Build-Step rot (199221c + b53d738, gleicher Code),
-Lint-Job "kein Report" (stirbt vor der Analyse), 46-Sekunden-Job.
+**Round 6 (now):** ROOT CAUSE: `androidx.compose.ui.platform.
+LocalResources` does NOT exist in this Compose version (BOM
+2024.09.03) — the round-2 repair referenced a library API that does
+not exist (an unspoken assumption, not even used anywhere in the
+repo; Theme.kt uses LocalContext). A single compile error explains
+everything at once: CI build step red (199221c + b53d738, same code),
+lint job "no report" (dies before the analysis), 46-second job.
 Fix: `import androidx.compose.ui.platform.LocalContext` +
-`val resources = LocalContext.current.resources` — dieselbe
-Resources-Klasse, kanonischer Compose-Zugriff, API die das Repo schon
-kompiliert. Sonst nichts geändert (Plurals, Call-Stil, Workflow).
-Fehler-Artifact in lint.yml bekommt zusätzlich /tmp/lint-report.md +
-gradle-lint.log. Doku: errors.md (nicht-existierende API +
-Fehler-Fingerprint "CI rot + Lint ohne Report = Compiler, nicht
-Lint-Finding"), CHANGELOG + session.md. Ergebnis: **CI und Lint &
-Security grün auf a983414**; Nutzer hat **PR #48 merged** (20:04Z,
-Merge-Commit afae8c8 auf main). Release auf main lief danach neu und
-ist grün.
+`val resources = LocalContext.current.resources` — the same
+Resources class, the canonical Compose access, an API the repo
+already compiles. Nothing else changed (plurals, call style,
+workflow). The failure artifact in lint.yml additionally gets
+/tmp/lint-report.md + gradle-lint.log. Docs: errors.md
+(non-existent API + error fingerprint "CI red + lint without report
+= compiler, not a lint finding"), CHANGELOG + session.md. Result:
+**CI and Lint & Security green on a983414**; the owner **merged PR
+#48** (20:04Z, merge commit afae8c8 on main). The release on main
+then ran fresh and is green.
 
-### Round 2026-10-25 (post-merge: Doc-Audit aus Screenshot)
+### Round 2026-10-25 (post-merge: doc audit from a screenshot)
 
-Nutzer hat den GitHub-README-Stand (main, afae8c8) als Screenshot
-gefordert, alles zu prüfen: Screenshot-Ansprüche + finale Doku in
-jedem Ordner. Neue Session-Branch `arena/c19193e9-bestai` (von
+The owner requested (via screenshot of the GitHub README state, main
+afae8c8) a full check: the screenshot's claims + the final docs in
+every folder. New session branch `arena/c19193e9-bestai` (from
 afae8c8).
 
-**Geprüft und bestätigt (gemessen/gestimmt, keine Änderung):**
-Token-Sequenz `[471, 386, 385, 386, 385, 386, 385, 386]` (starter,
-start_token=42, 8 Steps) per echtem Build+Run reproduziert; CI
-neon-test (aarch64-Crosscompile + qemu, Paritäts-Run 42 8 --json) +
-NEON-vs-Skalar im selben ARM-Binary (test_engine.c); Emulator-Evidence
-in android/README.md; make_model.py assertet A[0] != 0 / B[0] != 0;
-zero runtime npm deps + ESLint dev-only; `make ui` → :8787
-(server.js PORT); FORMAT.md "Version 2" + test_version_two_format;
-.hydra2 unimplementiert (kein hydra2 in src/include), FORMAT-V2.md
-ist die Spec; docs_claim_check.sh grün.
+**Verified and confirmed (measured/counted, no change):** token
+sequence `[471, 386, 385, 386, 385, 386, 385, 386]` (starter model,
+start_token=42, 8 steps) reproduced with a real build + run; CI
+neon-test (aarch64 cross-compile + qemu, parity run 42 8 --json) +
+NEON-vs-scalar inside the same ARM binary (test_engine.c); emulator
+evidence in android/README.md; make_model.py asserts A[0] != 0 /
+B[0] != 0; zero runtime npm deps + ESLint dev-only; `make ui` →
+:8787 (server.js PORT); FORMAT.md "Version 2" +
+test_version_two_format; .hydra2 unimplemented (no hydra2 in
+src/include), FORMAT-V2.md is the spec; docs_claim_check.sh green.
 
-**Gefunden und gefixt:** (1) Lizenz-Widerspruch — LICENSE ist
-GPL-3.0-Volltext (GitHub-Header zeigt "GPL-3.0 license"), README
-sagte "MIT" an zwei Stellen (License-Sektion + Struktur-Baum),
-package.json "license": "MIT" → alle drei jetzt GPL-3.0 (LICENSE
-selbst unangetastet — Rechtsentscheidung des Nutzers; die
-llama.cpp-MIT-Referenzen in AGENTS.md/ANDROID-AUDIT.md sind korrekt
-und bleiben). (2) Roadmap-Verweis auf eine "*Roadmap status*"-Sektion
-in docs/ARCHITECTURE.md, die es nie gab (git log -S) → zeigt jetzt
-auf die echte Sektion "Known Structural Redundancy", wo das
-superseded-Design A[i]/B[i] steht (Zeile 106). Doku: CHANGELOG,
-errors.md (Lizenz-/Cross-Reference-Fingerprint). PR geöffnet
-(R17: Merge ist beim Nutzer).
+**Found and fixed:** (1) license contradiction — LICENSE is the full
+GPL-3.0 text (GitHub header shows "GPL-3.0 license"), the README said
+"MIT" in two places (license section + structure tree), package.json
+`"license": "MIT"` → all three now GPL-3.0 (LICENSE itself untouched
+— a legal decision of the owner; the llama.cpp MIT references in
+AGENTS.md/ANDROID-AUDIT.md are correct and stay). (2) a roadmap
+reference to a "*Roadmap status*" section in docs/ARCHITECTURE.md
+that never existed (git log -S) → now points at the real section
+"Known Structural Redundancy", where the superseded A[i]/B[i] design
+lives (line 106). Docs: CHANGELOG, errors.md (license /
+cross-reference fingerprint). PR opened (R17: the merge is with the
+owner).
 
 ### Session close (2026-10-25)
 

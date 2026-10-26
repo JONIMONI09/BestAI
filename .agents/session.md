@@ -419,3 +419,180 @@ annotations are the source of truth for any remaining findings.
     said out loud per R23). Full results in the commit message of 75b2649 and in the
     PR #67 description. Committed as 75b2649 (40 files, +5022/−212), pushed, PR #67
     opened (facts only). Merge: owner.
+
+## Round 2026-10-26 (round 9: GGUF verification — spec conformance, the ggml_type bug, the pinned llama.cpp smoke, the behavior gate, the .hydra2 GGUF boundary, all-.md pass)
+**Session start (R33):** 2026-10-26 (branch `arena/75337031-bestai`, base `0522d68` = merged PR #67). Read before the first edit: AGENTS.md, .agents/session.md (rounds 7-8), .agents/errors.md (top entries), .agents/rules.md (R2/R14/R23/R25/R26/R32/R33), .agents/user.md, .agents/Environment.md (round-8 section), docs/GGUF-IMPORT.md (full), docs/FORMAT-V2.md (header + boundary), README.md (Features + Android + tools tree), CHANGELOG.md (round-8 entry), tools/gguf_test.py + gguf_reader.py + gguf_to_hydra.py (current state), Makefile (gguf-test target) + .github/workflows/ci.yml (test-run), and - for the smoke test - the pinned llama.cpp source in /tmp/lc (llama-arch.cpp, llama-vocab.cpp, llama-graph.cpp, models/llama.cpp, llama-model.cpp, ggml.h enum) plus the official sources fetched fresh (ggml-org/ggml include/ggml.h + docs/gguf.md).
+
+
+**Owner directive (verbatim intent):** "super, habe schon gemerged, dann prüfe nochmal, ob man dann GGUF dings modelle dort nutzen kann etc, also dass diese wirklich richtig schreiben, mit ihrer ganzen Intelligenz etc!!! mache tests, schaue im Web, und mache dann Doku etc!!!! alles an .md dateien aktualisieren!" — PR #67 merged by the owner as `0522d68` before this round started.
+
+**Question answered (honestly):** the app is dual-engine. The **llama.cpp
+engine** (submodule pinned at v0.5.0, `7fe450e19305b828c199d602c23a8337aaa1f03b`,
+`LlamaEngine.kt` + `llama_jni.cpp`, `isExperimental = false` per
+LlamaEngine.kt) is the main engine and runs GGUF with full transformer
+inference — that is the "ganze Intelligenz" path. The `GGUF → .hydra`
+converter is a documented 64-dim projection (seed model, not the source
+network); its output now has a behavior gate that states exactly what it
+can and cannot prove.
+
+**Plan + status (all local-gated before commit):**
+- [x] R9-A: web verification against official sources — ggml_type enum
+      (ggml-org/ggml `include/ggml.h`) and the GGUF spec (ggml-org/ggml
+      `docs/gguf.md`; the ggml-org/gguf repo does not exist).
+- [x] R9-B: bug found by the enum audit — `tools/gguf_reader.py`
+      quantised-name table wrong (31=TQ1_0/32=TQ2_0/34=MXFP4 vs official
+      34=TQ1_0/35=TQ2_0/39=MXFP4, +40/41/42 missing, 31–33/36–38 reserved).
+      Fixed; converter refusal now names tensor + layout
+      (`token_embd.weight (TQ1_0)`); regression gate `run_type_names` in
+      `tools/gguf_test.py` (6 current names + 6 reserved slots + message).
+- [x] R9-C: spec conformance checked (header order, 13 KV types, tensor
+      info, offsets relative to data section, alignment; version 2–3).
+      LE-only = spec-conformant (spec: assume LE, not detectable);
+      64-byte name cap not enforced (harmless) — both documented.
+- [x] R9-D: behavior gate `run_behavior` (converted model: two identical
+      `./hydra-run` runs + ≥2 distinct tokens, not the input repeated,
+      for (0,24)/(3,40)/(11,16)); measured streams before choosing the
+      threshold (token 0 → 3 distinct, tokens 3/11 → 2 distinct; ≥3 would
+      have failed on the real 4-token fixture — 16-token scratch fixture
+      gave 8–9 and does not count).
+- [x] R9-E: pinned llama.cpp smoke — built the pin (codeload tarball,
+      `cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF`,
+      `--target llama-cli llama-server`); `tools/gguf_minimal_llama.py`
+      (NEW, stdlib, fixed-seed LCG, 2 layers / dim 64 / heads 4 / ffn 192,
+      99-token BPE charmap, empty merges, 21 tensors) → `llama-cli -m
+      /tmp/smoke.gguf -p "a" -c 64 -n 4 -t 1 --temp 0` on the pin:
+      **prompt 36 082.5 t/s, generation 5 640.6 t/s, generated text
+      `1'aV+uE~`** (random by construction, byte-identical across
+      runs, `llama-cli -p "a" -c 64 -n 8 -t 1 --temp 0`). Generator
+      fixes from the run + the Qodo review (R9-I):
+      `tokenizer.ggml.model`="gpt2" (not "BPE" — "unknown tokenizer"),
+      `token_type` INT32 with the pinned enum (chars NORMAL=1,
+      specials CONTROL=3 — the original file had them REVERSED, which
+      is why the first smoke printed nothing),
+      `tokenizer.ggml.add_bos_token` / `padding_token_id` (not the
+      `llama.*` names — those are parsed but ignored by the pin),
+      `output_norm.weight`, `llama.feed_forward_length`, LCG weights
+      with real signs, ffn layout `{n_embd,n_ff}` / `{n_ff,n_embd}` in
+      this build. F16 variant reaches a ggml type mismatch in the pin
+      (f32 act × f16 norm in `ggml_mul`) → `--dtype f32` default
+      (library + gate + docs aligned). `run_minimal_llama` keeps the
+      generator alive in CI (dtype, token types, keys). llama-cli in
+      this build is always-REPL: closed stdin → `> ` prompt
+      busy-loop (sandbox artifact, documented).
+- [x] R9-F: `.hydra2` boundary — `src/hydra_v2_container.c` refuses the
+      GGUF magic BY NAME (bytes 0x47 0x47 0x55 0x46, LE u32
+      0x46554747; points at LlamaEngine + converter +
+      docs); +2 checks in `tests/test_hydra2_container.c` (suite 120→122;
+      `tools/test_count_baseline.txt` M-G note updated in this commit).
+- [x] R9-G: ALL .md updated — GGUF-IMPORT.md §11 + §4/§9, README
+      (dual-engine, import bullet, tools tree, 122), FORMAT-V2.md
+      (GGUF not a v2 container), CHANGELOG (round-9 entry + 122),
+      errors.md (round-9 mistakes), Environment.md (round-9: /tmp reset,
+      venv /tmp/lintenv2, llama.cpp build recipe), this section.
+- [x] R9-H: gate sweep + commit + push + PR #68 (facts only; owner
+      merges). Local results: gguf_test green incl. the three new
+      gates; hydra2-test 122/0; flawfinder 0; cppcheck 0; make 0
+      warnings; bandit medium+ 0 (20 Low = triaged asserts/subprocess,
+      lint.yml comment); pyflakes clean; v1 baseline `471 386 385 386
+      385 386 385 386` unchanged; llama.cpp build + smoke as above.
+- [x] R9-I: Qodo code-review fixes on PR #68 (all 11 findings; every
+      one verified against the sources before acting — all were
+      valid): (1) **HIGH**: the R33 session-start marker (top of this
+      section) was missing — `tools/session_start_check.sh` would
+      have been RED in CI; (2) the two tokenizer keys renamed to the
+      `tokenizer.ggml.*` namespace the pin actually reads
+      (llama-arch.cpp L394/397 — the `llama.*` names are parsed but
+      ignored); (3) README: llama.cpp availability per ABI (arm64
+      selectable / x86_64 packaged but not selectable / armeabi-v7a
+      absent — MainActivity.kt L84-94 + CMakeLists verified); (4)
+      `run_behavior` now asserts the exact requested token count;
+      (5) token types NORMAL(1)/CONTROL(3) — the original file had
+      them reversed (UNKNOWN chars are dropped by the BPE
+      detokenizer: the root cause of the first empty smoke output);
+      (6) dtype defaults aligned on f32 (library, gate, docs);
+      (7) §11.4 intro now describes the fixture as F32; (8) LCG
+      produces real (-1,1) weights (was [0, 2·scale)); (9) GGUF
+      magic written as bytes 0x47 0x47 0x55 0x46 / LE u32 0x46554747
+      (the C message had the BE value 0x47475546) — C, FORMAT-V2,
+      CHANGELOG; (10) generator docstring: stale numbers replaced by
+      a pointer to §11.4, fact count corrected; (11) the §11.4
+      recipe runs the generator from the repo root (it lived in a
+      post-`cd` directory that does not contain tools/). Smoke
+      re-run after the fixes: prompt 36 082.5 t/s, generation
+      5 640.6 t/s, text `1'aV+uE~` (deterministic). NOT implemented
+      (owner call, per the standing "CI speed up safely" directive):
+      a CI job that builds the pin and runs the smoke automatically —
+      Qodo's optional suggestion, 10–15 min per PR. The manual
+      recipe is documented in §11.4; re-run it whenever the pin
+      changes.
+
+## Round 2026-10-26 (round 10: the documented smoke recipe bug, all-.md English pass, real-model verification, the opt-in real-model gate)
+
+**Session start (R33):** 2026-10-26 (branch `arena/75337031-bestai`, base `634a4fb`). Read before the first edit: AGENTS.md, .agents/session.md (rounds 8-9 + R9-I addendum), .agents/errors.md (top entries), .agents/rules.md (R2/R14/R23/R25/R26/R32/R33), .agents/user.md (directive list), .agents/Environment.md (round-9 section), docs/GGUF-IMPORT.md (full, esp. 11.4 recipe), README.md (GGUF + Android bullets, tools tree), CHANGELOG.md (round 9), docs/FORMAT-V2.md, the GitHub issue the owner linked (the `timeout` recipe bug, GGUF-IMPORT.md 458-460), and — for the English pass — every *.md in the repo (systematic scan, 33 files) plus .github/workflows/{lint,release,ci}.yml and the Makefile; for the real-model work: tools/gguf_test.py (main/run_behavior/run_v3), tools/gguf_to_hydra.py (dim/vocab handling), tools/gguf_reader.py (is_decodable/decode_rows), android/app/src/main/java/dev/hydrastone/{LlamaBridge,LlamaEngine}.kt + android/app/src/main/cpp/llama_jni.cpp (the load path).
+
+**Owner directive (verbatim intent):** "prüfe folgendes [the Qodo issue: the documented smoke command makes `timeout` treat `OMP_NUM_THREADS=1` as an executable], und prüfe CI und alles auf englisch dort übersetzen, dann alle .md dateien analysieren und bearbeiten, prüfe die tests, lade dir wirklich ein Modell herunter, was evtl so 300 MB ist und was schreiben kann, und finetune alles, ermögliche alles auf der app."
+
+- [x] R10-A: recipe bug fixed + verified — the §11.4 line was
+      `(sleep 10 | timeout 10 OMP_NUM_THREADS=1 $LLAMA/…/llama-cli …)`:
+      `timeout` takes `OMP_NUM_THREADS=1` as the command to run, so the
+      documented recipe NEVER launched llama-cli (reproduced:
+      `timeout: failed to run command 'OMP_NUM_THREADS=1'`). Now
+      `timeout 10 env OMP_NUM_THREADS=1 …`; the fixed recipe was
+      executed verbatim from a clean cwd and printed the fixture
+      output (`1'aV+uE~`, prompt 34 410.1 t/s, generation 6 323.4 t/s).
+      errors.md entry added.
+- [x] R10-B: all .md + CI in English. Systematic scan (word-boundary
+      regex, umlauts + strict German function words; the first scan
+      was a false-positive disaster — "commit" contains "mit").
+      Translated: .github/workflows/lint.yml (6 blocks), release.yml
+      (15 blocks), Makefile (1 line), .agents/docs/SESSION-ARCHIVE.md
+      (rounds 3-6 + doc-audit section, ~90 lines of German prose).
+      Kept deliberately: verbatim owner directives quoted in
+      user.md/session.md/errors.md (they record what the owner said),
+      the MIT licence string, and the v1 product's German CLI output
+      (product identity, quoted by the docs; string-format gates).
+      YAML re-validated; the C/Kotlin runtime strings stay German
+      (documented scope decision).
+- [x] R10-C: real model downloaded + verified. The sandbox network
+      allows only github.com/codeload/api.github.com/npm/pypi — Hugging
+      Face, raw.githubusercontent.com and the GitHub LFS endpoint are
+      all unreachable, and GitHub stores model files >= 100 MB via
+      LFS, so the "300 MB" target is not deliverable here (proven for
+      gemma-3-270m-it-Q8_0 291.5 MB, qwen2.5-0.5b-instruct-q4_k_m,
+      smollm2-135m — every copy found was an LFS pointer, 133/134 B).
+      The largest real writing model obtainable: **llama-68m-chat-v1
+      Q8_0, 73 018 688 B (73.0 MB)**, arch llama, 2 layers, dim 768,
+      ctx 2048, 32k vocab, 21 tensors (16 Q8_0 + 5 F32), from
+      BodhiSearch/BodhiApp (HF-cache layout, plain git blob) via the
+      codeload tarball. Run on the PINNED llama-cli v0.5.0 (open
+      stdin): "The capital of France is" -> "...France.<|im_end|>",
+      prompt 109.4 t/s, generation 6.6 t/s (2 threads); longer prompt
+      greedy 172.7 / 4.4 t/s; temp 0.7 generation 8.2 t/s. Honest
+      ceiling: a 68M model writes thin prose; the pipeline (load,
+      tokenize, full decode incl. Q8_0, sampling, detokenize, stream)
+      is what is proven.
+- [x] R10-D: the app path. LlamaBridge.load(path, nCtx) -> JNI ->
+      `llama_model_load_from_file` (pinned v0.5.0) -> generate/
+      cancel/unload: a thin wrapper, no size/arch/quant restriction of
+      our own, architecture delegated to the pinned loader (the
+      README claim, now backed by a real model). The model's ctx
+      2048 fits the app clamp 256..8192. NOT measured (R32): the
+      .so inside the APK on a device/emulator — the Android CI tier
+      compiles the exact JNI source; the x86_64 emulator is the
+      documented device-side path.
+- [x] R10-E: the opt-in real-model gate. `tools/gguf_test.py
+      --real-model <path>` (6 checks, off by default so CI stays
+      offline + fast): magic bytes 47 47 55 46, full parse, every
+      decodable tensor decodes, the converter projects it to .hydra
+      v3 (dim 64, 2 layers, vocab 1024, 30 976 tokens dropped), the C
+      engine runs the projection deterministically (two runs
+      byte-identical, 16 tokens, non-degenerate). llama-68m: 107
+      checks, 0 failed; the default set stays 101.
+- [x] R10-F: docs — GGUF-IMPORT.md 11.7 (the full section: source,
+      recipe, numbers, what each tool proved, what is not measured,
+      the size ceiling + how a normal machine runs a ~300 MB model
+      through the identical commands), README (GGUF bullet + tools
+      tree), CHANGELOG round 10, Environment.md (model location +
+      re-fetch recipe), user.md (directive 29). Gate sweep green,
+      commit + push (PR #68 updated).
+
