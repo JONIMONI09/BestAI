@@ -634,7 +634,16 @@ static void wr_header_version(FILE *f, uint16_t version, uint16_t vocab,
 /* Independent scalar reference of the v2 plane unpack (4 weights per
  * byte, weight j at bits 2j..2j+1): the SAME code table as the engine
  * (00=0, 01=+1, 10=-1, 11=0), written from docs/FORMAT.md, not from
- * hydra_build_aggregation_v1_1. */
+ * hydra_build_aggregation_v1_1.
+ *
+ * Defined only when an architecture that USES it compiles its v2
+ * unpack tests (NEON or AVX2): the strict CI clang syntax check runs
+ * on x86 WITHOUT -mavx2, where both test blocks are compiled out and
+ * an unconditional definition would trip -Wunused-function under
+ * -Werror (clang diagnoses it during analysis, even in
+ * -fsyntax-only; gcc only during codegen, so its check stays silent).
+ */
+#if defined(__ARM_NEON) || defined(__AVX2__)
 static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
 {
     static const int8_t map[4] = {0, 1, -1, 0};
@@ -644,6 +653,7 @@ static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
             agg[i * 4 + j] += map[(byte >> (2 * j)) & 0x03];
     }
 }
+#endif /* __ARM_NEON || __AVX2__ */
 
 #ifdef __ARM_NEON
 #include "../src/hydra_neon.h"
