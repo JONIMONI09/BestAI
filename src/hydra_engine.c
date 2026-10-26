@@ -206,14 +206,20 @@ static void hydra_build_aggregation(HydraEngine *engine)
          * the scalar path unchanged.
          *
          * AVX2 needs a RUNTIME CPU probe (a -mavx2 build may run on a
-         * non-AVX2 CPU). NEON needs none: on AArch64 it is part of the
-         * base ISA, and an ARM build without NEON never defines
-         * __ARM_NEON, so the kernel is simply not compiled in. */
+         * non-AVX2 CPU). The AArch64 NEON kernel needs none: on
+         * AArch64 NEON is base ISA, and an ARM build without NEON
+         * never defines __ARM_NEON, so the kernel is simply not
+         * compiled in. HYDRA_NEON_V2_UNPACK (see src/hydra_neon.h)
+         * is defined for AArch64 ONLY — the kernel's vqtbl1q_u8
+         * table-lookup intrinsic does not exist in the 32-bit ARM
+         * headers, and the Android NDK builds this engine for
+         * armeabi-v7a as well; on 32-bit ARM the scalar decode
+         * below runs instead (once per model load). */
 #if defined(__AVX2__)
         const int use_avx2 = hydra_simd_has_avx2()
                             && engine->header.dim % 64 == 0;
 #endif
-#if defined(__ARM_NEON)
+#if defined(HYDRA_NEON_V2_UNPACK)
         const int use_neon = engine->header.dim % 64 == 0;
 #endif
 
@@ -229,7 +235,7 @@ static void hydra_build_aggregation(HydraEngine *engine)
                 continue;
             }
 #endif
-#if defined(__ARM_NEON)
+#if defined(HYDRA_NEON_V2_UNPACK)
             if (use_neon) {
                 for (size_t d = 0; d < engine->header.dim; d += 64) {
                     hydra_neon_unpack_v2_plane(engine->agg_a + d, packed_a + d / 4, 64);

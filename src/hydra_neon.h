@@ -32,18 +32,17 @@
 #include <arm_neon.h>
 #include <stdint.h>
 
-/* Bit-pattern redefinition of uint8x16_t as int8x16_t.
- *
- * The AArch64 arm_neon.h headers of BOTH CI toolchains (GCC's
- * gcc-12-aarch64-linux-gnu and Apple clang on macos-latest) use the
- * source-suffixed spelling vreinterpretq_s8_u8; the unsuffixed
- * vreinterpretq_s8 belongs to the 32-bit ARM headers and is not
- * declared for AArch64 (proven by the CI compile of gcc-12:
- * "implicit declaration of function 'vreinterpretq_s8'; did you
- * mean 'vreinterpretq_u8_s8'?"). Using the suffixed name
- * unconditionally is therefore the only spelling that compiles on
- * every AArch64 toolchain. */
-#define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8_u8(v)
+/* The in-register version-2 plane unpack below uses the 128-bit
+ * table-lookup intrinsic vqtbl1q_u8, which exists only in the AArch64
+ * (64-bit) arm_neon.h headers; the 32-bit ARM headers provide
+ * vtbl1_u8 with a different lane shape instead. The Android NDK builds
+ * this header for armeabi-v7a as well, so the kernel is compiled for
+ * AArch64 only. On 32-bit ARM the engine takes the scalar v2 decode at
+ * load time (hydra_build_aggregation) — bit-identical result, the
+ * difference is one model load instead of every token. */
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#define HYDRA_NEON_V2_UNPACK 1
+#endif
 
 /**
  * acc[i] += A[i]*token + B[i]*state[i]  fuer genau 16 Werte.
@@ -83,6 +82,20 @@ static inline void hydra_neon_accumulate_agg(
                   vaddq_s64(vld1q_s64(acc + i + 2), vmovl_s32(vget_high_s32(v))));
     }
 }
+
+#if defined(HYDRA_NEON_V2_UNPACK)
+
+/* Bit-pattern redefinition of uint8x16_t as int8x16_t.
+ *
+ * The AArch64 arm_neon.h headers of BOTH CI toolchains (GCC's
+ * gcc-12-aarch64-linux-gnu and Apple clang on macos-latest) use the
+ * source-suffixed spelling vreinterpretq_s8_u8; the unsuffixed
+ * vreinterpretq_s8 belongs to the 32-bit ARM headers and is not
+ * declared for AArch64 (proven by the CI compile of gcc-12:
+ * "implicit declaration of function 'vreinterpretq_s8'; did you
+ * mean 'vreinterpretq_u8_s8'?"). The suffixed name is the one
+ * spelling every AArch64 toolchain declares. */
+#define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8_u8(v)
 
 /**
  * Load-time kernel for a version-2 plane (4 ternary weights per byte,
@@ -217,5 +230,6 @@ static inline void hydra_neon_unpack_v2_plane(
     }
 }
 
+#endif /* HYDRA_NEON_V2_UNPACK */
 #endif /* __ARM_NEON */
 #endif /* HYDRA_NEON_H */

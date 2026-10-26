@@ -3,6 +3,57 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 — NEON v2 test heap overflow fix + 32-bit ARM gate (third CI red run)
+
+The new in-step `::error::` diagnostics did their job and named both
+remaining failures precisely.
+
+1. **Runtime heap overflow in `test_neon_v2_load_matches_scalar`
+   (macOS arm64 + qemu-aarch64, same bug).** The ASan rebuild added to
+   the macOS unit-test step reported
+   `heap-buffer-overflow: WRITE of size 1 at 0 bytes after 16-byte
+   region, test_engine.c (v2 load test)`: the test allocated
+   `malloc(dim / 4)` = 16 bytes for each of `pa`/`pb` but wrote
+   `layers * dim / 4` = 48 bytes (3 layers × 16). The plain binary
+   survived the overflow until the heap metadata was hit (macOS:
+   "Trace/BPT trap", exit 133; qemu/glibc: `malloc(): corrupted top
+   size` + SIGABRT in the neon-test job). Fixed: allocate
+   `layers * (dim / 4)`. All other `malloc`s in the test file were
+   audited (v1 models correctly use `dim * layers`).
+2. **Android `armeabi-v7a` (32-bit ARM) cannot compile the v2
+   kernel.** The APK build compiles `src/hydra_neon.h` for the 32-bit
+   target and failed with
+   `call to undeclared function 'vqtbl1q_u8'`: the 128-bit
+   table-lookup intrinsic exists only in the AArch64 headers (32-bit
+   ARM provides the differently shaped `vtbl1_u8` instead). The v2
+   unpack kernel is therefore compiled for AArch64 only, via a new
+   `HYDRA_NEON_V2_UNPACK` macro in `src/hydra_neon.h` (defined when
+   `__ARM_NEON` and `__aarch64__`/`__arm64__`/`_M_ARM64`). On 32-bit
+   ARM the engine takes the existing SCALAR v2 decode at load time —
+   bit-identical result; the difference is one model load, not every
+   token. The existing step kernel (hot path, dual-ABI intrinsics) is
+   unchanged and still runs on 32-bit ARM.
+   - `src/hydra_neon.h`: `HYDRA_NEON_V2_UNPACK` macro; the v2 kernel
+     + `hydra_neon_u8x16_as_s8` gated with it.
+   - `src/hydra_engine.c`: the `use_neon` wiring uses
+     `HYDRA_NEON_V2_UNPACK` instead of `__ARM_NEON` (32-bit ARM falls
+     to the scalar decode).
+   - `tests/test_engine.c`: the two v2 tests and the shared
+     `ref_unpack_v2_plane` helper are gated with
+     `HYDRA_NEON_V2_UNPACK`/`__AVX2__` (the helper must not be
+     compiled where no caller exists — the same `-Wunused-function`
+     trap the CI clang gate caught on x86). Test counts are
+     UNCHANGED: the qemu-aarch64 (151) and macOS (151) builds define
+     the macro, the x86 build (142) never did.
+- **`tests/test_engine.c`**: `pa`/`pb` allocated `layers * (dim / 4)`
+  (was `dim / 4`).
+
+Verified locally: x86 gate green (142/0, jni 86/0, large 7/0, zero
+warnings), CI clang-syntax config clean (both TUs, no-AVX2 x86,
+`-Werror`), baseline `[471, 386, 385, 386, 385, 386, 385, 386]` @ 42
+unchanged, clean zig-clang aarch64 build of both TUs with all 11 v2
+assertion strings present in the binary (0 in the x86 binary).
+
 ## 2026-10-26 — NEON kernel portability fix (real ARM compilers reject the intrinsics as written) + CI failure diagnostics
 
 CI run on `5c1f145`: the `lint` job failed because `ref_unpack_v2_plane`

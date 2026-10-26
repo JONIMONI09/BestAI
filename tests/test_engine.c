@@ -7,6 +7,11 @@
  * Build: make test  |  Ausfuehrung: ./hydra-test
  */
 #include "hydra_model.h"
+/* Included on every architecture: the content is guarded by
+ * __ARM_NEON internally, and the guard macro HYDRA_NEON_V2_UNPACK
+ * (AArch64-only v2 unpack kernel) must be visible to the test
+ * selection below, which is defined before the architecture blocks. */
+#include "../src/hydra_neon.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -637,13 +642,16 @@ static void wr_header_version(FILE *f, uint16_t version, uint16_t vocab,
  * hydra_build_aggregation_v1_1.
  *
  * Defined only when an architecture that USES it compiles its v2
- * unpack tests (NEON or AVX2): the strict CI clang syntax check runs
- * on x86 WITHOUT -mavx2, where both test blocks are compiled out and
- * an unconditional definition would trip -Wunused-function under
- * -Werror (clang diagnoses it during analysis, even in
- * -fsyntax-only; gcc only during codegen, so its check stays silent).
+ * unpack tests: the AArch64 NEON unpack (HYDRA_NEON_V2_UNPACK — note
+ * this is NOT the same as __ARM_NEON, which is also set on 32-bit
+ * ARM, where the v2 kernel and its tests are compiled out) or AVX2.
+ * The strict CI clang syntax check runs on x86 WITHOUT -mavx2, where
+ * both test blocks are compiled out and an unconditional definition
+ * would trip -Wunused-function under -Werror (clang diagnoses it
+ * during analysis, even in -fsyntax-only; gcc only during codegen,
+ * so its check stays silent).
  */
-#if defined(__ARM_NEON) || defined(__AVX2__)
+#if defined(HYDRA_NEON_V2_UNPACK) || defined(__AVX2__)
 static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
 {
     static const int8_t map[4] = {0, 1, -1, 0};
@@ -653,10 +661,9 @@ static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
             agg[i * 4 + j] += map[(byte >> (2 * j)) & 0x03];
     }
 }
-#endif /* __ARM_NEON || __AVX2__ */
+#endif /* HYDRA_NEON_V2_UNPACK || __AVX2__ */
 
 #ifdef __ARM_NEON
-#include "../src/hydra_neon.h"
 /* Skalare Referenzimplementierung von step() — unabhaengig vom NEON-Pfad.
  * Wird im selben Build gegen die Engine gefahren (BUG-1), damit die
  * Vorzeichen-Inversion im NEON-Dekoder nicht mehr unbemerkt bleibt. */
@@ -877,11 +884,19 @@ static void test_neon_matches_scalar(void)
     CHECK(state_match, "NEON-Pfad == skalare Referenz (State-Vektor, gleicher Build)");
 }
 
+#endif /* __ARM_NEON */
+
+/* The two v2 unpack tests need the AArch64-only kernel
+ * (HYDRA_NEON_V2_UNPACK, see src/hydra_neon.h) — on 32-bit ARM the
+ * engine takes the scalar v2 decode, so there is no kernel to
+ * cross-check and these tests are compiled out. */
+#if defined(HYDRA_NEON_V2_UNPACK)
+
 /* M1 completion: the NEON version-2 plane unpack (in-register 2-bit
  * decode of the load path, counterpart of the AVX2 kernel in
  * src/hydra_simd.h) vs the independent scalar reference. Same pattern
- * as test_avx2_v2_unpack; runs only in NEON builds (the CI
- * qemu-aarch64-static leg). */
+ * as test_avx2_v2_unpack; runs only in AArch64 NEON builds (the CI
+ * qemu-aarch64-static leg and macos-latest). */
 static void test_neon_v2_unpack(void)
 {
     /* Random planes over 3 layers (the multi-layer ADD path of the
@@ -965,8 +980,14 @@ static void test_neon_v2_load_matches_scalar(void)
     const uint16_t vocab = 512;
 
     lcg_seed(0x5EED5EEDu);
-    uint8_t *pa = (uint8_t *)malloc(dim / 4);
-    uint8_t *pb = (uint8_t *)malloc(dim / 4);
+    /* One plane per layer for A and B: the file (and both decoders)
+     * hold layers * (dim/4) bytes. An earlier revision allocated only
+     * dim/4 and wrote layers * dim/4 — a heap overflow that CI's ASan
+     * leg caught on macOS ("heap-buffer-overflow WRITE of size 1, 0
+     * bytes after 16-byte region") and glibc caught on the qemu-aarch64
+     * leg ("malloc(): corrupted top size"). */
+    uint8_t *pa = (uint8_t *)malloc((size_t)layers * (dim / 4));
+    uint8_t *pb = (uint8_t *)malloc((size_t)layers * (dim / 4));
     if (!pa || !pb) { perror("malloc"); exit(1); }
     for (uint32_t l = 0; l < layers; ++l)
         for (size_t i = 0; i < dim / 4; ++i) {
@@ -1050,7 +1071,7 @@ static void test_neon_v2_load_matches_scalar(void)
     free(pb);
     unlink(path);
 }
-#endif /* __ARM_NEON */
+#endif /* HYDRA_NEON_V2_UNPACK */
 
 /* Version 2 (4 weights per byte, docs/FORMAT.md): positive parity test and
  * negative controls.
@@ -2148,8 +2169,13 @@ int main(void)
 #ifdef __ARM_NEON
     test_neon_matches_scalar();
     test_neon_all_ternary_codes();
+    /* The v2 unpack tests need the AArch64-only kernel (see
+     * HYDRA_NEON_V2_UNPACK in src/hydra_neon.h); on 32-bit ARM the
+     * engine has no kernel to cross-check, so they are compiled out. */
+#if defined(HYDRA_NEON_V2_UNPACK)
     test_neon_v2_unpack();
     test_neon_v2_load_matches_scalar();
+#endif
 #else
     printf("SKIP: NEON-Vergleichstest (nur auf ARM builds mit __ARM_NEON)\n");
 #endif
