@@ -422,6 +422,8 @@ annotations are the source of truth for any remaining findings.
 
 ## Round 2026-10-26 (round 9: GGUF verification — spec conformance, the ggml_type bug, the pinned llama.cpp smoke, the behavior gate, the .hydra2 GGUF boundary, all-.md pass)
 
+**Session start (R33):** 2026-10-26 (branch `arena/75337031-bestai`, base commit `42a79e13c4def56b72d843d71a90676291deba4d`). Read before touching code: AGENTS.md (full) → `.agents/session.md` (current round) → `.agents/errors.md` (top 3 entries) → `.agents/rules.md` (R1–R33, §6–§8) → `.agents/user.md` (owner directives) → `.agents/Environment.md` (Arena section) → `engine-ci-verify`, `ci-triage`, and `repo-docs-audit` SKILL.md files. Also read the PR context and relevant gate script before applying this remediation.
+
 **Owner directive (verbatim intent):** "super, habe schon gemerged, dann prüfe nochmal, ob man dann GGUF dings modelle dort nutzen kann etc, also dass diese wirklich richtig schreiben, mit ihrer ganzen Intelligenz etc!!! mache tests, schaue im Web, und mache dann Doku etc!!!! alles an .md dateien aktualisieren!" — PR #67 merged by the owner as `0522d68` before this round started.
 
 **Question answered (honestly):** the app is dual-engine. The **llama.cpp
