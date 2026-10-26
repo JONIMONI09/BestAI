@@ -257,9 +257,43 @@ jobs:
           rrc=$?
           set -e
           if [ $rrc -ne 0 ]; then
-            echo "::error::build-test: unit tests failed on $(uname -m)"
+            echo "::error::build-test: unit tests failed on $(uname -m), exit $rrc"
             tail -n 40 /tmp/hydra-test-run.log \
               | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            # On a segfault the buffered stdout of the test binary is
+            # lost and the stderr tail only shows the last model load —
+            # not where the fault happened. On ARM runners rebuild the
+            # same translation units with ASan+UBSan (same sources, no
+            # source change) and run again: the report names the
+            # exact faulting instruction and stack frames.
+            if [ "$(uname -m)" = "arm64" ]; then
+              echo "::error::build-test: rebuilding with -fsanitize=address,undefined for a crash trace"
+              set +e
+              cc -O1 -g -fsanitize=address,undefined -Iinclude \
+                 src/hydra_engine.c tests/test_engine.c -lm \
+                 -o /tmp/hydra-test-asan > /tmp/hydra-asan-build.log 2>&1
+              arc=$?
+              set -e
+              if [ $arc -eq 0 ]; then
+                set +e
+                /tmp/hydra-test-asan > /tmp/hydra-asan-run.log 2>&1
+                arcr=$?
+                set -e
+                echo "::error::build-test: ASan run exit $arcr"
+                if grep -q "ERROR: " /tmp/hydra-asan-run.log; then
+                  grep -n -m 1 -A 40 "ERROR: " /tmp/hydra-asan-run.log \
+                    | head -n 60 \
+                    | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+                else
+                  tail -n 30 /tmp/hydra-asan-run.log \
+                    | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+                fi
+              else
+                echo "::error::build-test: ASan build failed"
+                tail -n 20 /tmp/hydra-asan-build.log \
+                  | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+              fi
+            fi
             exit 1
           fi
 

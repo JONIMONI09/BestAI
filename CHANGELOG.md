@@ -32,13 +32,18 @@ two CI toolchains' `arm_neon.h` headers actually accept:
    (the sign-fill bits always land above the mask) — confirmed by
    the 200,000-plane shadow proof against the scalar decoder, which
    used logical shifts.
-2. **The unsuffixed `vreinterpretq_s8` does not exist in recent
-   headers.** Clang 14+ `arm_neon.h` only provides the
-   source-suffixed `vreinterpretq_s8_u8`; GCC's header still only
-   provides the unsuffixed `vreinterpretq_s8`. A header used by both
-   toolchains cannot hardcode either spelling. New
-   `hydra_neon_u8x16_as_s8()` macro selects the spelling by
-   `__clang__`.
+2. **The unsuffixed `vreinterpretq_s8` does not exist in the AArch64
+   headers of either CI toolchain.** The first fix attempt selected
+   the spelling by `__clang__` (unsuffixed for GCC) and the next CI
+   run proved that wrong with the actual compiler error:
+   aarch64-linux-gnu-gcc-12 reports
+   "implicit declaration of function 'vreinterpretq_s8'; did you
+   mean 'vreinterpretq_u8_s8'?" — GCC's AArch64 `arm_neon.h` also
+   uses only the source-suffixed names (the unsuffixed spelling is a
+   32-bit-ARM header convention). The kernel now calls
+   `vreinterpretq_s8_u8` unconditionally via the
+   `hydra_neon_u8x16_as_s8()` macro — the one spelling both AArch64
+   toolchains declare.
 
 The defects were found by reproducing the aarch64 compile locally
 with a zig-bundled clang toolchain (`pip install ziglang`; the
@@ -51,7 +56,8 @@ counts untouched (x86 142 / arm 151).
 
 - **`src/hydra_neon.h`**: `vshlq_n_u8(bytes, -N)` →
   `vshrq_n_u8(bytes, N)` (2/4/6); `vreinterpretq_s8(v)` →
-  `hydra_neon_u8x16_as_s8(v)` (compiler-selected spelling).
+  `hydra_neon_u8x16_as_s8(v)` = `vreinterpretq_s8_u8(v)` (the only
+  spelling both AArch64 toolchains declare).
 - **`tests/test_engine.c`**: `ref_unpack_v2_plane` now compiled only
   where it is used (`__ARM_NEON || __AVX2__`) — CI syntax gate green
   on the x86 no-AVX2 clang check again.
@@ -59,8 +65,14 @@ counts untouched (x86 142 / arm 151).
   the `build-test` build/run steps now capture the real compiler /
   test output and, on failure, mirror it into check-run `::error::`
   annotations before exiting — the log/blob hosts are not reachable
-  from every network, so the Checks API is the reliable read path
-  for these jobs.
+  from every network, and the check-run annotation API is the
+  reliable read path for these jobs (proven: the real GCC error
+  above arrived through exactly this channel). On top of that, the
+  macos-arm64 unit-test step now rebuilds the same sources with
+  `-fsanitize=address,undefined` on a runtime failure and mirrors the
+  ASan report (faulting instruction + stack) into annotations — the
+  plain binary's buffered stdout is lost in a segfault, so the
+  report is the only channel that shows WHERE the fault happened.
 
 ## 2026-10-26 — M1 completion: ARM NEON in-register v2 plane unpack (2-bit decode at load)
 

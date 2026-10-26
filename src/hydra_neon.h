@@ -32,18 +32,18 @@
 #include <arm_neon.h>
 #include <stdint.h>
 
-/* Bit-pattern redefinition of uint8x16_t as int8x16_t. Recent
- * AArch64 arm_neon.h headers (clang 14+) only provide the
- * source-suffixed spelling vreinterpretq_s8_u8, while GCC's
- * arm_neon.h still only provides the plain vreinterpretq_s8. CI
- * compiles this header with BOTH (aarch64-linux-gnu-gcc-12 and
- * Apple clang on macos-latest), so the spelling is selected by
- * compiler instead of hardcoding one of them. */
-#if defined(__clang__)
+/* Bit-pattern redefinition of uint8x16_t as int8x16_t.
+ *
+ * The AArch64 arm_neon.h headers of BOTH CI toolchains (GCC's
+ * gcc-12-aarch64-linux-gnu and Apple clang on macos-latest) use the
+ * source-suffixed spelling vreinterpretq_s8_u8; the unsuffixed
+ * vreinterpretq_s8 belongs to the 32-bit ARM headers and is not
+ * declared for AArch64 (proven by the CI compile of gcc-12:
+ * "implicit declaration of function 'vreinterpretq_s8'; did you
+ * mean 'vreinterpretq_u8_s8'?"). Using the suffixed name
+ * unconditionally is therefore the only spelling that compiles on
+ * every AArch64 toolchain. */
 #define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8_u8(v)
-#else
-#define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8(v)
-#endif
 
 /**
  * acc[i] += A[i]*token + B[i]*state[i]  fuer genau 16 Werte.
