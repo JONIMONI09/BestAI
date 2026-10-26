@@ -277,14 +277,14 @@ int hydra_swiglu(const float *g, const float *u, size_t dim, float *out);
  * overwrites its oldest non-sink entry once full, so the resident
  * set is always: sinks (append order) + the last (capacity - sinks)
  * tokens. */
-typedef struct hydra_kv_cache {
+struct hydra_kv_cache {
     float *k;            /* capacity * dim floats (caller storage)  */
     float *v;            /* capacity * dim floats (caller storage)  */
     uint32_t dim;        /* key/value vector length                 */
     uint32_t capacity;   /* total slots (sinks + window)            */
     uint32_t num_sinks;  /* permanent sink slots (<= capacity)      */
     uint32_t count;      /* total appends since init                */
-} hydra_kv_cache_t;
+};
 
 /* Initialize on caller-provided storage. num_sinks <= capacity.
  * Returns 0 on success, -1 on invalid arguments (cache left zeroed). */
