@@ -1873,3 +1873,298 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       C++ parse, exact CI 1a) + suites green. RESEARCH.md section 10
       extended. (The PR tier catching both reds before merge is the
       intended behaviour.)
+- [x] **PR #56 final: 15/15 GREEN @ 95c6721** (owner merges per R17;
+      base for round 4). Post-merge: verify the main release build
+      (build-macos) is green.
+
+## Round 2026-10-26 (round 4: true per-layer execution — format v3, full-dim decode, converters, 672 pin)
+
+Owner directive (round 4): the "1D deterministic token automaton by
+construction" conclusion was REJECTED as lazy documentation — the
+per-layer non-linear forward pass is mandatory real engineering:
+"NO STUBS, NO FAKES, NO MOCKS, ZERO HEAP", web-verify BitNet b1.58 +
+bitnet.cpp I2_S, deterministic C tests (dim d>0 changes the stream;
+multi-layer NOT reducible to load-time sums), local gates with real
+outputs, "document everything".
+
+- [x] **Web research verified (2026-10-26):** b1.58 W1.58A8 —
+      arXiv 2402.17764 + 2504.12285 + HF bitnet-b1.58-2B-4T:
+      W̃=RoundClip(W/γ,±1), γ=absmean; A8 = per-token absmax int8 in
+      [−127,127]; kernel packs 4 ternary/byte, unpacks in SRAM, GEMV =
+      add/sub. bitnet.cpp I2_S (arXiv 2410.16144 Table 1, read
+      directly): codes 00=−1, 01=0, 10=+1, 11 unused, 128-element
+      block-interleaved layout (microsoft/BitNet #412). CONFLICT
+      RESOLVED: the repo's table (00=0, 01=+1, 10=−1, 11=0) is a
+      different but equally valid permutation — repo KEEPS its table
+      for v2/v3 file compatibility; no layout-identity claim anywhere
+      in the docs. Recorded in docs/RESEARCH.md (new).
+- [x] **Format version 3 (docs/FORMAT.md canonical):** same 24-byte
+      header, version=3, dim%4==0. Per layer: Wg (dim²/4 B) + Wu
+      (dim²/4 B) + w1 (dim/4 B) + scale u16 LE (absmean·256, min 1) —
+      the scale sits AFTER the w1 plane. Final W_out (dim²/4 B).
+      layer_bytes = dim²/2 + dim/4 + 2. Errors: -10 (body size),
+      -14 (cross-version step), -15 (scale 0), -16 (non-finite),
+      -17 (kv append).
+- [x] **Engine: `hydra_engine_step_tf()`** — per token: per layer
+      xeff[i]=clamp127(state[i]+w1·token) → ternary mat-vecs
+      gate=Wg·xefx, up=Wu·xefx (int32 exact, `tf_row_dot`) → /scale →
+      SwiGLU → RMSNorm → RoPE(step_count) → state=clamp127(n·32); once
+      per token KV sink-0 residual + append(k=v=state); then
+      y=W_out·state (UNscaled int32), greedy argmax over ALL dim
+      (token = i mod vocab); `hydra_sample_token()` v3 mode feeds y
+      into the existing repetition/softmax/min-p/seeded sampler.
+      Zero heap: stack arrays only, weights read from the mmap.
+      step/step_fast refuse v3 → -14 (and vice versa). Loader: v3
+      branch (no aggregation build; "v3-Modell geladen" log).
+      Struct: +step_count (u32) → **sizeof(HydraEngine) 664→672
+      (LP64 pin in include/hydra_model.h)**.
+- [x] **REAL engine bug found + fixed (scale offset):** step_tf read
+      the u16 scale at w1p[0..1] (the w1 bytes!) instead of
+      w1p+dim/4 → sf=1/256. POS test passed by accident (SiLU
+      saturation + RMSNorm scale invariance); NEG: g=−256 →
+      sigmoid float-underflow → dead state. Diagnosed via instrumented
+      /tmp copy (gcc -Isrc), fixed + comment. Hand-built 2-bit
+      decode tests (POS +64/token, NEG −64/token 1) guard it.
+- [x] **main.c:** v3 routes to step_tf in bench + generation (KV
+      loop, caller-owned storage), --fast reported N/A on v3.
+- [x] **tests/test_engine.c: +32 arch-independent checks (142→174):**
+      v3 writer helpers (byte-precise, hand-derived), flip contrast
+      (dim d>0 changes v3 stream; identical v1 twin invariant),
+      4-layer non-reducibility vs load-time plane sums, KV sink/
+      append semantics, 2-bit hand decode POS+NEG, validation
+      (scale 0 → -15, short body → -10, dim%4 → -8, healthy control),
+      cross-version refusals (±14), prefill == manual step_tf, seeded
+      sampling reproducible. Test-writer bugs found while building
+      these (v3_fill_block OR-smash: missing +j/4; OR-only pack
+      couldn't clear bits) — both fixed, mask-then-set.
+- [x] **tools/test_count_baseline.txt:** x86 142→174, arm 151→183
+      (+32, arch-independent; ARM re-measure on the CI leg).
+- [x] **Converters v3 (both):** --v3 + --v3-layers N. Gate/up =
+      ternarised top-left dim×dim slices of cycled decodable tensors
+      (cands[(2l)%n], cands[(2l+1)%n]); w1 = cycling embedding rows;
+      W_out = first tensor; per-layer scale = max(absmean_g,
+      absmean_u)·256 clamped [1,65535]; **stdlib-only write-time
+      roundtrip check** (re-read, re-decode first scale + full W_out,
+      abort on drift); report names every source tensor/γ/density +
+      honest "dim×dim slice" note. decode_rows returns a FLAT list
+      (rows concatenated) — caught when the w1 row read indexed a
+      float.
+- [x] **tools/gguf_test.py: +14 gates (59→73):** v3 GGUF + v3
+      safetensors conversions, byte-level layout (header, body len,
+      non-zero scales, non-zero W_out), two-run engine determinism,
+      --dim 10 / --v3-layers 0 refused (ap.error raises SystemExit —
+      caught explicitly, uncaught it kills the test process).
+- [x] **Docs:** FORMAT.md (v3 section: corrected forward-pass
+      pseudocode — token enters xeff BEFORE the mat-vecs, KV is
+      once-per-token after the loop; layout table; validation rules
+      incl. v3 errors; converter writers + roundtrip check),
+      ARCHITECTURE.md (new "Version 3 forward pass" section —
+      previously referenced but missing; M4 "not yet wired" → wired;
+      Memory Model 672 per-field table; v1 "algebraically free"
+      scoped to v1/v2; testing strategy +2 bullets), README
+      (672 B ×2, v3 feature bullet, roadmap item checked, math
+      section v3 note, project structure), CHANGELOG round-4 entry,
+      docs/RESEARCH.md new (BitNet b1.58 + I2_S facts + repo
+      decisions), this file.
+- [x] **Local gates (round 4, real outputs):**
+      `make test-run` → `73 checks, 0 failed` (gguf_test) +
+      `=== 174 Tests, 0 failures ===` (hydra-test) +
+      `86 checks, 0 failed` (jni-batch) + `7 checks, 0 failed`
+      (large-model), rc=0. `gcc -fanalyzer` (strict C99 -Werror for
+      engine+main; Makefile flags for the test TUs) → all 4 TUs rc=0.
+      cppcheck --enable=all src/ include/ → 0 error/warning/
+      performance/portability (12 style `staticFunction` = public M4
+      API used by the test TU, same classification as round 3).
+      flawfinder --minlevel=4 → `Hits@level [4] 0 [5] 0`.
+      test_count_check → `ok test count 174 (arch 'x86')`.
+      py_compile (both converters + gate) rc=0. clang-tidy 23.1.4
+      (PyPI wheel, venv) on engine+main: new v3 code 0 bugprone
+      findings (fixed: unsigned shift literals `2u/4u/6u`, uint32_t
+      scale decode, (size_t) offset casts — the checker's caret is
+      misleading, the SIGNED operand was the int literal); 26
+      pre-existing signed-bitwise (v2 unpack/RNG, benign, classified)
+      + 7 swappable-parameters remain, all in legacy code;
+      concurrency-*/security-analyzer: 0.
+- [x] **RepoInspect PDF (user-attached): INVALID for this repo.**
+      It names Pydantic/LangChain/Poetry (not used), "1,482 files /
+      918 contributors" (repo has 122 tracked files), and a CRITICAL
+      at `BestAI/chains/llm_math/prompt.py:40` — no `chains/` dir,
+      no `prompt.py`, no such dependency anywhere. Generic/placeholder
+      report (most panels "Calculating..."); findings ignored, told to
+      the user.
+- [x] **Commit + push + PR (R17: owner merges)** — branch
+      `arena/f2400a75-bestai` (session branch; main @ d6aeb0d already
+      contains the round-3 merge of PR #56).
+
+## Round 2026-10-26 (round 5: UI/UX bugs + expanded settings — user request)
+
+User request: "find a way to make everything possible, expand settings with
+various functions (model-related, thinking etc.), make the UI better, find
+UI/UX bugs". Screenshots: Android app, landscape with keyboard open shows
+the composer at the TOP of the screen with zero visible chat. Attached
+"RepoInspect" PDF is INVALID for this repo (names Pydantic/LangChain/Poetry,
+`chains/llm_math/prompt.py`, "1,482 files / 918 contributors"; the repo has
+122 tracked files, C engine + stdlib Python, no such files) - ignored and
+told to the user.
+
+### Plan (verified in code before writing it)
+
+**A. UI/UX bug fixes (all with code evidence):**
+- [x] A1: "state 17 B" in the model row is the WRONG metric.
+      llama_jni.cpp:426 reports `llama_state_get_size(ctx)` - per the pinned
+      llama v0.5.0 header (line 818-822) that is the SERIALIZED state size at
+      the current position ("Only use when saving the state"), which is ~17 B
+      at n_past=0. The comment in the JNI ("logits plus KV cache ... a
+      measurement of the library's own allocation") is false. Fix: add
+      `kv_bytes` (2 * n_layer * n_ctx * n_embd * 2B - type_k/type_v default
+      GGML_TYPE_F16, confirmed in llama-context.cpp:3721-3722) and
+      `logits_bytes` (n_vocab * n_embd * 4B) to the load report; header row
+      shows "kv" instead of "state"; fix the comment.
+- [x] A2: the chat never auto-scrolls. MessageList (HydraApp.kt) is a
+      LazyColumn with no position effect - new/streaming tokens are invisible
+      until the user scrolls in a long conversation. Fix:
+      rememberLazyListState + LaunchedEffect keyed on (last message id, last
+      message text length); follow ONLY while the user is at the bottom (no
+      yanking back over history they read).
+- [x] A3: keyboard stays open after Send, covering the streaming answer.
+      Fix: hide the IME in sendMessage (FocusManager.clearFocus +
+      LocalSoftwareKeyboardController / WindowInsetsController).
+- [x] A4: the screenshot-2 layout is a REAL defect, not a transition artifact:
+      `imePadding()` sits on the InputRow, so on API 30+ (edge-to-edge,
+      ADJUST_NOTHING) the keyboard inset inflates ONLY the row and eats the
+      weighted space of AdaptiveHeaderSplit - in landscape (or any short
+      window) TopAppBar + nav bar + keyboard consume the whole window, the
+      split collapses to 0 and the composer renders directly under the
+      TopAppBar with no chat visible (exactly the screenshot). Fix: apply the
+      IME inset to the ChatTab root column so the WHOLE column (split +
+      telemetry + row) sits above the keyboard; the split keeps its visible
+      share.
+- [x] A5: RunTelemetryRow jumps in height on the first run (returns Unit
+      before) - reserve a min height.
+
+**B. Expanded settings (the explicit ask):**
+- [x] B1: real SettingsTab (replaces the "coming soon" block): Thinking /
+      chain-of-thought switch (model reasoning: prompts the model to show
+      step-by-step reasoning), system-prompt field, temperature 0..2 slider,
+      top-k 1..100, min-p 0..0.5, repetition penalty 1..2, max tokens
+      32..1024, context size 512..8192 (llama; needs reload, said so),
+      reset-to-defaults. Benchmark / engine info / new conversation / log
+      stay.
+- [x] B2: wire-through: EngineInterface.generate gets a GenerationParams
+      (temperature/topK/minP/repeatPenalty/maxTokens); llama_jni.cpp
+      build_sampler_chain becomes parameterized (top_k, min_p +
+      llama_sampler_init_rep_penalty - API confirmed in the pinned header),
+      chain rebuilt on key change (key = the tuple, not just temp);
+      LlamaBridge/LlamaEngine signatures follow; HydraEngine ignores the
+      sampling params (deterministic engine - documented on the interface).
+      System prompt + thinking prompt prepend in MainActivity, llama only
+      (EngineCapabilities.understandsTextPrompt). Context size -> n_ctx of
+      the llama load.
+- [x] B3: persistence: SharedPreferences for all settings + selected engine
+      + auto-run (survives process death, not just rotation).
+- [x] B4: real Models tab (replaces placeholder): current model facts
+      (name, size, format, engine detail), import button, and
+      "Remove imported model" (back to the bundled starter) - a delete the
+      app currently cannot do at all.
+
+**C. Verification (honest split):**
+- [x] C++: g++ -fsyntax-only of llama_jni.cpp against the PINNED llama v0.5.0
+      submodule headers (now initialized) + a minimal jni.h stub (no NDK in
+      this sandbox; stub limits the check to syntax/semantics of the llama
+      calls, stated as such).
+- [x] Kotlin: careful manual review - no kotlinc in the sandbox; the Android
+      CI tier (android-lint + APK) builds it, same as every previous round.
+- [x] strings.xml: XML well-formed check + every R.string referenced in the
+      new code exists (grep cross-check).
+- [x] C engine untouched: `make test-run` re-run before the commit.
+
+### Results (all executed, real outputs)
+
+**A. Bug fixes (shipped):**
+- [x] A1: load report now carries `kv_bytes` (2 * n_layer * n_ctx * n_embd
+      * 2 B, F16 KV default at the pin - verified in llama-context.cpp) and
+      `logits_bytes` (n_vocab * n_embd * 4 B) on top of `state_bytes`, which
+      is kept but documented for what it is (serialized-state size at
+      n_past=0, a few bytes of metadata - NOT RAM). The false JNI comment
+      ("logits plus KV cache") is replaced with the pinned-header citation.
+      Header row shows "kv" (detailFor), not "state".
+- [x] A2: MessageList now holds a rememberLazyListState; a LaunchedEffect
+      keyed on (last message id, last text length, lastIsUser) scrolls to the
+      bottom while the user is AT the bottom, and ALWAYS for the user's own
+      message. History you scrolled up to is never yanked away.
+- [x] A3: sendMessage hides the IME + clears focus (InputMethodManager,
+      Activity-level; no Compose plumbing needed).
+- [x] A4: .imePadding() + .navigationBarsPadding() moved from the InputRow to
+      the ChatTab root column. The weighted split now absorbs the keyboard
+      height instead of the row inflating and eating the split's space -
+      the screenshot-2 collapse (composer under the TopAppBar, zero chat)
+      cannot happen on any window shape.
+- [x] A5: RunTelemetryRow reserves height(28.dp) before the first run; no
+      layout jump when telemetry first appears.
+
+**B. Settings expansion (shipped):**
+- [x] B1: real SettingsTab: Thinking switch (prompt-based: a reasoning
+      instruction is prepended - no engine change, works for any instruct
+      GGUF), system-prompt field, sliders for temperature 0..2, top-k
+      0..100 (0=off), top-p 0.05..1 (1=off), min-p 0..0.5, max tokens
+      32..1024, context 512..8192 (llama, "applies on reload"), reset-to-
+      defaults. Sliders commit on release (local state, persist-on-commit -
+      no SharedPreferences storm during a drag).
+- [x] B2: EngineInterface.generate carries GenerationParams
+      (temperature/topK/topP/minP); EngineInterface.load carries a
+      contextWindow request (0 = engine default). llama_jni.cpp:
+      build_sampler_chain(SamplerKey) - conditional top_k -> top_p -> min_p
+      -> temp -> dist, rebuilt on tuple change, all four clamped+logged at
+      the JNI boundary. LlamaBridge/LlamaEngine follow (context clamped
+      256..8192 there, reported granted value back). HydraEngine accepts and
+      documents that it ignores both (deterministic by construction).
+      DEVIATION, stated: the pinned llama.cpp v0.5.0 chain has NO
+      repetition-penalty sampler (verified in the pinned header - the
+      inventory is greedy/dist/top_k/top_p/min_p/typical/temp/temp_ext/xtc/
+      top_n_sigma/mirostat1/2), so no rep-penalty control exists in Settings
+      rather than a slider that would change nothing.
+- [x] B3: SharedPreferences persistence for every setting + selected engine +
+      auto-run; restored in onCreate BEFORE prepareModel. BUG FOUND + FIXED
+      on the way: prepareModel() never looked at imported.gguf on relaunch,
+      so a persisted llama selection + imported GGUF silently ran the v1
+      starter - it now loads the GGUF through llama.cpp as the authority
+      (NOT the .hydra header rules - catching that reportModel would have
+      rejected a valid GGUF was itself the fix).
+- [x] B4: real Models tab: current model card (label + engine facts),
+      import button, "Remove imported model" (deletes the imported file
+      only - never the starter; falls back to the v1 engine + starter when
+      the selected engine loses its model).
+
+**C. Verification (real outputs, this turn):**
+- C++: `g++ -std=c++17 -fsyntax-only -Wall -Wextra` of llama_jni.cpp against
+      the PINNED v0.5.0 submodule headers + minimal jni.h/android/log.h
+      stubs (no NDK in the sandbox; stub declared as such): SYNTAX OK, zero
+      warnings. cppcheck (warning,performance,portability, std=c++17,
+      pinned includes): clean.
+- Kotlin: careful manual review of every changed hunk + brace-balance check
+      on all 10 .kt files (no kotlinc in the sandbox; the Android CI tier
+      builds, same as every previous round).
+- strings.xml: XML parses (all values/*.xml); 106 strings; every R.string /
+      R.plurals referenced in Kotlin exists (0 missing); no new string
+      unreferenced; tools/string_format_check.py: 37 passed, 0 failed, 4
+      unverified (all 4 pre-existing: err_version_human, log_model_imported,
+      log_model_starter, ok_version - templates formatted in code).
+- tools/compose_scroll_guard.py: "ok no nested scrollable containers"
+      (A2's LazyColumn stays the body's only scrollable).
+- JNI signatures cross-checked native<->Kotlin by type: load
+      (jstring,jint), generate (jstring,jint,jfloat,jint,jfloat,jfloat,
+      jobject), cancel(), unload() - all match.
+- C engine untouched: make test-run -> `=== 174 Tests, 0 failures ===` +
+      `86 checks, 0 failed` + `7 checks, 0 failed` + `73 checks, 0 failed`
+      (identical to the round-4 baseline).
+- Web console (reviewed, same mandate): node tools/server_test.js ->
+      37/37 pass; node tools/console_train_test.js -> all assertions passed.
+      Code audit found no new UI/UX bugs (abort + server-side cancel
+      protocol, single-flight busy guard, no innerHTML, encoded paths all
+      in place from the earlier audit rounds).
+
+**Files:** android/app/src/main/cpp/llama_jni.cpp,
+android/app/src/main/java/dev/hydrastone/{EngineInterface,HydraEngine,
+LlamaBridge,LlamaEngine,MainActivity}.kt,
+android/app/src/main/java/dev/hydrastone/ui/HydraApp.kt,
+android/app/src/main/res/values/strings.xml.

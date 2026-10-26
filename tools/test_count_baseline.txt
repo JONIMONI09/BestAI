@@ -50,6 +50,22 @@
 # x86 re-measured at 142, ARM = 119 + 21 = 140 (re-measure on the ARM
 # CI leg).
 #
+# 2026-10-26 (version-3 per-layer pass): +32 architecture-independent
+# checks (v3 suite: the dim d>0 weight flip changes the deterministic
+# v3 token stream while the SAME flip leaves the legacy v1 stream
+# untouched - the column-0 bottleneck contrast; a 4-layer v3 pass is
+# NOT reproducible by summing the weight planes at load time and
+# running one SwiGLU/RMSNorm/RoPE pass; the KV memory channel changes
+# the run, counts appends exactly and persists sink 0 bit-exact;
+# hand-built 2-bit decode proof that POS/NEG/ZERO codes of Wg, Wu, w1
+# and W_out each land where the format says; loader validation of
+# scale-0 (-15), short body (-10) and dim%4 (-8) plus a healthy-load
+# control; legacy step/step_fast refuse v3 with -14 and step_tf
+# refuses v1 with -14; prefill on v3 equals the manual step_tf run;
+# seeded v3 sampling reproducibility across two engines, two seeds).
+# x86 re-measured at 174; ARM = 151 + 32 = 183 because all thirty-two
+# compile on every architecture - re-measure on the ARM CI leg.
+#
 # 2026-10-26 (M1 completion): +11 ARM-ONLY checks (NEON v2 plane
 # unpack vs the independent scalar reference: random 3-layer dim-64
 # planes, the 4-code table sweep with per-code pinned values, a
@@ -61,5 +77,5 @@
 # qemu-aarch64-static leg), so ARM = 140 + 11 = 151 and x86 stays at
 # 142 (re-measure on the ARM CI leg).
 
-x86: 142
-arm: 151
+x86: 174
+arm: 183

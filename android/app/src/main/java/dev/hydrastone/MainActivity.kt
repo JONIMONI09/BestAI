@@ -1,7 +1,9 @@
 package dev.hydrastone
 
+import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.view.inputmethod.InputMethodManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
@@ -55,6 +57,17 @@ import java.io.File
 class MainActivity : ComponentActivity() {
 
     private var modelFile: File? = null
+
+    /**
+     * The user-adjustable generation settings (Settings tab).
+     *
+     * Holds defaults until onCreate() loads the persisted values; every
+     * change is written back immediately, so a relaunch continues with the
+     * same sampling controls, context size, system prompt and thinking
+     * switch. The engine selection and the auto-run flag persist in the
+     * same file: nothing the user set is lost by closing the app.
+     */
+    private var settings = GenerationSettings()
 
     /**
      * The engine the chat talks to.
@@ -140,6 +153,24 @@ class MainActivity : ComponentActivity() {
         CrashHandler.appContext = applicationContext
         CrashHandler.install()
 
+        /* Persisted user choices FIRST, so prepareModel() and the auto-run
+         * below already see the context size, the engine selection and the
+         * auto-run flag the user set last time - not the defaults. */
+        settings = loadSettings()
+        autoRun = prefs().getBoolean(KEY_AUTO_RUN, true)
+        // The engine selection is restored BEFORE prepareModel, for two
+        // reasons at once: the model that gets prepared must be reported
+        // into the engine the user chose last time, and a persisted llama
+        // selection is what makes prepareModel look for the imported GGUF
+        // (see below). A persisted id that is not available on this device
+        // (llama on a non-arm64 ABI) simply stays on the default.
+        val persistedEngine = prefs().getString(KEY_ENGINE, hydraEngine.id)
+        availableEngines.firstOrNull { it.id == persistedEngine }
+            ?.let { if (it !== selectedEngine) selectedEngine = it }
+        _ui.update {
+            it.copy(settings = settings, autoRun = autoRun, selectedEngineId = selectedEngine.id)
+        }
+
         /* Keyboard and system bars, chosen by API level.
          *
          * API 30+: the window draws edge-to-edge. On this API level a
@@ -203,11 +234,16 @@ class MainActivity : ComponentActivity() {
                             // the file on most providers.
                             openModel.launch(arrayOf("*/*"))
                         },
-                        onAutoRunChanged = { checked -> autoRun = checked },
+                        onAutoRunChanged = { checked ->
+                            autoRun = checked
+                            prefs().edit().putBoolean(KEY_AUTO_RUN, checked).apply()
+                        },
                         onBenchmark = { runBenchmark() },
                         onEngineSelected = { id ->
                             availableEngines.firstOrNull { it.id == id }?.let { selectEngine(it) }
-                        }
+                        },
+                        onSettingsChanged = { new -> updateSettings(new) },
+                        onRemoveImportedModel = { removeImportedModel() }
                     )
                 )
             }
@@ -266,6 +302,37 @@ class MainActivity : ComponentActivity() {
      * @return true when [modelFile] points at a usable .hydra.
      */
     private fun prepareModel(): Boolean {
+        // An imported GGUF is tried first, and only when the selected engine
+        // is llama.cpp: the file that engine can actually run beats the
+        // bundled starter, and a relaunch must not silently run the v1
+        // starter while the user's GGUF sits unused in filesDir (the import
+        // itself validated size and magic; llama.cpp's loader is the
+        // authority on the rest, and a failure here is reported, not hidden).
+        // With the v1 engine selected the .hydra rules below apply instead.
+        val importedGguf = File(filesDir, IMPORTED_GGUF_NAME)
+        if (selectedEngine === llamaEngine && importedGguf.isFile && importedGguf.length() > 4) {
+            modelFile = importedGguf
+            // llama.cpp's loader is the authority here, exactly as in
+            // importGguf: NOT the .hydra header rules (a GGUF would fail
+            // their magic check for the good reason that it is a different
+            // format). The magic was already verified at import time; a
+            // file the library refuses is reported and the starter flow
+            // below takes over instead of leaving the app model-less.
+            val result = llamaEngine.load(importedGguf.absolutePath, settings.contextSize)
+            if (result.ok) {
+                log(getString(R.string.log_model_imported, importedGguf.name))
+                _ui.update {
+                    it.copy(
+                        hasModel = true,
+                        modelLabel = describeGguf(result.detail),
+                        modelDetail = detailFor(llamaEngine, importedGguf.absolutePath, result)
+                    )
+                }
+                return true
+            }
+            log(getString(R.string.log_error, result.error ?: "the imported model could not be loaded"))
+        }
+
         val imported = File(filesDir, IMPORTED_NAME)
         if (imported.isFile && imported.length() > HEADER_BYTES) {
             modelFile = imported
@@ -347,7 +414,10 @@ class MainActivity : ComponentActivity() {
      * load result's facts (quantisation, RAM footprint) to the chat header.
      */
     private fun loadIntoSelectedEngine(path: String) {
-        val result = selectedEngine.load(path)
+        // The Settings context size is the request; the engine reports what
+        // it actually granted through capabilities, and detailFor shows the
+        // RAM the granted size allocates.
+        val result = selectedEngine.load(path, settings.contextSize)
         _ui.update { it.copy(modelDetail = detailFor(selectedEngine, path, result)) }
         if (!result.ok) {
             // A failed load must be visible on the log surface: otherwise
@@ -371,7 +441,11 @@ class MainActivity : ComponentActivity() {
             "llama" -> linkedMapOf(
                 "quant" to (result.detail["quant"] ?: "unknown"),
                 "weights" to formatBytes(result.detail["size_bytes"]?.toLongOrNull() ?: 0L),
-                "state" to formatBytes(result.detail["state_bytes"]?.toLongOrNull() ?: 0L)
+                // The KV cache is the RAM the context allocates (2 *
+                // n_layer * n_ctx * n_embd * 2 bytes, F16 at this pin). The
+                // serialized-state size is a few bytes of metadata at
+                // n_past = 0 and is deliberately NOT the figure on screen.
+                "kv" to formatBytes(result.detail["kv_bytes"]?.toLongOrNull() ?: 0L)
             )
             else -> {
                 // v1 .hydra: the file size IS the weight footprint - the
@@ -393,7 +467,27 @@ class MainActivity : ComponentActivity() {
         _ui.update { it.copy(input = "") }
         chat.onUserMessage(text)
         syncChat()
+        // A3: the run just started, the keyboard is done with. Leaving it
+        // open costs the chat its vertical space for the entire run - on a
+        // phone in portrait that can be half the screen. Clearing the focus
+        // as well stops the IME from popping back on the next token update.
+        hideKeyboard()
         startInference(text)
+    }
+
+    /**
+     * Hides the soft keyboard and clears the focus that summoned it.
+     *
+     * The InputMethodManager API rather than the Compose
+     * SoftwareKeyboardController on purpose: this runs from the Activity,
+     * not from composition, and the platform call needs no Compose plumbing.
+     * Safe when nothing is focused (returns before touching the window).
+     */
+    private fun hideKeyboard() {
+        val focus = currentFocus ?: return
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(focus.windowToken, 0)
+        focus.clearFocus()
     }
 
     /**
@@ -430,19 +524,23 @@ class MainActivity : ComponentActivity() {
             _ui.update { it.copy(hasModel = false, modelLabel = getString(R.string.err_no_model)) }
             return
         }
+        // The engine sees the system prompt and the thinking instruction
+        // prepended, when set: prompt-based, and only for engines that
+        // understand text (buildPrompt is the single place this happens).
+        val fullPrompt = buildPrompt(prompt)
         lineCount.clear()
         _ui.update { it.copy(log = "") }
         setRunning(true)
         chat.onGenerationStarted()
         syncChat()
-        log(resources.getQuantityString(R.plurals.log_running, MAX_STEPS, MAX_STEPS))
+        log(resources.getQuantityString(R.plurals.log_running, settings.maxTokens, settings.maxTokens))
 
         val t0 = SystemClock.elapsedRealtime()
         Thread {
             var liveTokens = 0
             selectedEngine.generate(
-                prompt,
-                MAX_STEPS,
+                fullPrompt,
+                settings.maxTokens,
                 object : GenerationCallbacks {
                     override fun onFirstToken() {
                         chat.onFirstToken()
@@ -492,10 +590,157 @@ class MainActivity : ComponentActivity() {
                         syncChat()
                         setRunning(false)
                     }
-                }
+                },
+                GenerationParams(
+                    settings.temperature,
+                    settings.topK,
+                    settings.topP,
+                    settings.minP
+                )
             )
         }.start()
     }
+
+    /**
+     * The text the engine actually sees: the optional system prompt, the
+     * optional thinking instruction, then the user text.
+     *
+     * Prompt-based on purpose: the pinned llama.cpp runs whatever text it is
+     * given, so "thinking mode" is a reasoning instruction prepended to the
+     * prompt - no engine change, no architecture dependency, and it works
+     * for any GGUF that can follow instructions. It is only applied to
+     * engines that understand text (capabilities.understandsTextPrompt);
+     * the v1 automaton derives its token sequence from the raw bytes and
+     * would just echo the instruction, so for it the prompt passes through
+     * unchanged and its runs stay byte-identical to before the tab existed.
+     */
+    private fun buildPrompt(userText: String): String {
+        if (!selectedEngine.capabilities.understandsTextPrompt) return userText
+        val sb = StringBuilder()
+        if (settings.systemPrompt.isNotBlank()) {
+            sb.append("SYSTEM: ").append(settings.systemPrompt.trim()).append('\n')
+        }
+        if (settings.thinking) {
+            sb.append(getString(R.string.thinking_prompt)).append('\n')
+        }
+        sb.append(userText)
+        return sb.toString()
+    }
+
+    /**
+     * Applies a Settings-tab change: persists it, mirrors it into the UI,
+     * and - only when the context size changed and the llama engine is the
+     * selected one - reloads the model so the new window is actually in
+     * effect. The reload runs on a background thread: creating a context
+     * maps and allocates the KV cache, and that must not block the frame
+     * loop of the screen the user is adjusting.
+     *
+     * A change while a run is in flight is persisted but not reloaded: the
+     * run owns the context it started with, and swapping it out from under
+     * the decode loop is how you get a torn read. It takes effect on the
+     * next load (engine switch, model import, or relaunch).
+     */
+    private fun updateSettings(new: GenerationSettings) {
+        val contextChanged = new.contextSize != settings.contextSize
+        settings = new
+        saveSettings()
+        _ui.update { it.copy(settings = settings) }
+
+        if (!contextChanged || selectedEngine !== llamaEngine || running) return
+        val file = modelFile ?: return
+        Thread {
+            val result = llamaEngine.load(file.absolutePath, new.contextSize)
+            runOnUiThread {
+                _ui.update {
+                    it.copy(modelDetail = detailFor(llamaEngine, file.absolutePath, result))
+                }
+                if (result.ok) {
+                    log(getString(R.string.log_context_applied, new.contextSize))
+                } else {
+                    // Say which size was refused: 8192 on a small model is a
+                    // real, user-recoverable outcome, not an internal fault.
+                    log(getString(R.string.log_error, result.error ?: "context $new.contextSize refused"))
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Removes a user-imported model and goes back to the bundled starter.
+     *
+     * Only imported files are candidates for deletion: the starter is
+     * shipped in the APK and re-created on the next launch, so deleting it
+     * would not reset anything. Deleting an import is the one removal this
+     * app performs - prepareModel() itself never deletes, for exactly this
+     * reason. When the selected engine loses its only model (the imported
+     * GGUF on llama.cpp), the selection falls back to the v1 engine with
+     * the starter rather than leaving a Send button that fails on every
+     * press.
+     */
+    private fun removeImportedModel() {
+        val candidates = listOf(
+            File(filesDir, IMPORTED_NAME),
+            File(filesDir, IMPORTED_GGUF_NAME)
+        ).filter { it.isFile }
+        if (candidates.isEmpty()) {
+            log(getString(R.string.log_model_nothing_to_remove))
+            return
+        }
+        for (f in candidates) {
+            if (f.delete()) {
+                log(getString(R.string.log_model_removed, f.name))
+            } else {
+                log(getString(R.string.log_error, "could not delete ${f.name}"))
+            }
+        }
+        modelFile = null
+        // Re-runs the full prepare path: starter copy if missing, validation,
+        // report into the selected engine.
+        if (!prepareModel()) {
+            log(getString(R.string.err_no_model))
+            return
+        }
+        if (selectedEngine === llamaEngine) {
+            // The starter is a .hydra; llama.cpp cannot run it. The prepare
+            // above logged the failed load truthfully - now hand the chat to
+            // the engine that can actually run the model that is on disk.
+            selectEngine(hydraEngine)
+        }
+    }
+
+    /**
+     * The user's persisted settings, keyed individually so a partially
+     * written file (a very old install) degrades field by field to the
+     * defaults instead of to "all settings lost".
+     */
+    private fun loadSettings(): GenerationSettings {
+        val p = prefs()
+        return GenerationSettings(
+            thinking = p.getBoolean(KEY_THINKING, false),
+            systemPrompt = p.getString(KEY_SYSTEM_PROMPT, "") ?: "",
+            temperature = p.getFloat(KEY_TEMPERATURE, GenerationParams.DEFAULT_TEMPERATURE),
+            topK = p.getInt(KEY_TOP_K, GenerationParams.DEFAULT_TOP_K),
+            topP = p.getFloat(KEY_TOP_P, GenerationParams.DEFAULT_TOP_P),
+            minP = p.getFloat(KEY_MIN_P, GenerationParams.DEFAULT_MIN_P),
+            maxTokens = p.getInt(KEY_MAX_TOKENS, DEFAULT_MAX_TOKENS),
+            contextSize = p.getInt(KEY_CONTEXT_SIZE, DEFAULT_CONTEXT_SIZE)
+        )
+    }
+
+    private fun saveSettings() {
+        prefs().edit()
+            .putBoolean(KEY_THINKING, settings.thinking)
+            .putString(KEY_SYSTEM_PROMPT, settings.systemPrompt)
+            .putFloat(KEY_TEMPERATURE, settings.temperature)
+            .putInt(KEY_TOP_K, settings.topK)
+            .putFloat(KEY_TOP_P, settings.topP)
+            .putFloat(KEY_MIN_P, settings.minP)
+            .putInt(KEY_MAX_TOKENS, settings.maxTokens)
+            .putInt(KEY_CONTEXT_SIZE, settings.contextSize)
+            .apply()
+    }
+
+    private fun prefs() = getPreferences(Context.MODE_PRIVATE)
 
     /**
      * Send and Stop are mutually exclusive: the composer renders one button
@@ -995,6 +1240,9 @@ class MainActivity : ComponentActivity() {
             // compiler honest: from here on, `file` is non-null, so the
             // success branch below may use `file.absolutePath` directly.
             selectedEngine = engine
+            // Persisted even without a model: the choice is a user decision
+            // that must survive the relaunch that installs a model.
+            prefs().edit().putString(KEY_ENGINE, engine.id).apply()
             _ui.update {
                 it.copy(
                     hasModel = false,
@@ -1007,8 +1255,12 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val result = engine.load(file.absolutePath)
+        val result = engine.load(file.absolutePath, settings.contextSize)
         selectedEngine = engine
+        // B3: the selection survives a relaunch. Only llama is a real choice
+        // (hydra is the other option); both ids persist, so no migration is
+        // possible by construction.
+        prefs().edit().putString(KEY_ENGINE, engine.id).apply()
         if (result.ok) {
             _ui.update {
                 it.copy(
@@ -1072,6 +1324,22 @@ class MainActivity : ComponentActivity() {
         const val STARTER_NAME = "starter.hydra"
         const val IMPORTED_NAME = "imported.hydra"
         const val IMPORTED_GGUF_NAME = "imported.gguf"
+
+        /** Settings-tab defaults; the ranges the UI offers are clamped again on the native side. */
+        const val DEFAULT_MAX_TOKENS = 256
+        const val DEFAULT_CONTEXT_SIZE = 2048
+
+        /** SharedPreferences keys; one file, individual keys (see loadSettings). */
+        const val KEY_ENGINE = "engine"
+        const val KEY_AUTO_RUN = "auto_run"
+        const val KEY_THINKING = "thinking"
+        const val KEY_SYSTEM_PROMPT = "system_prompt"
+        const val KEY_TEMPERATURE = "temperature"
+        const val KEY_TOP_K = "top_k"
+        const val KEY_TOP_P = "top_p"
+        const val KEY_MIN_P = "min_p"
+        const val KEY_MAX_TOKENS = "max_tokens"
+        const val KEY_CONTEXT_SIZE = "context_size"
 
         /**
          * Upper bound on a GGUF import.

@@ -112,6 +112,12 @@ constexpr float DEFAULT_TEMPERATURE = 0.7f;
 // bound exists so an impossible request is clamped and reported instead of
 // silently producing a different kind of model.
 constexpr float MAX_TEMPERATURE = 2.0f;
+// The other three bounds, with the values the chain historically used hard-
+// coded (top_k 40, min_p 0.05); top_p was never present, and 1.0 is its
+// "off" value, so old and new behaviour coincide for unchanged settings.
+constexpr int32_t DEFAULT_TOP_K = 40;
+constexpr float   DEFAULT_TOP_P = 1.0f;
+constexpr float   DEFAULT_MIN_P = 0.05f;
 
 // Two independent stop reasons, because they are set by different threads and
 // mean different things:
@@ -148,6 +154,27 @@ bool stop_requested() {
     return g_cancel.load() || g_quit.load();
 }
 
+/**
+ * The sampling parameters one sampler chain is built for.
+ *
+ * Equality is exact float equality on purpose, like the old temperature-only
+ * check: both sides of a comparison are always the output of the same clamp
+ * on the Kotlin side, so a repeat of the same settings must reuse the chain
+ * instead of rebuilding it, and a tolerance would be wrong in the other
+ * direction (rebuilding for values that do not differ).
+ */
+struct SamplerKey {
+    float   temperature = DEFAULT_TEMPERATURE;
+    int32_t top_k       = DEFAULT_TOP_K;
+    float   top_p       = DEFAULT_TOP_P;
+    float   min_p       = DEFAULT_MIN_P;
+
+    bool operator==(const SamplerKey & o) const {
+        return temperature == o.temperature && top_k == o.top_k
+            && top_p == o.top_p && min_p == o.min_p;
+    }
+    bool operator!=(const SamplerKey & o) const { return !(*this == o); }
+};
 struct Session {
     llama_model   * model   = nullptr;
     llama_context * ctx     = nullptr;
@@ -157,33 +184,53 @@ struct Session {
     int32_t         n_batch = 0;
     int32_t         n_past  = 0;  // tokens already in the KV cache
     bool            batch_ok = false;
-    // Temperature the live `smpl` chain was built with. llama.cpp bakes the
-    // temperature into the sampler at construction time, so a different
-    // requested value means a new chain, and this is how generate() knows.
-    float           temperature = DEFAULT_TEMPERATURE;
+    // The exact sampling parameters the live `smpl` chain was built with.
+    // llama.cpp bakes every one of them into the sampler at construction
+    // time, so a different requested combination means a new chain, and
+    // this is how generate() knows. The whole tuple is the key, not just
+    // the temperature: a chain built for (temp, top_k, top_p, min_p) is
+    // only valid for that combination.
+    SamplerKey      sampler_key{};
 };
 
 // One session. The app drives one engine at a time; a second load replaces it.
 Session g_session;
 bool    g_backend_ready = false;
 
-// The sampling chain. top_k and min_p bound the candidates, temp shapes the
+
+// The sampling chain. top_k/top_p/min_p bound the candidates, temp shapes the
 // distribution, dist draws from it. The seed is fixed (SAMPLER_SEED), so a run
 // is reproducible and a regression is comparable against a previous one.
 //
-// `temp` is a parameter because the JNI signature carries a temperature and the
-// Kotlin side passes one. A hard-coded value here would leave that argument
-// decorative: changing it on the Kotlin side would change nothing, and the
-// signature would be a lie about what the function does.
-llama_sampler * build_sampler_chain(float temp) {
+// Every bound is a parameter because the JNI signature carries it and the
+// Kotlin side (the Settings tab) passes one: a hard-coded value would leave
+// the argument decorative, and the signature would be a lie about what the
+// function does.
+//
+// Bounds are conditional, and the order matters:
+//  - top_k (k <= 0 is a noop per the pinned header), then top_p
+//    (p >= 1.0 selects the full vocabulary), then min_p (p <= 0 keeps
+//    everything) - the candidates are cut FIRST, the distribution is
+//    shaped over what is left, and dist always closes the chain.
+//  - The pinned llama.cpp v0.5.0 chain has no repetition-penalty sampler
+//    (it landed in a later release), so that control does not exist in
+//    Settings rather than being a slider that changes nothing.
+llama_sampler * build_sampler_chain(const SamplerKey & key) {
     llama_sampler * chain =
         llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (chain == nullptr) {
         return nullptr;
     }
-    llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+    if (key.top_k > 0) {
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(key.top_k));
+    }
+    if (key.top_p < 1.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_top_p(key.top_p, 1));
+    }
+    if (key.min_p > 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_min_p(key.min_p, 1));
+    }
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(key.temperature));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(SAMPLER_SEED));
     return chain;
 }
@@ -253,7 +300,7 @@ void session_release() {
         g_session.model = nullptr;
     }
     g_session.n_past = 0;
-    g_session.temperature = DEFAULT_TEMPERATURE;
+    g_session.sampler_key = SamplerKey{};
 }
 
 }  // namespace
@@ -356,7 +403,9 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
     bridge_log("load: ctx created n_ctx=%d n_batch=%u n_ubatch=%u",
                g_session.n_ctx, cparams.n_batch, cparams.n_ubatch);
 
-    g_session.smpl = build_sampler_chain(DEFAULT_TEMPERATURE);
+    // The default key, so a model loaded with the default Settings still
+    // generates with them; generate() rebuilds on the first different set.
+    g_session.smpl = build_sampler_chain(SamplerKey{});
     if (g_session.smpl == nullptr) {
         bridge_log("load: the sampler chain could not be allocated");
         llama_free(ctx);
@@ -369,7 +418,7 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
                  "")
                 .c_str());
     }
-    g_session.temperature = DEFAULT_TEMPERATURE;
+    g_session.sampler_key = SamplerKey{};
 
     // cparams.n_batch was set to min(256, n_ctx) above, so the narrowing is
     // bounded by construction. The cast is spelled out rather than left to the
@@ -419,20 +468,41 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
     out += ",\"n_embd\":"      + std::to_string(llama_model_n_embd(model));
     out += ",\"n_layer\":"     + std::to_string(llama_model_n_layer(model));
     out += ",\"size_bytes\":"  + std::to_string(llama_model_size(model));
-    // The ACTUAL state size - logits plus KV cache, from llama.cpp itself and
-    // not a formula. This is what makes the RAM figure on the Models tab a
-    // measurement of the library's own allocation rather than an estimate we
-    // invented.
+    // The serialized-state size at the CURRENT position (n_past = 0 here,
+    // right after load). Per the pinned header this is "only use when saving
+    // the state", i.e. the size of the state as it is NOW - a few dozen bytes
+    // of sampler/RNG metadata, NOT the RAM the context occupies. It is kept
+    // in the report for completeness and labelled as what it is; the RAM
+    // figures the UI shows are the two below.
     out += ",\"state_bytes\":" + std::to_string(llama_state_get_size(ctx));
+    // The KV cache the context actually allocates: one K tensor and one V
+    // tensor per layer, each n_ctx * n_embd elements in type_k/type_v. Both
+    // default to GGML_TYPE_F16 (llama_context_default_params at this pin,
+    // src/llama-context.cpp), and this bridge never overrides them, so 2
+    // bytes per element is the allocation, not an estimate. 64-bit arithmetic
+    // throughout: n_layer * n_ctx * n_embd overflows int32 for a phone-sized
+    // context on a big model.
+    const long long kv_bytes = 2LL
+        * static_cast<long long>(llama_model_n_layer(model))
+        * static_cast<long long>(llama_n_ctx(ctx))
+        * static_cast<long long>(llama_model_n_embd(model))
+        * 2LL;
+    // The logits buffer: one f32 per vocabulary entry, per output position.
+    const long long logits_bytes =
+        static_cast<long long>(llama_vocab_n_tokens(llama_model_get_vocab(model)))
+        * static_cast<long long>(llama_model_n_embd(model)) * 4LL;
+    out += ",\"kv_bytes\":"     + std::to_string(kv_bytes);
+    out += ",\"logits_bytes\":" + std::to_string(logits_bytes);
     out += ",\"quant_type\":\"" + json_escape(llama_ftype_name(llama_model_ftype(model))) + "\"";
     out += "}";
 
     bridge_log(
         "load: model ok arch=%s n_embd=%d n_layer=%d n_ctx=%d n_ctx_train=%d "
-        "weights=%lld state_bytes=%lld quant=%s",
+        "weights=%lld state_bytes=%lld kv_bytes=%lld logits_bytes=%lld quant=%s",
         arch, llama_model_n_embd(model), llama_model_n_layer(model), g_session.n_ctx,
         trained, static_cast<long long>(llama_model_size(model)),
         static_cast<long long>(llama_state_get_size(ctx)),
+        static_cast<long long>(kv_bytes), static_cast<long long>(logits_bytes),
         llama_ftype_name(llama_model_ftype(model)));
 
     return env->NewStringUTF(out.c_str());
@@ -447,7 +517,7 @@ Java_dev_hydrastone_LlamaBridge_load(JNIEnv * env, jobject self, jstring path, j
 JNIEXPORT jstring JNICALL
 Java_dev_hydrastone_LlamaBridge_generate(
         JNIEnv * env, jobject self, jstring prompt, jint max_tokens, jfloat temperature,
-        jobject callback) {
+        jint top_k, jfloat top_p, jfloat min_p, jobject callback) {
 
     (void) self;
     if (g_session.ctx == nullptr) {
@@ -537,23 +607,44 @@ Java_dev_hydrastone_LlamaBridge_generate(
         bridge_log("generate: temperature %.3f out of range, using %.3f",
                    static_cast<double>(temperature), static_cast<double>(requested));
     }
+    // Every float bound from the UI is clamped with the same two-comparison
+    // shape as the temperature: `!(x <= MAX)` is true for NaN, so an unusable
+    // value is clamped AND reported, never passed to the sampler as-is.
+    // top_p lives in [0, 1] (0 selects the single best candidate, 1 keeps
+    // everything), min_p likewise, top_k in [0, 100] (0 = off).
+    const bool  k_bad = !(top_k >= 0) || !(top_k <= 100);
+    // Out of range means "clamped to the boundary", never "silently off":
+    // 500 becomes 100, -3 becomes 0, and both are logged above.
+    const int32_t k_used = k_bad ? (top_k < 0 ? 0 : 100) : top_k;
+    const bool  p_bad = !(top_p >= 0.0f) || !(top_p <= 1.0f);
+    const float p_used = p_bad ? 1.0f
+                               : (top_p < 0.0f ? 0.0f : (top_p > 1.0f ? 1.0f : top_p));
+    const bool  m_bad = !(min_p >= 0.0f) || !(min_p <= 1.0f);
+    const float m_used = m_bad ? 0.0f
+                               : (min_p < 0.0f ? 0.0f : (min_p > 1.0f ? 1.0f : min_p));
+    if (k_bad || p_bad || m_bad) {
+        bridge_log("generate: sampling bounds out of range (top_k=%d top_p=%.3f min_p=%.3f), clamped",
+                   static_cast<int>(top_k), static_cast<double>(top_p),
+                   static_cast<double>(min_p));
+    }
+    const SamplerKey requested_key{requested, k_used, p_used, m_used};
     // Exact equality is the intent here, not an oversight: both sides are the
-    // output of the clamp above, so the caller repeating the same float must
-    // reuse the chain instead of rebuilding it every message. A tolerance
+    // output of the clamps above, so the caller repeating the same settings
+    // must reuse the chain instead of rebuilding it every message. A tolerance
     // would be wrong in the other direction - it would rebuild on values that
     // do not differ, which is wasted work and a torn-down sampler for nothing.
-    if (g_session.smpl == nullptr || requested != g_session.temperature) {
-        llama_sampler * rebuilt = build_sampler_chain(requested);
+    if (g_session.smpl == nullptr || requested_key != g_session.sampler_key) {
+        llama_sampler * rebuilt = build_sampler_chain(requested_key);
         if (rebuilt != nullptr) {
             llama_sampler_free(g_session.smpl);
             g_session.smpl        = rebuilt;
-            g_session.temperature = requested;
+            g_session.sampler_key = requested_key;
         } else {
             // Keep the old chain rather than generating with none: a finished
             // answer beats an error, and the log line records which
-            // temperature actually ran.
+            // settings actually ran.
             bridge_log("generate: sampler rebuild failed; keeping temp=%.3f",
-                       static_cast<double>(g_session.temperature));
+                       static_cast<double>(g_session.sampler_key.temperature));
         }
     }
 
@@ -682,9 +773,12 @@ Java_dev_hydrastone_LlamaBridge_generate(
         env->CallVoidMethod(callback, on_done);
     }
 
-    bridge_log("generate: finished generated=%d cancelled=%d n_past=%d temp=%.3f native_calls=%llu",
+    bridge_log("generate: finished generated=%d cancelled=%d n_past=%d temp=%.3f top_k=%d top_p=%.3f min_p=%.3f native_calls=%llu",
                generated, cancelled ? 1 : 0, g_session.n_past,
-               static_cast<double>(g_session.temperature),
+               static_cast<double>(g_session.sampler_key.temperature),
+               g_session.sampler_key.top_k,
+               static_cast<double>(g_session.sampler_key.top_p),
+               static_cast<double>(g_session.sampler_key.min_p),
                static_cast<unsigned long long>(g_native_calls.load()));
 
     std::string out = "{\"ok\":true";

@@ -39,7 +39,7 @@
 4. 4-KiB pages are faulted in on demand and are clean → reclaimable under memory pressure without swap traffic.
 5. The runtime state is **fixed-size and independent of model size**: the recurrent state `int8_t[64]` (64 B), the two load-time aggregates `int32_t[64]` each (512 B for `agg_a` + `agg_b`), and an `int64_t[64]` accumulator (512 B, stack-local inside `hydra_engine_step`). Nothing in that list grows with `layers` or with the file size.
 
-**`sizeof(HydraEngine)` = 664 bytes on 64-bit (LP64) platforms**
+**`sizeof(HydraEngine)` = 672 bytes on 64-bit (LP64) platforms**
 (measured with `sizeof` on x86-64; pinned at compile time on all LP64
 targets by `hydra_engine_size_check` in `include/hydra_model.h`, which
 CI compiles on macOS arm64 and the AArch64 NEON leg. The pin is
@@ -61,15 +61,20 @@ caught by CI's android-lint NDK step on 2026-10-26):
 | `long resident_kb_after_load` | 8 |
 | `long rss_kb_before_load` | 8 |
 | `uint64_t rng_state` (sampler) | 8 |
-| **total** | **664** |
+| `uint32_t step_count` (v3 RoPE position) + 4 B trailing padding | 8 |
+| **total** | **672** |
 
 (The 656 B that the README claimed until 2026-10-26 was the size before
-`rng_state` was added for min-p sampling. `include/hydra_model.h` now
-pins 664 at compile time on every platform, so the number can never
-silently drift again.)
+`rng_state` was added for min-p sampling; 664 B was the size before
+`step_count` was added for the version-3 RoPE position.
+`include/hydra_model.h` now pins 672 at compile time on every LP64
+platform, so the number can never silently drift again.)
 
-The per-token step touches only 576 B of that (the two aggregate arrays
-plus the state vector); the rest is load-time bookkeeping.
+The **v1/v2** per-token step touches only 576 B of that (the two aggregate
+arrays plus the state vector); the rest is load-time bookkeeping. The v3
+path (`hydra_engine_step_tf`) does not use the aggregates at all — it
+reads the weight planes directly from the mapping and keeps all of its
+working set in stack-local arrays (see "Version 3 forward pass" below).
 
 **Honest statement of what is (and is not) guaranteed.** The engine's *own*
 memory is ~1.1 KiB of fixed buffers — the state vector, both aggregate vectors
@@ -130,13 +135,78 @@ partially written result — the same safety posture as the loader.
   Caller-provided storage (zero heap), O(1) memory, O(1) per append and
   lookup.
 
-These are float building blocks; they are not yet wired into a forward pass
-over the ternary core (that is the remaining roadmap item). The **bridge to
-the engine's int8 state world** is itself tested: the SwiGLU output is
-quantised through the engine's own `±127` clamp and shown to be in-range and
-idempotent, so a feed-forward block's output can feed the recurrent state
-without the engine rejecting or wrapping it. The KV cache's eviction is
-tested to preserve sinks while sliding the window (see `test_kv_cache`).
+These are float building blocks, and they are now wired into a forward
+pass over the ternary core: the **version-3** model format runs
+SwiGLU → RMSNorm → RoPE between real per-layer ternary projections, and
+the KV cache carries one state per token (see "Version 3 forward pass"
+below). The **bridge to the engine's int8 state world** is itself
+tested: the SwiGLU output is quantised through the engine's own `±127`
+clamp and shown to be in-range and idempotent, so a feed-forward block's
+output can feed the recurrent state without the engine rejecting or
+wrapping it. The KV cache's eviction is tested to preserve sinks while
+sliding the window (see `test_kv_cache`).
+
+## Version 3 forward pass (per-layer non-linear ternary stack)
+
+Version 1 and 2 of the `.hydra` format store an *aggregated* recurrence:
+the loader pre-sums the layer weights into `agg_a[i]`/`agg_b[i]` and the
+per-token step is `A[i]·token + B[i]·state[i]` (see "Known Structural
+Redundancy" below for what that implies). Version 3 is a different
+architecture, not a repackaging: the loader keeps the per-layer ternary
+weight matrices in the mapping, and `hydra_engine_step_tf()` executes a
+real forward pass through all `layers` at every token.
+
+Per token, for `l = 0 .. layers−1` (all working memory is stack-local;
+the weights are read directly from the mmap — zero heap, zero copies):
+
+```
+xeff[i]  = clamp127(state[i] + w1_l[i]·token)     token injection, int8
+gate[i]  = Σ_j Wg_l[i][j]·xeff[j]                 ternary BitLinear mat-vec
+up[i]    = Σ_j Wu_l[i][j]·xeff[j]                 (int32, exact: ±1 × int8)
+g_f[i]   = gate[i] / (scale_l/256)                per-layer absmean rescale
+u_f[i]   = up[i]   / (scale_l/256)
+h        = SwiGLU(g_f, u_f)                       (hydra_swiglu)
+n        = RMSNorm(h, w=1, eps=1e-5)              (hydra_rmsnorm)
+n        = RoPE(n, pos=step_count, theta=10000)   (hydra_rope_inplace)
+state[i] = clamp(round(n[i]·32), ±127)            back into the int8 domain
+```
+
+after the loop: the attention-sink residual from KV cache slot 0 (when a
+cache is given and non-empty), one `kv_cache_append` of the final state,
+then the **full-dimension** logit mix `y[i] = Σ_j W_out[i][j]·state[j]`
+and a greedy decode over all `dim` entries (`token = argmax_i y[i] mod
+vocab`). `hydra_sample_token()` (v3 mode) feeds the same `y` vector
+through the existing repetition-penalty / softmax / min-p / seeded-CDF
+sampler, so every state dimension can influence the output token.
+
+Design notes, stated as facts:
+
+- **The mat-vec is the BitNet b1.58 "W1.58A8" pattern**: ternary weights
+  ({−1, 0, +1}) × int8 activations (±127), where the float GEMV becomes
+  integer add/sub per non-zero weight. The per-layer `scale` is the
+  source tensor's absmean (b1.58's γ) in fixed point (×256, u16); the
+  ternary matrix is `clip(round(W/γ), ±1)` of a real tensor, so the
+  rescaled mat-vec reproduces the source magnitude. See `docs/RESEARCH.md`
+  for the sources (arXiv 2402.17764, 2504.12285; microsoft/BitNet).
+- **Depth is real, not cosmetic.** SwiGLU, RMSNorm and RoPE run
+  *between* layers, so the layer stack does not collapse into load-time
+  sums: `test_tf_multilayer_not_reducible_by_loadtime_sums` builds a
+  4-layer model whose state/tokens a summed-plane single pass provably
+  cannot reproduce, and `test_tf_dim_positive_weight_changes_stream`
+  shows a weight flip in any dimension `d > 0` changes the token stream
+  (the v1 column-0 bottleneck does not exist in v3).
+- **The legacy path stays legacy.** `agg_a`/`agg_b` are only built and
+  used for v1/v2; `hydra_engine_step()` and `hydra_engine_step_fast()`
+  refuse v3 engines with `-14`, and `hydra_engine_step_tf()` refuses
+  v1/v2 engines with the same code — no silent cross-version fallback.
+- **The per-layer pass is scalar** (`tf_row_dot` walks 2-bit codes with
+  int32 accumulation). There is no SIMD kernel for the v3 path yet; the
+  SIMD table below applies to the v1/v2 step. `dim ≤ 64` keeps the cost
+  to `layers·dim²` add/subs per token, exact in int32 for every layer
+  count the loader accepts (`4096 · 64 · 127 ≈ 3.3e7 << INT32_MAX`).
+
+The format details (block layout, packing, error codes, forward-pass
+contract) are canonical in `docs/FORMAT.md`, "Version 3".
 
 ## SIMD Strategy (Honest Assessment)
 
@@ -167,9 +237,17 @@ AVX2 overflow analysis: the step kernel accumulates in **int32** lanes, and that
 
 **Performance implication:** on x86-64 with AVX2, the step is now SIMD-accelerated (8 dims per iteration for the 64-dim standard model) *and* the storage is compact (less memory bandwidth, more cache hits) and FP-multiplication-free. The v2 plane unpack is also SIMD-decoded at load time (`hydra_avx2_unpack_v2_plane`); the 4-weights/byte scatter to stride-4 dimensions stays a small scalar loop there — a 4×16 byte transpose is not cleanly expressible with plain AVX2 shuffles, and it runs once at load, not per token. AVX-512 is not implemented.
 
-## Known Structural Redundancy: the Layer Loop Is Algebraically Free
+## Known Structural Redundancy: the v1 Layer Loop Is Algebraically Free
 
-Inside the layer loop, both `token_val` and `state_vector[i]` are **loop-invariant**. The accumulation therefore collapses:
+**Scope: version 1 (and version 2, which carries the same aggregated
+model in a tighter packing) only.** This section describes why the
+v1/v2 recurrence collapses to load-time sums — and the version-3
+format exists precisely to remove that redundancy (per-layer
+non-linearities between real projections, "Version 3 forward pass"
+above; `test_tf_multilayer_not_reducible_by_loadtime_sums` is the
+proof that the v3 stack does *not* collapse).
+
+Inside the v1 layer loop, both `token_val` and `state_vector[i]` are **loop-invariant**. The accumulation therefore collapses:
 
 ```
 acc[i] = Σ_l ( w1[l][i]·token + w2[l][i]·state[i] )
@@ -205,6 +283,8 @@ Every test in the suite is falsifiable — no tautological "same input → same 
 - **Endianness** — the loader decodes the header with explicit little-endian readers; tests write with explicit little-endian writers, so the suite is meaningful on big-endian hosts too.
 - **Temp files** — `mkstemp()` with cleanup, so parallel runs cannot collide and a hostile `/tmp` cannot be pre-seeded with a symlink.
 - **Dual-path validation** — macOS CI runners are ARM64, so the NEON comparison test runs there; Ubuntu CI covers the scalar path.
+- **Version-3 depth proofs** — hand-built byte-precise 2-bit models with hand-derived states/tokens (the POS/NEG pair that caught the scale-offset bug: the POS case passed by saturation accident, the NEG case exposed it), a dim-`d>0` weight-flip contrast proving the token stream depends on every weight, a 4-layer non-reducibility proof against load-time plane sums, KV sink/append semantics on the TF path, prefill ≡ manual `step_tf` replay, seeded-sampling determinism across engines, and the loader's v3 validation (zero scale → −15, short body → −10, cross-version step refusal → −14). All in `tests/test_engine.c`.
+- **Converter v3 gates** — `tools/gguf_test.py` converts a real (hand-built) GGUF and a real safetensors file with `--v3`, verifies the file layout byte-for-byte (header, body length, non-zero scales, non-zero W_out), re-runs the C engine twice for determinism, and checks the write-time roundtrip report; `--dim 10` and `--v3-layers 0` must be refused.
 
 ## Coexistence Axiom
 

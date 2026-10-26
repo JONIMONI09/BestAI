@@ -123,4 +123,25 @@
     <string name="coming_soon">Not available in this build yet</string>
     <string name="section_diagnostics">Diagnostics</string>
     <string name="section_engine_info">Engine information</string>
+    <string name="settings_generation">Generation</string>
+    <string name="settings_llama_only">These model controls configure the sampler of llama.cpp. The v1 engine is deterministic by construction and has no sampler, so its runs ignore these values.</string>
+    <string name="settings_reset">Reset to defaults</string>
+    <string name="thinking_switch">Thinking mode</string>
+    <string name="thinking_summary">Ask the model to reason step by step before answering</string>
+    <string name="thinking_prompt">Take a deep breath and think step by step about what you know before writing the answer.</string>
+    <string name="setting_system_prompt">System prompt</string>
+    <string name="setting_system_prompt_hint">Instructions the model follows on every message (optional)</string>
+    <string name="setting_temperature">Temperature</string>
+    <string name="setting_top_k">Top-K (0 = off)</string>
+    <string name="setting_top_p">Top-P (1 = off)</string>
+    <string name="setting_min_p">Min-P (0 = off)</string>
+    <string name="setting_max_tokens">Max tokens per run</string>
+    <string name="setting_context_size">Context size (applies on reload)</string>
+    <string name="model_current">Current model</string>
+    <string name="model_none">No model loaded</string>
+    <string name="model_remove_imported">Remove imported model</string>
+    <string name="models_tab_body">A .gguf is run by llama.cpp, a .hydra by the v1 engine. Removing the imported model returns to the bundled starter.</string>
+    <string name="log_context_applied">Context size applied: %1$d tokens</string>
+    <string name="log_model_removed">Removed %1$s</string>
+    <string name="log_model_nothing_to_remove">No imported model to remove</string>
 </resources>

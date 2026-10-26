@@ -327,6 +327,194 @@ def plane_from_tensor(blob, data_base, meta, dim, label):
     return report, [int(v) for v in folded]
 
 
+# ---------------------------------------------------------------------------
+# Version 3 export: per-layer ternary blocks + per-layer absmean scale.
+# Same layout and same b1.58 absmean rule as tools/gguf_to_hydra.py's
+# --v3 mode (docs/FORMAT.md "Version 3"): the ternary weight matrices
+# themselves (dim x dim per block, 2-bit packed) plus the layer's absmean
+# scale, so the engine's per-layer forward pass applies real cross-
+# dimension projections between non-linearities.
+# ---------------------------------------------------------------------------
+
+
+def pack_ternary_block(codes, dim):
+    """Row-major -1/0/+1 codes -> dim*dim/4 bytes (00=0, 01=+1, 10=-1)."""
+    out = bytearray((dim * dim) // 4)
+    for idx, c in enumerate(codes):
+        code = CODE_POS if c > 0 else (CODE_NEG if c < 0 else CODE_ZERO)
+        out[idx // 4] |= code << (2 * (idx & 3))
+    return bytes(out)
+
+
+def unpack_ternary_block(raw, dim):
+    """Inverse of pack_ternary_block, for the write-time roundtrip check."""
+    out = []
+    for idx in range(dim * dim):
+        code = (raw[idx // 4] >> (2 * (idx & 3))) & 0x03
+        out.append(1 if code == CODE_POS else (-1 if code == CODE_NEG else 0))
+    return out
+
+
+def v3_block_from_tensor(blob, data_base, meta, dim, name):
+    """Ternarise the top-left dim x dim slice of one real tensor.
+
+    gamma is the absmean over the WHOLE tensor (the safetensors path
+    materialises the values list for v1/v2 anyway, so no extra memory).
+    A tensor smaller than dim x dim is zero-padded; the report says so.
+    """
+    values = decode_tensor(blob, data_base, meta)
+    rows, cols = (meta['shape'] + [1])[:2]
+    gamma = absmean(values)
+    sr = min(dim, rows)
+    sc = min(dim, cols)
+    codes = [0] * (dim * dim)
+    nonzeros = 0
+    if gamma > 0.0 and sr > 0 and sc > 0:
+        thr = (gamma + EPS) * 0.5
+        for i in range(sr):
+            for j in range(sc):
+                w = values[i * cols + j]
+                if w >= thr:
+                    c = 1
+                elif w <= -thr:
+                    c = -1
+                else:
+                    c = 0
+                codes[i * dim + j] = c
+                nonzeros += 1 if c != 0 else 0
+    scale = 1
+    if gamma > 0.0:
+        scale = max(1, min(65535, int(round(gamma * 256.0))))
+    report = {
+        'tensor': name,
+        'dtype': meta['dtype'],
+        'shape': meta['shape'],
+        'gamma': round(gamma, 9),
+        'scale': scale,
+        'density': round(nonzeros / float(dim * dim), 6),
+        'zeroPadded': (dim - sr, dim - sc),
+    }
+    return codes, scale, report
+
+
+def _convert_v3_st(args, blob, data_base, tensors):
+    """Version 3 export: per-layer blocks from real tensor slices."""
+    dim = args.dim
+    if dim % 4 != 0:
+        raise SafetensorsError('--v3 needs --dim a multiple of 4 (got %d)' % dim)
+    layers = args.v3_layers
+    if not 1 <= layers <= MAX_LAYERS:
+        raise SafetensorsError('--v3-layers must be between 1 and %d' % MAX_LAYERS)
+    names = list(tensors.keys())
+    if not names:
+        raise SafetensorsError('no tensor in this file')
+    n = len(names)
+    w1_name = names[0]  # first tensor (embedding in practice)
+    w1_meta = tensors[w1_name]
+    w1_values = decode_tensor(blob, data_base, w1_meta)
+    w1_rows, w1_cols = (w1_meta['shape'] + [1])[:2]
+    w1_gamma = absmean(w1_values)
+    w1_thr = (w1_gamma + EPS) * 0.5 if w1_gamma > 0.0 else 0.0
+
+    layer_reports = []
+    body = bytearray()
+    for l in range(layers):
+        # Gate/up sources cycle deterministically through the tensors
+        # (two distinct tensors per layer when at least two exist).
+        t_g = names[(2 * l) % n]
+        t_u = names[(2 * l + 1) % n]
+        codes_g, scale_g, rep_g = v3_block_from_tensor(blob, data_base, tensors[t_g], dim, t_g)
+        codes_u, scale_u, rep_u = v3_block_from_tensor(blob, data_base, tensors[t_u], dim, t_u)
+        # One scale per layer: the larger of the two source absmeans, so
+        # neither projection is rescaled above its own magnitude.
+        scale = max(scale_g, scale_u)
+        # Token injection: one embedding row per layer (cycling), ternary
+        # with the embedding's own absmean.
+        w1_codes = [0] * dim
+        w1_nz = 0
+        if w1_thr > 0.0:
+            r = l % w1_rows
+            for i in range(min(dim, w1_cols)):
+                w = w1_values[r * w1_cols + i]
+                if w >= w1_thr:
+                    w1_codes[i] = 1
+                elif w <= -w1_thr:
+                    w1_codes[i] = -1
+                w1_nz += 1 if w1_codes[i] != 0 else 0
+        body += pack_ternary_block(codes_g, dim)
+        body += pack_ternary_block(codes_u, dim)
+        body += pack_ternary_block(w1_codes, dim)[:dim // 4]
+        body += struct.pack('<H', scale)
+        layer_reports.append({
+            'layer': l,
+            'gate': rep_g,
+            'up': rep_u,
+            'scale': scale,
+            'w1': {
+                'tensor': w1_name,
+                'row': l % w1_rows,
+                'gamma': round(w1_gamma, 9),
+                'nonzeros': w1_nz,
+            },
+        })
+
+    codes_o, scale_o, rep_o = v3_block_from_tensor(blob, data_base, tensors[names[0]], dim, names[0])
+    body += pack_ternary_block(codes_o, dim)
+    w_out_report = dict(rep_o)
+    w_out_report['note'] = ('final logit-mix block; the engine applies it '
+                            'without rescaling (int32 logits)')
+
+    vocab, dropped = pick_vocab(blob, data_base, args.vocab)
+    header = struct.pack('<IHHIIII', MAGIC, 3, vocab, dim, layers,
+                         HEADER_SIZE, len(body))
+    tmp = args.out + '.tmp'
+    with open(tmp, 'wb') as fh:
+        fh.write(header)
+        fh.write(bytes(body))
+    os.replace(tmp, args.out)
+
+    # Write-time roundtrip check (stdlib only): re-read, re-decode the
+    # first layer's scale and the whole W_out block, compare with the
+    # source-derived values. Catches layout drift before the C tests.
+    with open(args.out, 'rb') as fh:
+        raw = fh.read()
+    wlen = struct.unpack_from('<I', raw, 20)[0]
+    lb = dim * dim // 2 + dim // 4 + 2
+    scale0 = struct.unpack_from('<H', raw, HEADER_SIZE + lb - 2)[0]
+    wout_base = HEADER_SIZE + layers * lb
+    wout_full = unpack_ternary_block(raw[wout_base:wout_base + dim * dim // 4], dim)
+    if not (wlen == len(body) and scale0 == layer_reports[0]['scale']
+            and wout_full == codes_o):
+        raise SafetensorsError('v3 write-time roundtrip check failed (layout drift)')
+
+    return {
+        'ok': True,
+        'source': os.path.basename(args.input),
+        'out': args.out,
+        'bytes': HEADER_SIZE + len(body),
+        'header': {
+            'magic': '0x%08X' % MAGIC,
+            'version': 3,
+            'vocab': vocab,
+            'dim': dim,
+            'layers': layers,
+            'weights_offset': HEADER_SIZE,
+            'weights_len': len(body),
+        },
+        'layers': layer_reports,
+        'wOut': w_out_report,
+        'roundtripCheck': 'passed',
+        'vocabulary': {'entries': vocab, 'dropped': dropped, 'writtenTo': None},
+        'whatThisIs': (
+            'version 3: a per-layer ternary forward pass built from dim x dim '
+            'slices of real tensors (top-left corner, zero-padded when the '
+            'tensor is smaller). The engine runs dim <= %d, so this is a '
+            'faithful miniature of the source model, not the full model; '
+            'per-layer absmean scales keep the relative magnitudes honest.'
+            % MAX_DIM),
+    }
+
+
 # ---------------------------------------------------------------- writing
 
 
@@ -430,6 +618,8 @@ def pick_vocab(header_blob, data_base, override):
 
 def convert(args):
     blob, data_base, tensors = load_safetensors(args.input)
+    if getattr(args, 'v3', False):
+        return _convert_v3_st(args, blob, data_base, tensors)
     a_name, b_name = pick_tensors(tensors, args.a_tensor, args.b_tensor)
     dim = min(args.dim, MAX_DIM)
 
@@ -502,13 +692,21 @@ def main(argv=None):
     ap.add_argument('--a-tensor', help='tensor for the A plane (default: first)')
     ap.add_argument('--b-tensor', help='tensor for the B plane (default: second)')
     ap.add_argument('--vocab', type=int, help='force the header vocab size')
+    ap.add_argument('--v3', action='store_true',
+                    help='export a version-3 model (per-layer ternary blocks '
+                         '+ absmean scales; run by hydra_engine_step_tf)')
+    ap.add_argument('--v3-layers', type=int, default=16,
+                    help='number of real layers for --v3 (default 16, max %d)'
+                         % MAX_LAYERS)
     ap.add_argument('--json', action='store_true', help='print the report as JSON')
     args = ap.parse_args(argv)
 
     if not 1 <= args.dim <= MAX_DIM:
         ap.error('--dim must be between 1 and %d' % MAX_DIM)
     if args.dim % 4 != 0:
-        ap.error('--dim must be a multiple of 4 for version 2')
+        ap.error('--dim must be a multiple of 4 for version 2 (and v3)')
+    if args.v3 and not 1 <= args.v3_layers <= MAX_LAYERS:
+        ap.error('--v3-layers must be between 1 and %d' % MAX_LAYERS)
 
     try:
         report = convert(args)
@@ -526,12 +724,22 @@ def main(argv=None):
     else:
         h = report['header']
         print('[safetensors_to_hydra] %s -> %s' % (report['source'], report['out']))
-        for p in report['planes']:
-            print('  plane %s      : %s %s, gamma %.6g, non-zero density %.3f'
-                  % (p['plane'], p['shape'], p['dtype'], p['gamma'], p['density']))
+        if 'planes' in report:
+            for p in report['planes']:
+                print('  plane %s      : %s %s, gamma %.6g, non-zero density %.3f'
+                      % (p['plane'], p['shape'], p['dtype'], p['gamma'], p['density']))
+            print('  aggregation  : exact (peak |A| = %d)' % report['aggregation']['peakAbs'])
+        else:
+            print('  v3 layers      : %d blocks, roundtrip check: %s'
+                  % (h['layers'], report['roundtripCheck']))
+            for lr in report['layers'][:4]:
+                print('  layer %-3d    : gate %s (gamma %.6g) | up %s (gamma %.6g) | scale %d'
+                      % (lr['layer'], lr['gate']['tensor'], lr['gate']['gamma'],
+                         lr['up']['tensor'], lr['up']['gamma'], lr['scale']))
+            if h['layers'] > 4:
+                print('  ...          : %d more layers' % (h['layers'] - 4))
         print('  header       : vocab %d, dim %d, layers %d, %d bytes'
               % (h['vocab'], h['dim'], h['layers'], report['bytes']))
-        print('  aggregation  : exact (peak |A| = %d)' % report['aggregation']['peakAbs'])
         print('  note         : %s' % report['whatThisIs'])
     return 0
 

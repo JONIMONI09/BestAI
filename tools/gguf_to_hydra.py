@@ -338,6 +338,247 @@ def pick_vocab(gguf, a_tensor, override):
     return 512, 0, []
 
 
+
+# ---------------------------------------------------------------------------
+# Version 3 export: per-layer ternary blocks + per-layer absmean scale.
+#
+# Unlike the v1/v2 aggregation (column sums of the ternary matrices), v3
+# stores the ternary weight MATRICES themselves (dim x dim per block,
+# 2-bit packed, 4 weights/byte) plus the layer's absmean scale, so the
+# engine's per-layer forward pass applies real cross-dimension
+# projections between non-linearities. The b1.58 rule is unchanged:
+# ternary = clip(round(W / gamma), -1, +1), gamma = mean(|W|) over the
+# sampled rows (threshold form: |w| >= mean/2).
+# ---------------------------------------------------------------------------
+
+CODE_ZERO, CODE_POS, CODE_NEG = 0, 1, 2
+
+
+def pack_ternary_block(codes, dim):
+    """Row-major -1/0/+1 codes -> dim*dim/4 bytes (00=0, 01=+1, 10=-1)."""
+    out = bytearray((dim * dim) // 4)
+    for idx, c in enumerate(codes):
+        code = CODE_POS if c > 0 else (CODE_NEG if c < 0 else CODE_ZERO)
+        out[idx // 4] |= code << (2 * (idx & 3))
+    return bytes(out)
+
+
+def unpack_ternary_block(raw, dim):
+    """Inverse of pack_ternary_block, for the write-time roundtrip check."""
+    out = []
+    for idx in range(dim * dim):
+        code = (raw[idx // 4] >> (2 * (idx & 3))) & 0x03
+        out.append(1 if code == CODE_POS else (-1 if code == CODE_NEG else 0))
+    return out
+
+
+def v3_block_from_tensor(gguf, tensor, dim, max_rows):
+    """Ternarise the top-left dim x dim slice of a real tensor.
+
+    gamma (the scale) is the absmean over the tensor's SAMPLED rows - the
+    same rows the v1/v2 path samples - so a converted v3 model and its
+    v1 twin see the same source magnitudes. The slice itself is small
+    (dim <= 64 -> 4096 elements) and is materialised; the absmean over
+    the rest of the tensor is NOT, for the same memory reasons as the
+    v1/v2 two-count pass. A tensor smaller than dim x dim is zero-
+    padded; the report says so.
+    """
+    rows, cols = tensor.shape()
+    used_rows = rows if not max_rows or rows <= max_rows else max_rows
+    if used_rows == 0 or cols == 0:
+        raise gguf_reader.GgufError('tensor %r is empty' % tensor.name)
+    blocks = _row_blocks(rows, cols, used_rows)
+    mean = mean_abs(gguf, tensor, used_rows, cols, blocks)
+    thr = mean * 0.5 if mean > 0.0 else 0.0
+    sr = min(dim, rows)
+    sc = min(dim, cols)
+    codes = [0] * (dim * dim)
+    nonzeros = 0
+    if thr > 0.0 and sr > 0:
+        chunk = gguf.decode_rows(tensor, 0, sr)
+        for i in range(sr):
+            row = chunk[i * cols:(i + 1) * cols]
+            for j in range(sc):
+                w = row[j]
+                if w >= thr:
+                    c = 1
+                elif w <= -thr:
+                    c = -1
+                else:
+                    c = 0
+                codes[i * dim + j] = c
+                nonzeros += 1 if c != 0 else 0
+    # scale u16 = absmean * 256 (fixed point), clamped to [1, 65535]:
+    # 0 is forbidden (the engine divides by it) and 65535 the field cap.
+    scale = 1
+    if mean > 0.0:
+        scale = max(1, min(65535, int(round_half_away(mean * 256.0))))
+    report = {
+        'tensor': tensor.name,
+        'shape': [rows, cols],
+        'rowsRead': used_rows,
+        'rowsTotal': rows,
+        'sampled': used_rows != rows,
+        'type': tensor.type_name,
+        'gamma': round(mean, 9),
+        'scale': scale,
+        'density': round(nonzeros / float(dim * dim), 6),
+        'zeroPadded': (dim - sr, dim - sc),
+    }
+    return codes, scale, report
+
+
+def _find_preference(gguf, candidates):
+    """First decodable 2-D tensor matching A_PREFERENCE, else candidates[0]."""
+    for name in A_PREFERENCE:
+        t = gguf.find(name)
+        if t is not None and t.is_decodable and t.shape() is not None:
+            return t
+    return candidates[0]
+
+
+def _convert_v3(args, gguf):
+    """Version 3 export: per-layer blocks from real tensor slices."""
+    dim = args.dim
+    if dim % 4 != 0:
+        raise gguf_reader.GgufError(
+            '--v3 needs --dim a multiple of 4 (got %d)' % dim)
+    layers = args.v3_layers
+    if not 1 <= layers <= MAX_LAYERS:
+        raise gguf_reader.GgufError(
+            '--v3-layers must be between 1 and %d' % MAX_LAYERS)
+    candidates = [c for c in gguf.decodable_candidates()
+                  if c.shape() is not None]
+    if not candidates:
+        raise gguf_reader.GgufError('no decodable 2-D tensor in this file')
+    n = len(candidates)
+    w1_src = _find_preference(gguf, candidates)
+
+    w1_rows, w1_cols = w1_src.shape()
+    w1_used = w1_rows if not args.max_rows or w1_rows <= args.max_rows else args.max_rows
+    w1_mean = mean_abs(gguf, w1_src, w1_used, w1_cols,
+                       _row_blocks(w1_rows, w1_cols, w1_used))
+    w1_thr = w1_mean * 0.5 if w1_mean > 0.0 else 0.0
+
+    layer_reports = []
+    body = bytearray()
+    for l in range(layers):
+        # Gate/up sources cycle deterministically through the candidate
+        # tensors (two distinct tensors per layer when at least two
+        # exist). Stated in the report, never passed off as one tensor.
+        t_g = candidates[(2 * l) % n]
+        t_u = candidates[(2 * l + 1) % n]
+        codes_g, scale_g, rep_g = v3_block_from_tensor(gguf, t_g, dim, args.max_rows)
+        codes_u, scale_u, rep_u = v3_block_from_tensor(gguf, t_u, dim, args.max_rows)
+        # One scale per layer (the engine divides gate and up by the
+        # same value): the LARGER of the two source absmeans, so neither
+        # projection is rescaled above its own magnitude.
+        scale = max(scale_g, scale_u)
+        # Token injection: one embedding row per layer (cycling), ternary
+        # with the embedding's own absmean - the closest real-tensor
+        # analogue of the v1 token drive.
+        w1_codes = [0] * dim
+        w1_nz = 0
+        if w1_thr > 0.0:
+            # decode_rows returns a flat list of values (rows
+            # concatenated); one requested row is the whole list.
+            row = gguf.decode_rows(w1_src, l % w1_rows, 1)
+            for i in range(min(dim, w1_cols)):
+                w = row[i]
+                if w >= w1_thr:
+                    w1_codes[i] = 1
+                elif w <= -w1_thr:
+                    w1_codes[i] = -1
+                w1_nz += 1 if w1_codes[i] != 0 else 0
+        body += pack_ternary_block(codes_g, dim)
+        body += pack_ternary_block(codes_u, dim)
+        body += pack_ternary_block(w1_codes, dim)[:dim // 4]
+        body += struct.pack('<H', scale)
+        layer_reports.append({
+            'layer': l,
+            'gate': rep_g,
+            'up': rep_u,
+            'scale': scale,
+            'w1': {
+                'tensor': w1_src.name,
+                'row': l % w1_rows,
+                'gamma': round(w1_mean, 9),
+                'nonzeros': w1_nz,
+            },
+        })
+
+    w_out_src = candidates[0]
+    codes_o, scale_o, rep_o = v3_block_from_tensor(gguf, w_out_src, dim, args.max_rows)
+    body += pack_ternary_block(codes_o, dim)
+    w_out_report = dict(rep_o)
+    w_out_report['note'] = ('final logit-mix block; the engine applies it '
+                            'without rescaling (int32 logits)')
+
+    vocab, dropped, tokens = pick_vocab(gguf, w1_src, args.vocab)
+    header = struct.pack('<IHHIIII', MAGIC, 3, vocab, dim, layers,
+                         HEADER_SIZE, len(body))
+    tmp = args.out + '.tmp'
+    with open(tmp, 'wb') as fh:
+        fh.write(header)
+        fh.write(bytes(body))
+    os.replace(tmp, args.out)
+
+    # Write-time roundtrip check, stdlib only: re-read the file, re-decode
+    # the first layer's scale and one W_out row, and compare with the
+    # source-derived values. Catches a layout drift between writer and
+    # format on the spot, before the C tests ever run.
+    with open(args.out, 'rb') as fh:
+        raw = fh.read()
+    wlen = struct.unpack_from('<I', raw, 20)[0]
+    lb = dim * dim // 2 + dim // 4 + 2
+    scale0 = struct.unpack_from('<H', raw, HEADER_SIZE + lb - 2)[0]
+    wout_base = HEADER_SIZE + layers * lb
+    wout_full = unpack_ternary_block(raw[wout_base:wout_base + dim * dim // 4], dim)
+    ok = (wlen == len(body)
+          and scale0 == layer_reports[0]['scale']
+          and wout_full == codes_o)
+    if not ok:
+        raise gguf_reader.GgufError(
+            'v3 write-time roundtrip check failed (layout drift)')
+
+    report = {
+        'ok': True,
+        'source': os.path.basename(args.input),
+        'out': args.out,
+        'bytes': HEADER_SIZE + len(body),
+        'gguf': gguf.summary(),
+        'header': {
+            'magic': '0x%08X' % MAGIC,
+            'version': 3,
+            'vocab': vocab,
+            'dim': dim,
+            'layers': layers,
+            'weights_offset': HEADER_SIZE,
+            'weights_len': len(body),
+        },
+        'layers': layer_reports,
+        'wOut': w_out_report,
+        'roundtripCheck': 'passed',
+        'vocabulary': {
+            'entries': vocab,
+            'dropped': dropped,
+            'writtenTo': None,
+        },
+        'whatThisIs': (
+            'version 3: a per-layer ternary forward pass built from dim x dim '
+            'slices of real tensors (top-left corner, zero-padded when the '
+            'tensor is smaller). The engine runs dim <= %d, so this is a '
+            'faithful miniature of the source model, not the full model; '
+            'per-layer absmean scales keep the relative magnitudes honest.'
+            % MAX_DIM),
+    }
+    if args.vocab_out and tokens:
+        with open(args.vocab_out, 'w') as fh:
+            json.dump(build_map(tokens, vocab), fh, ensure_ascii=False, indent=1)
+        report['vocabulary']['writtenTo'] = args.vocab_out
+    return report
+
+
 def write_hydra(path, vocab, dim, layers, a_vec, b_vec):
     """Write a .hydra whose aggregation equals a_vec / b_vec exactly.
 
@@ -390,6 +631,8 @@ def build_map(tokens, vocab):
 def convert(args):
     gguf = gguf_reader.GgufFile.open(args.input)
     try:
+        if getattr(args, 'v3', False):
+            return _convert_v3(args, gguf)
         return _convert(args, gguf)
     finally:
         gguf.close()
@@ -515,6 +758,12 @@ def main(argv=None):
                          % DEFAULT_MAX_ROWS)
     ap.add_argument('--a-tensor', help='tensor for the A plane (default: the embedding)')
     ap.add_argument('--b-tensor', help='tensor for the B plane (default: the next readable tensor)')
+    ap.add_argument('--v3', action='store_true',
+                    help='export a version-3 model (per-layer ternary blocks '
+                         '+ absmean scales; run by hydra_engine_step_tf)')
+    ap.add_argument('--v3-layers', type=int, default=16,
+                    help='number of real layers for --v3 (default 16, max %d)'
+                         % MAX_LAYERS)
     ap.add_argument('--vocab', type=int, help='force the header vocab size')
     ap.add_argument('--vocab-out', help='write the token list here as a word -> id JSON map')
     ap.add_argument('--expect', help='also write the header and A/B here, for the test gate')
@@ -523,6 +772,11 @@ def main(argv=None):
 
     if not 1 <= args.dim <= MAX_DIM:
         ap.error('--dim must be between 1 and %d' % MAX_DIM)
+    if args.v3:
+        if args.dim % 4 != 0:
+            ap.error('--v3 needs --dim a multiple of 4')
+        if not 1 <= args.v3_layers <= MAX_LAYERS:
+            ap.error('--v3-layers must be between 1 and %d' % MAX_LAYERS)
     if args.max_rows < 0:
         ap.error('--max-rows must be 0 (all rows) or a positive count')
 
@@ -543,14 +797,33 @@ def main(argv=None):
         h = report['header']
         print('[gguf_to_hydra] %s -> %s' % (report['source'], report['out']))
         print('  architecture : %s' % (report['gguf']['architecture'] or 'unknown'))
-        print('  tensors read : %s' % ', '.join(p['tensor'] for p in report['planes']))
-        for p in report['planes']:
-            print('  plane %s      : %s %s, %d/%d rows, |w|<=1 density %.3f, gamma %.6g'
-                  % (p['plane'], p['shape'], p['type'], p['rowsRead'],
-                     p['rowsTotal'], p['density'], p['gamma']))
+        if 'planes' in report:
+            print('  tensors read : %s' % ', '.join(p['tensor'] for p in report['planes']))
+            for p in report['planes']:
+                print('  plane %s      : %s %s, %d/%d rows, |w|<=1 density %.3f, gamma %.6g'
+                      % (p['plane'], p['shape'], p['type'], p['rowsRead'],
+                         p['rowsTotal'], p['density'], p['gamma']))
+        else:
+            tens = []
+            for lr in report['layers']:
+                tens.append(lr['gate']['tensor'])
+                tens.append(lr['up']['tensor'])
+            tens.append(report['wOut']['tensor'])
+            print('  tensors read : %s' % ', '.join(dict.fromkeys(tens)))
         print('  header       : vocab %d, dim %d, layers %d, %d bytes'
               % (h['vocab'], h['dim'], h['layers'], report['bytes']))
-        print('  aggregation  : exact (peak |A| = %d)' % report['aggregation']['peakAbs'])
+        if 'aggregation' in report:
+            print('  aggregation  : exact (peak |A| = %d)' % report['aggregation']['peakAbs'])
+        if report['header']['version'] == 3:
+            print('  v3 layers      : %d blocks, roundtrip check: %s'
+                  % (report['header']['layers'], report['roundtripCheck']))
+            for lr in report['layers'][:4]:
+                print('  layer %-3d    : gate %s (gamma %.6g) | up %s (gamma %.6g) | scale %d'
+                      % (lr['layer'], lr['gate']['tensor'], lr['gate']['gamma'],
+                         lr['up']['tensor'], lr['up']['gamma'], lr['scale']))
+            if report['header']['layers'] > 4:
+                print('  ...          : %d more layers'
+                      % (report['header']['layers'] - 4))
         if report['vocabulary']['writtenTo']:
             print('  vocabulary   : %d entries -> %s'
                   % (report['vocabulary']['entries'], report['vocabulary']['writtenTo']))

@@ -1478,7 +1478,7 @@ static int sample_once(uint16_t vocab, uint32_t layers, uint8_t wbyte,
     if (make_v1_model(path, vocab, layers, wbyte) != 0) { unlink(path); return -1; }
     HydraEngine e;
     if (hydra_engine_load(&e, path) != 0) { unlink(path); return -2; }
-    int rc = hydra_sample_token(&e, 0, cfg, recent, nrec, out);
+    int rc = hydra_sample_token(&e, 0, cfg, recent, nrec, NULL, out);
     hydra_engine_unload(&e);
     unlink(path);
     return rc;
@@ -1508,8 +1508,8 @@ static void test_sampler_greedy_guard(void)
     for (int s = 0; s < 32; ++s) {
         uint16_t oa, ob, oc;
         if (hydra_engine_step(&a, ta, &oa) != 0 ||
-            hydra_sample_token(&b, tb, &cfg0, &tb, (size_t)(s > 0 ? 1 : 0), &ob) != 0 ||
-            hydra_sample_token(&c, tc, &cfg1, &tc, (size_t)(s > 0 ? 1 : 0), &oc) != 0) {
+            hydra_sample_token(&b, tb, &cfg0, &tb, (size_t)(s > 0 ? 1 : 0), NULL, &ob) != 0 ||
+            hydra_sample_token(&c, tc, &cfg1, &tc, (size_t)(s > 0 ? 1 : 0), NULL, &oc) != 0) {
             same0 = same1 = 0;
             break;
         }
@@ -1572,7 +1572,7 @@ static void test_sampler_repetition_penalty(void)
         cfg.repetition_penalty = 1.0f;
         uint16_t recent0 = 7;
         uint16_t o = 0;
-        ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, &o) == 0 && o == 1;
+        ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, NULL, &o) == 0 && o == 1;
         CHECK(ok, "Sampler: negatives Logit ohne Penalty -> c=7 (out 1)");
         hydra_engine_unload(&e);
         ok = hydra_engine_load(&e, path) == 0;
@@ -1580,7 +1580,7 @@ static void test_sampler_repetition_penalty(void)
         if (ok) {
             cfg.repetition_penalty = 4.0f;
             uint16_t o2 = 0;
-            ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, &o2) == 0 && o2 == 7;
+            ok = hydra_sample_token(&e, 0, &cfg, &recent0, 1, NULL, &o2) == 0 && o2 == 7;
             CHECK(ok, "Sampler: negatives Logit WIRD mit Penalty multipliziert (c=7 -> 6, out 1 -> 7)");
             hydra_engine_unload(&e);
         } else {
@@ -1689,8 +1689,8 @@ static void test_sampler_reproducible(void)
         for (int s = 0; s < 64 && ok; ++s) {
             size_t n = (size_t)(s > 8 ? 8 : s);
             uint16_t o1, o2;
-            if (hydra_sample_token(&e1, t1, &cfg, seq1 + (s - n), n, &o1) != 0 ||
-                hydra_sample_token(&e2, t2, &cfg, seq2 + (s - n), n, &o2) != 0) {
+            if (hydra_sample_token(&e1, t1, &cfg, seq1 + (s - n), n, NULL, &o1) != 0 ||
+                hydra_sample_token(&e2, t2, &cfg, seq2 + (s - n), n, NULL, &o2) != 0) {
                 ok = 0; break;
             }
             seq1[s] = o1; seq2[s] = o2;
@@ -1711,11 +1711,11 @@ static void test_sampler_invalid(void)
     cfg.repetition_penalty = 1.0f; cfg.penalty_window = 1; cfg.rng_seed = 1;
     uint16_t out = 0;
 
-    CHECK(hydra_sample_token(NULL, 0, &cfg, NULL, 0, &out) == -1, "Sampler: NULL-Engine wird abgelehnt");
+    CHECK(hydra_sample_token(NULL, 0, &cfg, NULL, 0, NULL, &out) == -1, "Sampler: NULL-Engine wird abgelehnt");
     HydraEngine dummy;
     memset(&dummy, 0, sizeof(dummy));
-    CHECK(hydra_sample_token(&dummy, 0, NULL, NULL, 0, &out) == -1, "Sampler: NULL-Konfig wird abgelehnt");
-    CHECK(hydra_sample_token(&dummy, 0, &cfg, NULL, 0, NULL) == -1, "Sampler: NULL-Ausgabe wird abgelehnt");
+    CHECK(hydra_sample_token(&dummy, 0, NULL, NULL, 0, NULL, &out) == -1, "Sampler: NULL-Konfig wird abgelehnt");
+    CHECK(hydra_sample_token(&dummy, 0, &cfg, NULL, 0, NULL, NULL) == -1, "Sampler: NULL-Ausgabe wird abgelehnt");
 
     /* vocab=1 cannot sample (needs a distribution with >= 2 members). */
     char path[64];
@@ -1724,7 +1724,7 @@ static void test_sampler_invalid(void)
     HydraEngine e;
     int ok = hydra_engine_load(&e, path) == 0;
     if (ok) {
-        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, &out) == -3,
+        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, NULL, &out) == -3,
               "Sampler: Vokabular < 2 wird mit -3 abgelehnt");
         hydra_engine_unload(&e);
     } else {
@@ -1739,12 +1739,12 @@ static void test_sampler_invalid(void)
     ok = hydra_engine_load(&e, path2) == 0;
     if (ok) {
         cfg.temperature = 25.0f;
-        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, &out) == -4,
+        CHECK(hydra_sample_token(&e, 0, &cfg, NULL, 0, NULL, &out) == -4,
               "Sampler: temperature > 20 wird mit -4 abgelehnt (exp-Overflow-Schutz)");
         cfg.temperature = 1.0f;
         cfg.repetition_penalty = 0.5f;
         uint16_t one = 3;
-        CHECK(hydra_sample_token(&e, 0, &cfg, &one, 1, &out) == -1,
+        CHECK(hydra_sample_token(&e, 0, &cfg, &one, 1, NULL, &out) == -1,
               "Sampler: penalty < 1.0 wird abgelehnt (kein Discounting)");
         hydra_engine_unload(&e);
     } else {
@@ -2151,6 +2151,692 @@ static void test_kv_cache(void)
           "KV cache: OOB get, NaN append (no partial), S>capacity all -> -1");
 }
 
+
+/* ====================================================================
+ * Version 3 (per-layer non-linear ternary pass) tests.
+ *
+ * These prove the three load-bearing claims of the v3 architecture:
+ *   (a) every state dimension can reach the output token (the v1
+ *       column-0 bottleneck is gone),
+ *   (b) the between-layer non-linearities make the layer stack NOT
+ *       collapsible into load-time weight sums,
+ *   (c) the memory channel (KV sinks) actually changes the run.
+ * All models are written deterministically (the suite's portable LCG),
+ * so every assertion is reproducible on every platform.
+ * ==================================================================== */
+
+/* Code table of the 2-bit packing (docs/FORMAT.md: 00=0, 01=+1,
+ * 10=-1, 11=0) - the test's independent copy, deliberately NOT the
+ * engine's LUT, so a code-table drift breaks the parity. */
+static const int8_t V3_REF_CODE[4] = {0, 1, -1, 0};
+enum { V3W_WG = 0, V3W_WU, V3W_W1, V3W_WOUT };
+
+/* Set one 2-bit code in a packed byte (weight j of the 4-wide group
+ * lives in bits 2j..2j+1). */
+static void v3_pack(uint8_t *bytep, uint32_t j, int code)
+{
+    *bytep |= (uint8_t)((code & 0x03u) << (2 * (j & 3u)));
+}
+
+/* Fill a row-major block (n_rows x n_cols, row stride dim/4 bytes)
+ * with LCG ternary codes. */
+static void v3_fill_block(uint8_t *blk, uint32_t dim, uint32_t n_rows,
+                          uint32_t n_cols)
+{
+    for (uint32_t i = 0; i < n_rows; ++i)
+        for (uint32_t j = 0; j < n_cols; ++j)
+            v3_pack(blk + (size_t)i * (dim / 4) + (size_t)(j / 4), j, lcg_byte() % 3);
+}
+
+/* Deterministic v3 model writer (docs/FORMAT.md "Version 3" layout).
+ * force_block >= 0 pins one weight: (block, layer, row i, col j) ->
+ * force_code. W1 is a single row (i must be 0, j is the dimension). */
+static void write_v3_model(const char *path, uint32_t dim, uint32_t layers,
+                           uint16_t vocab, uint32_t seed,
+                           int force_block, int force_layer,
+                           uint32_t force_i, uint32_t force_j, int force_code)
+{
+    lcg_seed(seed);
+    const size_t lb = (size_t)dim * dim / 2 + dim / 4 + 2;
+    const size_t body_len = (size_t)layers * lb + (size_t)dim * dim / 4;
+    uint8_t *body = (uint8_t *)malloc(body_len);
+    if (!body) { perror("malloc"); exit(1); }
+    memset(body, 0, body_len);
+    for (uint32_t l = 0; l < layers; ++l) {
+        uint8_t *base = body + (size_t)l * lb;
+        v3_fill_block(base, dim, dim, dim);                  /* Wg */
+        v3_fill_block(base + (size_t)dim * dim / 4, dim, dim, dim); /* Wu */
+        v3_fill_block(base + (size_t)dim * dim / 2, dim, 1, dim);   /* w1 */
+        base[lb - 2] = 0;   /* scale = 256 (absmean 1.0, fixed-point 256) */
+        base[lb - 1] = 1;
+    }
+    v3_fill_block(body + (size_t)layers * lb, dim, dim, dim); /* W_out */
+    if (force_block >= 0) {
+        uint8_t *blk;
+        if (force_block == V3W_WOUT)
+            blk = body + (size_t)layers * lb + (size_t)force_i * (dim / 4);
+        else if (force_block == V3W_W1)
+            blk = body + (size_t)force_layer * lb + (size_t)dim * dim / 2;
+        else
+            blk = body + (size_t)force_layer * lb
+                + ((force_block == V3W_WU) ? (size_t)dim * dim / 4 : 0)
+                + (size_t)force_i * (dim / 4);
+        uint8_t *bp = blk + (force_j / 4);
+        *bp &= (uint8_t)~(0x03u << (2u * (force_j & 3u)));
+        *bp |= (uint8_t)(((uint32_t)force_code & 0x03u) << (2u * (force_j & 3u)));
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
+    wr_header_version(f, 3, vocab, dim, layers,
+                      (uint32_t)sizeof(HydraModelHeader), (uint32_t)body_len);
+    fwrite(body, 1, body_len, f);
+    fclose(f);
+    free(body);
+}
+
+/* v1 writer with one pinned w2 code (bits 2..3 of byte l*dim+i): the
+ * same RNG stream as write_seeded_model, so the two models differ in
+ * exactly one weight. */
+static void write_seeded_v1_pinned(const char *path, uint32_t seed,
+                                   uint32_t dim, uint32_t layers,
+                                   uint16_t vocab, uint32_t pin_layer,
+                                   uint32_t pin_i, uint8_t pin_c2)
+{
+    lcg_seed(seed);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
+    wr_header(f, vocab, dim, layers, (uint32_t)sizeof(HydraModelHeader),
+              (uint32_t)(dim * layers));
+    for (uint32_t l = 0; l < layers; ++l)
+        for (uint32_t i = 0; i < dim; ++i) {
+            uint8_t c1 = (uint8_t)(lcg_byte() % 3u);
+            uint8_t c2 = (uint8_t)(lcg_byte() % 3u);
+            if (l == pin_layer && i == pin_i) c2 = pin_c2;
+            fputc((int)(c1 | (uint8_t)(c2 << 2)), f);
+        }
+    fclose(f);
+}
+
+/* Patch one 2-bit weight of an already-written v3 file (same layout
+ * math as write_v3_model's force parameter). */
+static void v3_patch_weight(const char *path, uint32_t dim, uint32_t layers,
+                            int block, int layer, uint32_t i, uint32_t j,
+                            int code)
+{
+    const size_t lb = (size_t)dim * dim / 2 + dim / 4 + 2;
+    size_t off = sizeof(HydraModelHeader);
+    if (block == V3W_WOUT)
+        off += (size_t)layers * lb + (size_t)i * (dim / 4) + j / 4;
+    else if (block == V3W_W1)
+        off += (size_t)layer * lb + (size_t)dim * dim / 2 + j / 4;
+    else
+        off += (size_t)layer * lb
+             + ((block == V3W_WU) ? (size_t)dim * dim / 4 : 0)
+             + (size_t)i * (dim / 4) + j / 4;
+    FILE *f = fopen(path, "r+b");
+    if (!f) { perror("fopen"); exit(1); }
+    if (fseek(f, (long)off, SEEK_SET) != 0) { perror("fseek"); exit(1); }
+    uint8_t b = 0;
+    if (fread(&b, 1, 1, f) != 1) { perror("fread"); exit(1); }
+    b &= (uint8_t)~(0x03u << (2u * (j & 3u)));
+    b |= (uint8_t)(((uint32_t)code & 0x03u) << (2u * (j & 3u)));
+    fseek(f, (long)off, SEEK_SET);
+    fputc(b, f);
+    fclose(f);
+}
+
+/* (a) The column-0 bottleneck is dead in v3: flipping ONE weight in
+ * dimension d > 0 changes the deterministic token stream. The same
+ * flip in the legacy v1 model leaves the stream untouched, because
+ * the v1 decode reads only accumulator[0] - the contrast proves the
+ * difference is the architecture, not the test. */
+static void test_tf_dim_d_gt_0_changes_output(void)
+{
+    char pa[64], pb[64], pv1[64], pv2[64];
+    tmp_path_new(pa, sizeof(pa));
+    tmp_path_new(pb, sizeof(pb));
+    tmp_path_new(pv1, sizeof(pv1));
+    tmp_path_new(pv2, sizeof(pv2));
+    const uint32_t dim = 16, layers = 4;
+    const uint16_t vocab = 64;
+    const uint32_t seed = 0xA11CEu;
+
+    /* v3 A/B: identical except Wu, layer 0, row i=1 (d>0), col j=0. */
+    write_v3_model(pa, dim, layers, vocab, seed, V3W_WU, 0, 1, 0,
+                   (int)HYDRA_TERNARY_POS);
+    write_v3_model(pb, dim, layers, vocab, seed, V3W_WU, 0, 1, 0,
+                   (int)HYDRA_TERNARY_NEG);
+    /* Pin w1[0][0] = +1 in BOTH models: with the zero state the token
+     * injection is the only non-zero input, and the flipped Wu weight
+     * (row 1, col 0) must see a non-zero xeff[0] to have any effect. */
+    v3_patch_weight(pa, dim, layers, V3W_W1, 0, 0, 0, (int)HYDRA_TERNARY_POS);
+    v3_patch_weight(pb, dim, layers, V3W_W1, 0, 0, 0, (int)HYDRA_TERNARY_POS);
+
+    int ran = 1;
+    uint16_t sa[32], sb[32];
+    HydraEngine ea, eb;
+    if (hydra_engine_load(&ea, pa) != 0 || hydra_engine_load(&eb, pb) != 0)
+        ran = 0;
+    uint16_t tok = 3;
+    for (int t = 0; t < 32 && ran; ++t) {
+        uint16_t na = 0, nb = 0;
+        if (hydra_engine_step_tf(&ea, tok, &na, NULL) != 0) { ran = 0; break; }
+        if (hydra_engine_step_tf(&eb, tok, &nb, NULL) != 0) { ran = 0; break; }
+sa[t] = na; sb[t] = nb;
+        tok = na;
+    }
+    int differ = 0;
+    for (int t = 0; t < 32; ++t)
+        if (sa[t] != sb[t]) { differ = 1; break; }
+    hydra_engine_unload(&ea);
+    hydra_engine_unload(&eb);
+
+    /* v1 contrast: the SAME two flipped weights as w2 (state plane) of
+     * layer 0, dimension 1 - the legacy stream must not move. */
+    write_seeded_v1_pinned(pv1, seed, dim, layers, vocab, 0, 1,
+                           (uint8_t)HYDRA_TERNARY_POS);
+    write_seeded_v1_pinned(pv2, seed, dim, layers, vocab, 0, 1,
+                           (uint8_t)HYDRA_TERNARY_NEG);
+    int v1_ran = 1;
+    uint16_t va[32], vb[32];
+    HydraEngine h1, h2;
+    if (hydra_engine_load(&h1, pv1) != 0 || hydra_engine_load(&h2, pv2) != 0)
+        v1_ran = 0;
+    tok = 3;
+    for (int t = 0; t < 32 && v1_ran; ++t) {
+        uint16_t na = 0, nb = 0;
+        if (hydra_engine_step(&h1, tok, &na) != 0) { v1_ran = 0; break; }
+        if (hydra_engine_step(&h2, tok, &nb) != 0) { v1_ran = 0; break; }
+        va[t] = na; vb[t] = nb;
+        tok = na;
+    }
+    int v1_same = 1;
+    for (int t = 0; t < 32; ++t)
+        if (va[t] != vb[t]) { v1_same = 0; break; }
+    hydra_engine_unload(&h1);
+    hydra_engine_unload(&h2);
+
+    CHECK(ran, "v3 Flip-Test hat tatsaechlich Schritte ausgefuehrt");
+    CHECK(differ,
+          "v3: Flip in Dim d>0 aendert den Token-Stream (Column-0 tot)");
+    CHECK(v1_ran && v1_same,
+          "v1-Kontrast: derselbe Flip in Dim d>0 laesst den Legacy-Stream unangetastet");
+    unlink(pa); unlink(pb); unlink(pv1); unlink(pv2);
+}
+
+/* (b) Non-linear depth is not collapsible: summing every weight plane
+ * at load time and running ONE SwiGLU/RMSNorm/RoPE pass on the sums
+ * must NOT reproduce the true per-layer pass - the non-linearities are
+ * applied BETWEEN the layers. All scales are identical (256) so the
+ * mismatch cannot hide behind per-layer rescaling: only the order of
+ * linear and non-linear stages can explain it. */
+static void test_tf_multilayer_not_reducible_by_loadtime_sums(void)
+{
+    char pa[64];
+    tmp_path_new(pa, sizeof(pa));
+    const uint32_t dim = 16, layers = 4, vocab = 64;
+    write_v3_model(pa, dim, layers, vocab, 0xBEE7u, -1, 0, 0, 0, 0);
+
+    HydraEngine e;
+    int ran = (hydra_engine_load(&e, pa) == 0);
+    uint16_t tok = 3;
+    int8_t true_state[HYDRA_EMBED_DIM];
+    if (ran) {
+        if (hydra_engine_step_tf(&e, tok, &tok, NULL) != 0) ran = 0;
+        memcpy(true_state, e.state_vector, sizeof(true_state));
+    }
+
+    /* Independent reference: decode the SAME file bytes with the test's
+     * own code table, sum the planes, run one pass with the engine's
+     * primitives (so the contrast is purely about where the non-
+     * linearities sit). */
+    int ran_ref = 1;
+    int8_t ref_state[HYDRA_EMBED_DIM];
+    if (ran_ref) {
+        FILE *rf = fopen(pa, "rb");
+        if (!rf) { ran_ref = 0; }
+        if (ran_ref) {
+            const size_t lb = (size_t)dim * dim / 2 + dim / 4 + 2;
+            size_t wlen = 0;
+            if (fseek(rf, (long)sizeof(HydraModelHeader), SEEK_SET) != 0)
+                ran_ref = 0;
+            uint8_t *body = (uint8_t *)malloc((size_t)layers * lb + (size_t)dim * dim / 4);
+            if (!body) { perror("malloc"); exit(1); }
+            wlen = (size_t)layers * lb + (size_t)dim * dim / 4;
+            if (fread(body, 1, wlen, rf) != wlen) ran_ref = 0;
+            fclose(rf);
+            if (ran_ref) {
+                int16_t Ag[HYDRA_EMBED_DIM][HYDRA_EMBED_DIM];
+                int16_t Au[HYDRA_EMBED_DIM][HYDRA_EMBED_DIM];
+                int16_t Aw[HYDRA_EMBED_DIM];
+                memset(Ag, 0, sizeof(Ag));
+                memset(Au, 0, sizeof(Au));
+                memset(Aw, 0, sizeof(Aw));
+                for (uint32_t l = 0; l < layers && ran_ref; ++l) {
+                    const uint8_t *base = body + (size_t)l * lb;
+                    for (uint32_t i = 0; i < dim; ++i) {
+                        for (uint32_t j = 0; j < dim; ++j) {
+                            const uint8_t by =
+                                base[(size_t)i * (dim / 4) + j / 4];
+                            Ag[i][j] += V3_REF_CODE[(by >> (2 * (j & 3u))) & 0x03u];
+                            const uint8_t by2 =
+                                base[(size_t)dim * dim / 4 + (size_t)i * (dim / 4) + j / 4];
+                            Au[i][j] += V3_REF_CODE[(by2 >> (2 * (j & 3u))) & 0x03u];
+                        }
+                        const uint8_t bw =
+                            base[(size_t)dim * dim / 2 + i / 4];
+                        Aw[i] += V3_REF_CODE[(bw >> (2 * (i & 3u))) & 0x03u];
+                    }
+                }
+                const int32_t token_val = 3;
+                int8_t xeff[HYDRA_EMBED_DIM];
+                float gf[HYDRA_EMBED_DIM], uf[HYDRA_EMBED_DIM];
+                float hf[HYDRA_EMBED_DIM], nf[HYDRA_EMBED_DIM];
+                float onew[HYDRA_EMBED_DIM];
+                for (uint32_t i = 0; i < dim; ++i) onew[i] = 1.0f;
+                /* first token: state is zero, only the injection is non-zero */
+                for (uint32_t i = 0; i < dim; ++i) {
+                    int64_t v = (int64_t)Aw[i] * token_val;
+                    if (v > 127) v = 127; else if (v < -127) v = -127;
+                    xeff[i] = (int8_t)v;
+                }
+                for (uint32_t i = 0; i < dim; ++i) {
+                    int64_t g = 0, u = 0;
+                    for (uint32_t j = 0; j < dim; ++j) {
+                        g += (int64_t)Ag[i][j] * (int32_t)xeff[j];
+                        u += (int64_t)Au[i][j] * (int32_t)xeff[j];
+                    }
+                    gf[i] = (float)(g);  /* scale 256 -> divide by 1.0 */
+                    uf[i] = (float)(u);
+                }
+                if (hydra_swiglu(gf, uf, dim, hf) != 0) ran_ref = 0;
+                if (ran_ref && hydra_rmsnorm(hf, onew, dim, HYDRA_TF_RMSNORM_EPS, nf) != 0)
+                    ran_ref = 0;
+                if (ran_ref && hydra_rope_inplace(nf, dim, 0, HYDRA_TF_ROPE_THETA) != 0)
+                    ran_ref = 0;
+                if (ran_ref)
+                    for (uint32_t i = 0; i < dim; ++i) {
+                        const double v = (double)nf[i] * HYDRA_TF_QUANT_GAIN;
+                        int64_t q = (v >= 0.0) ? (int64_t)(v + 0.5) : (int64_t)(v - 0.5);
+                        if (q > 127) q = 127; else if (q < -127) q = -127;
+                        ref_state[i] = (int8_t)q;
+                    }
+            }
+            free(body);
+        }
+    }
+    CHECK(ran, "v3 Nicht-Kollabierbarkeit: Engine-Lauf hat ausgefuehrt");
+    CHECK(ran_ref, "v3 Nicht-Kollabierbarkeit: Referenz-Lauf hat ausgefuehrt");
+    CHECK(ran && ran_ref && memcmp(true_state, ref_state, (size_t)dim) != 0,
+          "4-Layer v3-Pass != Load-Zeit-Ebenen-Summe (nichtlineare Tiefe wirkt)");
+    hydra_engine_unload(&e);
+    unlink(pa);
+}
+
+/* (c) The memory channel is not decorative: with a KV cache the run
+ * differs from the cache-less run, the append counter is exact, and
+ * sink 0 holds the first appended state bit-for-bit (the attention-
+ * sink residual the architecture promises). */
+static void test_tf_kv_memory_is_active(void)
+{
+    char pa[64];
+    tmp_path_new(pa, sizeof(pa));
+    const uint32_t dim = 16, layers = 4, vocab = 64;
+    write_v3_model(pa, dim, layers, vocab, 0x50C1u, -1, 0, 0, 0, 0);
+
+    /* cache-less stream */
+    HydraEngine ea;
+    int ran = (hydra_engine_load(&ea, pa) == 0);
+    uint16_t sa[16], tok = 3;
+    for (int t = 0; t < 16 && ran; ++t) {
+        if (hydra_engine_step_tf(&ea, tok, &sa[t], NULL) != 0) ran = 0;
+        else tok = sa[t];
+    }
+    hydra_engine_unload(&ea);
+
+    /* cached stream */
+    HydraEngine eb;
+    float *kk = (float *)malloc((8 + 1) * (size_t)dim * sizeof(float));
+    float *vv = (float *)malloc((8 + 1) * (size_t)dim * sizeof(float));
+    if (!kk || !vv) { perror("malloc"); exit(1); }
+    hydra_kv_cache_t kv;
+    int ran_b = (hydra_engine_load(&eb, pa) == 0) &&
+                (hydra_kv_cache_init(&kv, kk, vv, dim, 8, 1) == 0);
+    uint16_t sb[16];
+    int8_t state_after_one[HYDRA_EMBED_DIM];
+    tok = 3;
+    for (int t = 0; t < 16 && ran_b; ++t) {
+        if (hydra_engine_step_tf(&eb, tok, &sb[t], &kv) != 0) { ran_b = 0; break; }
+        if (t == 0) memcpy(state_after_one, eb.state_vector, sizeof(state_after_one));
+        tok = sb[t];
+    }
+    int differ = 0;
+    for (int t = 0; t < 16; ++t)
+        if (ran && ran_b && sa[t] != sb[t]) { differ = 1; break; }
+    float kout[HYDRA_EMBED_DIM] = {0}, vout[HYDRA_EMBED_DIM] = {0};
+    int sink_ok = 0;
+    if (ran_b && kv.count == 16 && hydra_kv_cache_sink(&kv, 0, kout, vout) == 0) {
+        sink_ok = 1;
+        for (uint32_t i = 0; i < dim; ++i)
+            if (vout[i] != (float)state_after_one[i])
+                sink_ok = 0;
+    }
+    CHECK(ran && ran_b, "v3 KV-Test hat beide Laeufe ausgefuehrt");
+    CHECK(differ, "v3: Memory-Kanal (Sink-Residual) aendert den Token-Stream");
+    CHECK(ran_b && kv.count == 16, "v3: KV-Append-Zaehler ist exakt (16 Tokens)");
+    CHECK(sink_ok, "v3: Sink 0 == erster State, bitgenau (Attention-Sink-Persistenz)");
+    hydra_engine_unload(&eb);
+    free(kk); free(vv);
+    unlink(pa);
+}
+
+/* Zero-initialized v3 writer with explicit packed planes (hand-built
+ * decode-proof models; every weight pinned, nothing LCG-random). */
+static void write_v3_zero_planted(const char *path, uint32_t dim,
+                                  uint32_t layers, uint16_t vocab,
+                                  const uint8_t *Wg, const uint8_t *Wu,
+                                  const uint8_t *w1, const uint8_t *Wout)
+{
+    const size_t lb = (size_t)dim * dim / 2 + dim / 4 + 2;
+    const size_t body_len = (size_t)layers * lb + (size_t)dim * dim / 4;
+    uint8_t *body = (uint8_t *)calloc(1, body_len);
+    if (!body) { perror("calloc"); exit(1); }
+    for (uint32_t l = 0; l < layers; ++l) {
+        uint8_t *base = body + (size_t)l * lb;
+        memcpy(base, Wg, (size_t)dim * dim / 4);
+        memcpy(base + (size_t)dim * dim / 4, Wu, (size_t)dim * dim / 4);
+        memcpy(base + (size_t)dim * dim / 2, w1, dim / 4);
+        base[lb - 2] = 0;
+        base[lb - 1] = 1;
+    }
+    memcpy(body + (size_t)layers * lb, Wout, (size_t)dim * dim / 4);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
+    wr_header_version(f, 3, vocab, dim, layers,
+                      (uint32_t)sizeof(HydraModelHeader), (uint32_t)body_len);
+    fwrite(body, 1, body_len, f);
+    fclose(f);
+    free(body);
+}
+
+/* 2-bit decode proof with hand-built weights: the POS and NEG codes of
+ * Wg, Wu, w1 and W_out each change the output in exactly the way the
+ * format promises (zero codes stay zero - if code 00 mis-decoded, the
+ * zero rows would leak into the state). */
+static void test_tf_2bit_decode_known_weights(void)
+{
+    char p1[64], p2[64];
+    tmp_path_new(p1, sizeof(p1));
+    tmp_path_new(p2, sizeof(p2));
+    const uint32_t dim = 4, layers = 1;
+    const uint16_t vocab = 8;
+    /* Model 1 (POS codes): Wg row0 = [+1,+1,0,0], Wu row0 = [+1,0,0,0],
+     * w1 = [+1,0,0,0], W_out row0 = [+1,0,0,0], W_out row1 = [-1,0,0,0],
+     * W_out row3 = [+1,0,0,0]. Everything else zero. */
+    uint8_t Wg[16] = {0}, Wu[16] = {0}, w1[1] = {0}, Wout[16] = {0};
+    /* dim 4: Wg row0: bytes0 codes j=0..3 -> [+1,+1,0,0] = 1 | 1<<2 | 0 | 0 = 0x5 */
+    Wg[0] = 0x01 | (0x01 << 2);
+    Wu[0] = 0x01;
+    w1[0] = 0x01;
+    Wout[0] = 0x01;             /* row0: [+1,0,0,0] */
+    Wout[4] = 0x02;             /* row1: [-1,0,0,0] (code 10) */
+    Wout[12] = 0x01;            /* row3: [+1,0,0,0] */
+    write_v3_zero_planted(p1, dim, layers, vocab, Wg, Wu, w1, Wout);
+
+    HydraEngine e1;
+    int ran1 = (hydra_engine_load(&e1, p1) == 0);
+    uint16_t t1 = 0;
+    if (ran1 && hydra_engine_step_tf(&e1, 1, &t1, NULL) != 0) ran1 = 0;
+    /* xeff[0] = 1; g0 = u0 = 1 -> h0 = silu(1); RMS over 4 dims;
+     * RoPE pos 0 is identity; x32 -> state[0] = 64; y0=64, y1=-64,
+     * y3=+64 -> argmax 0 -> token 0. */
+    CHECK(ran1, "v3 2-Bit-Decode: POS-Modell geladen");
+    CHECK(ran1 && e1.state_vector[0] == 64,
+          "v3 2-Bit-Decode: POS-Codes von Wg/Wu/w1 liefern State[0]=64");
+    CHECK(ran1 && t1 == 0,
+          "v3 2-Bit-Decode: W_out-POS/NEG-Mix dekodiert auf Token 0");
+    hydra_engine_unload(&e1);
+
+    /* Model 2: Wg row0 col0 = -1 (NEG code) -> g0 = -1 -> h0 = silu(-1)
+     * -> state[0] = -64; y0=-64, y1=+64, y3=-64 -> argmax 1 -> token 1. */
+    uint8_t Wg2[16] = {0}, Wu2[16] = {0}, w12[1] = {0}, Wout2[16] = {0};
+    Wg2[0] = 0x02;                       /* row0: [-1,0,0,0] */
+    memcpy(Wu2, Wu, sizeof(Wu2));
+    memcpy(w12, w1, sizeof(w12));
+    memcpy(Wout2, Wout, sizeof(Wout2));
+    write_v3_zero_planted(p2, dim, layers, vocab, Wg2, Wu2, w12, Wout2);
+
+    HydraEngine e2;
+    int ran2 = (hydra_engine_load(&e2, p2) == 0);
+    uint16_t t2 = 0;
+    if (ran2 && hydra_engine_step_tf(&e2, 1, &t2, NULL) != 0) ran2 = 0;
+    CHECK(ran2, "v3 2-Bit-Decode: NEG-Modell geladen");
+    CHECK(ran2 && e2.state_vector[0] == -64,
+          "v3 2-Bit-Decode: NEG-Code in Wg liefert State[0]=-64");
+    CHECK(ran2 && t2 == 1,
+          "v3 2-Bit-Decode: W_out-Mix mit negiertem State dekodiert auf Token 1");
+    hydra_engine_unload(&e2);
+    unlink(p1); unlink(p2);
+}
+
+/* v3 load-time validation: zero scale is refused (-15), a short weight
+ * body is refused (-10), dim % 4 != 0 is refused (-8); the healthy
+ * model loads (control). */
+static void test_tf_format_validation(void)
+{
+    char pa[64], pb[64], pc[64];
+    tmp_path_new(pa, sizeof(pa));
+    tmp_path_new(pb, sizeof(pb));
+    tmp_path_new(pc, sizeof(pc));
+    const uint32_t dim = 16, layers = 2, vocab = 16;
+    write_v3_model(pa, dim, layers, vocab, 7u, -1, 0, 0, 0, 0);
+    write_v3_model(pb, dim, layers, vocab, 8u, -1, 0, 0, 0, 0);
+    /* pc: dim 6 (6 % 4 == 2) */
+    {
+        const size_t lb = (size_t)6 * 6 / 2 + 6 / 4 + 2; /* not multiple of 4 anyway */
+        const size_t body_len = (size_t)layers * lb + (size_t)6 * 6 / 4;
+        uint8_t *body = (uint8_t *)calloc(1, body_len);
+        if (!body) { perror("calloc"); exit(1); }
+        int fd = open(pc, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+        if (fd < 0) { perror("open"); exit(1); }
+        FILE *f = fdopen(fd, "wb");
+        if (!f) { perror("fdopen"); close(fd); exit(1); }
+        wr_header_version(f, 3, vocab, 6, layers,
+                          (uint32_t)sizeof(HydraModelHeader), (uint32_t)body_len);
+        fwrite(body, 1, body_len, f);
+        fclose(f);
+        free(body);
+    }
+    /* zero the scale of layer 0 in pa */
+    {
+        const size_t lb = (size_t)dim * dim / 2 + dim / 4 + 2;
+        FILE *f = fopen(pa, "r+b");
+        int patched = 0;
+        if (f) {
+            if (fseek(f, (long)sizeof(HydraModelHeader) + (long)(lb - 2),
+                      SEEK_SET) == 0) {
+                fputc(0, f); fputc(0, f);
+                patched = 1;
+            }
+            fclose(f);
+        }
+        CHECK(patched, "v3 Validierung: Scale-Byte gepatcht");
+    }
+    /* shorten the declared weights_len of pb by 1 */
+    {
+        FILE *f = fopen(pb, "r+b");
+        int patched = 0;
+        if (f) {
+            uint8_t hdr[24];
+            if (fread(hdr, 1, 24, f) == 24) {
+                uint32_t wlen = (uint32_t)hdr[20] | ((uint32_t)hdr[21] << 8)
+                              | ((uint32_t)hdr[22] << 16) | ((uint32_t)hdr[23] << 24);
+                hdr[20] = (uint8_t)(wlen - 1);
+                fseek(f, 0, SEEK_SET);
+                fwrite(hdr, 1, 24, f);
+                patched = 1;
+            }
+            fclose(f);
+        }
+        CHECK(patched, "v3 Validierung: weights_len gekürzt");
+    }
+    HydraEngine e;
+    int rc_ok = hydra_engine_load(&e, pa);   /* scale 0 -> -15 */
+    hydra_engine_unload(&e);
+    int rc_short = hydra_engine_load(&e, pb); /* short body -> -10 */
+    hydra_engine_unload(&e);
+    int rc_dim = hydra_engine_load(&e, pc);   /* dim 6 -> -8 */
+    hydra_engine_unload(&e);
+    /* control: a fresh healthy model loads */
+    write_v3_model(pa, dim, layers, vocab, 9u, -1, 0, 0, 0, 0);
+    int rc_good = hydra_engine_load(&e, pa);
+    hydra_engine_unload(&e);
+    CHECK(rc_ok == -15, "v3 Validierung: Scale 0 wird mit -15 abgelehnt");
+    CHECK(rc_short == -10, "v3 Validierung: zu kurzer Weight-Body wird mit -10 abgelehnt");
+    CHECK(rc_dim == -8, "v3 Validierung: dim %% 4 != 0 wird mit -8 abgelehnt");
+    CHECK(rc_good == 0, "v3 Validierung: gesundes v3-Modell laedt (Kontrolle)");
+    unlink(pa); unlink(pb); unlink(pc);
+}
+
+/* The legacy paths refuse v3 engines (-14), the v3 path refuses v1
+ * engines (-14), prefill works on v3, and the greedy sampler is
+ * bit-identical to a direct step_tf call. */
+static void test_tf_legacy_paths_refuse(void)
+{
+    char pv3[64], pv1[64];
+    tmp_path_new(pv3, sizeof(pv3));
+    tmp_path_new(pv1, sizeof(pv1));
+    const uint32_t dim = 16, layers = 4;
+    const uint16_t vocab = 64;
+    write_v3_model(pv3, dim, layers, vocab, 0x77u, -1, 0, 0, 0, 0);
+    write_seeded_model(pv1, 0x77u, dim, layers, vocab);
+
+    HydraEngine e3;
+    int ran = (hydra_engine_load(&e3, pv3) == 0);
+    uint16_t out = 0;
+    int rc_step = hydra_engine_step(&e3, 3, &out);
+    int rc_fast = hydra_engine_step_fast(&e3, 3, &out);
+    uint16_t pre[5] = {1, 2, 3, 4, 5};
+    int rc_prefill = hydra_engine_prefill(&e3, pre, 5);
+    hydra_engine_unload(&e3);
+
+    HydraEngine e1;
+    int rc_tf_on_v1 = -99;
+    if (hydra_engine_load(&e1, pv1) == 0) {
+        rc_tf_on_v1 = hydra_engine_step_tf(&e1, 3, &out, NULL);
+        hydra_engine_unload(&e1);
+    }
+
+    /* greedy sampler == direct step_tf */
+    HydraEngine ga, gb;
+    int greedy_ok = 0;
+    if (hydra_engine_load(&ga, pv3) == 0 && hydra_engine_load(&gb, pv3) == 0) {
+        hydra_sampler_config_t cfg;
+        cfg.temperature = 0.0f;
+        cfg.min_p = 0.0f;
+        cfg.repetition_penalty = 1.0f;
+        cfg.penalty_window = 8;
+        cfg.rng_seed = 0;
+        uint16_t ta = 0, tb = 0;
+        greedy_ok = (hydra_sample_token(&ga, 3, &cfg, NULL, 0, NULL, &ta) == 0)
+                 && (hydra_engine_step_tf(&gb, 3, &tb, NULL) == 0)
+                 && (ta == tb);
+    }
+    hydra_engine_unload(&ga);
+    hydra_engine_unload(&gb);
+
+    CHECK(ran, "v3 Legacy-Refusal: v3-Modell geladen");
+    CHECK(rc_step == -14, "v3 Legacy-Refusal: hydra_engine_step verweigert v3 (-14)");
+    CHECK(rc_fast == -14, "v3 Legacy-Refusal: hydra_engine_step_fast verweigert v3 (-14)");
+    CHECK(rc_prefill == 0, "v3: Prefill laeuft durch step_tf (5 Tokens)");
+    CHECK(rc_tf_on_v1 == -14, "v3 Legacy-Refusal: step_tf verweigert v1 (-14)");
+    CHECK(greedy_ok, "v3: Greedy-Sampler bit-identisch zu step_tf");
+    unlink(pv3); unlink(pv1);
+}
+
+/* v3 sampling mode is seeded-reproducible: same seed -> identical
+ * stream across two fresh engines; a second seed is reproducible the
+ * same way. (Different seeds may or may not differ - that is not the
+ * claim; determinism is.) */
+static void test_tf_sampler_v3_deterministic(void)
+{
+    char pa[64];
+    tmp_path_new(pa, sizeof(pa));
+    const uint32_t dim = 16, layers = 4, vocab = 64;
+    write_v3_model(pa, dim, layers, vocab, 0x5A1Du, -1, 0, 0, 0, 0);
+
+    int rep_ok = 1, second_ok = 1;
+    for (uint32_t seed = 12345u; seed <= 12346u; ++seed) {
+        hydra_sampler_config_t cfg;
+        cfg.temperature = 1.0f;
+        cfg.min_p = 0.0f;
+        cfg.repetition_penalty = 1.2f;
+        cfg.penalty_window = 8;
+        cfg.rng_seed = seed;
+        HydraEngine x, y;
+        if (hydra_engine_load(&x, pa) != 0 || hydra_engine_load(&y, pa) != 0)
+            { rep_ok = 0; second_ok = 0; break; }
+        uint16_t sx[16], sy[16];
+        uint16_t hx[16], hy[16];
+        uint16_t tx = 3, ty = 3;
+        for (int t = 0; t < 16; ++t) {
+            uint16_t nx = 0, ny = 0;
+            if (hydra_sample_token(&x, tx, &cfg, hx, (size_t)t, NULL, &nx) != 0 ||
+                hydra_sample_token(&y, ty, &cfg, hy, (size_t)t, NULL, &ny) != 0) {
+                rep_ok = 0; second_ok = 0; break;
+            }
+            hx[t] = nx; hy[t] = ny;
+            sx[t] = nx; sy[t] = ny;
+            tx = nx; ty = ny;
+        }
+        if (seed == 12345u)
+            rep_ok = rep_ok && (memcmp(sx, sy, sizeof(sx)) == 0);
+        else
+            second_ok = second_ok && (memcmp(sx, sy, sizeof(sx)) == 0);
+        hydra_engine_unload(&x);
+        hydra_engine_unload(&y);
+    }
+    CHECK(rep_ok, "v3 Sampling: Seed 12345 reproduziert bit-identischen Stream");
+    CHECK(second_ok, "v3 Sampling: Seed 12346 reproduziert bit-identischen Stream");
+    unlink(pa);
+}
+
+/* v3 prefill must equal a manual run of the same tokens through
+ * step_tf (no hidden second prompt implementation). */
+static void test_tf_prefill_matches_manual(void)
+{
+    char pa[64];
+    tmp_path_new(pa, sizeof(pa));
+    const uint32_t dim = 16, layers = 4, vocab = 64;
+    write_v3_model(pa, dim, layers, vocab, 0x7u, -1, 0, 0, 0, 0);
+    const uint16_t prompt[5] = {1, 2, 3, 4, 5};
+
+    HydraEngine a, b;
+    int ran = (hydra_engine_load(&a, pa) == 0)
+           && (hydra_engine_load(&b, pa) == 0)
+           && (hydra_engine_prefill(&a, prompt, 5) == 0);
+    for (int i = 0; i + 1 < 5 && ran; ++i) {
+        uint16_t d = 0;
+        if (hydra_engine_step_tf(&b, prompt[i], &d, NULL) != 0) ran = 0;
+    }
+    uint16_t ta = 0, tb = 0;
+    if (ran && hydra_engine_step_tf(&a, prompt[4], &ta, NULL) != 0) ran = 0;
+    if (ran && hydra_engine_step_tf(&b, prompt[4], &tb, NULL) != 0) ran = 0;
+    int same = ran && ta == tb
+        && memcmp(a.state_vector, b.state_vector, sizeof(a.state_vector)) == 0;
+    CHECK(ran, "v3 Prefill-Test hat ausgefuehrt");
+    CHECK(same, "v3: Prefill(5 Tokens) == manuelle step_tf-Lauf (Token + State)");
+    hydra_engine_unload(&a);
+    hydra_engine_unload(&b);
+    unlink(pa);
+}
+
 int main(void)
 {
     printf("=== Hydra Engine Unit-Tests ===\n\n");
@@ -2202,6 +2888,14 @@ int main(void)
     test_rope();
     test_swiglu();
     test_kv_cache();
+    test_tf_dim_d_gt_0_changes_output();
+    test_tf_multilayer_not_reducible_by_loadtime_sums();
+    test_tf_kv_memory_is_active();
+    test_tf_2bit_decode_known_weights();
+    test_tf_format_validation();
+    test_tf_legacy_paths_refuse();
+    test_tf_sampler_v3_deterministic();
+    test_tf_prefill_matches_manual();
 
     printf("\n=== %d Tests, %d failures ===\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

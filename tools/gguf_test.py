@@ -544,9 +544,102 @@ def run(engine, tmp):
     ok &= check('the inspector identifies the fixture', _inspect(gguf, 'llama'))
     ok &= check('the inspector refuses a non-GGUF', _inspect_refuses(out))
 
+    # v3: per-layer ternary blocks -> .hydra v3 (real tensor slices)
+    ok &= run_v3(engine, tmp, gguf)
+
     # M5: safetensors -> .hydra v2 (4 ternary weights/byte) round trip
     ok &= run_safetensors(engine, tmp)
     return ok
+
+
+def run_v3(engine, tmp, gguf):
+    """v3 gate: gguf -> .hydra v3 (per-layer ternary blocks + absmean
+    scales), proven three ways - an independent byte reader, the
+    write-time roundtrip check inside the converter, and the real C
+    engine (deterministic two-run comparison)."""
+    ok = True
+    dim, layers = 8, 3
+    out = os.path.join(tmp, 'v3_converted.hydra')
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = gguf_to_hydra.main([gguf, '--out', out, '--json',
+                                 '--v3', '--v3-layers', str(layers),
+                                 '--dim', str(dim)])
+    ok &= check('v3: the converter accepts a real GGUF', rc == 0)
+    if rc != 0:
+        return ok
+    report = json.loads(buf.getvalue())
+    ok &= check('v3: the report is version 3 and passed its roundtrip',
+                report['header']['version'] == 3
+                and report['roundtripCheck'] == 'passed'
+                and len(report['layers']) == layers)
+
+    # the file itself: header fields and the exact body length
+    raw = open(out, 'rb').read()
+    magic, version, vocab, d, l, off, wlen = struct.unpack('<IHHIIII', raw[:24])
+    lb = dim * dim // 2 + dim // 4 + 2
+    ok &= check('v3: the header is version 3 with the v3 body length',
+                version == 3 and d == dim and l == layers and off == 24
+                and wlen == layers * lb + dim * dim // 4
+                and len(raw) == 24 + wlen,
+                'version %d, wlen %d, want %d'
+                % (version, wlen, layers * lb + dim * dim // 4))
+
+    # scale factors must be non-zero (the engine refuses 0) and the W_out
+    # block must contain at least one non-zero 2-bit code
+    scales = [struct.unpack_from('<H', raw, 24 + i * lb + lb - 2)[0]
+              for i in range(layers)]
+    wout = raw[24 + layers * lb:24 + layers * lb + dim * dim // 4]
+    ok &= check('v3: every per-layer scale is non-zero',
+                all(sc > 0 for sc in scales), str(scales))
+    ok &= check('v3: the W_out block is not all-zero', any(b != 0 for b in wout))
+
+    # engine: deterministic two-run comparison
+    if engine:
+        runs = []
+        for _ in range(2):
+            proc = subprocess.run([engine, out, '3', '12', '--json'],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                ok &= check('v3: the C engine loads the converted model',
+                            False, proc.stderr[-300:])
+                break
+            runs.append(json.loads(proc.stdout))
+        else:
+            ok &= check('v3: the C engine loads the converted model', True)
+            ok &= check('v3: the engine stream is deterministic',
+                        runs[0]['tokens'] == runs[1]['tokens']
+                        and runs[0]['state'] == runs[1]['state'])
+            toks = runs[0]['tokens']
+            ok &= check('v3: the engine emits the requested steps',
+                        len(toks) == 12 and all(0 <= t < report['header']['vocab']
+                                                for t in toks),
+                        str(toks))
+    else:
+        print('SKIP: the v3 C engine check needs a built ./hydra-run (--engine)')
+
+    # negative controls (ap.error() raises SystemExit - that is the refusal)
+    bad = os.path.join(tmp, 'v3_dim10.hydra')
+    ok &= check('v3: --dim 10 (not a multiple of 4) is refused',
+                _v3_cli_fails(gguf, bad, '--dim', '10'))
+    bad2 = os.path.join(tmp, 'v3_layers0.hydra')
+    ok &= check('v3: --v3-layers 0 is refused',
+                _v3_cli_fails(gguf, bad2, '--v3-layers', '0'))
+    return ok
+
+
+def _v3_cli_fails(gguf, out, *extra):
+    """gguf_to_hydra.main() must refuse the combination: either a non-zero
+    return code or argparse's SystemExit(2). Both count as a clean refusal;
+    an uncaught exception (traceback) would escape this helper and fail the
+    whole run, so this is a real gate, not a formality."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = gguf_to_hydra.main([gguf, '--out', out, '--v3'] + list(extra))
+    except SystemExit as exc:
+        return exc.code not in (0, None)
+    return rc != 0
 
 
 def run_safetensors(engine, tmp):
@@ -650,6 +743,38 @@ def run_safetensors(engine, tmp):
         st_hydra.main([other, '--out', out2])
     ok &= check('a different source produces a different v2 model',
                 read_hydra_v2(out2)['A'] != got['A'])
+
+    # 6. v3 from safetensors: same gates as the GGUF v3 path
+    dim3, layers3 = 8, 2
+    out3 = os.path.join(tmp, 'st_v3.hydra')
+    buf3 = io.StringIO()
+    with contextlib.redirect_stdout(buf3):
+        rc3 = st_hydra.main([st_in, '--out', out3, '--json',
+                             '--v3', '--v3-layers', str(layers3),
+                             '--dim', str(dim3)])
+    ok &= check('v3-st: the converter accepts a real safetensors file', rc3 == 0)
+    if rc3 == 0:
+        rep3 = json.loads(buf3.getvalue())
+        raw3 = open(out3, 'rb').read()
+        _, ver3, _, d3, l3, off3, wlen3 = struct.unpack('<IHHIIII', raw3[:24])
+        lb3 = dim3 * dim3 // 2 + dim3 // 4 + 2
+        ok &= check('v3-st: the header is version 3 with the v3 body length',
+                    rep3['roundtripCheck'] == 'passed' and ver3 == 3
+                    and d3 == dim3 and l3 == layers3 and off3 == 24
+                    and wlen3 == layers3 * lb3 + dim3 * dim3 // 4)
+        if engine:
+            p1 = subprocess.run([engine, out3, '2', '10', '--json'],
+                                capture_output=True, text=True)
+            p2 = subprocess.run([engine, out3, '2', '10', '--json'],
+                                capture_output=True, text=True)
+            d1 = json.loads(p1.stdout) if p1.returncode == 0 else None
+            d2 = json.loads(p2.stdout) if p2.returncode == 0 else None
+            ok &= check('v3-st: the C engine runs the converted model',
+                        d1 is not None and d2 is not None)
+            if d1 is not None and d2 is not None:
+                ok &= check('v3-st: the engine stream is deterministic',
+                            d1['tokens'] == d2['tokens']
+                            and d1['state'] == d2['state'])
     return ok
 
 

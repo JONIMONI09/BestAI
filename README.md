@@ -25,7 +25,7 @@ Hydra-Stone is a C99 engine that maps a `.hydra` file of ternary weights ({-1, 0
 | **total while stepping** | | **1088 B ≈ 1.06 KiB** | |
 | load-time scratch (released) | `int64_t[64]` × 2 | 1024 B | stack in `hydra_build_aggregation()` |
 
-`sizeof(HydraEngine)` is 664 B in total on 64-bit platforms — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header, the load-measurement fields and the sampler RNG state (pinned at compile time on LP64 targets by `hydra_engine_size_check` in `include/hydra_model.h`; 32-bit ABIs use a smaller layout). Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
+`sizeof(HydraEngine)` is 672 B in total on 64-bit platforms — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header, the load-measurement fields, the sampler RNG state and the version-3 RoPE step counter (pinned at compile time on LP64 targets by `hydra_engine_size_check` in `include/hydra_model.h`; 32-bit ABIs use a smaller layout). Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
 
 The weight pages are **not** counted there, because they are not the engine's memory: they live in the **kernel page cache**, appear in `dumpsys meminfo` as *Private Clean*, and are reclaimed by the OS under memory pressure. The engine therefore cannot and does not keep the model's resident set size at zero. Build with `-DHYDRA_DROP_CACHE` to explicitly hand touched pages back after every step.
 
@@ -158,7 +158,8 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 
 ## Features
 
-- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path, and the engine's own working set is fixed and measured: a 664-byte context, of which 576 bytes (two `int32[64]` aggregates + one `int8[64]` state) is what the per-token step touches
+- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path (including the version-3 per-layer forward pass, which reads the weight planes straight from the mmap and keeps all working memory stack-local), and the engine's own working set is fixed and measured: a 672-byte context, of which 576 bytes (two `int32[64]` aggregates + one `int8[64]` state) is what the v1/v2 per-token step touches
+- ✅ **Version-3 per-layer transformer path** — real non-linear depth over the ternary core: per-layer SwiGLU (ternary BitLinear gate/up, b1.58 absmean scale) → RMSNorm → RoPE → int8 state, KV sink+append per token, full-dimension logit mix (no column-0 bottleneck). Proven non-reducible to load-time plane sums, and every dim-`d>0` weight demonstrably affects the stream (`tests/test_engine.c`). Legacy v1/v2 recurrence stays available and is explicitly refused on v3 models (`-14`)
 - ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 4 bits of file per weight** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The v2 header variant packs 4 weights per byte — exactly the 2-bit code of each weight, no reserved bits — which **halves the file** — implemented, tested and documented in `docs/FORMAT.md` ("Version 2"); it is the same 24-byte header, not the `.hydra2` container.
 - ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
@@ -327,8 +328,9 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── tools/make_model.py        Starter-model generator (format reference)
 ├── tools/gguf_reader.py       GGUF header/tensor reader (Python stdlib only)
 ├── tools/gguf_inspect.py      Read-only GGUF report (no numpy, no torch)
-├── tools/gguf_to_hydra.py     GGUF → .hydra converter, absmean ternarisation
-├── tools/gguf_test.py         Converter gate: synthetic GGUF in, real C engine out
+├── tools/gguf_to_hydra.py     GGUF → .hydra converter, absmean ternarisation (--v3: per-layer blocks + scales)
+├── tools/safetensors_to_hydra.py  safetensors → .hydra converter, absmean ternarisation (--v3: per-layer blocks + scales)
+├── tools/gguf_test.py         Converter gate: synthetic GGUF + safetensors in, real C engine out (incl. v3)
 ├── tests/test_engine.c        unit tests (NEON-vs-scalar, OOB + overflow PoC regressions); count is architecture-dependent and drift-gated
 ├── android/                   NDK/JNI app wrapping the same C source
 ├── server.js                  UI server (Node, 0 runtime dependencies; ESLint is dev-only)
@@ -338,6 +340,7 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── docs/GGUF-IMPORT.md        GGUF import, absmean ternarisation, limits
 ├── docs/FORMAT-V2.md          .hydra2 sparse-MoE format — CANONICAL v2 spec, no loader yet
 ├── docs/HYDRA2-RESEARCH.md    research spec: bounded measured memory, load strategies, ternary math
+├── docs/RESEARCH.md           external research: BitNet b1.58 (W1.58A8), bitnet.cpp I2_S 2-bit packing
 ├── docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
 ├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
 ├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
@@ -391,6 +394,17 @@ per weight** of information inside 4 allocated bits. Second, v2's
 nothing reserved, so the file halves while the code table stays identical.
 See `docs/FORMAT.md`.
 
+**Version 3 changes what the file stores, not just how:** instead of the
+aggregated `A[i]/B[i]` recurrence it stores the per-layer ternary weight
+matrices themselves (`Wg`/`Wu` per layer, a token-injection `w1`, a u16
+absmean scale, and a final `W_out` logit mix — all 2-bit packed, 4
+weights/byte), which `hydra_engine_step_tf()` executes layer by layer
+with SwiGLU/RMSNorm/RoPE between the projections (BitNet b1.58 W1.58A8
+style, see [`docs/RESEARCH.md`](docs/RESEARCH.md)). Both converters
+(`tools/gguf_to_hydra.py --v3`, `tools/safetensors_to_hydra.py --v3`)
+write v3 from real tensor slices, with a stdlib-only write-time
+roundtrip check.
+
 ## Testing Strategy
 
 The test suite goes beyond smoke checks — every test can fail:
@@ -425,7 +439,7 @@ make ui       # builds hydra-run + the starter model and serves on :8787
 
 ## Roadmap
 
-- [ ] Full transformer forward pass on top of the ternary core — the primitives now exist and are tested (M4: `hydra_rmsnorm`, `hydra_rope_inplace`, `hydra_swiglu` and the `hydra_kv_cache_t` sink+window cache in `src/hydra_engine.c`, unit-tested in `tests/test_engine.c`), but they are **not yet wired into a forward pass** over the recurrent core
+- [x] Full per-layer non-linear forward pass on top of the ternary core — the M4 primitives (`hydra_rmsnorm`, `hydra_rope_inplace`, `hydra_swiglu`, `hydra_kv_cache_t` sink+window cache) are wired into a real layer-by-layer forward pass executed by `hydra_engine_step_tf()` on **version-3** models (BitNet b1.58 style: ternary BitLinear projections `y[i]=Σ_j W[i][j]·x[j]` over the full dim, per-layer absmean scale, SwiGLU→RMSNorm→RoPE between layers, KV per token, full-dimension logit mix — no column-0 bottleneck). Zero-heap/stack-only, loader refuses v3 on the legacy step (`-14`) and vice versa. Depth is proven non-reducible to load-time sums (`test_tf_multilayer_not_reducible_by_loadtime_sums`), and a dim-`d>0` weight flip provably changes the stream (`test_tf_dim_positive_weight_changes_stream`). The v1/v2 aggregated recurrence remains as an explicit legacy path (`--fast`). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Version 3 forward pass* and [`docs/FORMAT.md`](docs/FORMAT.md) § *Version 3*
 - [x] Min-P sampling & repetition penalty — `hydra_sample_token()` (`include/hydra_model.h`, `src/hydra_engine.c`) with a bit-identical greedy guard; CLI `--temp --min-p --rep-penalty` (`src/main.c`); tested in `tests/test_engine.c` (`test_sampler_min_p`, `test_sampler_repetition_penalty`, `test_sampler_greedy_guard`)
 - [x] safetensors import with automatic absmean ternarization — `tools/safetensors_to_hydra.py` (stdlib only) parses/validates the container, decodes F32/F16/BF16, ternarises by absmean and writes a version-2 `.hydra`; round-trip-gated in `tools/gguf_test.py` (`run_safetensors`). GGUF is done too — see [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md)
 - [x] AVX2 kernel for x86 — `src/hydra_simd.h` (`hydra_avx2_accumulate_agg` step kernel + `hydra_avx2_unpack_v2_plane` LUT), runtime CPU dispatch with a scalar fallback in `src/hydra_engine.c` (a `-mavx2` build still runs on non-AVX2 CPUs; a plain build has no AVX2 instruction); parity-tested in `tests/test_engine.c` (`test_avx2_step_kernel`, `test_avx2_v2_unpack`). **AVX-512 is not implemented.**

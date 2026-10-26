@@ -225,7 +225,10 @@ static double bench_run(const char *model_path, const BenchRequest *req,
     uint16_t tok = req->start_token;
     for (long i = 0; i < e.header.layers; ++i) {
         uint16_t n = 0;
-        if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
+        if (e.header.version == 3) {
+            if (hydra_engine_step_tf(&e, tok, &n, NULL) != 0) { hydra_engine_unload(&e); return -1.0; }
+        }
+        else if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
         else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
         tok = n;
     }
@@ -237,7 +240,10 @@ static double bench_run(const char *model_path, const BenchRequest *req,
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (long s = 0; s < req->steps; ++s) {
         uint16_t n = 0;
-        if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
+        if (e.header.version == 3) {
+            if (hydra_engine_step_tf(&e, tok, &n, NULL) != 0) { hydra_engine_unload(&e); return -1.0; }
+        }
+        else if (req->mode) { if (hydra_engine_step_fast(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; } }
         else if (hydra_engine_step(&e, tok, &n) != 0) { hydra_engine_unload(&e); return -1.0; }
         tok = n;
     }
@@ -271,9 +277,19 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
     double ns_full = bench_run(model_path, &full_req, &sink, &full_stats);
     if (ns_full < 0) { fprintf(stderr, "[Hydra] Bench: Modell konnte nicht geladen werden\n"); return 1; }
     uint16_t sink_fast = 0;
-    const BenchRequest fast_req = { start_token, steps, HYDRA_BENCH_FAST };
-    double ns_fast = bench_run(model_path, &fast_req, &sink_fast, NULL);
-    if (ns_fast < 0) { fprintf(stderr, "[Hydra] Bench: Fast Path fehlgeschlagen\n"); return 1; }
+    double ns_fast = -1.0;
+    if (h->version == 3) {
+        /* v3 has no aggregated legacy path to compare against: the
+         * per-layer non-linear pass is the ONLY path, so the fast
+         * benchmark is reported as not applicable (0.0) instead of
+         * measuring a different algorithm. */
+        sink_fast = sink;
+        ns_fast = 0.0;
+    } else {
+        const BenchRequest fast_req = { start_token, steps, HYDRA_BENCH_FAST };
+        ns_fast = bench_run(model_path, &fast_req, &sink_fast, NULL);
+        if (ns_fast < 0) { fprintf(stderr, "[Hydra] Bench: Fast Path fehlgeschlagen\n"); return 1; }
+    }
 
     /* Beide Ströme muessen identisch sein - sonst vergleicht der Benchmark
      * zwei verschiedene Algorithmen und die Zahlen sind Muell.
@@ -292,21 +308,24 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
     if (full_stats.rss_kb_before_load >= 0 && full_stats.resident_kb_after_load >= 0) {
         rss_delta = full_stats.resident_kb_after_load - full_stats.rss_kb_before_load;
     }
+    const char *bench_note = (h->version == 3)
+        ? "v3 per-layer pass; ns_per_token_fast=0 means the legacy fast path does not exist for v3 models; JNI callback costs are NOT included here"
+        : "JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device";
     printf("{\"mode\":\"bench\",\"engine\":\"cpu\",\"model\":\"%s\","
-           "\"dim\":%u,\"layers\":%u,\"vocab\":%u,\"steps\":%ld,"
+           "\"version\":%u,\"dim\":%u,\"layers\":%u,\"vocab\":%u,\"steps\":%ld,"
            "\"warmup_layers\":%u,"
            "\"ns_per_token_full\":%.2f,\"ns_per_token_fast\":%.2f,"
            "\"speedup\":%.3f,\"tokens_equal\":%s,"
            "\"load_ms\":%.3f,\"weights_bytes\":%zu,"
            "\"rss_before_kb\":%ld,"
            "\"rss_after_kb\":%ld,\"rss_delta_kb\":%ld,"
-           "\"note\":\"JNI callback costs are NOT included here; measure them with HydraBridge.benchmark() on the device\"}",
-           model_path, h->dim, h->layers, h->vocab_size, steps,
+           "\"note\":\"%s\"}",
+           model_path, h->version, h->dim, h->layers, h->vocab_size, steps,
            h->layers, ns_full, ns_fast, ns_fast > 0 ? ns_full / ns_fast : 0.0,
            sink == sink_fast ? "true" : "false",
            full_stats.load_ms, full_stats.weights_bytes,
            full_stats.rss_kb_before_load,
-           full_stats.resident_kb_after_load, rss_delta);
+           full_stats.resident_kb_after_load, rss_delta, bench_note);
     printf("\n");
     return sink == sink_fast ? 0 : 1;
 }
@@ -509,7 +528,7 @@ int main(int argc, char **argv)
      * original call shape for the default (greedy) invocation. */
     const int sampling_enabled =
         sampler.temperature > 0.0f && sampler.min_p < 1.0f;
-    if (sampling_enabled && fast_mode) {
+    if (sampling_enabled && fast_mode && engine.header.version != 3) {
         /* --fast only exists for the greedy path: sampling advances
          * the full state through hydra_engine_step() by contract, so
          * the fast path is ignored. Say so instead of being quiet. */
@@ -519,6 +538,38 @@ int main(int argc, char **argv)
                 (double)sampler.temperature, (double)sampler.min_p);
     }
 
+    /* Version 3: the CLI owns the KV storage the engine appends to
+     * (the engine itself stays zero-heap; see hydra_engine_step_tf).
+     * 512-slot ring + 1 permanent sink covers the CLI's max of 256
+     * steps; sinks keep the first transformed state resident for the
+     * whole run (attention-sink residual, see docs/ARCHITECTURE.md). */
+    int v3 = (engine.header.version == 3);
+    float *v3_k = NULL, *v3_v = NULL;
+    hydra_kv_cache_t v3cache;
+    hydra_kv_cache_t *v3_kv = NULL;
+    if (v3) {
+        const uint32_t cap = 512, nsink = 1, dimf = engine.header.dim;
+        v3_k = (float *)malloc(((size_t)cap + nsink) * (size_t)dimf * sizeof(float));
+        v3_v = (float *)malloc(((size_t)cap + nsink) * (size_t)dimf * sizeof(float));
+        if (!v3_k || !v3_v ||
+            hydra_kv_cache_init(&v3cache, v3_k, v3_v, dimf, cap, nsink) != 0) {
+            fprintf(stderr, "[Hydra] v3: KV-Initialisierung fehlgeschlagen\n");
+            free(v3_k); free(v3_v); free(tokens);
+            hydra_engine_unload(&engine);
+            return 1;
+        }
+        v3_kv = &v3cache;
+        if (fast_mode) {
+            /* v3 has no aggregated legacy path at all: --fast is not
+             * applicable, the per-layer pass is the model. Say so,
+             * then run the real thing instead of failing silently. */
+            fprintf(stderr,
+                "[Hydra] Hinweis: --fast ist bei v3-Modellen nicht anwendbar "
+                "(kein Aggregat-Legacy-Pfad); es laeuft der volle per-layer pass\n");
+            fast_mode = 0;
+        }
+    }
+
     double t0 = now_ms();
     for (long s = 0; s < steps; ++s) {
         uint16_t next = 0;
@@ -526,11 +577,16 @@ int main(int argc, char **argv)
         if (sampling_enabled) {
             /* Recent window = the last penalty_window generated tokens
              * (tokens[0..s-1]); the start token is included once it has
-             * been superseded by a generated token. */
+             * been superseded by a generated token. v3 passes the same
+             * KV cache so the sampled advance keeps the memory channel
+             * consistent with the greedy path. */
             size_t nrec = (size_t)s;
             if (nrec > sampler.penalty_window) nrec = sampler.penalty_window;
             step_rc = hydra_sample_token(&engine, current, &sampler,
-                                         tokens + (s - nrec), nrec, &next);
+                                         tokens + (s - nrec), nrec,
+                                         v3_kv, &next);
+        } else if (v3) {
+            step_rc = hydra_engine_step_tf(&engine, current, &next, v3_kv);
         } else if (fast_mode) {
             step_rc = hydra_engine_step_fast(&engine, current, &next);
         } else {
@@ -581,6 +637,8 @@ int main(int argc, char **argv)
                ok, (double)safe_val);
     }
 
+    free(v3_k);
+    free(v3_v);
     free(tokens);
     hydra_engine_unload(&engine);
     return 0;
