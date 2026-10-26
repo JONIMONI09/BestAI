@@ -225,3 +225,35 @@ cd, dead variables) — all fixed, all suites green. cpplint's remaining
 ~180 findings are Google-C++-style noise on a C99 codebase (line length,
 brace style, include order) and were deliberately not "fixed" by
 reformatting the project.
+
+## 9. Local/CI syntax drift: the five-file lesson (2026-10-26, PR #55 first run)
+
+The first CI run of PR #55 failed in gate 1a exactly where the local
+pass had not looked: the ci.yml "Syntax check (gcc, C99 strict,
+-Werror)" step compiles **five** translation units
+(`src/hydra_engine.c src/main.c tests/test_engine.c
+tests/test_jni_batch.c tests/test_large_model.c`) **with**
+`-D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE`, while the local pass had
+compiled two files **without** those flags. The in-file feature-test
+defines (added that day for self-containment) then collided with the
+command-line ones under `-Werror` (`"_DEFAULT_SOURCE" redefined`), and
+the extra test TUs were never locally compiled at all.
+
+Fix + permanent guard:
+- the in-file defines are now `#ifndef`-guarded (self-contained
+  standalone *and* warning-free when the same defines arrive via
+  command line — both modes verified rc=0);
+- new `tools/ci_syntax_mirror_test.sh` extracts the **exact** run block
+  of the 1a/1b steps from ci.yml at run time (indentation-aware awk,
+  nothing hardcoded) and executes it; a vacuous parse (<3 .c files or
+  no command) is a hard failure. Negative control proven: against the
+  pre-fix files it reproduces the CI error verbatim (redefinition →
+  -Werror, rc=1); against the fix it passes.
+- the same test is a step in the ci.yml lint job ("Syntax mirror
+  (local/CI parity)"), so a future edit that makes the CI syntax step
+  unparseable or locally broken fails CI in the same run.
+
+Lesson (recorded per R32): a local gate is only as strong as the exact
+command list and flags of the CI step it mirrors — "compiles locally"
+must mean "with the files and flags CI uses", parsed from the workflow,
+not copied by hand.

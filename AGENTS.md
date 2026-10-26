@@ -172,6 +172,10 @@ gcc -std=c99 -fsyntax-only -Wall -Wextra -Wpedantic -fanalyzer \
     -Iinclude src/hydra_engine.c src/main.c
 g++ -fsyntax-only -Wall -Wextra -Wpedantic -fanalyzer \
     -Iinclude src/hydra_engine.c src/main.c     # C++ parse must stay error-free
+bash tools/ci_syntax_mirror_test.sh             # the EXACT ci.yml syntax commands
+                                               # (5 TUs incl. tests, -D flags,
+                                               # -Werror) — local may never drift
+                                               # from CI (RESEARCH.md section 9)
 
 # 2. Python pipeline
 python3 tools/gguf_test.py --engine ./hydra-run   # expect "N checks, 0 failed" (N parsed, never assumed)
@@ -196,6 +200,7 @@ bash tools/docs_claim_check.sh             # banned unqualified claims in docs
 bash tools/ci_release_version_test.sh      # release versioning discipline (needs pyyaml)
 bash tools/compose_scroll_check.sh         # crash guard: nested same-axis vertical scrollables in Compose (self-testing, R25)
 bash tools/workflow_yaml_check.sh          # every .github YAML: syntax + duplicate keys (GitHub rejects what PyYAML accepts; self-testing, R25)
+bash tools/ci_syntax_mirror_test.sh        # runs the EXACT ci.yml gcc/clang syntax commands (parsed at run time) so local/CI can't drift apart (self-testing, R25)
 
 # 5. Web console (if UI touched)
 npm ci && npm run lint                     # ESLint (dev-only dependency)

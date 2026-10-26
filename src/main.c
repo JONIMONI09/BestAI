@@ -2,9 +2,14 @@
  * struct timespec / clock_gettime (POSIX 1b) behind these. Defining
  * them in the source file keeps the file self-contained instead of
  * relying on every build adding -D_POSIX_C_SOURCE=200809L
- * -D_DEFAULT_SOURCE (same finding as in hydra_engine.c, 2026-10-26). */
+ * -D_DEFAULT_SOURCE (same finding as in hydra_engine.c,
+ * guarded against command-line redefinition, 2026-10-26). */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#endif
 
 #include "hydra_model.h"
 #include <errno.h>

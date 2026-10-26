@@ -42,6 +42,14 @@ jobs:
               src/hydra_engine.c src/main.c tests/test_engine.c \
               tests/test_jni_batch.c tests/test_large_model.c
 
+
+      # Gate 1b-mirror: run the exact commands of gates 1a/1b through
+      # the same parser the local regression test uses (tools/
+      # ci_syntax_mirror_test.sh). Fails loudly if the step above stops
+      # being machine-readable or stops compiling locally - the class of
+      # failure where local and CI drift apart (2026-10-26, PR #55).
+      - name: Syntax mirror (local/CI parity)
+        run: bash tools/ci_syntax_mirror_test.sh
       # Gate 1c: static analysis (cppcheck), error-exitcode=2 on any
       # warning/error so nothing slips through
       - name: Static analysis (cppcheck)

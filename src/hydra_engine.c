@@ -3,10 +3,16 @@
  * file (before any include) keeps the file self-contained: every build
  * and every C++ parse of this translation unit gets the same symbol
  * set instead of relying on each consumer adding
- * -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE. (Found by the local
+ * -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE. (Guarded with #ifndef so builds that also pass the
+ * defines on the command line - the CI gates do - stay warning-free.
+ * Found by the local
  * g++ -fanalyzer / gcc -std=c99 -fanalyzer pass, 2026-10-26.) */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#endif
 
 #include "hydra_model.h"
 #include "hydra_neon.h"

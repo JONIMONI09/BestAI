@@ -1746,3 +1746,11 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       index; CHANGELOG entry written.
 - [x] Docs final check + local gate suite + commit + PR (R17): commit 445d3c8,
       PR #55 opened (owner merges per R17).
+- [x] **PR #55 first CI run:** tier split proven live (neon-test,
+      build-test, gpu-bench, android-apk all `skipping` on the PR; lint
+      tier ran). One red: ci.yml gate 1a compiles 5 TUs with command-line
+      feature macros -> in-file defines collided under -Werror. Fixed
+      (guarded defines, both compile modes rc=0) + regression test
+      tools/ci_syntax_mirror_test.sh (parses the exact CI command,
+      negative control reproduced the CI error verbatim) + mirror step
+      in ci.yml. See RESEARCH.md section 9.

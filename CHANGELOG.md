@@ -60,6 +60,20 @@ environment record for all AI agents.
    The first section (Arena AI, Debian 12) records the pip-wheel linter
    path above and the measured blocks (apt/Docker/QEMU/Android SDK,
    code-scanning API 403) with their workarounds.
+**6. First-run CI red found + fixed with a regression test.** The first
+   PR run failed in ci.yml gate 1a: that step compiles **five**
+   translation units (src + three tests) **with**
+   `-D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE`, while the local pass
+   had compiled two files without the flags — the new in-file
+   feature-test defines then hit `-Werror` as "redefined". Fix:
+   `#ifndef`-guarded defines in both `src/` files (standalone *and*
+   command-line-flagged compiles verified rc=0); permanent guard:
+   `tools/ci_syntax_mirror_test.sh` runs the **exact** ci.yml syntax
+   commands (parsed from the workflow at run time, vacuous-parse guard,
+   negative control proven against the pre-fix files) — now also a
+   ci.yml lint step so future drift fails in the same run. AGENTS.md
+   gate list updated.
+
 5. **AGENTS.md updated accordingly:** §3 adds the mandatory local
    C/C++ static-analysis gate (1b) and the "read Environment.md first"
    rule; §6 carries the Environment.md contract; §8 now documents the
