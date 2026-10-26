@@ -257,3 +257,14 @@ Lesson (recorded per R32): a local gate is only as strong as the exact
 command list and flags of the CI step it mirrors — "compiles locally"
 must mean "with the files and flags CI uses", parsed from the workflow,
 not copied by hand.
+
+Second instance of the same class (same day, same PR): the mirror
+itself failed on CI because ubuntu-latest's default `awk` is **mawk**,
+which rejects the regex literal `/run: \|/` ("missing operand", empty
+output -> the parse guard failed the step), while gawk on the local
+machine tolerated it. The extraction now uses only POSIX-safe
+constructs (field comparison `$1 == "run:" && $2 == "|"`,
+gsub+length whitespace counting, no match()/RSTART, no POSIX classes).
+Lesson: a script that mirrors CI must be tested against CI's
+*interpreter*, not just the local one — and the mirror step in ci.yml
+now guarantees that: it runs in both environments.

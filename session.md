@@ -1754,3 +1754,10 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       tools/ci_syntax_mirror_test.sh (parses the exact CI command,
       negative control reproduced the CI error verbatim) + mirror step
       in ci.yml. See RESEARCH.md section 9.
+- [x] **PR #55 second CI run:** gates 1a+1b (gcc+clang exact syntax)
+      PASS; the new mirror step failed on CI - ubuntu's default awk is
+      **mawk**, which rejects the gawk-tolerated regex literal (local/CI
+      drift inside the drift-guard). Fix: POSIX-safe awk only (field
+      comparison, gsub+length), verified incl. clang branch via
+      clang->gcc wrapper; negative control re-proven against 580acce
+      files (rc=1). RESEARCH.md section 9 updated.

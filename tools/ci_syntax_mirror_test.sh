@@ -15,12 +15,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-extract_cmd() { # $1 = step name to locate; prints its `run: |` block
+extract_cmd() { # $1 = step name to locate (plain text, matched with index())
   # mawk-portable awk (no match()/RSTART, no [[:space:]]): counts leading
   # blanks via gsub+length; a block ends at the first non-blank line whose
   # indent drops below the first content line's indent.
   awk -v pat="$1" '
-    !in_step && $0 ~ "name: " pat { in_step = 1; next }
+    !in_step && index($0, "name: " pat) > 0 { in_step = 1; next }
     in_step && $1 == "run:" && $2 == "|" { in_run = 1; next }
     in_run && /^[ 	]*$/      { next }
     in_run {
@@ -39,8 +39,8 @@ extract_cmd() { # $1 = step name to locate; prints its `run: |` block
 
 fail() { echo "CI-SYNTAX-MIRROR: FAIL - $1"; exit 1; }
 
-gcc_cmd=$(extract_cmd "Syntax check \(gcc")
-clang_cmd=$(extract_cmd "Syntax check \(clang")
+gcc_cmd=$(extract_cmd "Syntax check (gcc")
+clang_cmd=$(extract_cmd "Syntax check (clang")
 [ -n "$gcc_cmd" ] || fail "could not parse the gcc syntax-check command from ci.yml (step renamed or missing?)"
 nfiles=$(printf '%s\n' "$gcc_cmd" | grep -oE '[A-Za-z0-9_./-]+\.c\b' | sort -u | wc -l)
 [ "$nfiles" -ge 3 ] || fail "parsed command references only $nfiles .c files - parse is vacuous"
