@@ -103,6 +103,24 @@
 # reader's refusal of a GGUF file now carries the GGUF magic by name
 # (E_MAGIC + "GGUF" in the message), closing the boundary between the
 # .hydra2 container and the GGUF import paths. 120 -> 122.
+#
+# 2026-10-26 (M4 SIMD completion): +6 x86-ONLY checks (AVX2
+# tf_row_dot parity: the v3/v4 projection hot path now has an AVX2
+# kernel (src/hydra_simd.h, dispatched from tf_row_dot) - the tests
+# compare it against an independent scalar reference over 8 dims x 256
+# LCG cases with FULL int8 range in an x buffer allocated EXACTLY dim
+# bytes (the engine's state layout, which is what catches out-of-range
+# 8/16-byte loads), the 4-code table sweep pinned at +/-dim*127, and
+# the sign-extreme case). These compile only into -mavx2 builds and
+# print SKIP on non-AVX2 CPUs, so x86 = 219 + 6 = 225 (re-measured on
+# an AVX2 CPU) and ARM is unchanged by this block at 228.
+#
+# 2026-10-26 (M4 SIMD completion, NEON twin): +6 ARM-ONLY checks
+# (test_neon_tf_row_dot: identical design for the NEON kernel in
+# src/hydra_neon.h - 7 dims x 256 LCG cases with full int8 range in an
+# exactly-dim x buffer, 4-code table sweep at +/-dim*127, sign extreme;
+# guard __ARM_NEON, so armeabi-v7a is covered). ARM = 228 + 6 = 234
+# (re-measure on the ARM CI leg); x86 stays at 225.
 
-x86: 219
-arm: 228
+x86: 225
+arm: 234

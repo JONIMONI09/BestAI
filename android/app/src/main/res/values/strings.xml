@@ -56,6 +56,7 @@
     <!-- Magic-specific messages: the hex value alone never told anybody what
          they actually picked. -->
     <string name="err_magic_gguf">this is a GGUF model (llama.cpp / Ollama). The engine reads .hydra files. Convert it on the desktop with tools/gguf_to_hydra.py (or POST /api/models/import in the web console) and import the resulting .hydra here.</string>
+    <string name="err_magic_hydra2">this is a .hydra2 container (the \"HYDRA2\" magic, docs/FORMAT-V2.md). The Android engine reads v1 .hydra files; the .hydra2 sparse-MoE container is host-side tooling. Convert it on the desktop first - the app cannot run it.</string>
     <string name="err_magic_zip">this looks like a .zip archive, not a .hydra model</string>
     <string name="err_magic_elf">this looks like a compiled binary, not a .hydra model</string>
     <string name="err_magic_png">this looks like an image, not a .hydra model</string>

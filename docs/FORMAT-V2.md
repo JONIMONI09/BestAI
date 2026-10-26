@@ -89,6 +89,18 @@ Stated precisely, with the boundary between implemented and not:
   / slot leasing of section 6.2, prefetch of section 6.4, and every
   `B_eff`/throughput number in section 6, which remain **NOT MEASURED**.
   No `.hydra2` inference result may be quoted.
+- **SIMD status (2026-10-26).** The transformer formats v3/v4 (the engine's
+  per-layer ternary projections) compute their inner product through
+  `tf_row_dot`, which is **integer-exact** and has AVX2 and NEON kernels
+  (`src/hydra_simd.h` / `src/hydra_neon.h`, dispatched in
+  `src/hydra_engine.c` — `AGENTS.md` §2.1): x86 and ARM runs of a v3/v4
+  model are bit-identical token streams, pinned by parity tests. Two
+  deliberate scope decisions: the container's own arithmetic — the expert
+  top-k routing (`hydra2_route_top_k`, O(k²·n) with a double softmax) — is
+  scalar **by design**, because it is selection/ordering without
+  data-parallel arithmetic (SIMD has no correct form there), and the float
+  parts of v3/v4 (RMSNorm/RoPE/SwiGLU) stay scalar so the pinned token
+  streams are not broken by reassociation.
 - The **Q8_0 decoder** that appears in §3.2 is real code, but it belongs to the
   **GGUF import path** (`tools/gguf_reader.py`, feeding
   `tools/gguf_to_hydra.py`). It is a Python reader for somebody else's file

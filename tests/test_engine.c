@@ -664,6 +664,28 @@ static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
 }
 #endif /* HYDRA_NEON_V2_UNPACK || __AVX2__ */
 
+#if defined(__AVX2__) || defined(__ARM_NEON)
+/* Independent scalar reference for the transformer-format 2-bit row
+ * dot: one row byte carries four 2-bit codes (code of dim d is
+ * row[d/4] >> 2*(d%4) & 3), T3 = {0, 1, -1, 0}. Mirrors the engine's
+ * scalar decode, written here so the AVX2/NEON parity tests compare
+ * against a reference that does not share code with the kernels. */
+static int32_t ref_tf_row_dot(const uint8_t *row, const int8_t *x,
+                              uint32_t dim)
+{
+    static const int8_t T3[4] = {0, 1, -1, 0};
+    int32_t acc = 0;
+    for (uint32_t b = 0; b < dim; b += 4) {
+        const uint32_t by = row[b / 4];
+        acc += (int32_t)T3[by & 0x03u] * (int32_t)x[b];
+        acc += (int32_t)T3[(by >> 2u) & 0x03u] * (int32_t)x[b + 1];
+        acc += (int32_t)T3[(by >> 4u) & 0x03u] * (int32_t)x[b + 2];
+        acc += (int32_t)T3[(by >> 6u) & 0x03u] * (int32_t)x[b + 3];
+    }
+    return acc;
+}
+#endif /* __AVX2__ || __ARM_NEON */
+
 #ifdef __ARM_NEON
 /* Skalare Referenzimplementierung von step() — unabhaengig vom NEON-Pfad.
  * Wird im selben Build gegen die Engine gefahren (BUG-1), damit die
@@ -832,6 +854,75 @@ static void test_neon_all_ternary_codes(void)
         }
         unlink(pp);
         unlink(pn);
+    }
+}
+
+/* Parity of the NEON tf_row_dot kernel (the v3/v4 projection hot
+ * path, guard __ARM_NEON so armeabi-v7a is covered too) against the
+ * independent scalar reference - same design as the AVX2 twin:
+ *  - dims 4/8/12/16/32/48/64 (tail-only through 8 full chunks);
+ *  - x buffer allocated EXACTLY dim bytes, like the engine's state
+ *    vectors (the kernel's 8-byte vld1 must not run past it);
+ *  - x spans the full int8 range [-128, 127];
+ *  - all-code sweep pins each of the 4 codes at dim*127 (table AND
+ *    overflow bound in one step);
+ *  - signs stay exact at the extremes.
+ * Runs on the CI ARM leg (QEMU); the kernel is integer-exact, so the
+ * comparison is direct value equality and the pinned v3/v4 streams
+ * stay valid on NEON machines. */
+static void test_neon_tf_row_dot(void)
+{
+    static const uint32_t dims[] = {4, 8, 12, 16, 32, 48, 64};
+    int all_match = 1;
+    for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
+        const uint32_t dim = dims[di];
+        /* = {0}: every byte initialized before the (runtime-bounded)
+         * fill loop below, so uninit analysis sees no path where the
+         * kernel reads an uninitialized element. */
+        uint8_t row[16] = {0};
+        int8_t *x = (int8_t *)malloc(dim); /* exactly dim bytes (engine layout) */
+        if (!x) { perror("malloc"); exit(1); }
+        for (int it = 0; it < 256; ++it) {
+            for (uint32_t i = 0; i < dim / 4; ++i) row[i] = lcg_byte();
+            for (uint32_t i = 0; i < dim; ++i)
+                x[i] = (int8_t)(lcg_byte() - 128u); /* [-128, 127] */
+            const int32_t r = ref_tf_row_dot(row, x, dim);
+            const int32_t a = hydra_neon_tf_row_dot(row, x, dim);
+            if (r != a) all_match = 0;
+        }
+        free(x);
+    }
+    CHECK(all_match,
+          "NEON tf row dot == scalar reference (7 dims x 256 LCG cases, exakt-dim x-Buffer, volle int8-Spanne)");
+
+    for (int code = 0; code < 4; ++code) {
+        const uint32_t dim = 64;
+        uint8_t row[16];
+        int8_t x[64];
+        const uint8_t byte = (uint8_t)(code | (code << 2) | (code << 4) | (code << 6));
+        for (uint32_t i = 0; i < dim / 4; ++i) row[i] = byte;
+        for (uint32_t i = 0; i < dim; ++i) x[i] = 127;
+        const int32_t r = ref_tf_row_dot(row, x, dim);
+        const int32_t a = hydra_neon_tf_row_dot(row, x, dim);
+        if (code == 1)
+            CHECK(a == r && a == 64 * 127,
+                  "NEON tf row dot: code 01 -> +dim*127, Sweep/Extrem exakt");
+        else if (code == 2)
+            CHECK(a == r && a == -64 * 127,
+                  "NEON tf row dot: code 10 -> -dim*127, Sweep/Extrem exakt");
+        else
+            CHECK(a == r && a == 0,
+                  "NEON tf row dot: code 00/11 (reserved) -> 0, Sweep/Extrem exakt");
+    }
+
+    {
+        const uint32_t dim = 64;
+        uint8_t row[16];
+        int8_t x[64];
+        for (uint32_t i = 0; i < dim / 4; ++i) row[i] = 0xAA; /* code 10 in all slots */
+        for (uint32_t i = 0; i < dim; ++i) x[i] = -127;
+        CHECK(hydra_neon_tf_row_dot(row, x, dim) == 64 * 127,
+              "NEON tf row dot: code 10 x -127 -> +dim*127, Vorzeichen exakt");
     }
 }
 
@@ -1877,6 +1968,90 @@ static void test_avx2_v2_unpack(void)
             CHECK(ok, "AVX2 v2 unpack: code 00 -> 0 in all 4 slots/dim, Tafel exakt");
         else
             CHECK(ok, "AVX2 v2 unpack: code 11 (reserved) -> 0 in all 4 slots/dim, Tafel exakt");
+    }
+}
+
+/* tf_row_dot is the hot path of every v3/v4 projection (384 calls per
+ * token at dim 64), so its parity is proven against the independent
+ * scalar reference over random AND structured inputs:
+ *  - dims 4/8/12/16/20/32/48/64 cover tail-only, one chunk, mixed
+ *    chunk+tail and 8 full chunks;
+ *  - the x buffer is allocated EXACTLY dim bytes, like the engine's
+ *    state vectors - the kernel's 8/16-byte loads must not run past
+ *    it (the ASan leg of this test is what the OOB loads were caught
+ *    by, 2026-10-26);
+ *  - x spans the FULL int8 range [-128, 127];
+ *  - the all-code sweep pins each of the 4 codes at every slot
+ *    (table integrity, incl. the reserved code 11 -> 0);
+ *  - the extremes pin dim * 127 (the integer-exact overflow bound).
+ * Because the kernel is integer-exact (no float reassociation), the
+ * comparison is a direct value equality - and the pinned v3/v4 token
+ * streams stay valid on AVX2 machines. */
+static void test_avx2_tf_row_dot(void)
+{
+    if (!hydra_simd_has_avx2()) {
+        printf("SKIP: AVX2 tf row dot (build is -mavx2, CPU lacks AVX2)\n");
+        return;
+    }
+
+    /* Random parity: 256 iterations per dim, LCG (fixed seed R22). */
+    static const uint32_t dims[] = {4, 8, 12, 16, 20, 32, 48, 64};
+    int all_match = 1;
+    for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
+        const uint32_t dim = dims[di];
+        /* = {0}: every byte initialized before the (runtime-bounded)
+         * fill loop below, so uninit analysis sees no path where the
+         * kernel reads an uninitialized element. */
+        uint8_t row[16] = {0};
+        int8_t *x = (int8_t *)malloc(dim); /* exactly dim bytes (engine layout) */
+        if (!x) { perror("malloc"); exit(1); }
+        for (int it = 0; it < 256; ++it) {
+            for (uint32_t i = 0; i < dim / 4; ++i) row[i] = lcg_byte();
+            for (uint32_t i = 0; i < dim; ++i)
+                x[i] = (int8_t)(lcg_byte() - 128u); /* [-128, 127] */
+            const int32_t r = ref_tf_row_dot(row, x, dim);
+            const int32_t a = hydra_avx2_tf_row_dot(row, x, dim);
+            if (r != a) all_match = 0;
+        }
+        free(x);
+    }
+    CHECK(all_match,
+          "AVX2 tf row dot == scalar reference (8 dims x 256 LCG cases, exakt-dim x-Buffer, volle int8-Spanne)");
+
+    /* All-code sweep: one code in every slot against x = 127 must
+     * give T3[code] * dim * 127 - the table itself, pinned per code,
+     * AND the integer overflow bound (+/-dim*127, hand-computed) in
+     * the same step. The reserved code 11 must behave like 00. */
+    for (int code = 0; code < 4; ++code) {
+        const uint32_t dim = 64;
+        uint8_t row[16];
+        int8_t x[64];
+        const uint8_t byte = (uint8_t)(code | (code << 2) | (code << 4) | (code << 6));
+        for (uint32_t i = 0; i < dim / 4; ++i) row[i] = byte;
+        for (uint32_t i = 0; i < dim; ++i) x[i] = 127;
+        const int32_t r = ref_tf_row_dot(row, x, dim);
+        const int32_t a = hydra_avx2_tf_row_dot(row, x, dim);
+        if (code == 1)
+            CHECK(a == r && a == 64 * 127,
+                  "AVX2 tf row dot: code 01 -> +dim*127, Sweep/Extrem exakt");
+        else if (code == 2)
+            CHECK(a == r && a == -64 * 127,
+                  "AVX2 tf row dot: code 10 -> -dim*127, Sweep/Extrem exakt");
+        else
+            CHECK(a == r && a == 0,
+                  "AVX2 tf row dot: code 00/11 (reserved) -> 0, Sweep/Extrem exakt");
+    }
+
+    /* The remaining extreme: weights -1 against x = -127 ->
+     * +dim*127 the other way (signs must stay sign-exact). */
+    {
+        const uint32_t dim = 64;
+        uint8_t row[16];
+        int8_t x[64];
+        for (uint32_t i = 0; i < dim / 4; ++i) row[i] = 0xAA; /* code 10 in all slots */
+        for (uint32_t i = 0; i < dim; ++i) x[i] = -127;
+        CHECK(hydra_avx2_tf_row_dot(row, x, dim) == 64 * 127,
+              "AVX2 tf row dot: code 10 x -127 -> +dim*127, Vorzeichen exakt");
     }
 }
 #endif /* __AVX2__ */
@@ -3732,6 +3907,7 @@ int main(void)
 #ifdef __ARM_NEON
     test_neon_matches_scalar();
     test_neon_all_ternary_codes();
+    test_neon_tf_row_dot();
     /* The v2 unpack tests need the AArch64-only kernel (see
      * HYDRA_NEON_V2_UNPACK in src/hydra_neon.h); on 32-bit ARM the
      * engine has no kernel to cross-check, so they are compiled out. */
@@ -3754,6 +3930,7 @@ int main(void)
 #if defined(__AVX2__)
     test_avx2_step_kernel();
     test_avx2_v2_unpack();
+    test_avx2_tf_row_dot();
 #endif
     test_sampler_greedy_guard();
     test_sampler_repetition_penalty();

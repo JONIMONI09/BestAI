@@ -2356,3 +2356,81 @@
   that is more permissive than the consumer (here: PyYAML vs the
   GitHub compiler) will always accept what the consumer rejects; the
   validator has to model the STRICTEST consumer, not the common one.
+
+## 2026-10-26 (R11) — the `Number(null) === 0` coercion: a NaN-serialized field passed validation as temperature 0
+- **Symptom:** R11-B live HTTP test (`node --test tools/server_test.js`,
+  the NEW sampler suite) sent `{temperature: NaN}` —
+  `JSON.stringify` serializes NaN as `null` — and the `/api/infer`
+  v1 path, which validated with `Number(body.temperature)`, accepted
+  it: `Number(null) === 0` → temperature 0 → greedy run, no 400.
+- **Cause:** `Number()` is a COERCION, not a validation: it maps
+  `null → 0`, `"" → 0`, `"5abc" → NaN`, `"1e2" → 100`. The v1 sampler
+  code inherited the pattern from older numeric fields where the
+  coercion happened to be safe.
+- **Fix:** strict validation in `server.js`:
+  `typeof v !== 'number' || !Number.isFinite(v)` (repWindow
+  additionally `!Number.isInteger(v)`). The contract gate
+  `tools/sampler_contract_check.sh` pins the rule cross-surface, and
+  the 400 bad-value suite (17 values) includes the null/NaN cases.
+- **Prevention:** any `Number(x)` on request data is a bug candidate:
+  validate the TYPE first (`typeof` + `isFinite`/`isInteger`), never
+  coerce-then-check. The server test suite now carries the
+  NaN-serialized-field case as a permanent regression (R25-style:
+  the test that caught it ships with the fix).
+
+## 2026-10-26 (R11) — the tf_row_dot SIMD kernel: four independent bugs in one draft, each caught by a different gate
+- **Symptom:** first AVX2/NEON draft of `hydra_avx2_tf_row_dot`
+  compiled clean, but `hydra-test` went 219 → 2 FAIL (the pinned v3
+  Flip dim-16 token stream and the v4 Attention dim-8 KV run) and
+  `/tmp/par_check.c` (scalar reference + LCG, dims 4..64 × 2000)
+  mismatched at dim 8: row=[0x9b,0x1b], x=[64,−63,59,87,87,−51,115,−89]
+  → hand/skalar 201 vs kernel 87.
+- **Bug 1 (caught by the pinned stream tests + hand math):** the draft
+  treated one row byte as TWO nibble codes and loaded 4 row bytes per
+  8-dim chunk. The format packs **four 2-bit codes per byte** (code of
+  dim d is `row[d/4] >> 2·(d%4) & 3`), so an 8-dim chunk owns exactly
+  **2** row bytes + 8 state bytes.
+- **Bug 2 (caught by the parity sweep after Bug 1's fix):** the 16-bit
+  high-nibble trick `or(srli_epi16(rm,4), srli_epi16(srli_si128(rm,1),4))`
+  ORs the NEXT byte's high nibble back into the current byte's low
+  position (`0x09 | 0x05 = 0x0D` for V=[0x94,0x56]). The 0xF0 mask
+  already makes the plain `srli_epi16(V & 0xF0, 4)` clean — the second
+  term was not just unnecessary, it was corrupting.
+- **Bug 3 (caught by intermediate-value dumps):** `_mm_unpacklo_epi8`
+  interleaves **8 bytes from each operand** (16 output bytes), not 4.
+  The 8-byte row load therefore carries the NEXT chunk's row data
+  (bytes 2..7 of the load) into this chunk's interleave: V[4..5] reach
+  p0[8..11], colliding with the shifted q0 region in the OR. Dims ≤ 16
+  passed only because the zero padding of the row copy happened to
+  cover the leak. Fix: mask both nibble vectors down to the chunk's
+  own 2 bytes (`chunk2` mask) before any pshufb table lookup.
+- **Bug 4 (caught by ASan):** two out-of-range loads: (a) the row load
+  at dim 64 / b = 56 reads 6 bytes past a 16-byte row copy; (b)
+  `_mm_loadu_si128(x + b)` reads 16 bytes where a dim-sized state
+  buffer leaves only 8. Both fixed with zero-padded copies sized for
+  the load (row: dim/4+8 ≤ 24, x: dim+8 ≤ 72) — the padding decodes
+  to code 0 / never multiplies, but the loads must stay in range.
+- **NEON twin (caught by the zig aarch64 compile gate, which runs
+  locally per Environment.md instead of being deferred to CI):**
+  `vshl_n_u8(x, -4)` (GNU spelling, not in zig's arm_neon.h),
+  `vcreate_s8` called with 4 args (it is a SINGLE-lane constructor —
+  8-lane vectors are built from a byte array + `vld1_s8`),
+  `vceqq_u8` on 64-bit vectors (the q-suffix is 128-bit on every
+  toolchain; use `vceq_u8`), `vaddq_lane_s32` (not portable;
+  `vsetq_lane_s32` + `vaddq_s32`).
+- **Fix state:** `src/hydra_simd.h` / `src/hydra_neon.h` rewritten
+  accordingly; `/tmp/par_check.c` ALL OK (32 000 random cases, full
+  int8 range, x allocated EXACTLY dim bytes) and ASan-clean;
+  `hydra-test` 225/225 x86 (pinned streams re-verified);
+  zig aarch64 full compile (engine + tests) rc=0; NEON runtime proof
+  on the CI ARM leg (no QEMU in the sandbox — said so, never a green
+  that wasn't run).
+- **Prevention:** (1) hand-compute ONE small case before vectorizing —
+  the dim-8 hand math is the oracle that localized every bug; (2)
+  print intermediates (V/n0/n1/E/C/T/W/acc per chunk) instead of
+  guessing from the final value; (3) the parity harness must use the
+  CALLER's exact buffer sizes (x exactly dim bytes) or it proves the
+  wrong thing; (4) a SIMD header is recompiled after EVERY edit
+  (zig for the NEON side, since there is no local ARM runtime);
+  (5) the pinned token-stream tests are the real regression gate for
+  kernel swaps — they caught Bug 1 before the parity test existed.

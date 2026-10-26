@@ -6,6 +6,7 @@
 #include <math.h>
 #include "hydra_model.h"
 #include "hydra_batch.h"
+#include "hydra_sample_cfg.h"
 
 #define TAG "HydraJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -360,17 +361,22 @@ Java_dev_hydrastone_HydraBridge_runInferenceSampled(
     const float temp = (float)temperature;
     const float mp = (float)minP;
     const float rp = (float)repPenalty;
-    if (!isfinite(temp) || temp < 0.0f || temp > 20.0f) {
-        return (*env)->NewStringUTF(env,
-            "{\"ok\":false,\"error\":\"temperature out of range (0..20, 0 = greedy)\"}");
-    }
-    if (!isfinite(mp) || mp < 0.0f || mp > 1.0f) {
-        return (*env)->NewStringUTF(env,
-            "{\"ok\":false,\"error\":\"min-p out of range (0..1)\"}");
-    }
-    if (!isfinite(rp) || rp < 1.0f) {
-        return (*env)->NewStringUTF(env,
-            "{\"ok\":false,\"error\":\"repetition-penalty must be >= 1.0\"}");
+    /* The range rules live in hydra_sample_cfg.h (the same header the
+     * host test compiles); this file only maps the result to the JSON
+     * error the user sees. Check order is the header's contract order. */
+    const int scfg = hydra_sample_cfg_validate(temp, mp, rp);
+    if (scfg != HYDRA_SAMPLE_OK) {
+        const char *err =
+            (scfg == HYDRA_SAMPLE_BAD_TEMP)
+                ? "temperature out of range (0..20, 0 = greedy)"
+                : (scfg == HYDRA_SAMPLE_BAD_MINP)
+                      ? "min-p out of range (0..1)"
+                      : "repetition-penalty must be >= 1.0";
+        LOGE("runInferenceSampled rejected: %s (temp=%f minP=%f rp=%f)",
+             err, temp, mp, rp);
+        char out[160];
+        snprintf(out, sizeof(out), "{\"ok\":false,\"error\":\"%s\"}", err);
+        return (*env)->NewStringUTF(env, out);
     }
 
     /* A cancel pressed between two runs must not kill this one. */

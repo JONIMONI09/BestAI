@@ -12,6 +12,22 @@ A whole token sequence can be fed in as a prompt — every token before the last
 ./hydra-run my_model.hydra 0 16 --prompt 7,9,11 --json
 ```
 
+**Sampler flags** (the same four parameters the web console and the Android
+app expose — one validation contract, pinned by
+`tools/sampler_contract_check.sh`):
+
+| Flag | Range | Default | Effect |
+|---|---|---|---|
+| `--temp <f>` | finite float; the engine rejects > 20 at step time | `0` | sampling temperature; `0` = greedy |
+| `--min-p <f>` | `[0, 1]` | `0` | nucleus filter; `1` disables sampling |
+| `--rep-penalty <f>` | `>= 1.0` | `1.0` | repetition penalty (`1.0` = off) |
+| `--rep-window <n>` | `0 .. 4096` | `64` | tokens the penalty looks back over |
+| `--seed <n>` | `0 .. 4294967295` | `0` | sampler RNG seed (fixed seed → reproducible stream) |
+
+The defaults are the **greedy guard**: a plain invocation is
+bit-identical to the pre-sampling CLI, and sampling activates only when
+`temperature > 0` **and** `min_p < 1`.
+
 Hydra-Stone is a C99 engine that maps a `.hydra` file of ternary weights ({-1, 0, +1}) read-only via `mmap` and **aggregates them once at load time**. The inference step then consists purely of integer additions.
 
 **Memory claim, stated honestly:** the engine performs **no heap allocation for weights** — `src/hydra_engine.c` contains no `malloc`/`calloc`/`realloc` at all, only `mmap`/`madvise`. What it does use is a **fixed working set that does not grow with model size**:

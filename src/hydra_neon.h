@@ -31,6 +31,7 @@
 #define HYDRA_USE_NEON 1
 #include <arm_neon.h>
 #include <stdint.h>
+#include <string.h>
 
 /* The in-register version-2 plane unpack below uses the 128-bit
  * table-lookup intrinsic vqtbl1q_u8, which exists only in the AArch64
@@ -231,5 +232,112 @@ static inline void hydra_neon_unpack_v2_plane(
 }
 
 #endif /* HYDRA_NEON_V2_UNPACK */
+
+/* Transformer-format (v3/v4) core: the 2-bit ternary row dot
+ *     sum_b T3[code(b)] * x[b],  code(b) = row byte b/4, bits 2*(b%4)
+ * that every per-layer projection (Wg/Wu in v3, Wg/Wu/Wq/Wk/Wv plus
+ * W_out in v4) is made of. NEON counterpart of hydra_avx2_tf_row_dot
+ * (src/hydra_simd.h) - same chunking: one row byte carries FOUR 2-bit
+ * codes, so 8 dims take 2 row bytes + 8 state bytes; same scalar tail
+ * for dim % 8 == 4.
+ *
+ * INTEGER EXACT, bit-for-bit the scalar loop: the 2-bit codes come out
+ * of the same bit positions the scalar loop reads (nibble & 3 / >> 2
+ * & 3 - pure ALU, no lookup table at all, which is what also keeps
+ * this on ARMv7-A where the 8-byte vtbl1_u8 cannot hold a 16-entry
+ * table), vsub/vadd assemble T3 = {0, 1, -1, 0} from equality masks,
+ * vmovl_s8 keeps every value in its native range, and vmlal_s16
+ * (signed x signed -> int32) plus the 4-lane sum cannot overflow
+ * (worst case dim 64: 64 * 127 = 8128). No float reassociation, so the
+ * parity suite (tests/test_engine.c) can memcmp against the scalar
+ * reference and the pinned v3/v4 streams stay valid.
+ *
+ * dim % 4 == 0 is the loader's contract for v3/v4 (tf_layer_bytes), so
+ * row has exactly dim/4 bytes (<= 16). dim runs from 4 to
+ * HYDRA_EMBED_DIM. */
+static inline int32_t hydra_neon_tf_row_dot(const uint8_t *row,
+                                            const int8_t *x,
+                                            uint32_t dim)
+{
+    const uint8x8_t m3 = vdup_n_u8(0x03);
+    int32x4_t acc = vdupq_n_s32(0);
+
+    /* Zero-filled row copy. The per-chunk row read is 8 bytes wide
+     * (one 64-bit register) even though a chunk owns 2 row bytes, so
+     * the buffer must hold dim/4 + 8 (worst case dim 64: 16 + 8 = 24)
+     * - only lanes 0/1 of the read are used, and the padding is 0
+     * (code 0 / weight 0). */
+    uint8_t rp[24];
+    memset(rp, 0, sizeof(rp));
+    memcpy(rp, row, dim / 4);
+
+    uint32_t b = 0;
+    for (; b + 8 <= dim; b += 8) {
+        /* 2 row bytes = 8 codes; 8 state bytes = 8 x's. The row byte
+         * for dim d is row[d/4] (4 dims per byte), so the chunk's two
+         * row bytes sit at b/4 - the load is 8 bytes wide (one 64-bit
+         * NEON register), but only lanes 0/1 are ever read below. */
+        uint8_t rb[8];
+        memcpy(rb, rp + (b / 4), 8);
+        uint8x8_t V = vld1_u8(rb);
+        int8x8_t xv = vld1_s8(x + b);
+        /* The two nibbles of the two row bytes. vshr_n_u8 is the
+         * portable per-byte shift (the vshl_n_u8(x, -n) spelling is
+         * a GNU extension and not accepted by every toolchain's
+         * arm_neon.h). */
+        uint8x8_t n0 = vand_u8(V, vdup_n_u8(0x0F));
+        uint8x8_t n1 = vshr_n_u8(V, 4);
+        /* Codes of the 8 dims, two at a time:
+         *   E0 = [c0, c4, ...], E1 = [c1, c5, ...]
+         *   C0 = [c2, c6, ...], C1 = [c3, c7, ...]
+         * (padding bytes hold nibble 0 -> code 0.) */
+        uint8x8_t E0 = vand_u8(n0, m3);
+        uint8x8_t C0 = vand_u8(n1, m3);
+        uint8x8_t E1 = vand_u8(vshr_n_u8(n0, 2), m3);
+        uint8x8_t C1 = vand_u8(vshr_n_u8(n1, 2), m3);
+        /* w = [c0, c1, c2, c3, c4, c5, c6, c7] from the four
+         * [c?, c?, 0, ...] vectors: low 2 bytes of each, in order
+         * (vld1_s8 from a byte array - the portable way to build an
+         * 8-lane vector from scalars). */
+        const int8_t warr[8] = {
+            (int8_t)vget_lane_u8(E0, 0), (int8_t)vget_lane_u8(E1, 0),
+            (int8_t)vget_lane_u8(C0, 0), (int8_t)vget_lane_u8(C1, 0),
+            (int8_t)vget_lane_u8(E0, 1), (int8_t)vget_lane_u8(E1, 1),
+            (int8_t)vget_lane_u8(C0, 1), (int8_t)vget_lane_u8(C1, 1)
+        };
+        int8x8_t Wc = vld1_s8(warr);
+        /* T3 = {0, 1, -1, 0} from equality masks: +1 where code 1
+         * (the 0xFF mask is -1 as int8, negated), -1 where code 2.
+         * vceq_u8 (not vceqq_u8) is the 64-bit form - the q-suffixed
+         * intrinsic takes 128-bit vectors on every toolchain. */
+        const int8x8_t pos =
+            vreinterpret_s8_u8(vceq_u8(vreinterpret_u8_s8(Wc), vdup_n_u8(1)));
+        const int8x8_t neg =
+            vreinterpret_s8_u8(vceq_u8(vreinterpret_u8_s8(Wc), vdup_n_u8(2)));
+        int8x8_t w = vsub_s8(vneg_s8(pos), vand_s8(neg, vdup_n_s8(1)));
+        /* Widen signed and two-products-per-lane, both 4-lane halves:
+         * [w0*x0 + w1*x1, w2*x2 + w3*x3, w4*x4 + w5*x5, w6*x6 + w7*x7]. */
+        int16x8_t w16 = vmovl_s8(w);
+        int16x8_t x16 = vmovl_s8(xv);
+        acc = vmlal_s16(acc, vget_low_s16(w16), vget_low_s16(x16));
+        acc = vmlal_s16(acc, vget_high_s16(w16), vget_high_s16(x16));
+    }
+    for (; b < dim; b += 4) {
+        /* The tail (dim % 8 == 4, i.e. dims 4, 12, 20, ...) is a single
+         * 4-dim unit: decode it the scalar way into a lane. */
+        const uint32_t by = row[b / 4];
+        const int8_t T3[4] = {0, 1, -1, 0};
+        int32_t t = 0;
+        t += (int32_t)T3[by & 0x03u] * (int32_t)x[b];
+        t += (int32_t)T3[(by >> 2u) & 0x03u] * (int32_t)x[b + 1];
+        t += (int32_t)T3[(by >> 4u) & 0x03u] * (int32_t)x[b + 2];
+        t += (int32_t)T3[(by >> 6u) & 0x03u] * (int32_t)x[b + 3];
+        acc = vaddq_s32(acc, vsetq_lane_s32(t, vdupq_n_s32(0), 0));
+    }
+
+    return vgetq_lane_s32(acc, 0) + vgetq_lane_s32(acc, 1)
+         + vgetq_lane_s32(acc, 2) + vgetq_lane_s32(acc, 3);
+}
+
 #endif /* __ARM_NEON */
 #endif /* HYDRA_NEON_H */

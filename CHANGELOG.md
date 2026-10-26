@@ -2,6 +2,82 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-26 (round 11) — post-merge audit: sampler contract across all surfaces, .hydra2 Android validation, and the tf_row_dot SIMD completion (M1–M5)
+
+1. **One sampler validation contract across C, JNI and the web
+   console (M1).** `android/app/src/main/cpp/hydra_sample_cfg.h` is
+   now the single source for the sampler ranges (temp 0..20, min_p
+   0..1, rep-penalty >= 1.0, rep-window 0..4096), the validation
+   order (temp → min_p → rep; first invalid wins), the rejection
+   codes and the greedy defaults (0/0/1.0/64). `hydra_jni.c` calls
+   it (with a LOGE + JSON error payload); the CLI and `server.js`
+   keep their own (documented) stricter/sparser variants. New gate
+   `tools/sampler_contract_check.sh` (34 checks) cross-checks C
+   header vs JNI header vs server.js constants, including a drift
+   negative control ("C header '25.0' vs server.js '20'");
+   `tests/test_jni_batch.c` gained 23 checks (boundaries, 14
+   rejections incl. NaN/±Inf/first-invalid-wins, pinned defaults):
+   86 → **109**.
+2. **The web console speaks sampler (M2).** `server.js` validates
+   all four sampler fields strictly (`typeof v !== 'number' ||
+   !Number.isFinite(v)`; the window must additionally be an integer)
+   and appends `--temp/--min-p/--rep-penalty/--rep-window` to the
+   `hydra-run` invocation **only when the field is present** — a
+   field-less request is bit-identical to the pre-sampler CLI. The
+   console got a sampler section (`public/index.html` +
+   `public/app.js`, which sends only non-default values). This
+   caught a real server bug: `Number(null) === 0` had let a
+   `NaN`-serialized field pass as temperature 0 — now 400.
+   `tools/server_test.js`: 37 → **43** (bit-parity
+   legacy==temp-0, the deterministic stream does change when
+   temp/min_p are set, reproducibility, all four flags, boundaries,
+   the 400 bad-value suite). `tools/hydra_train.js` deliberately
+   untouched (deterministic hill-climbing, no sampling).
+3. **The Android header check validates .hydra2 next to .hydra
+   (M3).** `MainActivity.kt` now carries
+   `HYDRA2_TAIL_U32 = 0x00003241L` (the little-endian u32 of
+   `HYDRA2_MAGIC_STR` bytes 4..7) and a dedicated
+   `HeaderRule("format", …)` with `err_magic_hydra2` in
+   `strings.xml` — a `.hydra2` file is named as such instead of
+   failing the generic version rule. `tools/android_header_check.sh`
+   gained 7 checks incl. two **computed cross-surface** pins
+   (python3 recomputes the Kotlin constants from the C magic
+   strings), 21 → **28**; the negative control (a wrong tail)
+   fails as required. The Kotlin stub check
+   (`tools/kotlin_stub_check`) got the matching `R_gen.kt` stub and
+   stays green (kotlinc via the Environment.md recipe).
+4. **The v3/v4 transformer hot path is now SIMD on x86 and ARM
+   (M4).** `tf_row_dot` (384 calls/token at dim 64) dispatches to a
+   new **AVX2 kernel** (`src/hydra_simd.h`: 8 dims/chunk from 2 row
+   bytes, nibble split, two 16-entry `pshufb` code tables, a fixed
+   permutation, T3 through `pshufb`, `madd_epi16`) and a new
+   **NEON kernel** (`src/hydra_neon.h`: same chunking, per-byte
+   `vshr_n_u8` extraction without lookup tables, T3 from `vceq_u8`
+   masks, `vmovl_s8` + two `vmlal_s16`), with the scalar loop as
+   fallback. Both are **integer-exact** (lane-bound 2·127, total
+   bound 64·127 = 8128), so AVX2/NEON builds produce bit-identical
+   token streams — the pinned v3/v4 reference streams stayed valid
+   without re-pinning (the two pinned stream tests are exactly what
+   caught the first kernel draft). New parity tests
+   (`test_avx2_tf_row_dot`, `test_neon_tf_row_dot`): independent
+   scalar reference, full int8 range, x buffer allocated **exactly
+   dim bytes** (the engine's state layout — this is what caught the
+   two out-of-range loads, verified under ASan), 4-code table sweep
+   at ±dim·127: x86 219 → **225**, ARM 228 → **234**
+   (baseline updated in the same commit). The float parts of v3/v4
+   and the container's top-k routing stay scalar by design
+   (documented scope, `AGENTS.md` §2.1).
+5. **CI wiring + docs (M5).** The `jni-signatures` job gained the
+   two new gate steps (sampler contract + JNI signature negative
+   control, SKIP-safe without javac); `tools/workflow_yaml_check.sh`
+   re-validated all 5 workflows. `AGENTS.md` §2.1 now documents the
+   v3/v4 format, the SIMD dispatch and the documented-scope
+   decisions; §3 carries the new counts (jni-batch 109,
+   server_test 43) and the two new gates. `README.md` documents the
+   CLI sampler flags and their contract. The v1 starter baseline
+   `[471 386 385 386 385 386 385 386]` is re-verified
+   byte-identical.
+
 ## 2026-10-26 (round 10) — the documented smoke recipe bug, the all-.md English pass, real-model verification, the opt-in real-model gate
 
 1. **The documented §11.4 smoke recipe never ran llama-cli (Qodo

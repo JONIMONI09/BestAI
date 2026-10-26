@@ -84,6 +84,45 @@ tail and the whole x86 path share one code shape. `hydra_engine_step_fast()`
 is a token-only path whose stale-state contract is documented in
 `include/hydra_model.h` and tested in `tests/test_engine.c`.
 
+**Format versions 3/4 (transformer) and their SIMD path.** v3 (2026-10-26,
+`docs/FORMAT-V2.md` §roadmap + the v3 sections of `tests/test_engine.c`)
+and v4 (full per-layer attention: Wq/Wk/Wv + causal scaled dot-product on
+top of v3) replace the recurrent core with per-layer ternary
+projections (Wg/Wu in v3; +Wq/Wk/Wv and W_out in v4) driven by a
+transformer state. Their inner product is `tf_row_dot`: for a 2-bit-packed
+weight row (one byte = four codes, code of dim `d` is
+`row[d/4] >> (2·(d%4)) & 3`) it computes `Σ T3[code(b)]·x[b]` with
+`T3 = {0, 1, −1, 0}` — integer-only, no floats.
+
+`tf_row_dot` is the per-projection hot path (384 calls per token at
+dim 64) and is dispatched in `src/hydra_engine.c` to:
+
+- **AVX2** (`src/hydra_simd.h`, compile guard `__AVX2__` + runtime
+  `hydra_simd_has_avx2()`): 8 dims per chunk from 2 row bytes, nibble
+  split + two 16-entry `pshufb` code tables + a fixed permutation, T3
+  through `pshufb`, `cvtepi8_epi16` + `madd_epi16`, 4-dim scalar tail
+  for `dim % 8 == 4`.
+- **NEON** (`src/hydra_neon.h`, guard `__ARM_NEON` — covers
+  armeabi-v7a too): the same 2-row-byte chunking, per-byte `vshr_n_u8`
+  nibble/code extraction (no lookup tables: `vtbl1_u8` holds only 8
+  bytes), T3 from `vceq_u8` equality masks, `vmovl_s8` + two
+  `vmlal_s16` per chunk.
+- **scalar** fallback everywhere else.
+
+All three paths are **integer-exact** (worst case dim 64: 64·127 = 8128,
+lane-bound 2·127), so a SIMD build produces bit-identical token streams
+to the scalar build — the pinned v3/v4 reference streams in
+`tests/test_engine.c` stay valid without re-pinning. Parity is pinned by
+`test_avx2_tf_row_dot` / `test_neon_tf_row_dot` (independent scalar
+reference, full int8 range, x buffer allocated **exactly dim bytes** like
+the engine's state, 4-code table sweep at ±dim·127). The float parts of
+v3/v4 (RMSNorm/RoPE/SwiGLU) are scalar by design — re-associating floats
+would break the pinned streams, and there is no integer-exact SIMD
+equivalent for them. The `.hydra2` container's expert top-k routing
+(`route_top_k`, O(k²·n) with a double softmax) is scalar by design: it is
+selection/ordering, not data-parallel arithmetic, so SIMD has no correct
+form there — this is a documented scope decision, not an omission.
+
 ### 2.2 The GGUF/llama.cpp engine (Android)
 
 `llama_jni.cpp` wraps llama.cpp (pinned submodule) with one global session,
@@ -156,9 +195,14 @@ make test-run                              # RUNS them (test-run, not test)
 
 # 1. Native engine suites
 ./hydra-test                               # expect "N Tests, 0 failures" (N parsed, never assumed)
-./jni-batch-test                           # expect "86 checks, 0 failed" (count parses from output)
+./jni-batch-test                           # expect "109 checks, 0 failed" (count parses from output)
 ./large-model-test                         # 5 GiB sparse model + 32-bit offset refusals
 bash tools/test_count_check.sh ./hydra-test x86   # parsed count vs reviewed baseline (R21)
+bash tools/sampler_contract_check.sh      # C header <-> JNI header <-> server.js sampler
+                                          # contract (34 checks; the C header is the
+                                          # single source for ranges/defaults)
+bash tools/jni_signature_negative_test.sh # the signature gate must be able to fail
+                                          # (SKIP without javac — say so; CI has JDK 17)
 
 # 1b. C/C++ static analysis (mandatory locally on any src//include/ change —
 #     owner rule 2026-10-26: do NOT defer this to CI). Tool install paths
@@ -185,7 +229,9 @@ python3 tools/string_format_check.py               # format-string/specifier con
 bash tools/string_format_negative_test.sh          # the gate must be able to fail (R25)
 
 # 3. Node server, trainer, UI
-node --test tools/server_test.js           # 37 live HTTP tests
+node --test tools/server_test.js           # 43 live HTTP tests (incl. the 6-sampler
+                                           # suite: bit-parity legacy==temp0, flag
+                                           # plumbing, boundaries, 400 bad-value suite)
 node tools/console_train_test.js           # trainer vs the COMPILED engine, bit-for-bit
 node tools/contrast_check.js               # WCAG AA, 17 pairs
 
