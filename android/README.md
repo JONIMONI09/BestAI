@@ -49,11 +49,12 @@ cd android
 gradle assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The APK contains `libhydra.so` (the deterministic engine) and
-`libllama_jni.so` (the imported-GGUF engine, linked against the pinned
-llama.cpp submodule) for `arm64-v8a`, `armeabi-v7a` (the legacy 32-bit
-target from the original spec) and `x86_64` (emulators), plus the
-starter model as an asset.
+The APK contains `libhydra.so` (the deterministic engine) for all configured
+ABIs: `arm64-v8a`, `armeabi-v7a` (the legacy 32-bit target) and `x86_64`
+(emulators). `libllama_jni.so` (the imported-GGUF engine, linked against the
+pinned llama.cpp submodule) is built only for `arm64-v8a` and `x86_64`, as
+configured in CMake; the 32-bit build therefore includes only the Hydra
+engine. The starter model is included as an asset.
 
 ### Import limits
 
