@@ -1851,5 +1851,8 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
 - [x] RESEARCH.md §10 (Darwin inversion root cause + lesson),
       CHANGELOG round-3 entry, PR #55 body rewritten (facts only,
       per owner rule: no conversation/connector content in PRs).
-- [ ] Commit + push + PR (owner merges per R17); watch the new
-      macos-strict-scan job on the PR.
+- [x] Commit + push + PR (owner merges per R17): commit 3a57580,
+      PR #56 opened; macos-strict-scan job runs on the PR for the
+      first time. Note: this session's branch is arena/be94e6b7-bestai
+      (the earlier arena/91276612-bestai remote branch was deleted by
+      GitHub when PR #55 merged).
