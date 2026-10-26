@@ -358,3 +358,15 @@ aarch64 rc=0 (pin active), zig arm-32-bit rc=0 (pin inactive), C++
 parse rc=0, exact CI 1a rc=0, C suites green. Note: the PR tier
 caught this **before merge** - exactly the behaviour the owner asked
 for ("CI findet die Fehler auf dem PR").
+Second red of the same run (android-lint, step 9 "Kotlin-/C-
+Kompilierung"): the **universal** 664-byte compile-time pin broke the
+NDK **armeabi-v7a** build - 32-bit ABIs use the smaller ILP32 layout
+(sizeof != 664), reproduced locally with `zig cc -target
+arm-linux-gnueabihf` (the exact negative-size-array error). Fix: the
+pin is now LP64-conditional (`__LP64__`/`_LP64`/`__LP64`); the
+documented 664 B claim is a 64-bit statement, 32-bit targets
+legitimately compile a smaller layout. Verified: x86-64 rc=0, zig
+aarch64 rc=0 (pin active), zig arm-32-bit rc=0 (pin inactive), C++
+parse rc=0, exact CI 1a rc=0, C suites green. Note: the PR tier
+caught this **before merge** - exactly the behaviour the owner asked
+for ("CI findet die Fehler auf dem PR").

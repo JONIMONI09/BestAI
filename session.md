@@ -1865,3 +1865,11 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       same includes sets the baseline; glibc marker defines measured
       and handled); both branches proven by forced simulation.
       RESEARCH.md section 10 extended.
+- [x] **PR #56 second CI red (android-lint NDK step): fixed.** The
+      universal 664-byte pin broke the armeabi-v7a (32-bit, ILP32)
+      NDK compile - reproduced locally with zig arm-linux-gnueabihf.
+      Fix: LP64-conditional pin (the documented 664 B is a 64-bit
+      statement). All ABIs verified (x86-64, aarch64, arm-32-bit,
+      C++ parse, exact CI 1a) + suites green. RESEARCH.md section 10
+      extended. (The PR tier catching both reds before merge is the
+      intended behaviour.)
