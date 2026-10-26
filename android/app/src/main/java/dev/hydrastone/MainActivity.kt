@@ -655,7 +655,7 @@ class MainActivity : ComponentActivity() {
                     it.copy(modelDetail = detailFor(llamaEngine, file.absolutePath, result))
                 }
                 if (result.ok) {
-                    log(getString(R.plurals.log_context_applied, new.contextSize))
+                    log(getQuantityString(R.plurals.log_context_applied, new.contextSize, new.contextSize))
                 } else {
                     // Say which size was refused: 8192 on a small model is a
                     // real, user-recoverable outcome, not an internal fault.
