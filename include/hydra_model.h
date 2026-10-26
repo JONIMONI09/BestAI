@@ -77,14 +77,22 @@ typedef struct {
     uint64_t rng_state;
 } HydraEngine;
 
-/* Compile-time pin of the context size on every platform (C99-portable
- * static assert; the codebase compiles with -std=c99, so C11
- * static_assert is not available). Measured 2026-10-26: 664 bytes on
- * x86-64 - the full per-field derivation is in docs/ARCHITECTURE.md,
+/* Compile-time pin of the context size on 64-bit (LP64) platforms
+ * (C99-portable static assert; the codebase compiles with -std=c99, so
+ * C11 static_assert is not available). Measured 2026-10-26: 664 bytes
+ * on x86-64 - the full per-field derivation is in docs/ARCHITECTURE.md,
  * section "Memory Model". The README once claimed 656 B, the size from
- * before rng_state existed; this assert makes any future layout drift
- * a build error on every target instead of a stale doc number. */
+ * before rng_state existed; this assert makes that kind of layout drift
+ * a build error instead of a stale doc number.
+ *
+ * The pin is LP64-CONDITIONAL on purpose: 32-bit ABIs (armeabi-v7a in
+ * the Android NDK build) use a smaller ILP32 layout, and pinning the
+ * LP64 number unconditionally broke the 32-bit NDK compile
+ * (2026-10-26, caught by the android-lint NDK step on PR #56). The
+ * documented 664 B claim is a 64-bit statement. */
+#if defined(__LP64__) || defined(_LP64) || defined(__LP64)
 typedef char hydra_engine_size_check[sizeof(HydraEngine) == 664 ? 1 : -1];
+#endif
 
 /* Engine-Funktionen */
 int hydra_engine_load(HydraEngine *engine, const char *model_path);

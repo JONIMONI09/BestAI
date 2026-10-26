@@ -39,10 +39,13 @@
 4. 4-KiB pages are faulted in on demand and are clean → reclaimable under memory pressure without swap traffic.
 5. The runtime state is **fixed-size and independent of model size**: the recurrent state `int8_t[64]` (64 B), the two load-time aggregates `int32_t[64]` each (512 B for `agg_a` + `agg_b`), and an `int64_t[64]` accumulator (512 B, stack-local inside `hydra_engine_step`). Nothing in that list grows with `layers` or with the file size.
 
-**`sizeof(HydraEngine)` = 664 bytes on 64-bit platforms** (measured with
-`sizeof` on x86-64; pinned at compile time on every target by
-`hydra_engine_size_check` in `include/hydra_model.h`, which CI compiles
-on macOS arm64 and the AArch64 NEON leg):
+**`sizeof(HydraEngine)` = 664 bytes on 64-bit (LP64) platforms**
+(measured with `sizeof` on x86-64; pinned at compile time on all LP64
+targets by `hydra_engine_size_check` in `include/hydra_model.h`, which
+CI compiles on macOS arm64 and the AArch64 NEON leg. The pin is
+LP64-conditional: 32-bit ABIs such as armeabi-v7a use a smaller ILP32
+layout, and an unconditional pin broke the NDK 32-bit compile —
+caught by CI's android-lint NDK step on 2026-10-26):
 
 | field | bytes |
 |---|---|

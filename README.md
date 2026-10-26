@@ -25,7 +25,7 @@ Hydra-Stone is a C99 engine that maps a `.hydra` file of ternary weights ({-1, 0
 | **total while stepping** | | **1088 B ≈ 1.06 KiB** | |
 | load-time scratch (released) | `int64_t[64]` × 2 | 1024 B | stack in `hydra_build_aggregation()` |
 
-`sizeof(HydraEngine)` is 664 B in total — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header, the load-measurement fields and the sampler RNG state (pinned at compile time by `hydra_engine_size_check` in `include/hydra_model.h`). Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
+`sizeof(HydraEngine)` is 664 B in total on 64-bit platforms — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header, the load-measurement fields and the sampler RNG state (pinned at compile time on LP64 targets by `hydra_engine_size_check` in `include/hydra_model.h`; 32-bit ABIs use a smaller layout). Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
 
 The weight pages are **not** counted there, because they are not the engine's memory: they live in the **kernel page cache**, appear in `dumpsys meminfo` as *Private Clean*, and are reclaimed by the OS under memory pressure. The engine therefore cannot and does not keep the model's resident set size at zero. Build with `-DHYDRA_DROP_CACHE` to explicitly hand touched pages back after every step.
 
