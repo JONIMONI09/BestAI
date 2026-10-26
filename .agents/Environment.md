@@ -100,12 +100,16 @@
     "Resource not accessible by integration" (the repo Actions token has
     no security-events scope). Workaround: CodeQL job logs /
     check-run annotations API (works), or the Security tab UI (human).
-    Alert *handling* itself needs no API: GitHub delivers
-    `code_scanning_alert` events to
-    `.github/workflows/code-scanning-alert.yml` (added 2026-10-26, renamed
-    from `code-scanning.yml` 2026-10-26 — see the corrupted-registration
-    note in the round-6 block below) and resolves alerts natively when the
-    next analysis no longer reports them.
+    Alert *handling* needs no API at all: `code_scanning_alert` is a
+    WEBHOOK event, not a workflow trigger event (verified 2026-10-26
+    evening: not in the docs trigger list, rejected by actionlint, and
+    by GitHub's compiler — any workflow naming it fails to compile into
+    a zero-job run), so no Actions workflow can react to it. Instead,
+    the CodeQL/Semgrep jobs report findings on every PR (annotations +
+    check results) and alerts close themselves as fixed when the next
+    default-branch analysis no longer reports them. (The round-6 file
+    `.github/workflows/code-scanning-alert.yml` was added and deleted
+    again the same day for exactly this reason — see errors.md.)
   - **Deleting a registered Actions workflow** — 2026-10-26: `gh api
     -X DELETE /actions/workflows/{id}` → 404 for BOTH code-scanning
     workflow ids (396960786, 397125007); listing them works, deleting
@@ -163,6 +167,7 @@
      /tmp/lintenv/bin/shellcheck -S warning tools/*.sh
      /tmp/lintenv/bin/yamllint -d "{extends: default, rules: {line-length: {max: 200}, document-start: disable, truthy: disable, comments: {min-spaces-from-content: 1}, indentation: {spaces: consistent}}}" .github/
      bash tools/workflow_yaml_check.sh   # duplicate keys: GitHub rejects what PyYAML accepts
+     bash tools/workflow_lint_check.sh   # actionlint: invalid events/actions (self-recreates /tmp/al)
      ```
   4. **The standard 5-part gate** (AGENTS.md §3) runs fully in this
      sandbox: `make clean && make && make test && make test-run`,
@@ -271,20 +276,25 @@
      — it is not a parser — so for any change to `.github/workflows/` the
      venv-with-PyYAML variant is the stronger local check. All 5 workflows
      parsed clean 2026-10-26 with PyYAML 6.x.
-  5. **Corrupted workflow registration (the 3rd CI-red root cause, 2026-
-     10-26):** the `code_scanning_alert` workflow was registered the day
-     it was created with the file PATH as its name and a broken trigger
-     set — it executed on EVERY push (3 consecutive runs, event=push, 0
-     jobs, failure in <3s, no job logs: the "zero-job" signature described
-     by `tools/workflow_yaml_check.sh`). The file itself is valid (PyYAML
-     + duplicate-key gate clean), so no amount of local YAML checking
-     could have caught it; the fix is a re-registration, done by moving
-     the file to `.github/workflows/code-scanning-alert.yml` (same
-     content). Detection recipe: `gh api .../actions/workflows` (registered
-     name should equal the file's `name:` key), then compare against the
-     run's event field. After the merge to main, the orphaned
-     `code-scanning.yml` registration is expected to clear with the file
-     deletion; watch the next main push for any new zero-job runs.
+  5. **SUPERSEDED (2026-10-26 evening) — the "corrupted workflow
+     registration" diagnosis was WRONG.** The zero-job/same-second/
+     path-named runs were COMPILE FAILURES of every workflow file
+     naming `on: code_scanning_alert` — a webhook event, not a workflow
+     trigger event (not in the docs trigger list, rejected by
+     actionlint, and by GitHub's compiler itself; the phantom run always
+     named the file containing the bad event and followed it across
+     three commits). Resolved by deleting
+     `.github/workflows/code-scanning-alert.yml` and never naming the
+     event again; regression gate 1i
+     (`tools/workflow_lint_check.sh`, actionlint over every workflow
+     file + in-gate negative control `tools/fixtures/workflow_lint_bad.
+     yml`) makes this class a local red. Detection recipe that now
+     stands: a run with 0 jobs + same-second failure + the file PATH as
+     its name = that workflow file failed to COMPILE — diff it against
+     the last good version and run actionlint locally. The two stale
+     registrations (ids 396960786, 397125007) remain listed but are
+     inert without a matching file (no file at the path = no dispatch);
+     the PAT cannot delete them (404) — owner can via the web UI.
   6. **`/tmp` wipe confirmed again (2026-10-26):** `/tmp/ktnpm`,
      `/tmp/lintvenv` and every earlier session's venv were gone at session
      start; both recreate commands are recorded above (npm for the Kotlin

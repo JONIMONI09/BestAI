@@ -24,12 +24,64 @@
   `R.plurals.log_context_applied` — `Context.getString` resolves the
   quantity for plurals res-ids. `R_gen.kt` stub regenerated from the
   XML (string→plurals), stub check 0 errors, `string_format_check.py`
-  ok (it validates plurals too).
+  ok (it validates plurals too). **The plurals half needed a second
+  commit** (see entry below): `Context.getString` does not accept
+  plurals resources — the correct call is `getQuantityString`.
 - **Prevention:** new Compose state: pick the primitive overload
   (`mutableFloatStateOf`/`mutableIntStateOf`) from the start — lint
-  treats the boxed generic as a finding, not a style nit. New
-  count-formatted strings: write them as `<plurals>` immediately
-  (the existing `gen_*` plurals in strings.xml are the pattern).
+  treats the boxed generic
+  as a finding, not a style nit. New count-formatted strings: write
+  them as `<plurals>` immediately (the existing `gen_*` plurals in
+  strings.xml are the pattern) AND read them with
+  `getQuantityString`/the Compose plurals overload — never
+  `getString(R.plurals.…)` (see entry below).
+
+## 2026-10-26 (round 6) — `getString(R.plurals.…)`: stub check passed, Android lint's `ResourceType` failed
+
+- **Symptom:** run 40346890465 (3354a9f, the commit that converted
+  `log_context_applied` to `<plurals>`): Android lint reported one new
+  finding — `MainActivity.kt:658 ResourceType: Expected resource of
+  type string` on `getString(R.plurals.log_context_applied, …)`. The
+  local Kotlin stub check had reported 0 errors for the same code.
+- **Cause:** `Context.getString` is annotated `@StringRes` in the real
+  SDK; `R.plurals.*` ids are `@PluralsRes`. That distinction is
+  enforced by **Android lint (ResourceType), not by kotlinc** — the
+  compiler happily accepts any Int. The stub (plain `getString(resId:
+  Int, vararg …)`) cannot express the annotation, so it accepted the
+  wrong call. The correct API: `Resources.getQuantityString(@PluralsRes
+  id, quantity, vararg formatArgs)` (Resources, NOT Context — see the
+  second stage below).
+- **Fix (two stages):** (1) `MainActivity.kt:658` →
+  `getQuantityString(R.plurals.log_context_applied, new.contextSize,
+  new.contextSize)` — **WRONG RECEIVER, see stage 2**. (2) PR #62's CI
+  (run 40348442144) caught it: `MainActivity.kt:658:25 Unresolved
+  reference 'getQuantityString'` — `Context` has NO
+  `getQuantityString`; it is a `Resources` method (API 1,
+  developer.android.com: `context.resources.getQuantityString(R.plurals.
+  …, count, count)`). Final fix: `resources.getQuantityString(R.plurals.
+  log_context_applied, new.contextSize, new.contextSize)` — the same
+  pattern the codebase already used at lines 395/536/796 for its other
+  plurals. Stub `A_content.kt`: the fabricated `Context.getQuantityString`
+  member was removed (the `Resources` stub already had the real one);
+  a NOTE comment records the lint-only annotation gap.
+- **Prevention:** the stub check's README now lists this as a KNOWN
+  LIMITATION: resource-type annotations (`@StringRes`/`@PluralsRes`/
+  `@DrawableRes`, …) and other lint-only checks (ResourceType,
+  AutoboxingStateCreation, PluralsCandidate, UnusedResources) are NOT
+  covered by the kotlinc stub check — those classes stay with CI's
+  Android lint job, which is why that job must stay green before merge.
+  Rule of thumb when converting a string to plurals: change the
+  **reader** in the same commit to `resources.getQuantityString` (or
+  Compose's plurals `stringResource` overload) — never leave
+  `getString`. **STAGE-2 LESSON (the bigger one):** the stage-1 fix
+  added a NEW member to the stub `Context` without verifying it against
+  developer.android.com — exactly the stub-fabrication my own rule
+  forbids ("verify against developer.android.com / composables.com,
+  never guess"). A stub member must be copied from the real API
+  reference, not invented to silence a call; when in doubt, grep the
+  codebase for the existing usage pattern of that API family (the
+  `resources.getQuantityString` calls were right there, three call
+  sites above).
 
 ## 2026-10-26 (round 6) — workspace reset between turns: branch pointer back at f79ff96, work lost from local refs
 
@@ -73,41 +125,56 @@
   Environment.md if not — do not assume the previous turn's venvs
   (`/tmp/lintvenv`, `/tmp/zvenv`, `/tmp/ktnpm`) survived.
 
-## 2026-10-26 (round 6) — CI red #3: corrupted GitHub registration of the code-scanning workflow
+## 2026-10-26 (round 6) — CI red #3: `code_scanning_alert` is NOT a workflow trigger event (root cause corrected evening of 2026-10-26)
 
-- **Symptom:** the `code_scanning_alert` workflow ran on **every push**
-  (runs #20-#22 across three branches, event=push), each with **0 jobs**,
-  concluding `failure` in under 3 seconds, no job logs. The file itself
-  parses clean (PyYAML + the duplicate-key gate).
-- **Cause:** GitHub's registered definition for the workflow (created the
-  day the file was introduced, id 396960786) carries the file PATH as its
-  name — not the file's `name: Code scanning alert handling` — i.e. the
-  registration was built from a broken/intermediate state and was never
-  refreshed. Its trigger set did not match the file (push instead of
-  code_scanning_alert) and its job graph was empty. No amount of local
-  YAML validation can see this: it is server-side state, not file content.
-- **Fix (partly — outcome corrected 2026-10-26 evening):** moved the file
-  to `.github/workflows/code-scanning-alert.yml` (identical content) to
-  force a fresh registration under a new path. **The original assumption
-  was WRONG:** the old `code-scanning.yml` registration (id 396960786)
-  did NOT clear on rename — both registrations stayed `state: active`,
-  and BOTH show `name` = the file PATH (all other workflows of the repo
-  show their real `name:` — so the corruption is specific to these two
-  server-side objects, not a token display artifact). The new
-  registration (id 397125007) produced the same phantom zero-job runs,
-  auto-retried by GitHub every ~13 minutes (13:59 → 14:12 → 14:26, NOT
-  triggered by our pushes). `DELETE .../actions/workflows/{id}` is
-  token-blocked (404) in this sandbox. The retry loop stopped by itself
-  after 14:26 and no new phantom run appeared in the following 45+ min.
-  **Current state: dormant, not blocking the PR** (the phantom runs are
-  push-event runs, they never appear in `gh pr checks`). If it wakes up:
-  the user must delete the stale workflow from the GitHub web UI
-  (Settings → Actions → Workflows), which this PAT cannot do.
-- **Prevention:** detection recipe recorded in `.agents/Environment.md`
-  (Arena section, round 6, item 5): compare
-  `gh api .../actions/workflows` registered names against the files'
-  `name:` keys, and any run with 0 jobs + instant failure on a push
-  event for a non-push-triggered workflow = suspect registration.
+- **Symptom:** every workflow file containing
+  `on: code_scanning_alert: types: [created]` produced a "phantom" run on
+  EVERY push: **0 jobs**, `conclusion: failure` in the SAME second
+  (created_at == updated_at), run NAME = the file PATH (not the `name:`
+  key), no check-runs, no logs, no job details. First seen 13:37 as
+  `code-scanning.yml`, followed the file rename to
+  `code-scanning-alert.yml` at 13:59, and followed the (later) move of
+  the trigger INTO `lint.yml`: the 1b0ace5 push produced the same
+  zero-job failure under the name `.github/workflows/lint.yml` while
+  lint.yml's normal PR run was MISSING.
+- **Cause (corrected — the earlier "corrupted GitHub registration"
+  theory was WRONG):** `code_scanning_alert` is a Webhook event (for
+  webhook subscriptions) but is **not in the list of events that can
+  trigger GitHub Actions workflows** — not in the current
+  "Events that trigger workflows" docs (verified 2026-10-26: the page
+  runs `check_suite` → `create` with no code_scanning_alert section) and
+  not in actionlint's event schema (`npm i actionlint`, WASM build:
+  `unknown Webhook event "code_scanning_alert"`). GitHub's workflow
+  compiler therefore REJECTS the file at load time — the zero-job,
+  same-second, path-named failure IS the compile failure (same
+  signature as the earlier duplicate-key incident). The phantom always
+  named the file containing the bad event, across three different
+  commits (code-scanning.yml 13:37-13:53, code-scanning-alert.yml
+  13:59-15:11, lint.yml 15:13) — causality proven by the file move.
+  Why the misdiagnosis survived so long: PyYAML (and the duplicate-key
+  gate) validate YAML, not the Actions event schema; the `name` = path
+  display was a red herring (a compile-failed run has no `name:` to
+  show); the 14:12/14:26 "auto-retries" were just more dispatch attempts
+  of the same broken file, and the gap after 14:26 was simply a gap
+  without pushes until 15:11.
+- **Fix:** (1) deleted `.github/workflows/code-scanning-alert.yml`
+  (1b0ace5); (2) reverted the `code_scanning_alert` trigger + alert job
+  out of lint.yml (this commit) — a feature that cannot compile cannot
+  live in any workflow file. Code-scanning REACTION stays exactly where
+  the owner's rule puts it: the CodeQL/Semgrep jobs run on every PR and
+  report findings as annotations + check results, and alerts close
+  **themselves** as fixed when the next analysis on the default branch
+  no longer reports them — no custom event-driven workflow needed or
+  possible. (3) NEW GATE: `tools/workflow_lint_check.sh` runs
+  actionlint (npm WASM build, recreate `/tmp/al`) over every
+  `.github/**/*.yml` — it catches invalid event names, unknown actions,
+  and more that PyYAML cannot; wired into CI gate 1h.
+- **Prevention:** (1) actionlint gate above (R25: every error class → a
+  gate; this class was invisible to YAML-only validation by
+  construction); (2) a run with 0 jobs + same-second failure + path as
+  name = COMPILE FAILURE of that workflow file — read it that way first,
+  not "server-side corruption"; (3) new workflow triggers: verify the
+  event against the docs page / actionlint BEFORE the first push.
 
 ## 2026-10-26 (round 6) — CI red #2: `ClosedFloatingPointRange` has no `.last`/`.first`
 

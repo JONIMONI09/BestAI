@@ -2350,6 +2350,79 @@ annotations are the source of truth for any remaining findings.
    of the next turn. `/tmp` also wiped — kotlinc reinstalled from the
    Environment.md recipe (~1 min).
 
-**Open:** PR #59 open, branch head 3354a9f. After the next CI round:
-expect all jobs green (Android lint was the only red). Then merge
-prep. If code-scanning phantoms reappear: web-UI deletion by owner.
+**Open (superseded by follow-up 3 below):** PR #59 open, branch head
+3354a9f.
+
+### Round-6 follow-up 3 (fourth CI round + root-cause correction, 2026-10-26 evening)
+
+1. **ROOT CAUSE CORRECTION — the "corrupted GitHub registration" theory
+   was WRONG.** The phantom zero-job runs (0 jobs, same-second failure,
+   run named by the file PATH) were **compile failures of any workflow
+   file naming `on: code_scanning_alert`**: that event is a Webhook
+   event, NOT a GitHub Actions workflow trigger event (not in the
+   current docs trigger list — page runs `check_suite` → `create` with
+   no such section — and actionlint rejects it: `unknown Webhook
+   event`). Proof by causality: the phantom always named the file
+   containing the bad event, and followed it across three commits
+   (`code-scanning.yml` 13:37-13:53 → `code-scanning-alert.yml`
+   13:59-15:11 → `lint.yml` 15:13, the latter after I moved the trigger
+   in — where it again produced the zero-job failure AND the Lint&Sec
+   PR run went missing). The `name` = path display and the 14:12/14:26
+   "auto-retries" were red herrings (no `name:` to show on a
+   compile-failed run; more dispatch attempts of the same broken file).
+   PyYAML/the duplicate-key gate cannot see this: they validate YAML,
+   not the Actions event schema.
+2. **Action:** (a) deleted `.github/workflows/code-scanning-alert.yml`
+   (1b0ace5); (b) reverted the `code_scanning_alert` trigger + alert
+   job out of lint.yml; (c) NEW GATE 1i `tools/workflow_lint_check.sh`
+   = actionlint (npm WASM build, `/tmp/al` self-recreating, one fresh
+   node process per file — the WASM runtime crashes intermittently on
+   multi-file processes) over every workflow file + in-gate negative
+   control `tools/fixtures/workflow_lint_bad.yml` (the invalid trigger
+   event itself; R25). Wired into ci.yml after gate 1h. Code-scanning
+   REACTION stays native: CodeQL/Semgrep jobs report on every PR
+   (annotations + check results) and alerts close themselves as fixed
+   when the next default-branch analysis no longer reports them.
+3. **Android lint round 3 (run 40346890465, 3354a9f):** both original
+   findings cleared; the plurals conversion introduced ONE new finding
+   — `MainActivity.kt:658 ResourceType: Expected resource of type
+   string`: `Context.getString` does not accept `R.plurals.*`
+   (`@StringRes` vs `@PluralsRes` is enforced by LINT, not kotlinc —
+   the stub check cannot express resource annotations and stayed
+   green). Fix: `getQuantityString(R.plurals.log_context_applied,
+   new.contextSize, new.contextSize)`; stub `A_content.kt` gained
+   `getQuantityString`; stub-check README gained a KNOWN-LIMITATIONS
+   section (ResourceType / AutoboxingStateCreation / PluralsCandidate /
+   UnusedResources / Compose transforms are CI-lint-only classes).
+
+**Open (superseded by follow-up 4 below):** PR #59 open, fix commit
+7c534b2 pending.
+
+### Round-6 follow-up 4 (merge/revert incident + stage-2 API fix, 2026-10-26 evening — new session branch `arena/72470567-bestai`)
+
+1. **Incident:** PR #59 was merged by the owner at 15:15:21 at head
+   **1b0ace5** (the broken state — bad `code_scanning_alert` trigger in
+   lint.yml; the fix commit 7c534b2 landed 3.5 min later, after the
+   merge). Main went red immediately (zero-job compile-failure run of
+   lint.yml). 16 s after the merge the owner opened **PR #60 (full
+   revert of #59)** out of the red; the owner then CLOSED #60 and asked
+   for "everything correct" to land (PR #62 was opened from
+   `arena/ed8432d1-bestai` carrying exactly 7c534b2).
+2. **PR #62 CI exposed stage 2 of the plurals fix:** all jobs green
+   except Android lint — `MainActivity.kt:658:25 Unresolved reference
+   'getQuantityString'`: **`Context` has no `getQuantityString`**, it is
+   a `Resources` method (API 1, developer.android.com pattern
+   `context.resources.getQuantityString(R.plurals.…, count, count)`).
+   The stage-1 fix had added a fabricated `Context.getQuantityString`
+   to the STUB (violating the "never guess stub members" rule) — the
+   stub check passed, the real compiler failed. Final fix on this
+   branch: `resources.getQuantityString(R.plurals.log_context_applied,
+   new.contextSize, new.contextSize)` (the pattern the codebase
+   already used at 395/536/796), fabricated Context stub member
+   removed, errors.md entry expanded with the stage-2 lesson.
+3. **State:** this session branch = main (0ad01dd) + 7c534b2 + the
+   stage-2 fix. PR #62 (old branch) is red and should be CLOSED; the
+   green vehicle is the new PR from this branch. Stale workflow
+   registrations (396960786/397125007) remain listed but inert (no file
+   at the path = no dispatch); PAT cannot delete them (404), owner can
+   via the web UI.
