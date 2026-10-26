@@ -375,6 +375,12 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REPORT=android/app/build/reports/lint-results-debug.txt
+          # The machine-readable twin of the text report (AGP writes both).
+          # Annotations must be parsed from the XML - parsing the .txt with
+          # ElementTree crashes the step BEFORE it can publish a single
+          # finding (the 2026-10-26 red: the job failed with a generic
+          # exit 1 and zero lint annotations).
+          XMLREPORT=${REPORT%.txt}.xml
           # The job log is only readable in the Actions UI (log-download
           # and artifact hosts are unreachable by API-only clients). So
           # on any failure the diagnostic is published where the API can
@@ -417,8 +423,9 @@ jobs:
           # in the check-run's annotations, which the API serves
           # even when the log-download and artifact hosts are
           # unreachable.
-          if [ -f "$REPORT" ]; then
-            WS="${GITHUB_WORKSPACE%/}" python3 - "$REPORT" << 'PY'
+          if [ -f "$XMLREPORT" ]; then
+            WS="${GITHUB_WORKSPACE%/}" python3 - "$XMLREPORT" << 'PY' \
+                || echo "::warning::lint XML could not be parsed - the full text report is in the step summary"
           import os
           import sys
           import xml.etree.ElementTree as ET
@@ -451,7 +458,15 @@ jobs:
           if total > shown:
               print("::warning::{} more finding(s) not annotated (cap 40); "
                     "full list in the step summary".format(total - shown))
+          if total == 0:
+              print("::warning::lint report exists but contains no parseable issues; raw text in step summary")
           PY
+          elif [ -f "$REPORT" ]; then
+            # No XML (unexpected AGP configuration): annotate the finding
+            # lines from the text report instead of going silent.
+            { grep -E ":[0-9]+: (Warning|Error|Fatal):" "$REPORT" | head -40 \
+                | sed -E 's/^([^:]+):([0-9]+): (Warning|Error|Fatal): (.*)$/::warning::file=\1,line=\2,severity=\3 \4/';
+              } || echo "::warning::text lint report exists but no finding lines could be extracted (full text in step summary)"
           else
             # Same one-annotation pattern as the APK build job:
             # compiler error lines plus a short tail of the gradle

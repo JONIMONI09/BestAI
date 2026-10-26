@@ -102,7 +102,6 @@ object R {
         const val setting_max_tokens: Int = 0
         const val setting_context_size: Int = 0
         const val model_current: Int = 0
-        const val model_none: Int = 0
         const val model_remove_imported: Int = 0
         const val models_tab_body: Int = 0
         const val log_context_applied: Int = 0

@@ -48,6 +48,36 @@
   stdlib/library API doubt is verified by that check or on the web before
   the code ships — never by assumption.
 
+## 2026-10-26 (round 6) — Android-lint gate could not publish its own findings (txt parsed as XML)
+
+- **Symptom:** the `Android lint` job of Lint & Security failed with only a
+  generic `Process completed with exit code 1` annotation — no lint
+  findings, no "gradle died" tail, no step summary content readable via
+  the API, no PR comment. The Kotlin compile had just been fixed, so the
+  job had for the first time reached the lint analysis.
+- **Cause:** the "Check the lint report" step defined
+  `REPORT=.../lint-results-debug.txt` and the annotation step ran
+  `ET.parse($REPORT)` — i.e. it parsed the **text** report with
+  ElementTree. Once findings exist (the report no longer says
+  "No issues found"), the XML parse of the .txt throws, `set -e` kills
+  the step mid-script, and every line AFTER the parse — including the
+  final `::error::Android Lint reported findings` and the findings
+  themselves — never runs. A gate that fails without reporting what it
+  found (R25 in its nastiest form).
+- **Fix:** the annotation step now parses the machine-readable twin
+  `lint-results-debug.xml` (AGP writes both), with two fallbacks:
+  no XML → extract finding lines from the text report; no report at all
+  → the gradle-died tail (as before). The Python run is
+  best-effort (`|| ::warning::`) so a future parse surprise can never
+  again swallow the failure message. YAML + duplicate-key gate +
+  PyYAML clean.
+- **Prevention:** annotation/reporting code in a gate is part of the
+  gate's contract — it must be exercised on the FAILURE path (here:
+  "findings exist"), not only on the happy path. This gate had never
+  seen a successful lint analysis before round 6 (every earlier run
+  died at the Kotlin compile), which is exactly why the failure path
+  was untested.
+
 ## 2026-10-26 (round 6) — CI red #4: clang `-Wtypedef-redefinition` in hydra_model.h (C99)
 
 - **Symptom:** the CI `lint` job (ci.yml gate 1b:

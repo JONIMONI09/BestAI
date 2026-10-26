@@ -1043,34 +1043,56 @@ private fun ModelsTab(state: MainUiState, actions: MainActions) {
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.SemiBold
         )
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Text(
-                    text = if (state.hasModel) state.modelLabel
-                    else stringResource(R.string.model_none),
-                    style = MaterialTheme.typography.titleMedium
-                )
-                state.modelDetail.forEach { (k, v) ->
-                    Row(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = k,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.widthIn(min = 72.dp)
-                        )
-                        Text(text = v, style = MaterialTheme.typography.labelMedium)
+        if (state.hasModel) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = state.modelLabel,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    state.modelDetail.forEach { (k, v) ->
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = k,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.widthIn(min = 72.dp)
+                            )
+                            Text(text = v, style = MaterialTheme.typography.labelMedium)
+                        }
                     }
                 }
+            }
+            FilledTonalButton(onClick = actions.onRemoveImportedModel) {
+                Text(stringResource(R.string.model_remove_imported))
+            }
+        } else {
+            // Empty state: nothing imported yet (e.g. before the starter
+            // model has been pulled from the assets). A dedicated title +
+            // body string (models_empty_*) so the copy has one home.
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = stringResource(R.string.models_empty_title),
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(
+                    text = stringResource(R.string.models_empty_body),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
         Button(onClick = actions.onImportModel) {
             Text(stringResource(R.string.action_import_model))
-        }
-        FilledTonalButton(onClick = actions.onRemoveImportedModel) {
-            Text(stringResource(R.string.model_remove_imported))
         }
         Text(
             text = stringResource(R.string.models_tab_body),

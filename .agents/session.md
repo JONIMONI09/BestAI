@@ -2290,3 +2290,30 @@ code-scanning-alert.yml, 44 reference updates.
 **Open:** PR #59 open. After merge: confirm code-scanning-alert
 registers clean (no more zero-job push runs) and all four workflows green
 on main.
+
+### Round-6 follow-up (after the first PR #59 CI round, 2026-10-26)
+
+Two more reds surfaced in the first CI round of PR #59 and were fixed
+the same day (commit after 303b5c8):
+
+1. **Android lint job: gate crash + 2 real findings.** With the Kotlin
+   compile finally fixed, the job reached the lint analysis for the
+   first time in the repo's history. The annotation step crashed parsing
+   the `.txt` report as XML (see errors.md) — hiding the findings.
+   Real findings identified by resource audit: `models_empty_title` /
+   `models_empty_body` unused (UnusedResources) — the models-tab empty
+   state had never been implemented. Fix: implemented the empty state in
+   `ModelsTab` (uses both strings, `model_none` placeholder removed from
+   strings.xml, R stub regenerated: 105 strings + 6 plurals) and fixed
+   the gate to parse the XML report with text/gradle-died fallbacks and
+   best-effort annotation (R25: the gate must always report its
+   findings).
+2. **`Modifier.weight` import removed** (see root cause 5 in the list
+   above — K2 rejects the import; real API = scope member, no import).
+3. **clang gate 1b fixed** (hydra_model.h typedef redefinition, root
+   cause 4 above) — verified in CI: the `lint` job of ci.yml turned
+   GREEN on the PR after the fix.
+
+Status after the second CI round: ci.yml `lint` PASS, all fast checks
+PASS; Android lint was re-running with the fixed gate — its
+annotations are the source of truth for any remaining findings.
