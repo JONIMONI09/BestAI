@@ -48,13 +48,22 @@
   enforced by **Android lint (ResourceType), not by kotlinc** — the
   compiler happily accepts any Int. The stub (plain `getString(resId:
   Int, vararg …)`) cannot express the annotation, so it accepted the
-  wrong call. The correct API: `Context.getQuantityString(@PluralsRes
-  id, quantity, vararg formatArgs)`.
-- **Fix:** `MainActivity.kt:658` →
+  wrong call. The correct API: `Resources.getQuantityString(@PluralsRes
+  id, quantity, vararg formatArgs)` (Resources, NOT Context — see the
+  second stage below).
+- **Fix (two stages):** (1) `MainActivity.kt:658` →
   `getQuantityString(R.plurals.log_context_applied, new.contextSize,
-  new.contextSize)` (quantity + the `%1$d` arg); stub `A_content.kt`
-  gained `getQuantityString` with a comment naming the lint-only gap;
-  stub check 0 errors.
+  new.contextSize)` — **WRONG RECEIVER, see stage 2**. (2) PR #62's CI
+  (run 40348442144) caught it: `MainActivity.kt:658:25 Unresolved
+  reference 'getQuantityString'` — `Context` has NO
+  `getQuantityString`; it is a `Resources` method (API 1,
+  developer.android.com: `context.resources.getQuantityString(R.plurals.
+  …, count, count)`). Final fix: `resources.getQuantityString(R.plurals.
+  log_context_applied, new.contextSize, new.contextSize)` — the same
+  pattern the codebase already used at lines 395/536/796 for its other
+  plurals. Stub `A_content.kt`: the fabricated `Context.getQuantityString`
+  member was removed (the `Resources` stub already had the real one);
+  a NOTE comment records the lint-only annotation gap.
 - **Prevention:** the stub check's README now lists this as a KNOWN
   LIMITATION: resource-type annotations (`@StringRes`/`@PluralsRes`/
   `@DrawableRes`, …) and other lint-only checks (ResourceType,
@@ -62,8 +71,17 @@
   covered by the kotlinc stub check — those classes stay with CI's
   Android lint job, which is why that job must stay green before merge.
   Rule of thumb when converting a string to plurals: change the
-  **reader** in the same commit to `getQuantityString` (or Compose's
-  plurals `stringResource` overload) — never leave `getString`.
+  **reader** in the same commit to `resources.getQuantityString` (or
+  Compose's plurals `stringResource` overload) — never leave
+  `getString`. **STAGE-2 LESSON (the bigger one):** the stage-1 fix
+  added a NEW member to the stub `Context` without verifying it against
+  developer.android.com — exactly the stub-fabrication my own rule
+  forbids ("verify against developer.android.com / composables.com,
+  never guess"). A stub member must be copied from the real API
+  reference, not invented to silence a call; when in doubt, grep the
+  codebase for the existing usage pattern of that API family (the
+  `resources.getQuantityString` calls were right there, three call
+  sites above).
 
 ## 2026-10-26 (round 6) — workspace reset between turns: branch pointer back at f79ff96, work lost from local refs
 

@@ -8,8 +8,9 @@ open class Context {
     open fun getString(resId: Int, vararg formatArgs: Any?): String = throw UnsupportedOperationException("stub")
     // NOTE: kotlinc cannot express @StringRes vs @PluralsRes (that is a
     // lint check, ResourceType). getString(R.plurals.*) compiles here but
-    // fails Android lint on CI - use getQuantityString for plurals.
-    open fun getQuantityString(resId: Int, quantity: Int, vararg formatArgs: Any?): String = throw UnsupportedOperationException("stub")
+    // fails Android lint on CI - plurals are read via
+    // resources.getQuantityString(id, quantity, vararg) (Resources has the
+    // method, Context does NOT - verified 2026-10-26, developer.android.com).
     fun startActivity(intent: Intent) {}
     open val filesDir: File get() = throw UnsupportedOperationException("stub")
     open val resources: Resources get() = throw UnsupportedOperationException("stub")

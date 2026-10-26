@@ -2395,12 +2395,34 @@ annotations are the source of truth for any remaining findings.
    section (ResourceType / AutoboxingStateCreation / PluralsCandidate /
    UnusedResources / Compose transforms are CI-lint-only classes).
 
-**Open:** PR #59 open. The next push carries: lint.yml revert (no bad
-trigger), getQuantityString fix, gate 1i + fixture, docs. Expectation:
-all jobs green (Android lint was the only red; the phantom class is
-eliminated because no workflow file names the unsupported event).
-Merge prep after the green round. NOTE: the two stale workflow
-registrations (ids 396960786 / 397125007) may still be listed in
-Settings → Actions → Workflows; they are harmless without a matching
-file (no file at the path = no dispatch), and this PAT cannot delete
-them (404) — owner can clean them up in the web UI whenever.
+**Open (superseded by follow-up 4 below):** PR #59 open, fix commit
+7c534b2 pending.
+
+### Round-6 follow-up 4 (merge/revert incident + stage-2 API fix, 2026-10-26 evening — new session branch `arena/72470567-bestai`)
+
+1. **Incident:** PR #59 was merged by the owner at 15:15:21 at head
+   **1b0ace5** (the broken state — bad `code_scanning_alert` trigger in
+   lint.yml; the fix commit 7c534b2 landed 3.5 min later, after the
+   merge). Main went red immediately (zero-job compile-failure run of
+   lint.yml). 16 s after the merge the owner opened **PR #60 (full
+   revert of #59)** out of the red; the owner then CLOSED #60 and asked
+   for "everything correct" to land (PR #62 was opened from
+   `arena/ed8432d1-bestai` carrying exactly 7c534b2).
+2. **PR #62 CI exposed stage 2 of the plurals fix:** all jobs green
+   except Android lint — `MainActivity.kt:658:25 Unresolved reference
+   'getQuantityString'`: **`Context` has no `getQuantityString`**, it is
+   a `Resources` method (API 1, developer.android.com pattern
+   `context.resources.getQuantityString(R.plurals.…, count, count)`).
+   The stage-1 fix had added a fabricated `Context.getQuantityString`
+   to the STUB (violating the "never guess stub members" rule) — the
+   stub check passed, the real compiler failed. Final fix on this
+   branch: `resources.getQuantityString(R.plurals.log_context_applied,
+   new.contextSize, new.contextSize)` (the pattern the codebase
+   already used at 395/536/796), fabricated Context stub member
+   removed, errors.md entry expanded with the stage-2 lesson.
+3. **State:** this session branch = main (0ad01dd) + 7c534b2 + the
+   stage-2 fix. PR #62 (old branch) is red and should be CLOSED; the
+   green vehicle is the new PR from this branch. Stale workflow
+   registrations (396960786/397125007) remain listed but inert (no file
+   at the path = no dispatch); PAT cannot delete them (404), owner can
+   via the web UI.
