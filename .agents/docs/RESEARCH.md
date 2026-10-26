@@ -106,5 +106,5 @@ semantic, not a byte layout.
 - The engine's scale-offset bug (scale read from the w1 plane start
   instead of after it) was caught by a hand-built 2-bit model with a
   hand-derived state, where the POS case passed by SiLU-saturation
-  accident and the NEG case collapsed — see `docs/session.md`
+  accident and the NEG case collapsed — see `docs/.agents/session.md`
   (the engineering log) for the 2026-10-26 entry.

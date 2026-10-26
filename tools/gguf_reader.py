@@ -256,7 +256,7 @@ class Tensor:
         per_block, block_bytes = block
         n = self.n_elements
         if n % per_block:
-            # rules.md R14: a length-deriving field that does not divide is a
+            # .agents/rules.md R14: a length-deriving field that does not divide is a
             # malformed file, not something to round.
             raise GgufError(
                 'tensor %r holds %d elements, which is not a multiple of the '

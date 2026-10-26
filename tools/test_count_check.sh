@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS
 # ---------------
-# rules.md R21 used to hard-code "49 tests". It was wrong for years: the suite
+# .agents/rules.md R21 used to hard-code "49 tests". It was wrong for years: the suite
 # grew, the ARM build legitimately runs MORE assertions than the x86 build
 # (the NEON-vs-scalar comparison tests are compiled out on x86), and
 # `-DHYDRA_TOKENV_MASK` builds report yet another count. A stale literal in a

@@ -5,7 +5,7 @@
  * decides when a block of tokens crosses into Kotlin is driven here with
  * fake step and emit callbacks, so the behaviour is executable in CI instead
  * of being a claim about a device (no device or emulator is available here -
- * see docs/gpu-feasibility.md).
+ * see .agents/docs/gpu-feasibility.md).
  *
  * What is protected:
  *   - a step count that is NOT a multiple of HYDRA_JNI_BATCH still emits its

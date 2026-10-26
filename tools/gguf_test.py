@@ -1000,7 +1000,7 @@ def _q8_0_exact(tmp):
     not with anything from gguf_reader, so a decoder that transposes the
     block, reads the scale at the wrong offset, takes the neighbouring
     block's scale or drops the int8 sign fails here rather than returning
-    plausible numbers (rules.md R9).
+    plausible numbers (.agents/rules.md R9).
 
     Four blocks with four DIFFERENT scales: a fixture that repeated one
     scale everywhere would let a per-block indexing bug through - which a

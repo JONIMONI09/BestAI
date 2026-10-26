@@ -32,7 +32,7 @@ SAFETENSORS LAYOUT
 
 data_offsets are [start, end) RELATIVE TO THE DATA REGION, i.e. the
 absolute byte range is [8 + N + start, 8 + N + end). Every tensor's range
-is validated at BOTH ends (rules.md R14): start >= 0, end > start, and
+is validated at BOTH ends (.agents/rules.md R14): start >= 0, end > start, and
 8 + N + end <= file_size. A range that runs past the file end, a missing
 dtype, a non-integer offset or an unparseable header is refused with a
 message that names the field and the bound - never a generic "invalid".
@@ -102,7 +102,7 @@ EPS = 1e-8
 
 class SafetensorsError(Exception):
     """A malformed or unsupported safetensors file. The message names the
-    field, the value and the bound it violated (rules.md R27)."""
+    field, the value and the bound it violated (.agents/rules.md R27)."""
 
 
 def _little():

@@ -466,7 +466,7 @@ test('public/app.js initialises against the real markup without throwing', async
  *
  * The real engine answers 256 steps in microseconds, so counting processes
  * after a cancel proved nothing: the child had already exited on its own and
- * the test passed with the kill removed (verified - see errors.md). This
+ * the test passed with the kill removed (verified - see .agents/errors.md). This
  * fake records its own pid, sleeps, and only then prints a valid answer, so
  * the pid disappearing can only mean the server signalled it. */
 function withSlowEngine(run) {
@@ -1169,7 +1169,7 @@ test('the console binds to loopback unless HYDRA_ALLOW_REMOTE=1', async (t) => {
    * ECONNREFUSED - measured the sandbox, not the server. Dev hosts mirror
    * every port the console listens on onto the workspace address with
    * socat, so such a probe can succeed while the server itself is still
-   * bound to 127.0.0.1 (see errors.md, "a reachability probe is not a
+   * bound to 127.0.0.1 (see .agents/errors.md, "a reachability probe is not a
    * bind-address test"). The socket has to be identified by the pid that
    * owns it, not by its port number.
    *
