@@ -2225,8 +2225,10 @@ static void write_v3_model(const char *path, uint32_t dim, uint32_t layers,
         *bp &= (uint8_t)~(0x03u << (2u * (force_j & 3u)));
         *bp |= (uint8_t)(((uint32_t)force_code & 0x03u) << (2u * (force_j & 3u)));
     }
-    FILE *f = fopen(path, "wb");
-    if (!f) { perror("fopen"); exit(1); }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
     wr_header_version(f, 3, vocab, dim, layers,
                       (uint32_t)sizeof(HydraModelHeader), (uint32_t)body_len);
     fwrite(body, 1, body_len, f);
