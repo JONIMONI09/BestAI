@@ -81,6 +81,20 @@ jobs:
       - name: Docs claim lint (banned claims)
         run: bash tools/docs_claim_check.sh
 
+      # Gate 1g: Compose crash guard. A vertically scrollable container
+      # (a verticalScroll column or a LazyColumn) nested inside another
+      # same-axis scrollable is measured with an infinite max height and
+      # makes Compose throw IllegalStateException on every device at
+      # measure time - the 2026-10-26 Hydra-Stone crash (android 15 /
+      # arm64-v8a). The ideal detector is an instrumented Compose UI test,
+      # but this repo builds the APK without an emulator, so the pattern
+      # is detected statically, with the negative controls (the bad and
+      # ok fixtures, plus the pre-fix crash file from git history) run as
+      # part of the gate itself: the guard failing to detect is a build
+      # failure here, not a phone crash later.
+      - name: Compose crash guard (nested scrollables)
+        run: bash tools/compose_scroll_check.sh
+
       # On any lint failure, upload the captured diagnostics as a
       # workflow artifact so the error text is attached to the run.
       - name: Upload lint error report
@@ -558,6 +572,34 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # Speed-up (2026-10-26): the pinned SDK (the NDK alone is ~1 GB)
+      # and the Gradle distribution used to be re-downloaded on every run
+      # of every Android job. The key is built exclusively from the pinned
+      # versions, so from the second run on it is a hit and the composite
+      # action skips all downloads. A miss or a partially restored cache
+      # falls back to the full install inside the action - the cache can
+      # only make the job faster, never slower or wrong.
+      - name: Restore pinned Android SDK + Gradle
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            $HOME/android-sdk
+            $HOME/gradle-dist
+          key: android-sdk-${{ runner.os }}-cmdtools-11076708-api-34-buildtools-34.0.0-ndk-26.3.11579264-cmake-3.22.1-gradle-8.7
+
+      # Second-level cache: the resolved Maven/Google dependencies. On a
+      # cold runner the AGP + Kotlin + NDK-adjacent artifacts are a few
+      # hundred MB of downloads before a single source file is compiled.
+      - name: Restore Gradle dependency cache
+        id: gradle-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
+          restore-keys: |
+            gradle-deps-${{ runner.os }}-gradle8.7-
+
       - uses: ./.github/actions/setup-android
 
       - name: Derive version from the commit
@@ -698,6 +740,26 @@ jobs:
           mkdir -p dist
           cp "$APK" "dist/hydra-stone-ci-${{ github.run_number }}.apk"
           sha256sum "dist/hydra-stone-ci-${{ github.run_number }}.apk" | tee dist/SHA256SUMS.txt
+
+      # Persist the toolchain for the next run. Saving the SDK/Gradle is
+      # safe on any outcome (they are pinned, immutable packages); the
+      # Gradle dependency cache is saved only on success, so a failed
+      # build can never publish a half-resolved dependency set.
+      - name: Save pinned Android SDK + Gradle cache
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            $HOME/android-sdk
+            $HOME/gradle-dist
+          key: android-sdk-${{ runner.os }}-cmdtools-11076708-api-34-buildtools-34.0.0-ndk-26.3.11579264-cmake-3.22.1-gradle-8.7
+
+      - name: Save Gradle dependency cache
+        if: success() && steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
 
       - uses: actions/upload-artifact@v4
         if: always()

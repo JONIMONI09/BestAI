@@ -321,33 +321,31 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # Two failure sources handled in one step:
-      # 1) android-actions/setup-android@v3 installs the retired "tools"
-      #    package itself and fails with exit 1.
-      # 2) The runner ships a prebuilt SDK (platforms 35/36). Lint then
-      #    reports targetSdk 34 as "OldTargetApi" even though exactly this
-      #    toolchain combination is the locally verified one. Hence an own
-      #    SDK root that receives nothing but the pinned packages — the same
-      #    sequence as documented in docs/ANDROID_SKILL.md.
-      - name: Set up an isolated Android SDK (API 34 only)
-        run: |
-          set -e
-          SDK="$RUNNER_TEMP/android-sdk"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          mkdir -p "$SDK/cmdline-tools"
-          cd "$RUNNER_TEMP"
-          curl -sSLO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          rm -rf "$RUNNER_TEMP/cmdline"
-          unzip -q commandlinetools-linux-11076708_latest.zip -d "$RUNNER_TEMP/cmdline"
-          mv "$RUNNER_TEMP/cmdline/cmdline-tools" "$SDK/cmdline-tools/latest"
-          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-34" \
-                    "build-tools;34.0.0" "ndk;26.3.11579264" "cmake;3.22.1"
-          curl -sSL -o gradle.zip \
-            https://services.gradle.org/distributions/gradle-8.7-bin.zip
-          unzip -q gradle.zip -d /opt
+      # Toolchain setup moved into .github/actions/setup-android (same
+      # pinned, isolated API-34-only SDK the inline step used to build,
+      # plus the two-failure-source handling it documents), so this job
+      # and the APK job can share ONE cache: the key below is identical
+      # in both workflows, and from the second Android job on any day the
+      # ~1 GB NDK is a cache hit instead of a download.
+      - name: Restore pinned Android SDK + Gradle
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            $HOME/android-sdk
+            $HOME/gradle-dist
+          key: android-sdk-${{ runner.os }}-cmdtools-11076708-api-34-buildtools-34.0.0-ndk-26.3.11579264-cmake-3.22.1-gradle-8.7
+
+      - name: Restore Gradle dependency cache
+        id: gradle-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
+          restore-keys: |
+            gradle-deps-${{ runner.os }}-gradle8.7-
+
+      - uses: ./.github/actions/setup-android
 
       - name: Android Lint (must report 0 findings)
         working-directory: android
@@ -361,7 +359,7 @@ jobs:
           # publishes it where API-only clients can read it, and fails
           # the job itself.
           set +e
-          /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q \
+          "$GRADLE_BIN" lintDebug --no-daemon -q \
             > "$RUNNER_TEMP/gradle-lint.log" 2>&1
           rc=$?
           set -e
@@ -480,7 +478,28 @@ jobs:
 
       - name: Kotlin-/C-Kompilierung (NDK clang ist strenger als Host-gcc)
         working-directory: android
-        run: /opt/gradle-8.7/bin/gradle assembleDebug --no-daemon -q
+        run: $GRADLE_BIN assembleDebug --no-daemon -q
+
+      # Persist the toolchain for the next Android job (same key as the
+      # APK build job, so the two jobs share one warm cache). The
+      # dependency cache is saved on success only, same reasoning as
+      # there: a failed build must not publish a half-resolved set.
+      - name: Save pinned Android SDK + Gradle cache
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            $HOME/android-sdk
+            $HOME/gradle-dist
+          key: android-sdk-${{ runner.os }}-cmdtools-11076708-api-34-buildtools-34.0.0-ndk-26.3.11579264-cmake-3.22.1-gradle-8.7
+
+      - name: Save Gradle dependency cache
+        if: success() && steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
+          key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
 
       - uses: actions/upload-artifact@v4
         if: failure()
