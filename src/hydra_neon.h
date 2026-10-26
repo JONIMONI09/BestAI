@@ -32,6 +32,19 @@
 #include <arm_neon.h>
 #include <stdint.h>
 
+/* Bit-pattern redefinition of uint8x16_t as int8x16_t. Recent
+ * AArch64 arm_neon.h headers (clang 14+) only provide the
+ * source-suffixed spelling vreinterpretq_s8_u8, while GCC's
+ * arm_neon.h still only provides the plain vreinterpretq_s8. CI
+ * compiles this header with BOTH (aarch64-linux-gnu-gcc-12 and
+ * Apple clang on macos-latest), so the spelling is selected by
+ * compiler instead of hardcoding one of them. */
+#if defined(__clang__)
+#define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8_u8(v)
+#else
+#define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8(v)
+#endif
+
 /**
  * acc[i] += A[i]*token + B[i]*state[i]  fuer genau 16 Werte.
  *
@@ -125,23 +138,31 @@ static inline void hydra_neon_unpack_v2_plane(
         const uint8x16_t bytes = vld1q_u8(plane + d / 4);
 
         /* Normalize each weight to the low 2 bits (logical right
-         * shifts via negative vshlq immediates), then mask with 0x03:
-         * vqtbl1q_u8 indexes with each lane's LOW 4 bits only, so the
-         * weight must sit in bits 0-1 of the index (a pure AND mask
-         * like 0x3C/0xF0/0xC0 would leave the weight in bits 2-7 and
-         * decode planes 1-3 as 0). */
+         * shifts), then mask with 0x03: vqtbl1q_u8 indexes with each
+         * lane's LOW 4 bits only, so the weight must sit in bits 0-1
+         * of the index (a pure AND mask like 0x3C/0xF0/0xC0 would
+         * leave the weight in bits 2-7 and decode planes 1-3 as 0).
+         *
+         * vshrq_n_u8, not negative vshlq_n_u8 immediates: for
+         * uint8 lanes a negative shift has the same bit pattern as a
+         * positive logical right shift, but the negative form is not
+         * accepted by all arm_neon.h implementations (their fixed
+         * static-immediate macro/builtin rejects values outside the
+         * positive encode range) — proven by aarch64 clang/GCC
+         * builds. vshrq_n_u8 with 2/4/6 is in the legal 0..31 range
+         * of the AArch64 LSR instruction on every implementation. */
         const uint8x16_t m3 = vdupq_n_u8(0x03);
         const uint8x16_t d0 = vqtbl1q_u8(tv, vandq_u8(bytes, m3));
-        const uint8x16_t d1 = vqtbl1q_u8(tv, vandq_u8(vshlq_n_u8(bytes, -2), m3));
-        const uint8x16_t d2 = vqtbl1q_u8(tv, vandq_u8(vshlq_n_u8(bytes, -4), m3));
-        const uint8x16_t d3 = vqtbl1q_u8(tv, vandq_u8(vshlq_n_u8(bytes, -6), m3));
+        const uint8x16_t d1 = vqtbl1q_u8(tv, vandq_u8(vshrq_n_u8(bytes, 2), m3));
+        const uint8x16_t d2 = vqtbl1q_u8(tv, vandq_u8(vshrq_n_u8(bytes, 4), m3));
+        const uint8x16_t d3 = vqtbl1q_u8(tv, vandq_u8(vshrq_n_u8(bytes, 6), m3));
 
         /* Widen each decoded plane to 16 int32 (four int32x4 lanes):
          * Rj_r lane n = decoded weight for byte 4r+n, nibble j. */
-        const int8x16_t s0 = vreinterpretq_s8(d0);
-        const int8x16_t s1 = vreinterpretq_s8(d1);
-        const int8x16_t s2 = vreinterpretq_s8(d2);
-        const int8x16_t s3 = vreinterpretq_s8(d3);
+        const int8x16_t s0 = hydra_neon_u8x16_as_s8(d0);
+        const int8x16_t s1 = hydra_neon_u8x16_as_s8(d1);
+        const int8x16_t s2 = hydra_neon_u8x16_as_s8(d2);
+        const int8x16_t s3 = hydra_neon_u8x16_as_s8(d3);
         const int16x8_t s0a = vmovl_s8(vget_low_s8(s0));
         const int16x8_t s0b = vmovl_s8(vget_high_s8(s0));
         const int16x8_t s1a = vmovl_s8(vget_low_s8(s1));

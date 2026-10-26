@@ -3,6 +3,65 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 — NEON kernel portability fix (real ARM compilers reject the intrinsics as written) + CI failure diagnostics
+
+CI run on `5c1f145`: the `lint` job failed because `ref_unpack_v2_plane`
+became an unconditional static in `tests/test_engine.c` but is only
+called from the `__ARM_NEON`/`__AVX2__` test blocks — the x86 no-AVX2
+clang syntax check sees it as unused (`-Werror -Wunused-function`; gcc
+is silent under `-fsyntax-only` because it only emits that warning
+during codegen). Fixed by guarding the helper with
+`#if defined(__ARM_NEON) || defined(__AVX2__)` (`e1c6c3b`).
+
+The following run then exposed the real defect: `neon-test`
+(aarch64-linux-gnu-gcc-12) and the macos-latest `build-test` leg
+(Apple clang, arm64) both fail to COMPILE the new kernel, while the
+x86 leg never compiles NEON at all. The kernel's intrinsics were
+written against the ARM instruction set but not against what the
+two CI toolchains' `arm_neon.h` headers actually accept:
+
+1. **Negative `vshlq_n_u8` immediates are not portable.**
+   `vshlq_n_u8(bytes, -2/-4/-6)` is rejected by the AArch64
+   `arm_neon.h` implementations (the static-immediate macro/builtin
+   only encodes a positive range — `argument value -2 is outside the
+   valid range [0, 7]`). Replaced by `vshrq_n_u8(bytes, 2/4/6)` —
+   the logical right shift, in the legal `LSR` immediate range of
+   every AArch64 implementation. Semantics are unchanged: for the
+   LUT index only `shifted & 0x03` matters, and the low 2 bits after
+   a shift are identical for the arithmetic and the logical variant
+   (the sign-fill bits always land above the mask) — confirmed by
+   the 200,000-plane shadow proof against the scalar decoder, which
+   used logical shifts.
+2. **The unsuffixed `vreinterpretq_s8` does not exist in recent
+   headers.** Clang 14+ `arm_neon.h` only provides the
+   source-suffixed `vreinterpretq_s8_u8`; GCC's header still only
+   provides the unsuffixed `vreinterpretq_s8`. A header used by both
+   toolchains cannot hardcode either spelling. New
+   `hydra_neon_u8x16_as_s8()` macro selects the spelling by
+   `__clang__`.
+
+The defects were found by reproducing the aarch64 compile locally
+with a zig-bundled clang toolchain (`pip install ziglang`; the
+sandbox has no aarch64 gcc) — it emits exactly the errors the CI
+compilers report. Verification after the fix: clean aarch64
+cross-compile of both TUs (`-O2 -Wall -Wextra`), full x86 gate
+re-run green (142/0, jni 86/0, large 7/0), baseline
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42 unchanged, test
+counts untouched (x86 142 / arm 151).
+
+- **`src/hydra_neon.h`**: `vshlq_n_u8(bytes, -N)` →
+  `vshrq_n_u8(bytes, N)` (2/4/6); `vreinterpretq_s8(v)` →
+  `hydra_neon_u8x16_as_s8(v)` (compiler-selected spelling).
+- **`tests/test_engine.c`**: `ref_unpack_v2_plane` now compiled only
+  where it is used (`__ARM_NEON || __AVX2__`) — CI syntax gate green
+  on the x86 no-AVX2 clang check again.
+- **`.github/workflows/ci.yml`**: the `neon-test` build+run step and
+  the `build-test` build/run steps now capture the real compiler /
+  test output and, on failure, mirror it into check-run `::error::`
+  annotations before exiting — the log/blob hosts are not reachable
+  from every network, so the Checks API is the reliable read path
+  for these jobs.
+
 ## 2026-10-26 — M1 completion: ARM NEON in-register v2 plane unpack (2-bit decode at load)
 
 Closes the last gap of milestone M1 ("True In-RAM 2-bit packed
