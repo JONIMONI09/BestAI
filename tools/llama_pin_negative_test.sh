@@ -4,7 +4,7 @@
 # WHY THIS EXISTS
 # ---------------
 # The pin gate was written from scratch in the same change that introduced the
-# submodule. A brand new gate has never been seen to fail, so under rules.md R25
+# submodule. A brand new gate has never been seen to fail, so under .agents/rules.md R25
 # it is not yet a gate - it is a hope. This script is the proof, and it lives in
 # the repository and runs in CI so the proof cannot rot.
 #

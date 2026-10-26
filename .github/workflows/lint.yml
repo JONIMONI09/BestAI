@@ -5,7 +5,7 @@ name: Lint & Security
 #   Android app (Kotlin, manifest, resources).
 #
 # Every gate was executed locally and checked for falsifiability
-# (see errors.md, entries of 2026-10-02).
+# (see .agents/errors.md, entries of 2026-10-02).
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang-tidy clang-tools flawfinder cppcheck
 
-      # Verwendet die in errors.md dokumentierten POSIX-Feature-Makros,
+      # Verwendet die in .agents/errors.md dokumentierten POSIX-Feature-Makros,
       # sonst sind madvise/O_CLOEXEC/clock_gettime unter strict C99 undefiniert.
       - name: gcc -fanalyzer (GCC static analyzer, C99)
         run: |
@@ -87,7 +87,7 @@ jobs:
             ':(glob)tests/*.c' \
             ':(glob)android/app/src/main/cpp/*.c' \
             ':(glob)android/app/src/main/cpp/*.cpp')
-          # A gate that scans nothing exits 0 and looks green (rules.md R25).
+          # A gate that scans nothing exits 0 and looks green (.agents/rules.md R25).
           if [ "${#OWN_SRC[@]}" -lt 3 ]; then
             echo "::error::flawfinder matched only ${#OWN_SRC[@]} file(s); the input list is broken, not clean"
             exit 1
@@ -209,7 +209,7 @@ jobs:
 
       # A 413 that never reaches the client is invisible to every other
       # check: the request simply fails, without a status code. This
-      # asserts the answer actually arrives (see errors.md, "the 413 that
+      # asserts the answer actually arrives (see .agents/errors.md, "the 413 that
       # was never delivered").
       - name: Over-sized upload gets a readable 413
         run: |

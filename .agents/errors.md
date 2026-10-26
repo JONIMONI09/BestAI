@@ -6,6 +6,113 @@
 
 ---
 
+## 2026-10-26 (round 6) — CI red #3: corrupted GitHub registration of the code-scanning workflow
+
+- **Symptom:** the `code_scanning_alert` workflow ran on **every push**
+  (runs #20-#22 across three branches, event=push), each with **0 jobs**,
+  concluding `failure` in under 3 seconds, no job logs. The file itself
+  parses clean (PyYAML + the duplicate-key gate).
+- **Cause:** GitHub's registered definition for the workflow (created the
+  day the file was introduced, id 396960786) carries the file PATH as its
+  name — not the file's `name: Code scanning alert handling` — i.e. the
+  registration was built from a broken/intermediate state and was never
+  refreshed. Its trigger set did not match the file (push instead of
+  code_scanning_alert) and its job graph was empty. No amount of local
+  YAML validation can see this: it is server-side state, not file content.
+- **Fix:** moved the file to `.github/workflows/code-scanning-alert.yml`
+  (identical content) to force a fresh registration under a new path; the
+  orphaned `code-scanning.yml` registration clears with the file deletion
+  on merge. After merge: the next main push must show NO new zero-job run.
+- **Prevention:** detection recipe recorded in `.agents/Environment.md`
+  (Arena section, round 6, item 5): compare
+  `gh api .../actions/workflows` registered names against the files'
+  `name:` keys, and any run with 0 jobs + instant failure on a push
+  event for a non-push-triggered workflow = suspect registration.
+
+## 2026-10-26 (round 6) — CI red #2: `ClosedFloatingPointRange` has no `.last`/`.first`
+
+- **Symptom:** the "Android lint" job of Lint & Security (and the APK
+  compile in Release/CI) failed on main f79ff96. Annotation (via
+  check-run annotations API, logs blob-blocked): `HydraApp.kt:1011
+  Unresolved reference 'last'` / `'first'`.
+- **Cause:** round-5's `SettingSlider` took `valueRange: ClosedFloatingPoint
+  Range<Float>` and computed `steps` from `valueRange.last - valueRange.
+  first`. `.first`/`.last` exist on `IntRange`/`ClosedIntRange` but NOT on
+  the floating-point ranges — the compiler is right, the manual code
+  review of round 5 missed it (Kotlin stdlib API doubt, never verified).
+- **Fix:** the slider takes `start: Float, end: Float` + `step: Float`;
+  `steps = (((end - start) / step).toInt() - 1).coerceAtLeast(0)`; the 6
+  call sites converted to `start = .., end = ..`.
+- **Prevention:** `tools/kotlin_stub_check/` now type-checks all app
+  Kotlin locally in ~20s (kotlinc via npm + stub classpath). Any Kotlin
+  stdlib/library API doubt is verified by that check or on the web before
+  the code ships — never by assumption.
+
+## 2026-10-26 (round 6) — CI red #1: cppcheck `uninitvar` on the v3 test buffers
+
+- **Symptom:** CI gate 1c (cppcheck, warning+performance+portability)
+  failed on main f79ff96: `tests/test_engine.c:2790-2791` — `(hx, hy)`
+  "variable ... is read but has not been initialized" (uninitvar).
+- **Cause:** the v3 report roundtrip test fills `hx[16]`/`hy[16]`
+  incrementally inside a loop and passes the arrays to
+  `hydra_engine_report()`; cppcheck cannot prove write-coverage for every
+  iteration across the function boundary.
+- **Fix:** zero-init both buffers (`hx[16] = {0}`, `hy[16] = {0}`) — the
+  established codebase convention for incrementally-filled buffers; the
+  loop still writes every element, the init is a floor, not a value
+  source.
+- **Prevention:** any test buffer that is passed to a function before
+  every element is provably written gets `= {0}` at declaration. The C
+  gate (gate 1c in `.claude/skills/engine-ci-verify/SKILL.md`) runs
+  locally on every C change — this one would have been caught in 10
+  seconds before the push.
+
+## 2026-10-26 (round 6) — missing import: `Modifier.weight` in HydraApp.kt
+
+- **Symptom:** local Kotlin stub check: `unresolved reference 'weight'` ×5
+  (HydraApp.kt lines 544/605/746/953/1000) — after the `.last/.first`
+  fix, this was the next red waiting in CI.
+- **Cause:** `Modifier.weight(1f)` is a *scope-extension* function
+  (`RowScope.Modifier.weight` / `ColumnScope.Modifier.weight` in package
+  `androidx.compose.foundation.layout`). Kotlin extension functions need
+  an explicit import — the file imported the other layout extensions
+  individually and omitted `weight`.
+- **Fix:** added `import androidx.compose.foundation.layout.weight`.
+- **Prevention:** same as the `.last/.first` entry — the local stub check
+  is the gate; a manual import diff is not.
+
+## 2026-10-26 (round 6) — R stub generator corruption: `list.extend(string)`
+
+- **Symptom:** the generated `R_gen.kt` (the R-class stub for the Kotlin
+  stub check) was character-by-character corrupted; kotlinc reported
+  "syntax error: Expecting member declaration" from line 13 on.
+- **Cause:** the generator did `lines.extend(gen(...))` where `gen()`
+  returns a multi-line STRING — `extend` iterates the string into single
+  characters.
+- **Fix:** regenerated with `lines.append(...)`; the committed
+  `tools/kotlin_stub_check/stubs/R_gen.kt` is the good output (and the
+  generator discipline — regenerate, verify with the compiler — is in the
+  stub README).
+- **Prevention:** `extend` for characters, `append` for strings; and the
+  compiler is the verifier, never "it looks right".
+
+## 2026-10-26 (round 6) — empty C_runtime.kt masked as downstream unresolved refs
+
+- **Symptom:** after a python multi-edit, every compose file failed with
+  `unresolved reference 'runtime'` / `'Composable'` — 20+ errors that
+  seemed to point at the wrong files.
+- **Cause:** the edit sequence had truncated `C_runtime.kt` to zero bytes;
+  the "errors" were just the package no longer existing.
+- **Fix:** rewrote `C_runtime.kt` cleanly (Composable annotation with
+  FUNCTION+TYPE+TYPE_PARAMETER+VALUE_PARAMETER targets, State/
+  MutableState, remember/LaunchedEffect, getValue/setValue operators,
+  collectAsState); zero errors.
+- **Prevention:** after scripted multi-file surgery, re-read the files
+  that were touched (or `wc -c` them) before the next compile round — an
+  empty file fails silently at write time and loudly everywhere else.
+
+---
+
 ## 2026-10-02 — The 413 that was never delivered
 
 - **Symptom:** uploading a 100 MiB model produced an **empty response** and
@@ -584,7 +691,7 @@
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)` (five `..`),
   then `${HYDRA_ROOT}/src/hydra_engine.c`.
 - **Prevention:** debug the native build directly with the SDK CMake +
-  toolchain (see `docs/ANDROID_SKILL.md` §4) before invoking Gradle;
+  toolchain (see `.agents/docs/ANDROID_SKILL.md` §4) before invoking Gradle;
   AGP wraps and hides the real error text.
 
 ## 2026-10-01 — NDK clang: implicit declaration of `snprintf`/`clock`
@@ -696,7 +803,7 @@
   referencing a retired package name even after updates.
 - **Fix:** (a) download/unpack the cmdline-tools explicitly, set PATH
   and license acceptance explicitly — the same sequence proven locally
-  in `docs/ANDROID_SKILL.md`; (b) removed `--error`, added
+  in `.agents/docs/ANDROID_SKILL.md`; (b) removed `--error`, added
   `--suppress-errors`; (c) `build-mode: none` for both languages.
 - **Prevention:** check every external action and every CLI flag against
   the official docs before committing (R26). Additionally simulate

@@ -6,7 +6,7 @@
 # /api/models/inspect report, and the refusal must name what the user
 # actually picked ("this is a GGUF file…") instead of "wrong magic".
 #
-# There is no device or emulator in CI (see docs/gpu-feasibility.md,
+# There is no device or emulator in CI (see .agents/docs/gpu-feasibility.md,
 # "Measured on device"), so this is a static gate over the Kotlin source:
 # every check below fails when the corresponding behaviour is removed.
 # The negative control is the script itself, pointed at a copy with a rule

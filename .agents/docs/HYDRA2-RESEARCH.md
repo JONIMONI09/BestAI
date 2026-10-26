@@ -188,7 +188,7 @@ and measured worse: an explicit `MADV_DONTNEED` after every step was added to
 return memory after loading and made measured RSS **worse** than without it,
 because the mapping already uses `MADV_SEQUENTIAL`, which drops pages behind the
 read cursor automatically. It was reverted and the instrumentation kept. **[CODE]**
-`-DHYDRA_DROP_CACHE` still exists behind that flag; see `errors.md`.
+`-DHYDRA_DROP_CACHE` still exists behind that flag; see `.agents/errors.md`.
 
 ### 2.3 Metrics — what to record
 
@@ -294,7 +294,7 @@ so:
 
 > **No speed, memory or energy claim may appear anywhere in this project until a
 > ternary kernel has beaten the pinned llama.cpp baseline on the same device,
-> in the same run.** rules.md R32: measure before claiming; "blocked, not
+> in the same run.** .agents/rules.md R32: measure before claiming; "blocked, not
 > measured" is a valid result. A proxy measurement of a different system is not
 > a partial result — it is a measurement that will be quoted later as if it were
 > the right one.
@@ -396,7 +396,7 @@ Each is open because the answer requires a measurement that has not been made.
 
 **Until each of these is measured on a named device, it stays open.** Writing
 down a plausible number would be worse than leaving the question visible —
-`errors.md` records, more than once, that a number remembered from a plausible
+`.agents/errors.md` records, more than once, that a number remembered from a plausible
 derivation is how documentation ends up contradicting the code.
 
 ---

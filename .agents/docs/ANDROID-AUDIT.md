@@ -13,7 +13,7 @@ against.
   `a21dac8`). The working tree was clean (`git status --porcelain` → 0 lines).
 - **Author of this change:** none yet. This document is the first commit of the work.
 
-> **Provenance rule for this document** (rules.md R7, R31, R32). Every statement is
+> **Provenance rule for this document** (.agents/rules.md R7, R31, R32). Every statement is
 > one of: a **code citation** (`file:line` + symbol), a **measurement** (this
 > environment, 2026-10-03, with the command), or an explicit **NOT MEASURED** /
 > **ESTIMATE** marker. There are no unlabelled claims.
@@ -86,7 +86,7 @@ add_library(hydra SHARED    # line 9
 `CMAKE_C_STANDARD 99` (line 4), `-O3 -Wall -Wextra` (line 18), links only `log`
 (line 20–21). The v1 engine source is compiled straight out of the **repo root**,
 five levels up (`get_filename_component`, line 7) — there is one engine source, not a
-copy (rules.md R12).
+copy (.agents/rules.md R12).
 
 ### 1.5 Gradle / ABI surface — `android/app/build.gradle.kts` (103 lines)
 
@@ -157,7 +157,7 @@ Public v1 engine API (the second engine must be additive only):
 
 ## 3. llama.cpp target: pinned version, license, and the exact API
 
-Verified on the web on 2026-10-03 against the upstream repository (rules.md R26).
+Verified on the web on 2026-10-03 against the upstream repository (.agents/rules.md R26).
 
 | Property | Value | How it was verified |
 |---|---|---|
@@ -240,7 +240,7 @@ Ordered by how early they will bite. Each is a *finding*, not a decision.
 |---|---|---|---|---|
 | **B1** | **`-DANDROID_STL=none` (`app/build.gradle.kts:29`) is incompatible with llama.cpp.** llama.cpp is C++ and requires a real C++ runtime; the current setting gives the native build no STL at all. | `build.gradle.kts:29`; llama.cpp `CMakeLists.txt` is C++ throughout | Phase 2, immediately | Must change to `c++_static` (ships the runtime inside the APK; `none` will not link). This is a **toolchain change** and belongs in its own Phase-2 commit. |
 | **B2** | **No Gradle wrapper is checked in.** `android/gradle/wrapper/` does not exist; there is no `gradlew` anywhere in the repo. CI builds with `$GRADLE_BIN` (`.github/workflows/ci.yml:413`), pointing at a Gradle installed by `.github/actions/setup-android`. | `ls android/gradle/wrapper/` → no such file; `ci.yml:413` | Phase 1 gate wording | Phase 6's `./gradlew assembleDebug assembleRelease` is **not runnable as written**. This audit uses the CI's own mechanism instead (see §5). Do not report a `./gradlew` result that was never produced. |
-| **B3** | **Three Android CI gates grep the Kotlin UI source.** `tools/android_autostart_check.sh` (31 checks) asserts **View-specific mechanisms** that Compose removes: `CheckBox`, `setContentView(ScrollView`, `root.addView(output)`, `modelLabel.text`, `runButton.isEnabled = false`, `root.post { startInference() }`, `minLines = [0-9]`. `tools/android_header_check.sh` (22 checks) and `tools/android_crash_check.sh` grep `MainActivity.kt` for fixed literals but only for **logic** (`analyseHydraFile(tmp, bytes)`, `val weightsEnd = offset + len`, `CrashHandler.pendingReport(filesDir)`), which a Compose rewrite leaves in place. | `tools/android_autostart_check.sh:69-104`; `android_header_check.sh:40-77`; `android_crash_check.sh:104-106` | Phase 1 | Only the autostart gate actually breaks. **Correction to this audit's first pass**, which blamed the header gate: that gate is unaffected. The 9 autostart checks must be rewritten against the Compose mechanism **one for one**, keeping each check's original intent, and each rewritten check must be shown to still fail when its behaviour is removed (rules.md R25 negative control). |
+| **B3** | **Three Android CI gates grep the Kotlin UI source.** `tools/android_autostart_check.sh` (31 checks) asserts **View-specific mechanisms** that Compose removes: `CheckBox`, `setContentView(ScrollView`, `root.addView(output)`, `modelLabel.text`, `runButton.isEnabled = false`, `root.post { startInference() }`, `minLines = [0-9]`. `tools/android_header_check.sh` (22 checks) and `tools/android_crash_check.sh` grep `MainActivity.kt` for fixed literals but only for **logic** (`analyseHydraFile(tmp, bytes)`, `val weightsEnd = offset + len`, `CrashHandler.pendingReport(filesDir)`), which a Compose rewrite leaves in place. | `tools/android_autostart_check.sh:69-104`; `android_header_check.sh:40-77`; `android_crash_check.sh:104-106` | Phase 1 | Only the autostart gate actually breaks. **Correction to this audit's first pass**, which blamed the header gate: that gate is unaffected. The 9 autostart checks must be rewritten against the Compose mechanism **one for one**, keeping each check's original intent, and each rewritten check must be shown to still fail when its behaviour is removed (.agents/rules.md R25 negative control). |
 | **B4** | **`tools/jni_signature_check.sh` is scoped to `HydraBridge.kt` only** (default path, line 19). New `external fun`s in a new `LlamaEngine.kt` are **not covered** by any gate. | `jni_signature_check.sh:6,19` | Phase 2 | New JNI methods ship with **no signature verification**. Extending the gate to cover the llama bridge is a Phase-2 follow-up; until then, a wrong JNI descriptor is a runtime `UnsatisfiedLinkError`, not a build failure. |
 | **B5** | **No usable Android runtime target in this environment.** `adb devices` lists nothing; `/dev/kvm` does not exist. The one AVD, `hydra_test`, is API 24 **x86_64** with no KVM → pure TCG software emulation. | `adb devices`; `ls /dev/kvm` → no such file; `avdmanager list avd` | Phase 2 gate, Phase 6 | A Phase-2 "runs on an emulator" gate is **reachable but very slow**; a meaningful speed measurement is not. No **physical ARM device** exists here at all. |
 | **B6** | **The Phase-2 test model is not in the repo and must not be committed.** `android/app/src/main/assets/` contains exactly one file, `starter.hydra` (280 bytes). | `ls -la android/app/src/main/assets/` | Phase 2 | Needs a download script + a recorded licence note. A ~70–100 MB GGUF must never enter git. |
@@ -283,7 +283,7 @@ build-tools 34.0.0, platform-tools, cmdline-tools, **NDK 26.3.11579264** (matche
 
 `./hydra-test` exits 0 with **0 failures**. The assertion count is deliberately **not
 written down here**: `tools/docs_claim_check.sh` rejects a hard-coded count in any
-document (rules.md R21), and `tools/test_count_check.sh` parses the real count out of
+document (.agents/rules.md R21), and `tools/test_count_check.sh` parses the real count out of
 the binary and compares it against the single reviewed file
 `tools/test_count_baseline.txt` (`x86: 71`, `arm: 77`). That gate passed here — exit 0.
 **The ARM count is larger by design** — the NEON-vs-scalar comparison assertions only
@@ -293,7 +293,7 @@ exist in an NEON build; do not "fix" a drift by lowering it.
 
 ## 6. Explicitly NOT MEASURED
 
-Per rules.md R32 ("blocked, not measured"), none of the following is known, and no
+Per .agents/rules.md R32 ("blocked, not measured"), none of the following is known, and no
 number for any of them appears anywhere in this repository:
 
 - **Tokens/second** — for SmolLM2-135M, Qwen2.5-0.5B, or anything else, on any device.

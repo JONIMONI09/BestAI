@@ -17,7 +17,7 @@
 # tools/compose_scroll_guard.py: detector 1 = lexical nesting, detector 2
 # = a composable lambda invoked inside a scrollable whose definition
 # carries scrollable content). This wrapper is the GATE around it and
-# carries the controls (rules.md R25/R26):
+# carries the controls (.agents/rules.md R25/R26):
 #
 #   1. the real Android sources must come back clean,
 #   2. the pre-fix crash shape from git history (d0c7679 HydraApp.kt -

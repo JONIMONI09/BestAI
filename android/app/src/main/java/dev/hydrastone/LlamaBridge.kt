@@ -11,7 +11,7 @@ package dev.hydrastone
  * Every method returns a JSON string rather than throwing, because every
  * failure a user can cause - a corrupt file, an unsupported architecture, a
  * context too large for the phone - is an ordinary outcome that needs a
- * readable sentence, not an exception (rules.md R27).
+ * readable sentence, not an exception (.agents/rules.md R27).
  */
 object LlamaBridge {
 

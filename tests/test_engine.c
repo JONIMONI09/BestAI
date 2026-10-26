@@ -129,7 +129,7 @@ static void test_header_endianness(void)
  * ACHTUNG: der zweite Fall lieferte previously 11 statt 1. Das war das
  * Symptom des labs()-Bug (BUG-5): labs() hat das Vorzeichen vernichtet und
  * w=+1 sowie w=-1 auf denselben Token abgebildet. Der Wert wurde bewusst
- * angepasst — siehe errors.md, Eintrag "labs() vernichtet Vorzeichen".
+ * angepasst — siehe .agents/errors.md, Eintrag "labs() vernichtet Vorzeichen".
  */
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static int run_single_weight_case(uint8_t weight_byte, uint16_t token_in,

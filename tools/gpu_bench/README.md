@@ -3,8 +3,8 @@
 **Status: NOT MEASURED.** No Snapdragon 8 Elite tablet and no emulator were
 available in the environment where this code was written, so this directory
 contains a benchmark that has been *compiled for arm64* but **never run**.
-Nothing in `docs/gpu-feasibility.md` is based on output from this program,
-because there is no output yet. (Rule R32 in `rules.md`.)
+Nothing in `.agents/docs/gpu-feasibility.md` is based on output from this program,
+because there is no output yet. (Rule R32 in `.agents/rules.md`.)
 
 ## What it does
 

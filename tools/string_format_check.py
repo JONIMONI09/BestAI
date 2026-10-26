@@ -15,7 +15,7 @@ first frame with:
         at dev.hydrastone.MainActivity.startInference(MainActivity.kt:361)
 
 The compile is not the test. A string that cannot be formatted is a crash
-that only appears when a user presses a button. rules.md R7.
+that only appears when a user presses a button. .agents/rules.md R7.
 
 WHAT IS CHECKED
 ---------------

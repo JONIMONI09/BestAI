@@ -1,6 +1,6 @@
 ## Read this first
 
-**The Phase 0 tablet measurement is BLOCKED.** No Snapdragon 8 Elite tablet, no emulator and no `adb` in this environment. Nothing in this PR claims a device number. `docs/gpu-feasibility.md` separates *measured here* from *not measured*.
+**The Phase 0 tablet measurement is BLOCKED.** No Snapdragon 8 Elite tablet, no emulator and no `adb` in this environment. Nothing in this PR claims a device number. `.agents/docs/gpu-feasibility.md` separates *measured here* from *not measured*.
 
 Three items in the brief were **already merged** before this work (PR #24/#26) and were **not** redone: JNI batching, SAF import, the `labs()` sign fix, and the APK-in-release workflow.
 
@@ -44,7 +44,7 @@ Layer aggregation left `hydra_neon.h` **dead**. The ARM path would have silently
 * **Crash handler in all three apps.** Console (`window.onerror`, unhandled rejections, failed requests) → dialog with **Copy details**, clipboard API with a textarea fallback for plain-HTTP LAN use. Server (`uncaughtException`, `unhandledRejection`, failed requests) → bounded ring buffer at `GET /api/errors`, polled by the UI. Android → default `UncaughtExceptionHandler` writes `last-crash.txt` and starts `CrashActivity` (own process) with **Copy report**.
 * **Permissions.** SAF needs none, so `ci.yml` now fails if any dangerous permission appears in the APK.
 * **UI.** `:focus-visible` rings, `prefers-reduced-motion`, an empty state instead of a blank canvas, 44px touch targets.
-* **rules.md R31/R32** — everything through a PR in English; measure before claiming.
+* **.agents/rules.md R31/R32** — everything through a PR in English; measure before claiming.
 
 ## Verification (all executed here)
 
@@ -77,6 +77,6 @@ gpu_bench arm64 NDK compile          ok
 
 ## Recommendation
 
-**Do not start Phase 3 / a v2 format yet.** The precondition — a measured crossover — is not met, and the CPU side got ~7x faster before the question was asked. Run `gpu_bench` on the tablet, paste the table into `docs/gpu-feasibility.md`, and decide from data.
+**Do not start Phase 3 / a v2 format yet.** The precondition — a measured crossover — is not met, and the CPU side got ~7x faster before the question was asked. Run `gpu_bench` on the tablet, paste the table into `.agents/docs/gpu-feasibility.md`, and decide from data.
 
 Merge is the user's call (R14).

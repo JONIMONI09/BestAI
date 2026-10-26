@@ -71,7 +71,7 @@ Constraints and bounds (all enforced in `hydra_engine_load`, all tested in
 
 1. `dim % 4 == 0` — required, because the aggregation reads `dim/4` bytes per
    plane; without the guard the leftover dimensions would silently aggregate
-   to zero. Refused with error `-8`, not rounded (rules.md R11, R14).
+   to zero. Refused with error `-8`, not rounded (.agents/rules.md R11, R14).
 2. `weights_len >= layers * dim / 2` — the v2 read size. The loader validates
    the ACTUAL read size per version: a v1 file keeps its exact
    `layers * dim` requirement, a v2 file is checked against `layers * dim / 2`

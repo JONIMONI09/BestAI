@@ -3,7 +3,7 @@
 #
 # The behaviour the task asks for cannot be executed here: there is no
 # device, no emulator and no adb in this container (see
-# docs/gpu-feasibility.md, "Measured on device"). What CAN be checked
+# .agents/docs/gpu-feasibility.md, "Measured on device"). What CAN be checked
 # without a device is the set of properties that were the actual bugs:
 #
 #   1. the UncaughtExceptionHandler writes the report to a file BEFORE it

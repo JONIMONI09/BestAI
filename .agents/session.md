@@ -27,7 +27,7 @@
 - ✅ **2026-10-01 — Android NDK port (PR #6, merged):** APK builds for
   arm64-v7a/arm64-v8a/x86_64 via CMake+JNI; verified end-to-end on an
   API-24 x86_64 emulator (no KVM). 7 errors hit and fixed — full log in
-  `errors.md`, guide in `docs/ANDROID_SKILL.md`.
+  `errors.md`, guide in `.agents/docs/ANDROID_SKILL.md`.
 - ✅ **2026-10-01 — CI lint stage (PR #7, merged):** Dual-compiler
   syntax gates (gcc+clang), cppcheck, Python format gate,
   error-artifact upload. cppcheck caught a real `%u`/signed issue on
@@ -43,7 +43,7 @@
   `tools/test_count_check.sh` (see `tools/test_count_baseline.txt`), never
   written down here.
 - ✅ **2026-10-02 — Web console, skills, Android APK:** see
-  "Done (earlier today)" and `docs/ANDROID_SKILL.md`.
+  "Done (earlier today)" and `.agents/docs/ANDROID_SKILL.md`.
 
 ## Done (earlier today)
 
@@ -1613,7 +1613,7 @@ Work actually done:
 
 Audit first: Phase 1.3 (JNI batching), SAF import, the `labs()` sign fix
 and the APK-in-release workflow were **already merged** in PR #26/#24 —
-recorded in `docs/gpu-feasibility.md` so nobody repeats them.
+recorded in `.agents/docs/gpu-feasibility.md` so nobody repeats them.
 
 - [x] rules.md: **R31** (every change through a PR, English artefacts) and
       **R32** (measure before claiming; say "blocked" when a number cannot
@@ -1644,7 +1644,7 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       reference + GPU path + K sweep, checksum gate. **Compiles for arm64
       with the NDK, never executed** — no device, and no `glslangValidator`
       for the shader, so the `.spv` is deliberately not committed.
-- [x] `docs/gpu-feasibility.md`: measured vs blocked separated, conclusion
+- [x] `.agents/docs/gpu-feasibility.md`: measured vs blocked separated, conclusion
       "do not start v2 yet" with the reasoning.
 - [x] UI: focus-visible rings, `prefers-reduced-motion`, empty state for
       the engine panel, 44px touch targets on small screens.
@@ -1897,7 +1897,7 @@ outputs, "document everything".
       RESOLVED: the repo's table (00=0, 01=+1, 10=−1, 11=0) is a
       different but equally valid permutation — repo KEEPS its table
       for v2/v3 file compatibility; no layout-identity claim anywhere
-      in the docs. Recorded in docs/RESEARCH.md (new).
+      in the docs. Recorded in .agents/docs/RESEARCH.md (new).
 - [x] **Format version 3 (docs/FORMAT.md canonical):** same 24-byte
       header, version=3, dim%4==0. Per layer: Wg (dim²/4 B) + Wu
       (dim²/4 B) + w1 (dim/4 B) + scale u16 LE (absmean·256, min 1) —
@@ -1964,7 +1964,7 @@ outputs, "document everything".
       scoped to v1/v2; testing strategy +2 bullets), README
       (672 B ×2, v3 feature bullet, roadmap item checked, math
       section v3 note, project structure), CHANGELOG round-4 entry,
-      docs/RESEARCH.md new (BitNet b1.58 + I2_S facts + repo
+      .agents/docs/RESEARCH.md new (BitNet b1.58 + I2_S facts + repo
       decisions), this file.
 - [x] **Local gates (round 4, real outputs):**
       `make test-run` → `73 checks, 0 failed` (gguf_test) +
@@ -2168,3 +2168,98 @@ android/app/src/main/java/dev/hydrastone/{EngineInterface,HydraEngine,
 LlamaBridge,LlamaEngine,MainActivity}.kt,
 android/app/src/main/java/dev/hydrastone/ui/HydraApp.kt,
 android/app/src/main/res/values/strings.xml.
+
+## Round 2026-10-26 (round 6: CI red fix, local Kotlin type-check, .agents/ reorg — owner request)
+
+**Owner request (verbatim):** "CI ist rot! :(" — fix it; "Teste alles lokal
+mit Python"; "Immer Internet benutzen" + install missing tools (pip/npm);
+move all agent-specific docs into a new `.agents/` folder (README.md and
+AGENTS.md stay at root); add Rules etc. there; improve the agent files;
+create a user-rules file (`.agents/user.md`); read `.agents/` before any
+code, update it at the end of the round; adjust Environment.md.
+
+### Root causes of the red CI (main f79ff96, all four workflows)
+
+1. **CI job 1c (cppcheck):** `uninitvar` ×2 — `tests/test_engine.c:2790-91`,
+   the v3 report roundtrip test's `hx[16]`/`hy[16]` were passed to
+   `hydra_engine_report()` before cppcheck could prove a per-iteration
+   write. Fix: zero-init `= {0}` (codebase convention for
+   incrementally-filled buffers).
+2. **Lint & Security "Android lint" + Release "Android APK" + CI Android
+   jobs:** `HydraApp.kt:1011` — round-5 `SettingSlider` took
+   `valueRange: ClosedFloatingPointRange` and used `.last`/`.first`, which
+   only exist on IntRange. Found via check-run annotations
+   (`gh api .../check-runs/<jobId>/annotations`) because the job logs and
+   artifacts are blob-blocked from the sandbox. Fix: the slider takes
+   `start: Float, end: Float` + step; step count from the span; the 6 call
+   sites converted.
+3. **Code-scanning workflow: corrupted GitHub registration.** The workflow
+   was registered 2026-10-26 with the file PATH as its name and a broken
+   trigger set: it ran on EVERY push (runs #20-#22, event=push, 0 jobs,
+   fails in <3s, no logs — the "zero-job" signature). The file itself is
+   valid YAML (PyYAML + the repo's duplicate-key gate both clean). Fix:
+   force a fresh registration by moving it to
+   `.github/workflows/code-scanning-alert.yml` (same content, same
+   `name: Code scanning alert handling`). After the merge, the old
+   registration (path `code-scanning.yml`) is orphaned by the deletion and
+   the new path registers from the known-good content.
+4. **Bonus (found only because a local type-check now exists):**
+   `HydraApp.kt` used `Modifier.weight(1f)` (5×) without importing
+   `androidx.compose.foundation.layout.weight` — a scope-extension function
+   that needs an explicit import. Would have been the NEXT red after #2.
+   Import added.
+
+### The local Kotlin type-check (the capability this round added)
+
+No Android SDK is possible in the sandbox (Maven blocked), but the Kotlin
+COMPILER is on the npm registry:
+`npm install kotlin-compiler@2.4.21 javajre-linux-64@17.0.8` (kotlinc-jvm
+2.4.21 on JRE 17.0.8, matching the CI Temurin 17 major). Built a faithful
+stub classpath (`tools/kotlin_stub_check/stubs/`, 40 files: android.*/
+androidx.*/compose/org.json + R generated from the real strings.xml) and a
+runner: `bash tools/kotlin_stub_check/kotlin_stub_check.sh` → compiles all
+10 app .kt files in ~20s. This caught root cause #2 and the missing
+weight import locally, before CI. Verified: **0 errors** on the fixed tree
+(only 3 warnings, 2 pre-existing redundant-`else`, 1 stub artifact).
+Stub-fidelity rules learned (see `.agents/errors.md`): verify API
+signatures on the web before stubbing (Compose `items` key lambda is
+single-parameter `(item: T) -> Any` — the two-parameter one is
+`itemsIndexed`); one package per stub file; fun-interface for Java SAMs;
+JVM signature clashes when stubbing var+fun pairs.
+
+### .agents/ reorg (owner directive)
+
+Moved (git mv): rules.md, errors.md, session.md, Environment.md, CLAUDE.md
+→ `.agents/`; docs/{ANDROID-AUDIT,ANDROID_SKILL,RESEARCH,
+HYDRA2-RESEARCH,gpu-feasibility,pr-gpu-feasibility}.md → `.agents/docs/`;
+`.agent_memory/` → `.agents/docs/{TECHNICAL-AUDIT,RESEARCH-LOG}.md`
+(folder deleted). Root keeps README.md + AGENTS.md; `docs/` keeps the
+product specs (FORMAT.md, FORMAT-V2.md, GGUF-IMPORT.md, ARCHITECTURE.md).
+All path references updated repo-wide (44 files, incl. CI comments, tools,
+code comments, AGENTS.md pointer table); `tools/docs_claim_check.sh` FILES
+array extended with `.agents/docs/*.md` (gate still passes). New:
+`.agents/user.md` (owner's standing directives, dated, 21 entries) and
+`.agents/README.md` (index + maintenance rules). Historical CHANGELOG
+entries keep their dated old paths on purpose.
+
+### Verification (all local, real outputs)
+
+- `make test-run`: 174/0 + 86/0 + 7/0 + 73/0 (unchanged).
+- cppcheck (venv, --enable=all -Isrc -Itests): 0 issues.
+- `tools/kotlin_stub_check/kotlin_stub_check.sh`: OK (0 errors).
+- `bash tools/docs_claim_check.sh`: all banned claims absent.
+- `bash tools/workflow_yaml_check.sh`: 6 files parsed, negative control ok.
+- `python3 tools/string_format_check.py`: ok (39 checked).
+- PyYAML full parse of all 5 workflows: clean (installed via pip — the
+  stdlib-only fallback in workflow_yaml_check.sh cannot see syntax
+  errors; it passed, so the rename risk is covered by both).
+
+**Files:** tests/test_engine.c, android/app/src/main/java/dev/hydrastone/
+ui/HydraApp.kt, tools/kotlin_stub_check/ (new), .agents/ (new folder: 5
+moved files + 8 moved docs + user.md + README.md), .github/workflows/
+code-scanning.yml → code-scanning-alert.yml, 44 reference updates.
+
+**Open:** CI on this branch is check-only until a PR is opened (the
+push-tier workflows run on main/PR events). After merge: confirm
+code-scanning-alert registers clean (no more zero-job push runs) and the
+three formerly-red workflows go green.

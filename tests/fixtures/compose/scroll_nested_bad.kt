@@ -1,7 +1,7 @@
 package fixture.compose
 
 /*
- * NEGATIVE CONTROL for tools/compose_scroll_guard.py (rules.md R25).
+ * NEGATIVE CONTROL for tools/compose_scroll_guard.py (.agents/rules.md R25).
  *
  * Every scrollable pattern in this file is deliberately ILLEGAL: each one
  * produces the "Vertically/Horizontally scrollable component was measured

@@ -186,7 +186,7 @@ Design notes, stated as facts:
   integer add/sub per non-zero weight. The per-layer `scale` is the
   source tensor's absmean (b1.58's γ) in fixed point (×256, u16); the
   ternary matrix is `clip(round(W/γ), ±1)` of a real tensor, so the
-  rescaled mat-vec reproduces the source magnitude. See `docs/RESEARCH.md`
+  rescaled mat-vec reproduces the source magnitude. See `.agents/docs/RESEARCH.md`
   for the sources (arXiv 2402.17764, 2504.12285; microsoft/BitNet).
 - **Depth is real, not cosmetic.** SwiGLU, RMSNorm and RoPE run
   *between* layers, so the layer stack does not collapse into load-time
