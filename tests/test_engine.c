@@ -2643,8 +2643,10 @@ static void test_tf_format_validation(void)
         const size_t body_len = (size_t)layers * lb + (size_t)6 * 6 / 4;
         uint8_t *body = (uint8_t *)calloc(1, body_len);
         if (!body) { perror("calloc"); exit(1); }
-        FILE *f = fopen(pc, "wb");
-        if (!f) { perror("fopen"); exit(1); }
+        int fd = open(pc, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+        if (fd < 0) { perror("open"); exit(1); }
+        FILE *f = fdopen(fd, "wb");
+        if (!f) { perror("fdopen"); close(fd); exit(1); }
         wr_header_version(f, 3, vocab, 6, layers,
                           (uint32_t)sizeof(HydraModelHeader), (uint32_t)body_len);
         fwrite(body, 1, body_len, f);
