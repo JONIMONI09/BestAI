@@ -458,7 +458,10 @@ def _convert_v3_st(args, blob, data_base, tensors):
             },
         })
 
-    codes_o, scale_o, rep_o = v3_block_from_tensor(blob, data_base, tensors[names[0]], dim, names[0])
+    # scale_o is intentionally unused: the v3 W_out block has no scale field
+    # in the file format - the engine applies the raw ternary codes as int32
+    # logits without rescaling (the per-layer blocks keep their u16 scale).
+    codes_o, _scale_o, rep_o = v3_block_from_tensor(blob, data_base, tensors[names[0]], dim, names[0])
     body += pack_ternary_block(codes_o, dim)
     w_out_report = dict(rep_o)
     w_out_report['note'] = ('final logit-mix block; the engine applies it '
@@ -580,12 +583,10 @@ def pick_tensors(tensors, a_name, b_name):
     real matrix.
     """
     names = list(tensors.keys())
-    if a_name:
-        if a_name not in tensors:
-            raise SafetensorsError('no tensor named %r in this file' % a_name)
-        a_name = a_name
-    else:
+    if not a_name:
         a_name = names[0]
+    elif a_name not in tensors:
+        raise SafetensorsError('no tensor named %r in this file' % a_name)
     if b_name:
         if b_name not in tensors:
             raise SafetensorsError('no tensor named %r in this file' % b_name)
@@ -662,6 +663,9 @@ def convert(args):
             'weights_offset': HEADER_SIZE,
             'weights_len': layers * dim // 2,
         },
+        # mirrors the v3 report: the header vocab is uint16-capped, so the
+        # report must say how many of a forced --vocab were dropped
+        'vocabulary': {'entries': vocab, 'dropped': dropped, 'writtenTo': None},
         'planes': [report_a, report_b],
         'aggregation': {
             'A': a_vec,

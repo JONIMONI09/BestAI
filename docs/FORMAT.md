@@ -210,6 +210,96 @@ still not a 7B LLM: the state is 64 wide, the vocab is capped, and the
 converter slices real tensors into dim×dim blocks. That is stated in the
 converter report, not hidden.
 
+## Version 4 (full per-layer attention pass)
+
+Version 4 keeps the 24-byte `HYDR` header (`version = 4`, same magic, same
+field widths — v1/v2/v3 files are byte-identical to before and load the same
+way) and extends the v3 per-layer body with three attention planes. It is the
+transformer that v3's per-layer structure was preparing for.
+
+### Weight body layout
+
+Per layer, in this order (dim % 4 == 0 is enforced, all sizes exact):
+
+```
+v3: Wg | Wu | w1 | u16 scale                       2 weight planes
+v4: Wg | Wu | Wq | Wk | Wv | w1 | u16 scale        5 weight planes
+```
+
+- `Wg`, `Wu`: the v3 SwiGLU gate planes, each `dim*dim/4` bytes (4 ternary
+  weights per byte, same 2-bit codes as v1/v2).
+- `Wq`, `Wk`, `Wv`: NEW in v4. Full `dim × dim` ternary projection planes,
+  each `dim*dim/4` bytes, sitting between `Wu` and `w1`.
+- `w1`: the v3 token-injection vector, `dim/4` bytes (a `dim`-length ternary
+  vector, 4 per byte) — unchanged from v3.
+- `u16 scale`: the layer's little-endian absmean scale, last 2 bytes of the
+  block — unchanged from v3.
+
+After all layers: the final `W_out` block, `dim*dim/4` bytes — unchanged from
+v3. So the body is `layers * (5*dim*dim/4 + dim/4 + 2) + dim*dim/4` bytes for
+v4 (v3: `layers * (2*dim*dim/4 + dim/4 + 2) + dim*dim/4`).
+
+### Forward pass (executed per token by `hydra_transformer_forward_step`)
+
+Zero-heap engine, stack buffers only; the KV caches are caller-owned.
+
+```
+h = state_vector
+for each layer l (kv = kv_per_layer[l] if a cache array was given):
+  xeff = clamp127(h + w1 * token)                 (v3 input mix, unchanged)
+  q = Wq*xeff/scale   k = Wk*xeff/scale   v = Wv*xeff/scale
+                                                        (ternary, integer-exact)
+  rope(q, pos); rope(k, pos)                       (in-place, theta = 10000)
+  if kv: kv.append(k, v)                           (causality: current is last)
+  c = causal scaled dot-product attention over the RESIDENT kv entries:
+        s_i = (q . K_i) / sqrt(dim); w = softmax(s) (max-subtracted double);
+        c = sum_i w_i * V_i
+        with no cache (kv == NULL): c = v (self-only attention)
+  h1 = clamp127(h + quant(c))                      (residual #1, int8)
+  f  = SwiGLU(Wg*h1/scale, Wu*h1/scale)            (the v3 FFN block)
+  h  = clamp127(h1 + quant(RMSNorm(f)))            (residual #2, int8)
+state = h
+logits = W_out * quant(RMSNorm(state))             (integer-exact after requant)
+token  = argmax(logits) % vocab
+```
+
+`pos` is `step_count` before the increment (the 0-based position of the
+token just injected). Each layer attends only over **its own** cache — a
+shared ring would mix the projections of different layers. `kv_per_layer` is
+either `NULL` (no memory channel, every layer self-only) or a contiguous
+array of `layers` `hydra_kv_cache_t` structs (the same type
+`hydra_engine_step_tf()` and `hydra_sample_token()` take, so the sampler
+shares one cache design).
+
+Differences from v3, on purpose: the residual is **added** (`h + branch`)
+instead of replacing the state; RoPE acts on `q`/`k` at the token position
+instead of on the state; the memory channel is attention over resident K/V
+instead of the sink add-back; the final stage is RMSNorm + the `W_out`
+projection.
+
+### Constraints (all enforced in `hydra_engine_load`, tested)
+
+1. `dim % 4 == 0` (same guard as v2/v3; error `-8`).
+2. `weights_len >= layers * layer_bytes + dim*dim/4` with the **v4** layer
+   size (error `-10`) — a v3-sized body on a v4 header is refused, not
+   truncated.
+3. `scale == 0` in any layer is refused at load (`-15`) — same guard as v3.
+4. Cross-version refusal is symmetric: the legacy `hydra_engine_step()` /
+   `hydra_engine_step_fast()` and the v3 `hydra_engine_step_tf()` refuse v4
+   engines with `-14`, and `hydra_transformer_forward_step()` refuses
+   non-v4 engines with `-14`. No silent cross-version fallback.
+5. Runtime errors on the v4 path: `-16` (non-finite intermediate),
+   `-17` (KV append failed), `-18` (KV read failed or no allocation for the
+   per-token score buffer).
+
+### Writer status (honest)
+
+There is **no shipped Python v4 writer**: `tools/gguf_to_hydra.py` and
+`tools/safetensors_to_hydra.py` support `--v1/--v2/--v3` only. v4 files
+exist as byte-exact hand-built models in `tests/test_engine.c` (the v4
+suite), which is the same way v3's depth proofs are built. A converter `--v4`
+mode is not claimed anywhere in this repository.
+
 ## Reference Writer
 
 `tools/make_model.py` is the canonical Python reference for version 1:
@@ -274,7 +364,8 @@ What genuinely limits 32-bit (`armeabi-v7a`), in the order you hit it:
    the file.
 
 Supporting a single model whose weights start at or above 4 GiB needs the
-`.hydra2` container (64-bit offsets, `docs/FORMAT-V2.md` — not yet implemented)
+`.hydra2` container (64-bit offsets, `docs/FORMAT-V2.md` — the container
+reader is implemented since round 8, MoE inference on top of it is not yet)
 or a split mapping with `mmap64`/`off64_t`. Header version 2 (4 weights per
 byte) is *not* the answer to that question: it halves the file but keeps the
 32-bit offsets. It does **not** need more RAM, which is the point: the

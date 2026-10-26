@@ -216,7 +216,7 @@ def scroll_content_blocks(text: str, match_brace: dict,
     composable call it modifies: the trailing "{...}" after that call's
     closing paren, if the call has one. Returns (mod_pos, block_open)."""
     blocks = []
-    for pos, axis, label, r in scrollables:
+    for pos, _axis, label, _r in scrollables:
         if not label.endswith("()"):
             continue  # lazy call: its own lambda is handled per-call below
         open_paren = -1
@@ -259,7 +259,7 @@ def detector_lambda(text: str, path: str, match_brace: dict,
         owner = _enclosing_function(text, block_open)
         if owner is None:
             continue
-        func_name, func_open, func_close = owner
+        func_name, func_open, _func_close = owner
         params = set()
         header = None
         for hm in re.finditer(r"\bfun\s+" + re.escape(func_name) + r"\b",
@@ -364,9 +364,6 @@ def _enclosing_function(text: str, pos: int):
             k += 1
         if body_close is None or not (body_open < pos < body_close):
             continue
-        # ensure no other function body starts between body_open and pos
-        inner = [c for c in re.finditer(r"\bfun\s+\w+", text)
-                 if body_open < c.start() < pos]
         # nested functions are legal; the NEAREST enclosing one wins, and
         # 'candidates' is scanned from the closest backwards, so the first
         # hit is the nearest. A nested lambda containing pos would have

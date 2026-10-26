@@ -171,6 +171,43 @@ typedef struct hydra_kv_cache hydra_kv_cache_t;
  * argmax of the logit mix modulo vocab. Advances step_count. */
 int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
                          uint16_t *token_out, hydra_kv_cache_t *kv);
+
+/* Version 4: the full per-layer transformer pass.
+ *
+ * Pre-norm attention + SwiGLU FFN per layer, both with int8 residuals,
+ * over the ternary weight planes Wg/Wu/Wq/Wk/Wv (+ w1 token injection,
+ * u16 absmean scale) and the final W_out projection:
+ *
+ *   xeff = clamp127(h + w1*token)
+ *   q = Wq*xeff/scale, k = Wk*xeff/scale, v = Wv*xeff/scale   (exact)
+ *   rope(q, pos), rope(k, pos);  kv_per_layer[l].append(k, v)
+ *   c = causal scaled dot-product attention of layer l over the
+ *       RESIDENT entries of kv_per_layer[l] (sinks + ring + current;
+ *       self-only when kv_per_layer is NULL)
+ *   h1 = clamp127(h + quant(c));  h2 = clamp127(h1 + quant(RMSNorm(
+ *        SwiGLU(Wg*h1/scale, Wu*h1/scale))))
+ *   state = h2 (after the last layer);  logits = W_out*quant(RMSNorm(
+ *   state));  token = argmax % vocab;  step_count++.
+ *
+ * pos is engine->step_count (the RoPE position, incremented per call).
+ *
+ * kv_per_layer: every layer has its own Wq/Wk/Wv, so EVERY layer keeps
+ * its own caller-owned cache (see hydra_kv_cache_init). Either the
+ * whole pointer is NULL - no memory channel, every layer is
+ * self-only - or it points to a contiguous array of `layers` cache
+ * structs; layer l appends its k/v into that entry and attends over
+ * it only (the append advances the cache's counter, so the array is
+ * mutable; an entry whose k/v buffers are unset fails with -17/-18).
+ * The cache contract (sinks + ring, O(1) memory) is the one of
+ * hydra_engine_step_tf().
+ *
+ * Returns 0 on success, -1 invalid arguments, -2 bad magic, -14 wrong
+ * format version (v4 engines only), -16 non-finite intermediate, -17
+ * KV append failed, -18 KV read failed.
+ */
+int hydra_transformer_forward_step(HydraEngine *engine, uint16_t token_in,
+                                   uint16_t *token_out,
+                                   hydra_kv_cache_t *kv_per_layer);
 /* Prefill: faedt eine ganze Token-Sequenz durch die Engine, ohne sie
  * auszugeben. Danach ist der State so weit gelaufen, wie das Prompt ihn
  * getrieben hat, und hydra_engine_step() erzeugt die Fortsetzung.
@@ -228,12 +265,53 @@ typedef struct hydra_sampler_config {
 /* kv: version 3 only - the v3 sampling mode must advance the state
  * with the same memory channel the direct step uses, so the sampler
  * takes the same caller-owned KV cache as hydra_engine_step_tf()
- * (NULL = no memory channel). Ignored on v1/v2 engines. */
+ * (NULL = no memory channel). Ignored on v1/v2 engines.
+ * kv_layers: version 4 only - the per-layer cache array of
+ * hydra_transformer_forward_step() (NULL = no memory channel). The
+ * two are mutually exclusive: pass the one that matches the engine's
+ * version, NULL for the other. */
 int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
                        const hydra_sampler_config_t *cfg,
                        const uint16_t *recent_tokens, size_t recent_len,
                        hydra_kv_cache_t *kv,
+                       hydra_kv_cache_t *kv_layers,
                        uint16_t *token_out);
+
+/* Shared sampled-step callback for hydra_run_steps() (hydra_batch.h).
+ *
+ * ONE implementation of "which engine call produces the next token",
+ * used by the Android JNI bridge (runInferenceSampled) and by the host
+ * tests - the same R12 single-implementation rule the batch loop itself
+ * follows. The dispatch mirrors the CLI (src/main.c) exactly:
+ *
+ *   - sampling enabled (temperature > 0 AND min_p < 1):
+ *     hydra_sample_token() with the recent-token window (the last
+ *     penalty_window generated tokens, chronological, from gen[]),
+ *   - greedy + version 3: hydra_engine_step_tf() with the caller's KV,
+ *   - greedy + version 4: hydra_transformer_forward_step() with the
+ *     caller's per-layer KV array (kv_layers),
+ *   - greedy + v1/v2:     hydra_engine_step() (bit-identical to the
+ *     pre-sampler baseline - the greedy guard is inside the engine).
+ *
+ * gen is caller-owned with capacity >= the total step count; after a
+ * successful step gen[s] holds the token and s is incremented. kv is
+ * only used on version-3 engines (NULL otherwise); kv_layers is only
+ * used on version-4 engines (NULL otherwise); both are ignored by the
+ * v1/v2 paths, matching hydra_sample_token().
+ *
+ * Returns 0 on success, the negative engine rc when the underlying
+ * step or sampler refuses (range violations, vocab < 2, ...). */
+typedef struct {
+    HydraEngine *engine;
+    uint16_t tok;                     /* current input token        */
+    hydra_sampler_config_t cfg;       /* sampling configuration     */
+    uint16_t *gen;                    /* generated tokens, chrono.  */
+    size_t s;                         /* steps completed so far     */
+    hydra_kv_cache_t *kv;             /* v3 only; NULL for v1/v2/4  */
+    hydra_kv_cache_t *kv_layers;      /* v4 only; NULL otherwise    */
+} hydra_sampled_step_ctx_t;
+
+int hydra_sampled_step(void *user, uint16_t *token_out);
 
 /* -------------------------------------------------------------------
  * M4: Transformer primitives (float, zero-heap, guarded) and the

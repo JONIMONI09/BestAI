@@ -6,6 +6,67 @@
 
 ---
 
+## 2026-10-26 (round 8) — two real bugs in the new v2 container reader, both found by `gcc -fanalyzer` before they could ship
+
+- **Symptom 1 (guaranteed NULL deref on a refusal path):** the
+  non-ASCII-metadata-key refusal formatted the offending byte as
+  `c->meta_blob[kv->key_off + ch]` — **after** `meta_free_partial()`
+  had freed the blob and set it to NULL. Any `.hydra2` file with a
+  non-ASCII metadata key crashed the reader with a segfault instead of
+  refusing it loudly (the exact behaviour the spec forbids).
+- **Symptom 2 (partial-state leak):** a metadata parse failure after
+  some pairs were already copied left the earlier value allocations
+  reachable only through the freed/NULLed state — the caller closed the
+  container, but the function was not self-contained.
+- **Cause:** the metadata layout was restructured mid-review from an
+  array-of-structs to the flat `meta` index array + single `meta_blob`
+  (the struct form produced a *phantom* leak in gcc's analyzer), and
+  the failure paths were written against the old layout. gcc
+  `-fanalyzer` (now a CI gate in `lint.yml`, C job) reported both the
+  real leak (`CWE-401`) and the deref-after-free; clang-tidy's
+  `clang-analyzer-security.ArrayBound` also flagged the `&c->meta[i]`
+  access — triaged as a false positive: the minimum-size adjustment in
+  the allocator wrapper (`n ? n : 1`) made the analyzer join two region
+  states (1 byte vs `count*16` bytes). Fixed structurally, not
+  suppressed: the `count == 0` case is now a separate branch, so on the
+  loop-reachable path the region is exactly `count*16` bytes and the
+  finding is gone (finding count 1 → 0, verified with the pip clang
+  23.1.4 wheel).
+- **Fix:** (1) capture the offending key byte into a local
+  (`uint8_t kb`) **before** the free; (2) `meta_free_partial()` is now
+  self-contained (two flat frees) and is called before **every**
+  failure return in `parse_metadata`; (3) the branched allocation
+  above. All three are covered by `tests/test_hydra2_container.c`
+  (118 checks, ASan+UBSan clean, zero leaks) and by the CI
+  `gcc -fanalyzer` step on all three C files.
+- **Prevention:** every failure path that formats file data must
+  capture the bytes into locals before any free — the message is
+  written after the cleanup, and the cleanup may NULL the pointer it
+  would format. And: a static analyzer finding is *triaged*, never
+  deleted — fixed structurally, suppressed only with a written reason
+  (this entry is that record for the ArrayBound case).
+
+## 2026-10-26 (round 8) — scripted text insertion mangled a brace-less `if` body (process error, caught by the compiler)
+
+- **Symptom:** a `python str.replace()` pass that was meant to insert
+  `meta_free_partial(c);` before each `return refuse(...)` in
+  `parse_metadata` produced C where the `if` guarded only the inserted
+  line and the `return` became **unconditional** — every metadata
+  parse returned immediately; some sites were inserted twice.
+- **Cause:** C guards only the first statement of a brace-less `if`;
+  inserting a second statement above the `return` moves the `return`
+  out of the guard. The edit was blind (no recompile between the
+  replace and the next step). Two earlier scripted edits in the same
+  session silently no-op'd (text mismatch, no error) for the same
+  reason: replace-then-forget-to-verify.
+- **Fix:** full clean rewrite of the function with braces; the
+  -Wmisleading-indentation warning from the failed pass was the alarm.
+- **Prevention:** (1) never bulk-insert statements into brace-less `if`
+  bodies — if a guard needs two statements it gets braces first;
+  (2) after ANY scripted text edit: `grep` for the expected result and
+  compile before doing anything else; a `.replace()` that matches
+  nothing succeeds silently.
+
 ## 2026-10-26 (round 7) — the "read .agents/ first" rule kept being SKIPPED (process error, now enforced)
 
 - **Symptom:** owner report 2026-10-26: "du liest nie diese vorher" —

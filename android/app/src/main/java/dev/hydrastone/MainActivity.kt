@@ -595,7 +595,8 @@ class MainActivity : ComponentActivity() {
                     settings.temperature,
                     settings.topK,
                     settings.topP,
-                    settings.minP
+                    settings.minP,
+                    settings.repetitionPenalty
                 )
             )
         }.start()
@@ -735,6 +736,7 @@ class MainActivity : ComponentActivity() {
             .putInt(KEY_TOP_K, settings.topK)
             .putFloat(KEY_TOP_P, settings.topP)
             .putFloat(KEY_MIN_P, settings.minP)
+            .putFloat(KEY_REPETITION_PENALTY, settings.repetitionPenalty)
             .putInt(KEY_MAX_TOKENS, settings.maxTokens)
             .putInt(KEY_CONTEXT_SIZE, settings.contextSize)
             .apply()
@@ -1338,6 +1340,7 @@ class MainActivity : ComponentActivity() {
         const val KEY_TOP_K = "top_k"
         const val KEY_TOP_P = "top_p"
         const val KEY_MIN_P = "min_p"
+        const val KEY_REPETITION_PENALTY = "repetition_penalty"
         const val KEY_MAX_TOKENS = "max_tokens"
         const val KEY_CONTEXT_SIZE = "context_size"
 

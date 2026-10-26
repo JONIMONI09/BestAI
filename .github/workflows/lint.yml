@@ -40,10 +40,12 @@ jobs:
               -Wall -Wextra -Iinclude -c src/hydra_engine.c -o /dev/null
           gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -Wall -Wextra -Iinclude -c src/main.c -o /dev/null
+          gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -Wall -Wextra -Iinclude -c src/hydra_v2_container.c -o /dev/null
 
       - name: Clang Static Analyzer
         run: |
-          for f in src/hydra_engine.c src/main.c tests/test_engine.c; do
+          for f in src/hydra_engine.c src/main.c src/hydra_v2_container.c tests/test_engine.c tests/test_hydra2_container.c; do
             clang --analyze -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
                 -Iinclude -Xanalyzer -analyzer-output=text "$f" -o /dev/null
           done
@@ -55,7 +57,8 @@ jobs:
       # CERT-C calls an error indicator — for stdio that is just noise.
       - name: clang-tidy (bugprone / analyzer / cert / concurrency)
         run: |
-          clang-tidy src/hydra_engine.c src/main.c tests/test_engine.c \
+          clang-tidy src/hydra_engine.c src/main.c src/hydra_v2_container.c \
+            tests/test_engine.c tests/test_hydra2_container.c \
             --checks='-*,clang-analyzer-*,bugprone-*,cert-*,-cert-err33-c,concurrency-*,-concurrency-mt-unsafe' \
             -- -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude \
             || exit 1
@@ -137,6 +140,24 @@ jobs:
           UBSAN_OPTIONS=print_stacktrace=1 \
             ./hydra-test-san
 
+      - name: Run .hydra2 container suite under ASan + UBSan
+        # The container reader is the newest large C surface and the one
+        # with the most refusal paths; leak/OOB/UB detection on it is the
+        # difference between "the 118 checks pass" and "they pass with
+        # zero memory errors on every path, including the error paths".
+        # Locally proven 2026-10-26 (ASan+UBSan, zero leaks, 118/0).
+        run: |
+          gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -fsanitize=address,undefined -fno-sanitize-recover=all \
+              -fno-omit-frame-pointer -Wall -Wextra -Iinclude \
+              src/hydra_v2_container.c src/hydra_engine.c \
+              tests/test_hydra2_container.c -lm -o hydra2-test-san
+          python3 tools/make_model.py .hydra2-sanfix.hydra2 --v2
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+            HYDRA2_PY_FIXTURE="$PWD/.hydra2-sanfix.hydra2" ./hydra2-test-san
+          rm -f .hydra2-sanfix.hydra2
+
       - name: Run CLI under sanitizers
         run: |
           gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
@@ -151,6 +172,36 @@ jobs:
           ln -sf san.hydra link.hydra
           ASAN_OPTIONS=detect_leaks=1 ./hydra-run-san link.hydra 2>/dev/null \
             || echo "expected: symlink rejected"
+
+  # ---------- Python: linters ----------
+  # The Python surface is tools/ (fixture writers, converter gates, bench
+  # scripts) — stdlib-only by convention, so the linters run from pip on a
+  # fresh setup-python (the ubuntu-latest system Python is PEP-668
+  # externally-managed, a plain `pip install` refuses).
+  python-lint:
+    name: Python tools (pyflakes + bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pyflakes + bandit
+        run: python3 -m pip install --quiet pyflakes bandit
+
+      # Hard gate: any unused import, undefined name or redefinition fails.
+      - name: pyflakes (all tools/)
+        run: python3 -m pyflakes tools/
+
+      # bandit blocks on medium+ severity. The low-severity review-level
+      # findings (B101 asserts — these ARE the gates of the test scripts;
+      # B404 subprocess import; B603 subprocess calls) are triaged: every
+      # subprocess call uses a static argv list with explicit shell=False
+      # (see .agents/Environment.md, round 8, for the full triage).
+      - name: bandit (medium+ only)
+        run: python3 -m bandit -r tools/ --severity-level medium
 
   # ---------- JNI: NDK clang hardening ----------
   jni-lint:

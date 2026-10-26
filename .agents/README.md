@@ -2,8 +2,11 @@
 
 > Moved here 2026-10-26 by owner directive ("in .agents Ordner alle Dateien,
 > wie Rules etc auch hinzufügen"): **all** agent-specific documentation now
-> lives in this folder. The only agent docs that stay at the repository
-> root are `README.md` (project) and `AGENTS.md` (agent entry point).
+> lives in this folder. The agent docs that stay at the repository root are
+> `README.md` (project), `AGENTS.md` (agent entry point) and `CLAUDE.md`
+> (a real-file bridge containing only `@AGENTS.md` + `@.agents/CLAUDE.md`
+> imports, so Claude Code loads the project instructions on every OS and
+> version — no symlink involved; it must never diverge from this folder).
 
 ## Start here, in this order
 

@@ -1,15 +1,20 @@
-# The `.hydra2` Container Format (v2) — **specification only**
+# The `.hydra2` Container Format (v2)
 
-> **Status: SPECIFICATION. There is no v2 loader in this repository.**
-> `src/hydra_v2_reader.c` does not exist and no v2 file can be opened. This
-> document exists so the format can be reviewed and agreed **before** any
-> code is written against it.
+> **Status: SPECIFICATION, container implemented.** The container reader
+> (`src/hydra_v2_container.c`), the fixture generator
+> (`tools/make_model.py --v2`) and the test suite
+> (`tests/test_hydra2_container.c`) exist and are gated in CI. What does
+> **not** exist yet: MoE inference on top of the container, an expert cache,
+> and any measured throughput (section 6 is still a worked example, not a
+> result). See "Implementation status" below for the exact boundary.
 >
 > **v1 is untouched.** Every `.hydra` v1 file written by any v1 release loads
 > under any v1 loader, and no v2 change alters that. v1 and v2 have different
 > magics, different version fields and different file extensions
 > (`.hydra` vs `.hydra2`). A v1 loader must refuse a v2 file loudly, not read
-> it partially.
+> it partially. The v1 loader does refuse it: `hydra_engine_load()` checks the
+> 8-byte v2 magic before the v1 magic check, because the first four bytes of
+> `HYDRA2\0\0` are the v1 magic `HYDR` (`[CODE]` src/hydra_engine.c).
 >
 > **Disambiguation, because the name "version 2" is used two ways here.**
 > This document's v2 is the `.hydra2` container: magic `HYDRA2\0\0`, a
@@ -18,8 +23,8 @@
 > `HYDR` header — a 4-weights-per-byte packing variant of the v1 format
 > (documented in `docs/FORMAT.md`, "Version 2"). That is NOT this container:
 > different magic, different header, no experts, no streaming. Statements in
-> this document that "no v2 loader exists" refer to this container, and they
-> remain true.
+> this document about a "v2 reader" refer to the `.hydra2` container reader
+> in `src/hydra_v2_container.c`.
 
 ## Roadmap status — this is THE canonical v2 spec
 
@@ -56,19 +61,34 @@ implementing "v2" implements **this** document. The aggregated container stays
 available as a possible *v1.1 file-level optimisation* if it is ever wanted, and
 that is the only sense in which it is still on the table.
 
-### Implementation status of this document: nothing
+### Implementation status of this document
 
-Stated plainly, because the tensor table in §3.2 used to imply otherwise:
+Stated precisely, with the boundary between implemented and not:
 
-- **No part of the `.hydra2` container is implemented.** There is no reader, no
-  writer, no magic, no header parser, no expert directory, no routing metadata,
-  no expert cache. Not one byte of a `.hydra2` file can be produced or consumed
-  by this repository.
+- **Implemented `[CODE]` (2026-10-26):** the container reader
+  `src/hydra_v2_container.c` — the 128-byte header parser with the header
+  CRC-32 verified at open, both-ends validation of every region and entry
+  (section 5), the metadata K/V block, the tensor directory, the expert
+  directory (order + contiguous-offset rules), `hydra2_read_tensor()`
+  (trunk), `hydra2_read_expert()` (one `pread` per expert, CRC-32 verified
+  at read time, 5.1.5), and `hydra2_route_top_k()` (deterministic top-k with
+  tie-to-lower-id and softmax over the selected logits). The fixture writer
+  `tools/make_model.py --v2` produces files the reader accepts, and
+  `tests/test_hydra2_container.c` (run as `make hydra2-test`, gated in CI)
+  covers the happy path, every refusal class, routing determinism, the
+  Python/C cross-check, and the mutual v1/v2 refusal (7.2/7.3).
+- **Not implemented:** MoE inference on top of the container (there is no
+  code path in `hydra-run` that consumes a `.hydra2` file), the expert cache
+  / slot leasing of section 6.2, prefetch of section 6.4, and every
+  `B_eff`/throughput number in section 6, which remain **NOT MEASURED**.
+  No `.hydra2` inference result may be quoted.
 - The **Q8_0 decoder** that appears in §3.2 is real code, but it belongs to the
   **GGUF import path** (`tools/gguf_reader.py`, feeding
   `tools/gguf_to_hydra.py`). It is a Python reader for somebody else's file
-  format that converts to a **v1** `.hydra`. It is not a v2 reader and does not
-  become one by being listed here.
+  format that converts to a **v1** `.hydra`. The v2 container validates Q8_0
+  *entries* (element-group and byte-size rules) but does not **decode** Q8_0
+  values; the same is true for F16/BF16. TERNARY2 and F32 are the types the
+  current test fixtures exercise.
 - The **research** that motivates the sparse-MoE path is in
   [`.agents/docs/HYDRA2-RESEARCH.md`](../.agents/docs/HYDRA2-RESEARCH.md). Its benchmark plan is
   explicitly **not yet run**; nothing in it may be quoted as a result.
@@ -159,12 +179,16 @@ table is refused before a single tensor directory entry is read. **[SPEC]**
 | `0x0031` | `Q4_K` | reserved, **not implemented** |
 | `0x0032` | `MXFP4` | reserved, **not implemented** |
 
-**None of these is implemented in a v2 reader — there is no v2 reader.** The
-first five rows exist as decoders somewhere in this repository only in the sense
-that `tools/gguf_reader.py` can read F32/F16/BF16/Q8_0 for the **GGUF import
-path**, which produces a **v1** `.hydra`. The last three are listed so that a
-future reader rejects them **by name** rather than by falling through to
-"unsupported". **[SPEC]**
+The v2 reader **validates** all five implemented types structurally
+(`n_elements` multiple of the element group, `n_bytes == n_elements *
+bytes_per_element`) and **refuses** the last three **by name** rather than by
+falling through to "unsupported" (`[CODE]` `src/hydra_v2_container.c`,
+tensor/expert entry validation). Value **decoders** exist in this repository
+for the first five only in the sense that `tools/gguf_reader.py` can read
+F32/F16/BF16/Q8_0 for the **GGUF import path**, which produces a **v1**
+`.hydra`; the v2 container does not decode expert values yet — it streams
+them into caller buffers (that is what the expert cache + inference path,
+section 6, will consume). **[SPEC]** + **[CODE]**
 
 ### 3.3 Out of scope
 
@@ -179,6 +203,14 @@ are a separate research branch requiring their own evidence and approval.
 All integers are **little-endian**, without exception. A big-endian host must
 read through explicit byte-wise readers, exactly as v1 does
 (`rd_u32le` in `src/hydra_engine.c`). **[CODE]**
+
+**Alignment `[CODE]` (implementation decision, 2026-10-26).** The layout
+diagram says regions are "aligned" without a value; the reader enforces
+**16-byte** alignment for every region offset (`metadata_offset`,
+`tensor_dir_offset`, `expert_dir_offset`, `trunk_offset`, `experts_offset`)
+and for every tensor payload offset inside the trunk. Expert payload offsets
+are not aligned individually — they are contiguous in directory order, which
+is the property that makes one expert one `pread`.
 
 ```
 +----------------------------------------------+  0
@@ -282,6 +314,22 @@ search the directory for a layer, and one expert read is one contiguous
 `v2.top_k` is **required**, not defaulted. A reader that finds no `top_k` must
 refuse the file: guessing it would change which experts are read, and a
 silently different routing set is a wrong answer, not a slow one. **[SPEC]**
+
+**K/V block wire format `[CODE]` (implementation decision, 2026-10-26).** The
+specification names the keys but not the block layout; the reader and writer
+implement:
+
+```
+u32 count
+per pair: u32 key_len, u32 val_len, key bytes, value bytes
+```
+
+all little-endian, keys 1..63 printable ASCII and unique, values up to 65536
+bytes. The reader checks the value width of every required key above (u32
+keys must be exactly 4 bytes, `v2.expert_bytes_typ` exactly 8) and refuses
+trailing bytes, duplicates, and non-ASCII keys. `[CODE]`
+`src/hydra_v2_container.c` (`parse_metadata`),
+`tools/make_model.py` (`build_v2`).
 
 ---
 

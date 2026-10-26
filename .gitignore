@@ -5,6 +5,7 @@ hydra-run-*
 hydra-test-*
 jni-batch-test
 large-model-test
+hydra2-test
 gpu_bench_cpu
 *.o
 node_modules/
@@ -40,9 +41,16 @@ __pycache__/
 .vscode/
 .idea/
 
-# .agent_memory/ and the top-level RESEARCH.md are IN the repo on purpose
-# (owner decision 2026-10-26, AGENTS.md §5): permanent research record that
-# must be kept current — an agent may append to it, never ignore or delete it.
+# .agents/docs/RESEARCH-LOG.md and .agents/docs/SESSION-ARCHIVE.md are IN the
+# repo on purpose (owner decision 2026-10-26, AGENTS.md §5): the permanent
+# research and session records must be kept current — an agent may append to
+# them, never ignore or delete them. (The former top-level RESEARCH.md and
+# the .agent_memory/ folder were dissolved into .agents/docs/ in the
+# 2026-10-26 .agents/ reorg.)
+# .agent_memory/ is ignored as a LOCAL SCRATCHPAD only: repo memory lives in
+# .agents/ (user.md #19). If an agent recreates it locally it must not pollute
+# git status.
+.agent_memory/
 # Console artefacts (generated models, vocabularies)
 models/trained/
 models/vocab/

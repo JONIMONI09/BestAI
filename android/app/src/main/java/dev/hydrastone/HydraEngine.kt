@@ -6,9 +6,12 @@ import org.json.JSONObject
 /**
  * The Hydra v1 engine behind [EngineInterface].
  *
- * This is a thin adapter. It calls the existing [HydraBridge] and changes no C
- * code: the native bridge is reached through the same three functions it has
- * always had, and `hydra_jni.c` is untouched.
+ * This is a thin adapter over [HydraBridge]: generation goes through
+ * `runInferenceSampled` (the C sampler, see include/hydra_model.h),
+ * cancellation through `cancel`. The greedy baseline itself is untouched -
+ * with temperature 0 the native side delegates to the pre-sampler step and
+ * the token stream stays bit-identical to the old `runInference` path
+ * (pinned on the host by tests/test_engine.c).
  *
  * ## Why this engine is labelled "experimental"
  *
@@ -78,12 +81,17 @@ class HydraEngine : EngineInterface {
         prompt: String,
         maxTokens: Int,
         callbacks: GenerationCallbacks,
-        // Deliberately unused: this engine is deterministic by construction -
-        // a fixed recurrence over the weight file, no sampler exists that the
-        // Settings values could reach. The parameter is accepted for interface
-        // uniformity, and the UI says so (isExperimental surfaces it), instead
-        // of presenting sliders whose values would change nothing.
-        @Suppress("UNUSED_PARAMETER") params: GenerationParams
+        // The Settings values reach the C sampler through
+        // runInferenceSampled: temperature and minP on both format
+        // versions (the v1/v2 logit probe, the v3 logit vector),
+        // repetitionPenalty on both as well. temperature = 0 (the
+        // greedy guard) stays bit-identical to the pre-sampler
+        // recurrence - the engine's own guard guarantees that, and
+        // tests/test_engine.c pins it. The seed is fixed (below): a
+        // run is reproducible for fixed model + prompt + params, and
+        // there is no UI surface for a per-run seed yet, so
+        // inventing one silently would be a fake control.
+        params: GenerationParams
     ) {
         val path = loadedPath
         if (path == null) {
@@ -134,11 +142,23 @@ class HydraEngine : EngineInterface {
             }
         }
 
-        // runInference() blocks on the calling thread until the run finishes,
-        // so by the time it returns every onTokens block has already been
-        // delivered on this same thread and totalTokens is final.
+        // runInferenceSampled() blocks on the calling thread until the run
+        // finishes, so by the time it returns every onTokens block has
+        // already been delivered on this same thread and totalTokens is
+        // final. With the default Settings (temperature 0.7, minP 0.05)
+        // the run is SAMPLED and reproducible (fixed seed); sliding the
+        // temperature to 0 switches it back to the deterministic baseline.
         val json = try {
-            HydraBridge.runInference(path, tokens, steps, bridgeCallback)
+            HydraBridge.runInferenceSampled(
+                path,
+                tokens,
+                steps,
+                bridgeCallback,
+                params.temperature,
+                params.minP,
+                params.repetitionPenalty,
+                SAMPLING_SEED
+            )
         } catch (e: Throwable) {
             running = false
             if (!completed) {
@@ -245,5 +265,13 @@ class HydraEngine : EngineInterface {
 
         /** Token ids fed before generation; the last one is the seed. */
         const val PROMPT_TOKENS = 4
+
+        /**
+         * Fixed sampler seed for reproducibility: same model, prompt and
+         * Settings values always give the same token stream. 0 is not
+         * degenerate - the engine maps a zero seed to a non-zero RNG
+         * constant (see hydra_sample_token in src/hydra_engine.c).
+         */
+        const val SAMPLING_SEED = 0
     }
 }

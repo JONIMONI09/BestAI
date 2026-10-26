@@ -364,14 +364,26 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
         engine->header.weights_len    = rd_u32le(raw + 20);
     }
 
+    if (memcmp(engine->mapped_weights, "HYDRA2\0\0", 8) == 0) {
+        /* FORMAT-V2.md 7.2: a v2 container is refused on the magic, with
+         * the v2 magic named. The first 4 bytes 'HYDR' of the v2 magic
+         * equal the v1 magic, so without this check a v2 file would fall
+         * into v1 field parsing and die at the version check with a
+         * misleading "Falsche Version" message. */
+        fprintf(stderr,
+                "[Hydra] Magic 'HYDRA2\\0\\0': this is a v2 sparse-MoE "
+                "container (.hydra2, docs/FORMAT-V2.md 7.2); the v1 loader "
+                "cannot open it - use the v2 container reader\n");
+        rc = -5; goto fail;
+    }
     if (engine->header.magic != HYDRA_MAGIC) {
         fprintf(stderr, "[Hydra] Ungueltiges Format! Magic: 0x%08X (Erwartet: 0x%08X)\n",
                 engine->header.magic, HYDRA_MAGIC);
         rc = -5; goto fail;
     }
     if (engine->header.version != HYDRA_VERSION && engine->header.version != 2 &&
-        engine->header.version != 3) {
-        fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u, 2 oder 3)\n",
+        engine->header.version != 3 && engine->header.version != 4) {
+        fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u, 2, 3 oder 4)\n",
                 (unsigned)engine->header.version, (unsigned)HYDRA_VERSION);
         rc = -7; goto fail;
     }
@@ -387,7 +399,8 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * truncated by `dim / 4` in hydra_build_aggregation() and the leftover
      * dimensions would silently carry an aggregation of zero instead of their
      * real weights. Refused, not rounded (.agents/rules.md R11, R14). */
-    if ((engine->header.version == 2 || engine->header.version == 3) &&
+    if ((engine->header.version == 2 || engine->header.version == 3 ||
+         engine->header.version == 4) &&
         engine->header.dim % 4 != 0) {
         fprintf(stderr,
             "[Hydra] Version %u needs dim %% 4 == 0, got dim=%u\n",
@@ -431,12 +444,18 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * former behaviour. */
     {
         uint64_t needed_pairs;
-        if (engine->header.version == 3) {
+        if (engine->header.version == 3 || engine->header.version == 4) {
             /* v3: per layer Wg (dim*dim/4) + Wu (dim*dim/4) + w1 (dim/4)
              * + scale (2 bytes), plus the final W_out block (dim*dim/4).
-             * dim % 4 == 0 is guaranteed by the guard above. */
+             * v4: the SAME layout plus the attention planes Wq/Wk/Wv
+             * (dim*dim/4 each) between Wu and w1 - so five weight planes
+             * instead of two. dim % 4 == 0 is guaranteed by the guard
+             * above; the uint64 arithmetic is the R14 overflow guard. */
             const uint64_t d = engine->header.dim;
-            const uint64_t layer_bytes = d * d / 2 + d / 4 + 2;
+            const uint64_t planes =
+                (engine->header.version == 4) ? 5 : 2;
+            const uint64_t layer_bytes =
+                planes * d * d / 4 + d / 4 + 2;
             needed_pairs = (uint64_t)engine->header.layers * layer_bytes
                          + d * d / 4;
         } else if (engine->header.version == 2) {
@@ -453,19 +472,23 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
         }
     }
 
-    /* Sicherheits-Check 5 (v3): kein Layer darf Scale 0 haben - die
+    /* Sicherheits-Check 5 (v3/v4): kein Layer darf Scale 0 haben - die
      * Forward-Pass-Teilung durch (scale/256) waere eine Division durch
-     * Null. Der Check laeuft direkt ueber die gemappten Bytes. */
-    if (engine->header.version == 3) {
+     * Null. Der Check laeuft direkt ueber die gemappten Bytes. Die
+     * Scale liegt beider Versionen als letztes u16 des Layer-Blocks
+     * (nach dem w1-Plane), also bei lb-2. */
+    if (engine->header.version == 3 || engine->header.version == 4) {
         const uint8_t *w3 = engine->mapped_weights + engine->header.weights_offset;
-        const size_t lb = (size_t)engine->header.dim * engine->header.dim / 2
+        const size_t planes = (engine->header.version == 4) ? 5 : 2;
+        const size_t lb = planes * (size_t)engine->header.dim *
+                          (size_t)engine->header.dim / 4
                        + engine->header.dim / 4 + 2;
         for (uint32_t l = 0; l < engine->header.layers; ++l) {
             const uint8_t *sc = w3 + (size_t)l * lb + (size_t)lb - 2;
             if (sc[0] == 0 && sc[1] == 0) {
                 fprintf(stderr,
-                        "[Hydra] v3 Layer %u hat Scale 0 (Division durch Null)\n",
-                        (unsigned)l);
+                        "[Hydra] v%d Layer %u hat Scale 0 (Division durch Null)\n",
+                        (int)engine->header.version, (unsigned)l);
                 rc = -15; goto fail;
             }
         }
@@ -483,8 +506,9 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
         engine->resident_kb_after_load = hydra_resident_kb();
         engine->load_ms = 0.0;
         fprintf(stderr,
-                "[Hydra] v3-Modell geladen: Layers: %u, Dim: %u, Vocab: %u "
+                "[Hydra] v%u-Modell geladen: Layers: %u, Dim: %u, Vocab: %u "
                 "(per-layer non-linear pass, keine Aggregation)\n",
+                (unsigned)engine->header.version,
                 (unsigned)engine->header.layers, (unsigned)engine->header.dim,
                 (unsigned)engine->header.vocab_size);
         return 0;
@@ -550,10 +574,12 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
 {
     if (!engine || !token_out) return -1;
     if (engine->header.magic != HYDRA_MAGIC) return -2;
-    if (engine->header.version == 3) {
+    if (engine->header.version >= 3) {
         fprintf(stderr,
-            "[Hydra] v3-Modell: hydra_engine_step ist der Legacy-Pfad (v1/v2); "
-            "verwende hydra_engine_step_tf (per-layer non-linear pass)\n");
+            "[Hydra] v%u-Modell: hydra_engine_step ist der Legacy-Pfad (v1/v2); "
+            "verwende hydra_engine_step_tf (v3) bzw. "
+            "hydra_transformer_forward_step (v4)\n",
+            (unsigned)engine->header.version);
         return -14;
     }
     const int32_t vocab = (int32_t)engine->header.vocab_size;
@@ -657,10 +683,12 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
 {
     if (!engine || !token_out) return -1;
     if (engine->header.magic != HYDRA_MAGIC) return -2;
-    if (engine->header.version == 3) {
+    if (engine->header.version >= 3) {
         fprintf(stderr,
-            "[Hydra] v3-Modell: kein Aggregat vorhanden (per-layer non-linear "
-            "pass); verwende hydra_engine_step_tf\n");
+            "[Hydra] v%u-Modell: kein Aggregat vorhanden (per-layer non-linear "
+            "pass); verwende hydra_engine_step_tf (v3) bzw. "
+            "hydra_transformer_forward_step (v4)\n",
+            (unsigned)engine->header.version);
         return -14;
     }
     const int32_t vocab = (int32_t)engine->header.vocab_size;
@@ -926,35 +954,59 @@ static int32_t tf_row_dot(const uint8_t *row, const int8_t *x, uint32_t dim)
     return acc;
 }
 
-/* Byte size of one v3 layer block: Wg + Wu + w1 + u16 scale.
+/* Byte size of one per-layer non-linear block.
+ *   v3: Wg + Wu + w1 + u16 scale            (2 weight planes)
+ *   v4: Wg + Wu + Wq + Wk + Wv + w1 + u16   (5 weight planes)
  * (dim % 4 == 0 is enforced at load, so all divisions are exact.) */
-static size_t tf_layer_bytes(uint32_t dim)
+static size_t tf_layer_bytes(uint32_t version, uint32_t dim)
 {
-    return (size_t)dim * dim / 2 + (size_t)dim / 4 + 2;
+    const size_t planes = (version == 4) ? 5 : 2;
+    return planes * (size_t)dim * (size_t)dim / 4
+         + (size_t)dim / 4 + 2;
 }
 
 static const uint8_t *tf_layer_base(const HydraEngine *engine, uint32_t l)
 {
     return engine->mapped_weights + engine->header.weights_offset
-         + (size_t)l * tf_layer_bytes(engine->header.dim);
+         + (size_t)l * tf_layer_bytes(engine->header.version,
+                                      engine->header.dim);
+}
+
+/* v4 attention-plane bases: Wq/Wk/Wv sit between Wu and w1.
+ *   Wg | Wu | Wq | Wk | Wv | w1 | u16 scale
+ * (v3 has no attention planes; these are only used on v4 engines.) */
+static const uint8_t *tf_wq_base(const uint8_t *layer, uint32_t dim)
+{
+    return layer + (size_t)dim * dim / 2;
+}
+
+static const uint8_t *tf_wk_base(const uint8_t *layer, uint32_t dim)
+{
+    return layer + (size_t)dim * dim / 2 + (size_t)dim * dim / 4;
+}
+
+static const uint8_t *tf_wv_base(const uint8_t *layer, uint32_t dim)
+{
+    return layer + (size_t)dim * dim / 2 + (size_t)dim * dim / 2;
+}
+
+/* w1 starts AFTER all weight planes of the layer:
+ *   v3: Wg | Wu            -> 2 planes = dim*dim/2
+ *   v4: Wg | Wu | Wq | Wk | Wv -> 5 planes = 5*dim*dim/4
+ * (the u16 scale follows the w1 plane, see the loader). */
+static const uint8_t *tf_w1_base(const uint8_t *layer, uint32_t dim,
+                                 uint32_t version)
+{
+    return layer
+         + ((version == 4) ? 5u * (size_t)dim * dim / 4u
+                           : (size_t)dim * dim / 2);
 }
 
 static const uint8_t *tf_wout_base(const HydraEngine *engine)
 {
     return engine->mapped_weights + engine->header.weights_offset
-         + (size_t)engine->header.layers * tf_layer_bytes(engine->header.dim);
-}
-
-/* Final cross-dimension logit mix: y[i] = sum_j W_out[i][j] * state[j].
- * Shared by the step and the v3 sampler, so the sampler probes EXACTLY
- * the arithmetic the engine decodes from (the "probe the engine"
- * contract of hydra_sample_token). Integer exact. */
-static void tf_final_logits(const HydraEngine *engine, int32_t *y)
-{
-    const uint32_t dim = engine->header.dim;
-    const uint8_t *wout = tf_wout_base(engine);
-    for (uint32_t i = 0; i < dim; ++i)
-        y[i] = tf_row_dot(wout + (size_t)i * (dim / 4), engine->state_vector, dim);
+         + (size_t)engine->header.layers
+           * tf_layer_bytes(engine->header.version, engine->header.dim);
 }
 
 /* int32 -> int8 state domain, round-half-away + +-127 clamp.
@@ -965,6 +1017,53 @@ static int8_t tf_clamp127(double v)
     if (q > 127) q = 127;
     else if (q < -127) q = -127;
     return (int8_t)q;
+}
+
+/* Final cross-dimension logit mix: y[i] = sum_j W_out[i][j] * h[j].
+ * Shared by the step and the sampler, so the sampler probes EXACTLY
+ * the arithmetic the engine decodes from (the "probe the engine"
+ * contract of hydra_sample_token). Integer exact.
+ *
+ * v3: h is the raw int8 state (the per-layer pass ends with the
+ * RoPE'd, clamped state; no extra norm).
+ * v4: the documented final stage is RMSNorm + logits projection -
+ * the float state is RMSNormed, requantized with the SAME
+ * tf_clamp127(x*32) rule the layer outputs use, and W_out mixes the
+ * quantized vector. The requantization keeps the row dot integer
+ * exact and the stage deterministic on every platform. */
+static void tf_final_logits(const HydraEngine *engine, int32_t *y)
+{
+    const uint32_t dim = engine->header.dim;
+    const uint8_t *wout = tf_wout_base(engine);
+    if (engine->header.version == 4) {
+        /* = {0}: the fill loop below covers [0, dim) with dim <=
+         * HYDRA_EMBED_DIM; gcc -O2 (the NEON CI leg) otherwise flags the
+         * tail elements as maybe-uninitialized when it sees the arrays
+         * cross the hydra_rmsnorm() boundary. Same "ALWAYS initialized"
+         * convention as the y[] out params (CWE-457 fix, 2026-10-26). */
+        float sf_[HYDRA_EMBED_DIM] = {0}, nf[HYDRA_EMBED_DIM] = {0};
+        float onew[HYDRA_EMBED_DIM] = {0};
+        int8_t fin[HYDRA_EMBED_DIM] = {0};
+        for (uint32_t i = 0; i < dim; ++i) {
+            sf_[i] = (float)engine->state_vector[i];
+            onew[i] = 1.0f;
+        }
+        if (hydra_rmsnorm(sf_, onew, dim, HYDRA_TF_RMSNORM_EPS, nf) != 0) {
+            /* Unreachable from an int8 state (finite, bounded input,
+             * eps > 0, unit weights): kept as a defensive zero-vector
+             * so the out param is ALWAYS initialized, whatever
+             * happens. */
+            memset(fin, 0, sizeof(fin));
+        } else {
+            for (uint32_t i = 0; i < dim; ++i)
+                fin[i] = tf_clamp127((double)nf[i] * HYDRA_TF_QUANT_GAIN);
+        }
+        for (uint32_t i = 0; i < dim; ++i)
+            y[i] = tf_row_dot(wout + (size_t)i * (dim / 4), fin, dim);
+        return;
+    }
+    for (uint32_t i = 0; i < dim; ++i)
+        y[i] = tf_row_dot(wout + (size_t)i * (dim / 4), engine->state_vector, dim);
 }
 
 int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
@@ -985,10 +1084,14 @@ int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
     if (token_in >= vocab) token_in = (uint16_t)(token_in % vocab);
     const int32_t token_val = (int32_t)token_in;
 
-    /* Zero-heap stack buffers for the non-linear stages. */
-    float gf[HYDRA_EMBED_DIM], uf[HYDRA_EMBED_DIM];
-    float hf[HYDRA_EMBED_DIM], nf[HYDRA_EMBED_DIM];
-    float onew[HYDRA_EMBED_DIM];
+    /* Zero-heap stack buffers for the non-linear stages. The = {0}
+     * initializers are the file's "ALWAYS initialized" convention: the
+     * fill loops cover [0, dim) with dim <= HYDRA_EMBED_DIM, and gcc
+     * -O3 without -mavx2 (the macOS CI leg) otherwise flags the tail
+     * elements as maybe-uninitialized at the swiglu/rmsnorm boundaries. */
+    float gf[HYDRA_EMBED_DIM] = {0}, uf[HYDRA_EMBED_DIM] = {0};
+    float hf[HYDRA_EMBED_DIM] = {0}, nf[HYDRA_EMBED_DIM] = {0};
+    float onew[HYDRA_EMBED_DIM] = {0};
     float ktmp[HYDRA_EMBED_DIM] = {0}, vtmp[HYDRA_EMBED_DIM] = {0};
     float kvec[HYDRA_EMBED_DIM] = {0}; /* indexed 0..dim-1 before use */
     for (uint32_t i = 0; i < dim; ++i) onew[i] = 1.0f;
@@ -996,10 +1099,10 @@ int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
     for (uint32_t l = 0; l < engine->header.layers; ++l) {
         const uint8_t *base = tf_layer_base(engine, l);
         const uint8_t *wu   = base + (size_t)dim * dim / 4;
-        const uint8_t *w1p  = wu + (size_t)dim * dim / 4;
         /* scale sits AFTER the w1 plane (docs/FORMAT.md v3 layout:
          * Wg | Wu | w1 | u16 scale); reading it at w1p[0..1] would
          * decode the w1 bytes as the scale. */
+        const uint8_t *w1p  = tf_w1_base(base, dim, 3);
         const uint8_t *scp  = w1p + (size_t)dim / 4;
         const uint16_t scale =
             (uint16_t)(((uint32_t)scp[0]) | (((uint32_t)scp[1]) << 8u));
@@ -1063,7 +1166,7 @@ int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
 
     /* (5) Full cross-dimension logit mix over the final state; greedy
      *     decode over the WHOLE vector (no column-0 restriction). */
-    int32_t y[HYDRA_EMBED_DIM];
+    int32_t y[HYDRA_EMBED_DIM] = {0}; /* always-initialized out */
     tf_final_logits(engine, y);
     int32_t best = y[0];
     uint32_t bi = 0;
@@ -1072,6 +1175,250 @@ int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
     *token_out = (uint16_t)(bi % vocab);
     engine->step_count++;
     return 0;
+}
+
+/* -------------------------------------------------------------------
+ * Version 4: the full per-layer transformer pass.
+ *
+ * v3 is a per-layer SwiGLU recurrence (each layer re-injects the
+ * token into the state; RoPE encodes the position into the state
+ * itself). v4 is the transformer that v3 was preparing for:
+ *
+ *   for each layer:
+ *     xeff = clamp127(h + w1*token)          (v3 input mix, unchanged)
+ *     q = Wq*xeff/scale, k = Wk*xeff/scale, v = Wv*xeff/scale
+ *                                                (ternary, integer exact)
+ *     rope(q, pos), rope(k, pos)              (in-place, theta=10000)
+ *     kv.append(k, v)  if a cache is present
+ *     c  = causal scaled dot-product attention over the RESIDENT
+ *          cache entries (sinks + ring + the current one, which is
+ *          the last resident after the append):
+ *            s_i = (q . K_i) / sqrt(dim);  w = softmax(s)  (the
+ *            engine's established max-subtracted double softmax);
+ *            c = sum_i w_i * V_i
+ *          With no cache the memory channel is off and c = v (the
+ *          self-only attention), the same contract v3's kv=NULL
+ *          carries for the sink append.
+ *     h1 = clamp127(h + quant(c))             (residual #1, int8)
+ *     f  = SwiGLU(Wg*h1/scale, Wu*h1/scale)   (the v3 FFN block)
+ *     h2 = clamp127(h1 + quant(RMSNorm(f)))   (residual #2, int8)
+ *     h  = h2
+ *   state = h
+ *   logits = W_out * quant(RMSNorm(state))    (v4 final stage,
+ *            integer exact after the requantization)
+ *   token = argmax(logits) % vocab;  step_count++
+ *
+ * Differences from v3, on purpose:
+ *   - the residual is ADDED (h + branch) instead of replacing the
+ *     state - the transformer's load-bearing property,
+ *   - RoPE acts on q/k at the token position, not on the state,
+ *   - the memory channel is attention over the resident K/V, not
+ *     the sink add-back + k=v state append (both live in the KV
+ *     cache, which the sampler shares),
+ *   - the final stage is RMSNorm + the W_out projection.
+ *
+ * KV is caller-owned (the engine stays zero-heap) and is the SAME
+ * cache hydra_engine_step_tf() and hydra_sample_token() take.
+ * Return codes: the shared ones plus -14 (wrong format version),
+ * -16 (non-finite intermediate), -17 (KV append failed), -18 (KV
+ * read failed).
+ * ------------------------------------------------------------------- */
+int hydra_transformer_forward_step(HydraEngine *engine, uint16_t token_in,
+                                   uint16_t *token_out,
+                                   hydra_kv_cache_t *kv_per_layer)
+{
+    if (!engine || !token_out) return -1;
+    if (engine->header.magic != HYDRA_MAGIC) return -2;
+    if (engine->header.version != 4) {
+        fprintf(stderr,
+            "[Hydra] hydra_transformer_forward_step ist der Version-4-Pfad; "
+            "die Engine ist Version %u\n",
+            (unsigned)engine->header.version);
+        return -14;
+    }
+
+    /* Per-layer KV: every layer has its own Wq/Wk/Wv, so every layer
+     * keeps its OWN cache (a shared ring would mix the projections of
+     * different layers). kv_per_layer is either NULL (no memory
+     * channel, every layer is self-only) or a pointer to a contiguous
+     * array of `layers` hydra_kv_cache_t structs (layer l appends its
+     * k/v into kv_per_layer[l] and attends over that cache only). An
+     * element whose own k/v pointers are unset is caught by the cache
+     * guard: the append/read then fails with -17/-18. */
+
+    const uint32_t dim = engine->header.dim;
+    const uint32_t vocab = engine->header.vocab_size;
+    if (token_in >= vocab) token_in = (uint16_t)(token_in % vocab);
+    const int32_t token_val = (int32_t)token_in;
+    const uint32_t pos = engine->step_count;
+    const double inv_sqrt_dim = 1.0 / (double)sqrt((double)dim);
+
+    float onew[HYDRA_EMBED_DIM];
+    for (uint32_t i = 0; i < dim; ++i) onew[i] = 1.0f;
+
+    /* The layer input h starts as the current state and carries the
+     * residual through the layer. */
+    int8_t h[HYDRA_EMBED_DIM];
+    for (uint32_t i = 0; i < dim; ++i) h[i] = engine->state_vector[i];
+
+    for (uint32_t l = 0; l < engine->header.layers; ++l) {
+        hydra_kv_cache_t *kv = kv_per_layer ? &kv_per_layer[l] : NULL;
+        const uint8_t *base = tf_layer_base(engine, l);
+        const uint8_t *wg   = base;
+        const uint8_t *wu   = base + (size_t)dim * dim / 4;
+        const uint8_t *wq   = tf_wq_base(base, dim);
+        const uint8_t *wk   = tf_wk_base(base, dim);
+        const uint8_t *wv   = tf_wv_base(base, dim);
+        const uint8_t *w1p  = tf_w1_base(base, dim, 4);
+        const uint8_t *scp  = w1p + (size_t)dim / 4;
+        const uint16_t scale =
+            (uint16_t)(((uint32_t)scp[0]) | (((uint32_t)scp[1]) << 8u));
+        const double sf = (double)scale / (double)HYDRA_TF_SCALE_FP;
+
+        /* (1) Token injection (the v3 input mix) into the layer input. */
+        int8_t xeff[HYDRA_EMBED_DIM];
+        for (uint32_t i = 0; i < dim; ++i) {
+            const uint8_t code =
+                ((uint32_t)w1p[i / 4] >> (2u * (i & 3u))) & 0x03u;
+            const int32_t inj = (int32_t)HYDRA_T3[code] * token_val;
+            xeff[i] = tf_clamp127((double)(int32_t)h[i] + (double)inj);
+        }
+
+        /* (2) Ternary Q/K/V projections (integer exact) rescaled with
+         *     the layer's absmean scale, RoPE on q/k at the token
+         *     position. */
+        float qf[HYDRA_EMBED_DIM], kf[HYDRA_EMBED_DIM], vf[HYDRA_EMBED_DIM];
+        for (uint32_t i = 0; i < dim; ++i) {
+            qf[i] = (float)((double)tf_row_dot(wq + (size_t)i * (dim / 4),
+                                               xeff, dim) / sf);
+            kf[i] = (float)((double)tf_row_dot(wk + (size_t)i * (dim / 4),
+                                               xeff, dim) / sf);
+            vf[i] = (float)((double)tf_row_dot(wv + (size_t)i * (dim / 4),
+                                               xeff, dim) / sf);
+        }
+        if (hydra_rope_inplace(qf, dim, pos, HYDRA_TF_ROPE_THETA) != 0)
+            return -16;
+        if (hydra_rope_inplace(kf, dim, pos, HYDRA_TF_ROPE_THETA) != 0)
+            return -16;
+
+        /* (3) Causal scaled dot-product attention over the resident
+         *     cache. The current k/v is appended FIRST, so the last
+         *     resident entry is the current one - causality holds by
+         *     construction (no future entry exists). Sinks stay
+         *     resident for the whole run (streaming-LLM pattern). */
+        float c[HYDRA_EMBED_DIM];
+        if (kv) {
+            if (hydra_kv_cache_append(kv, kf, vf) != 0) return -17;
+            const uint32_t n = hydra_kv_cache_size(kv);
+            /* Scores live on the heap (n is the caller's resident
+             * set, up to its ring capacity): no VLA, no fixed cap.
+             * The K/V are read back in two passes through the cache
+             * getter (dim <= 64, so the scratch is tiny). */
+            double *s = (double *)malloc((size_t)n * sizeof(double));
+            float *ks = (float *)malloc((size_t)dim * sizeof(float));
+            float *vs = (float *)malloc((size_t)dim * sizeof(float));
+            if (!s || !ks || !vs) { free(s); free(ks); free(vs); return -18; }
+            /* Pass 1: s_i = (q . K_i) / sqrt(dim), accumulated in
+             * double (the engine's established softmax discipline). */
+            double maxs = -1e300;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (hydra_kv_cache_get(kv, i, ks, vs) != 0) {
+                    free(s); free(ks); free(vs);
+                    return -18;
+                }
+                double d = 0.0;
+                for (uint32_t j = 0; j < dim; ++j)
+                    d += (double)qf[j] * (double)ks[j];
+                s[i] = d * inv_sqrt_dim;
+                if (s[i] > maxs) maxs = s[i];
+            }
+            double sum = 0.0;
+            for (uint32_t i = 0; i < n; ++i) {
+                s[i] = exp(s[i] - maxs);
+                sum += s[i];
+            }
+            if (!(sum > 0.0)) { free(s); free(ks); free(vs); return -16; }
+            for (uint32_t i = 0; i < n; ++i) s[i] /= sum;
+            /* Pass 2: c = sum_i s_i * V_i (each resident entry is
+             * re-read: the scratch must never carry stale data from
+             * pass 1). */
+            double acc[HYDRA_EMBED_DIM];
+            for (uint32_t j = 0; j < dim; ++j) acc[j] = 0.0;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (hydra_kv_cache_get(kv, i, ks, vs) != 0) {
+                    free(s); free(ks); free(vs);
+                    return -18;
+                }
+                for (uint32_t j = 0; j < dim; ++j)
+                    acc[j] += s[i] * (double)vs[j];
+            }
+            for (uint32_t j = 0; j < dim; ++j) c[j] = (float)acc[j];
+            free(s);
+            free(ks);
+            free(vs);
+        } else {
+            /* No memory channel: the attention is self-only. */
+            for (uint32_t j = 0; j < dim; ++j) c[j] = vf[j];
+        }
+
+        /* (4) Attention residual into the int8 state domain (the same
+         *     quantization the v3 layer output uses). */
+        int8_t h1[HYDRA_EMBED_DIM];
+        for (uint32_t i = 0; i < dim; ++i) {
+            const int32_t a = (int32_t)tf_clamp127((double)c[i]
+                                                   * HYDRA_TF_QUANT_GAIN);
+            h1[i] = tf_clamp127((double)(int32_t)h[i] + (double)a);
+        }
+
+        /* (5) The v3 FFN block on the attention-updated state. */
+        float gf[HYDRA_EMBED_DIM], uf[HYDRA_EMBED_DIM];
+        for (uint32_t i = 0; i < dim; ++i) {
+            gf[i] = (float)((double)tf_row_dot(wg + (size_t)i * (dim / 4),
+                                               h1, dim) / sf);
+            uf[i] = (float)((double)tf_row_dot(wu + (size_t)i * (dim / 4),
+                                               h1, dim) / sf);
+        }
+        float hf[HYDRA_EMBED_DIM], nf[HYDRA_EMBED_DIM];
+        if (hydra_swiglu(gf, uf, dim, hf) != 0) return -16;
+        if (hydra_rmsnorm(hf, onew, dim, HYDRA_TF_RMSNORM_EPS, nf) != 0)
+            return -16;
+
+        /* (6) FFN residual. */
+        for (uint32_t i = 0; i < dim; ++i) {
+            const int32_t b = (int32_t)tf_clamp127((double)nf[i]
+                                                   * HYDRA_TF_QUANT_GAIN);
+            h[i] = tf_clamp127((double)(int32_t)h1[i] + (double)b);
+        }
+    }
+
+    for (uint32_t i = 0; i < dim; ++i)
+        engine->state_vector[i] = h[i];
+
+    /* (7) Final stage (v4): RMSNorm + the W_out logit projection,
+     *     greedy decode over the whole vector. */
+    int32_t y[HYDRA_EMBED_DIM] = {0}; /* always-initialized out */
+    tf_final_logits(engine, y);
+    int32_t best = y[0];
+    uint32_t bi = 0;
+    for (uint32_t i = 1; i < dim; ++i)
+        if (y[i] > best) { best = y[i]; bi = i; }
+    *token_out = (uint16_t)(bi % vocab);
+    engine->step_count++;
+    return 0;
+}
+
+/* Advance the state through the per-layer pass that matches the
+ * engine's format version: step_tf for v3, the full transformer for
+ * v4. The sampler uses this so a sampled run advances the EXACT same
+ * state machine the greedy path does (only the token differs). */
+static int tf_advance(HydraEngine *engine, uint16_t token_in,
+                      uint16_t *token_out, hydra_kv_cache_t *kv,
+                      hydra_kv_cache_t *kv_layers)
+{
+    if (engine->header.version == 4)
+        return hydra_transformer_forward_step(engine, token_in, token_out,
+                                              kv_layers);
+    return hydra_engine_step_tf(engine, token_in, token_out, kv);
 }
 
 /* -------------------------------------------------------------------
@@ -1091,30 +1438,33 @@ int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
                        const hydra_sampler_config_t *cfg,
                        const uint16_t *recent_tokens, size_t recent_len,
                        hydra_kv_cache_t *kv,
+                       hydra_kv_cache_t *kv_layers,
                        uint16_t *token_out)
 {
     if (!engine || !cfg || !token_out) return -1;
     if (engine->header.magic != HYDRA_MAGIC) return -2;
 
-    /* --- Version 3 mode ------------------------------------------------
+    /* --- Version 3/4 mode ----------------------------------------------
      * The logit vector is the full cross-dimension mix of the CURRENT
-     * state (tf_final_logits - exactly what the step decodes from).
-     * Candidates are the dim STATE BINS; a recent token t penalises
-     * every bin i with i % vocab == t (the inverse of the decode
-     * mapping). The chosen bin advances the real engine through
-     * step_tf with its token (bin % vocab), so the state machine stays
-     * identical to the greedy path - only the selection is stochastic.
+     * state (tf_final_logits - exactly what the step decodes from; on
+     * v4 that is the RMSNormed, requantized state). Candidates are the
+     * dim STATE BINS; a recent token t penalises every bin i with
+     * i % vocab == t (the inverse of the decode mapping). The chosen
+     * bin advances the real engine through step_tf (v3) or
+     * hydra_transformer_forward_step (v4) with its token (bin % vocab),
+     * so the state machine stays identical to the greedy path - only
+     * the selection is stochastic.
      * ------------------------------------------------------------------ */
-    if (engine->header.version == 3) {
+    if (engine->header.version == 3 || engine->header.version == 4) {
         const uint32_t dim = engine->header.dim;
         const uint32_t vocab = engine->header.vocab_size;
-        int32_t y[HYDRA_EMBED_DIM];
+        int32_t y[HYDRA_EMBED_DIM] = {0}; /* always-initialized out */
         double p[HYDRA_EMBED_DIM];
         tf_final_logits(engine, y);
         for (uint32_t i = 0; i < dim; ++i) p[i] = (double)y[i];
 
         if (cfg->temperature <= 0.0f || cfg->min_p >= 1.0f)
-            return hydra_engine_step_tf(engine, token_in, token_out, kv);
+            return tf_advance(engine, token_in, token_out, kv, kv_layers);
         if (vocab < 2) return -3;
         if (cfg->temperature > 20.0f) return -4;
         if (cfg->repetition_penalty < 1.0f) return -1; /* no discounting */
@@ -1173,7 +1523,7 @@ int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
         }
         engine->rng_state = st;
         const uint16_t chosen = (uint16_t)(bi % vocab);
-        return hydra_engine_step_tf(engine, chosen, token_out, kv);
+        return tf_advance(engine, chosen, token_out, kv, kv_layers);
     }
 
     /* Greedy guard: keep the deterministic path bit-identical.
@@ -1274,6 +1624,44 @@ int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
     return hydra_engine_step(engine, (uint16_t)c, token_out);
 }
 
+int hydra_sampled_step(void *user, uint16_t *token_out)
+{
+    hydra_sampled_step_ctx_t *c = (hydra_sampled_step_ctx_t *)user;
+    if (!c || !c->engine || !token_out) return -1;
+    /* gen is part of the contract in EVERY mode (each step is logged):
+     * the caller must provide a buffer with capacity >= the total step
+     * count, and the repetition-penalty window is read back from it. */
+    if (!c->gen) return -1;
+
+    /* Same guard as the CLI and inside hydra_sample_token(): sampling
+     * is active only when the greedy guard does NOT fire. With the
+     * guard set, this dispatch is exactly the pre-sampler path - the
+     * engine's own guard then delegates to the native step, so a
+     * greedy run stays bit-identical to hydra_engine_step() (v1/v2)
+     * or hydra_engine_step_tf() with the same KV (v3). */
+    const int sampling =
+        c->cfg.temperature > 0.0f && c->cfg.min_p < 1.0f;
+    int rc;
+    if (sampling) {
+        const size_t window = (size_t)c->cfg.penalty_window;
+        const size_t nrec =
+            (size_t)c->s < window ? (size_t)c->s : window;
+        rc = hydra_sample_token(c->engine, c->tok, &c->cfg,
+                                c->gen + (c->s - nrec), nrec,
+                                c->kv, c->kv_layers, token_out);
+    } else if (c->engine->header.version >= 3) {
+        rc = tf_advance(c->engine, c->tok, token_out, c->kv, c->kv_layers);
+    } else {
+        rc = hydra_engine_step(c->engine, c->tok, token_out);
+    }
+    if (rc != 0) return rc;
+
+    c->gen[c->s] = *token_out;
+    c->s++;
+    c->tok = *token_out;
+    return 0;
+}
+
 int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)
 {
     if (!engine || (n > 0 && !tokens)) return -1;
@@ -1288,8 +1676,12 @@ int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)
      * Prompt-Implementierung, die von step() abweichen koennte. */
     for (size_t i = 0; i + 1 < n; ++i) {
         uint16_t discarded = 0;
-        if (engine->header.version == 3) {
-            if (hydra_engine_step_tf(engine, tokens[i], &discarded, NULL) != 0)
+        if (engine->header.version >= 3) {
+            /* The per-layer pass has no aggregated legacy step; the
+             * prompt drives it token by token. kv stays NULL on
+             * purpose (the v3/v4 contract: prefill carries no memory
+             * channel; the KV cache is built during generation). */
+            if (tf_advance(engine, tokens[i], &discarded, NULL, NULL) != 0)
                 return -3;
         } else {
             if (hydra_engine_step(engine, tokens[i], &discarded) != 0) return -3;

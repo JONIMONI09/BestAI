@@ -20,7 +20,7 @@
 | File | Purpose |
 |---|---|
 | `include/hydra_model.h` | Public API, header struct, defines; also the sampler config (`hydra_sampler_config_t`), the transformer primitives (`hydra_rmsnorm`/`hydra_rope_inplace`/`hydra_swiglu`) and the streaming `hydra_kv_cache_t` |
-| `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate, the min-p/repetition-penalty sampler, and the zero-heap transformer primitives + KV cache |
+| `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate, the min-p/repetition-penalty sampler, the zero-heap transformer primitives + KV cache, and the v3/v4 per-layer passes (`hydra_engine_step_tf` / `hydra_transformer_forward_step`) |
 | `src/main.c` | CLI entry point (`--json` mode, `--temp`/`--min-p`/`--rep-penalty`/`--rep-window`/`--seed`) |
 | `src/hydra_neon.h` | NEON SIMD kernel — **actively integrated**: `step()` uses it on ARM in 16-lane chunks; bit-identical scalar fallback for remainders and x86 (proven by a same-build comparison test) |
 | `src/hydra_simd.h` | AVX2 kernel — **actively integrated** on x86-64 `-mavx2` builds: `hydra_avx2_accumulate_agg` (step) + `hydra_avx2_unpack_v2_plane` (load-time v2 LUT), runtime CPU dispatch with scalar fallback (proven by `test_avx2_step_kernel` / `test_avx2_v2_unpack`) |
@@ -207,6 +207,58 @@ Design notes, stated as facts:
 
 The format details (block layout, packing, error codes, forward-pass
 contract) are canonical in `docs/FORMAT.md`, "Version 3".
+
+## Version 4 forward pass (full per-layer attention)
+
+Version 4 (format, `docs/FORMAT.md` "Version 4") is the transformer that the
+v3 per-layer structure was preparing for. The loader treats v4 exactly like
+v3 — per-layer blocks in the mapping, no aggregation (`agg_a`/`agg_b` stay
+zero, the legacy step refuses v4 with `-14`) — except each layer carries
+three extra ternary planes `Wq`/`Wk`/`Wv` between `Wu` and `w1`.
+
+`hydra_transformer_forward_step()` (the v4-only step) executes, per token:
+
+```
+h = state_vector
+for l = 0 .. layers-1:
+  xeff = clamp127(h + w1_l·token)                  (v3 input mix)
+  q,k,v = ternary mat-vecs Wq,Wk,Wv vs xeff, / scale_l
+  rope(q,pos); rope(k,pos)                         (theta = 10000)
+  kv_l.append(k,v)                                 (per-layer cache, caller-owned)
+  c = softmax((q·K_resident)/sqrt(dim)) · V_resident   (causal by construction:
+                                                        current k/v is the last resident)
+        kv_l == NULL  →  c = v                      (self-only, memory off)
+  h1 = clamp127(h + quant(c))                        (residual #1)
+  f  = SwiGLU(Wg·h1/scale, Wu·h1/scale)              (the v3 FFN block)
+  h  = clamp127(h1 + quant(RMSNorm(f)))              (residual #2)
+state = h;  logits = W_out·quant(RMSNorm(state));  token = argmax % vocab
+```
+
+Facts that differ from v3, on purpose:
+
+- **Residuals are added** (`h1 = h + quant(c)`, `h = h1 + quant(RMSNorm(f))`)
+  instead of replacing the state — the transformer's load-bearing property.
+- **RoPE acts on `q`/`k`** at the token position, not on the state.
+- **The memory channel is attention** over each layer's resident K/V (sinks
+  + ring + the current entry), not v3's sink add-back + state append.
+- **Per-layer caches.** Every layer has its own `Wq/Wk/Wv`, so every layer
+  keeps its own `hydra_kv_cache_t`; the caller passes a contiguous array of
+  `layers` caches (or `NULL` for no memory channel). The cache type is the
+  one `hydra_engine_step_tf()` and `hydra_sample_token()` already take, so
+  one cache design serves v3 and v4 and the sampler.
+- **Final stage is RMSNorm + the `W_out` projection** (v3 already projected;
+  v4 normalises before it).
+
+The engine stays zero-heap: the only per-token allocations are the attention
+score/scratch buffers on the v4 path (sized by the caller's resident set,
+freed before every return, including errors). Runtime error codes: the shared
+ones plus `-16` (non-finite intermediate), `-17` (KV append failed), `-18`
+(KV read failed / no allocation). The v4 path is scalar (`tf_row_dot`), same
+honest assessment as v3: exact int32 add/sub, `dim ≤ 64`, no SIMD kernel yet.
+
+The full layout and contract (block bytes, constraints, return codes, the
+"no shipped Python v4 writer" status) are canonical in `docs/FORMAT.md`,
+"Version 4".
 
 ## SIMD Strategy (Honest Assessment)
 

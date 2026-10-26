@@ -508,7 +508,10 @@ def _convert_v3(args, gguf):
         })
 
     w_out_src = candidates[0]
-    codes_o, scale_o, rep_o = v3_block_from_tensor(gguf, w_out_src, dim, args.max_rows)
+    # scale_o is intentionally unused: the v3 W_out block has no scale field
+    # in the file format - the engine applies the raw ternary codes as int32
+    # logits without rescaling (the per-layer blocks keep their u16 scale).
+    codes_o, _scale_o, rep_o = v3_block_from_tensor(gguf, w_out_src, dim, args.max_rows)
     body += pack_ternary_block(codes_o, dim)
     w_out_report = dict(rep_o)
     w_out_report['note'] = ('final logit-mix block; the engine applies it '
@@ -639,7 +642,9 @@ def convert(args):
 
 
 def _convert(args, gguf):
-    a_tensor, b_tensor, rolled = pick_tensors(gguf, args.a_tensor, args.b_tensor)
+    # _rolled is (b_tensor is None) by construction of pick_tensors; the
+    # b_tensor-is-None branch below already names the rolled plane.
+    a_tensor, b_tensor, _rolled = pick_tensors(gguf, args.a_tensor, args.b_tensor)
 
     dim = min(args.dim, MAX_DIM)
     report_a, a_raw = plane_from_tensor(gguf, a_tensor, args.max_rows, dim, 'A')
