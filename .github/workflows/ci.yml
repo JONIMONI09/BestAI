@@ -143,6 +143,33 @@ jobs:
           path: lint-report.txt
           if-no-files-found: ignore
 
+
+  # ---------- Portability: macOS clang, PR tier ----------
+  # Regression for the 2026-10-26 release failure: release.yml's
+  # build-macos job compiles the engine with Darwin headers and no
+  # feature macros, where an in-file _POSIX_C_SOURCE hides the BSD
+  # extensions O_NOFOLLOW / MADV_SEQUENTIAL. This job runs the same
+  # compile SYNTAX-ONLY on every pull request, so that class of break
+  # is found before merge instead of in the release after merge.
+  # It is a scan (no -o, no artifact, no upload), not a finished build.
+  macos-strict-scan:
+    name: Portability scan (macOS clang, C99)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exact release-macos command, syntax-only
+        run: |
+          # Identical flags to release.yml build-macos (clang -O3
+          # -Wall -Wextra -Iinclude, both src TUs, no -D feature
+          # macros); -fsyntax-only replaces the -o/-lm link step
+          # so no binary or artifact is produced.
+          clang -O3 -fsyntax-only -Wall -Wextra -Iinclude \
+              src/hydra_engine.c src/main.c
+
+      - name: Feature-test macro hygiene (Apple vs glibc)
+        run: bash tools/apple_portability_check.sh
+
   # ---------- Stage 2a: NEON path on ARM64 (explicit) ----------
   # The NEON kernel shipped with an inverted sign that no existing test
   # could see, because the SIMD path and the scalar path had only ever

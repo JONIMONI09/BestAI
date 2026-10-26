@@ -37,7 +37,39 @@
 2. `mmap(PROT_READ, MAP_SHARED)` maps the file into the address space.
 3. `madvise(MADV_SEQUENTIAL)` tells the kernel the access pattern → aggressive read-ahead. This is a *sequencing* hint, **not** an eviction hint.
 4. 4-KiB pages are faulted in on demand and are clean → reclaimable under memory pressure without swap traffic.
-5. The runtime state is **fixed-size and independent of model size**: the recurrent state `int8_t[64]` (64 B), the two load-time aggregates `int32_t[64]` each (512 B for `agg_a` + `agg_b`), and an `int64_t[64]` accumulator (512 B). Nothing in that list grows with `layers` or with the file size.
+5. The runtime state is **fixed-size and independent of model size**: the recurrent state `int8_t[64]` (64 B), the two load-time aggregates `int32_t[64]` each (512 B for `agg_a` + `agg_b`), and an `int64_t[64]` accumulator (512 B, stack-local inside `hydra_engine_step`). Nothing in that list grows with `layers` or with the file size.
+
+**`sizeof(HydraEngine)` = 664 bytes on 64-bit (LP64) platforms**
+(measured with `sizeof` on x86-64; pinned at compile time on all LP64
+targets by `hydra_engine_size_check` in `include/hydra_model.h`, which
+CI compiles on macOS arm64 and the AArch64 NEON leg. The pin is
+LP64-conditional: 32-bit ABIs such as armeabi-v7a use a smaller ILP32
+layout, and an unconditional pin broke the NDK 32-bit compile —
+caught by CI's android-lint NDK step on 2026-10-26):
+
+| field | bytes |
+|---|---|
+| `int fd` + 4 B alignment padding | 8 |
+| `const uint8_t *mapped_weights` | 8 |
+| `size_t mapped_size` | 8 |
+| `HydraModelHeader header` (packed) | 24 |
+| `int8_t state_vector[64]` | 64 |
+| `int32_t agg_a[64]` | 256 |
+| `int32_t agg_b[64]` | 256 |
+| `double load_ms` | 8 |
+| `size_t weights_bytes` | 8 |
+| `long resident_kb_after_load` | 8 |
+| `long rss_kb_before_load` | 8 |
+| `uint64_t rng_state` (sampler) | 8 |
+| **total** | **664** |
+
+(The 656 B that the README claimed until 2026-10-26 was the size before
+`rng_state` was added for min-p sampling. `include/hydra_model.h` now
+pins 664 at compile time on every platform, so the number can never
+silently drift again.)
+
+The per-token step touches only 576 B of that (the two aggregate arrays
+plus the state vector); the rest is load-time bookkeeping.
 
 **Honest statement of what is (and is not) guaranteed.** The engine's *own*
 memory is ~1.1 KiB of fixed buffers — the state vector, both aggregate vectors

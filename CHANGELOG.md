@@ -1,4 +1,58 @@
 # Changelog
+All notable changes to this project, per change, are recorded here and in
+`session.md` (rules.md R2). Newest entries first.
+
+## 2026-10-26 (round 3) — macOS release fix + PR-tier portability scan, size pin, full audit
+
+1. **release.yml macOS build failure fixed (root cause: feature-test
+   inversion).** release.yml's `build-macos` job
+   (`clang -O3 -Wall -Wextra -Iinclude src/*.c`, macOS arm64, no -D
+   flags) failed after the PR #55 merge: the in-file
+   `_POSIX_C_SOURCE 200809L`/`_DEFAULT_SOURCE` defines *enable* the
+   POSIX symbols on glibc but Darwin headers treat `_POSIX_C_SOURCE`
+   as a **restriction** and hide the BSD extensions `O_NOFOLLOW` and
+   `MADV_SEQUENTIAL` (neither is in any POSIX version). Fix: the
+   define block in `src/hydra_engine.c` + `src/main.c` is now
+   `#if !defined(__APPLE__) && !defined(__MACH__)`. All compile modes
+   re-verified (strict C99 standalone, exact CI 1a with -D flags +
+   -Werror, C++ parse, C suite 142/0 + 86/0 + 7/0, zig aarch64 full
+   compile).
+2. **Portability now fails on PRs, not in the release.** New
+   `macos-strict-scan` job in ci.yml's PR tier: the exact release-macos
+   command with `-fsyntax-only` (no binary, no artifact) +
+   `tools/apple_portability_check.sh` (new, R25 self-testing:
+   preprocessor-output asserts that Apple configuration self-defines
+   no feature macro, plain configuration self-defines both, plus a
+   broken-pattern fixture). Local proof of the macro logic; the
+   Darwin-header proof is the job itself (measured: forcing
+   `-D__APPLE__` on glibc is not a valid Darwin simulation).
+3. **`sizeof(HydraEngine)` documented correctly and pinned.** Measured
+   664 B on x86-64; the README's 656 B was the pre-`rng_state` size
+   (stale). Fixed in README (2 places) and `docs/ARCHITECTURE.md` now
+   carries the full per-field derivation; `include/hydra_model.h` pins
+   664 at compile time on every platform
+   (`hydra_engine_size_check`, C99-portable) — layout drift is now a
+   build error.
+4. **Evidence-based audit (`.agent_memory/AUDIT.md`)**: verified the
+   zero-heap engine claim (true for `src/hydra_engine.c`;
+   `src/main.c:479` mallocs a ≤512 B CLI buffer), the SIMD parity
+   tests (all present, suite green), and the hardening in `server.js`;
+   documented the mathematical limits of the v1 format (after
+   load-time aggregation the whole model is 128 integers ≈ 208 bytes
+   of capacity; decoding reads only dimension 0; the GGUF converter
+   keeps ≤0.0075 % of a 7B model by construction), the M4 primitives
+   (unit-tested, not wired into the forward pass), and the honest
+   spec-only status of `.hydra2`; ranked the remaining hazards (mmap
+   TOCTOU SIGBUS by design, accepted) and a prioritized P0-P3
+   evolution plan.
+5. **Local linter stack re-run (pip wheels, incl. flawfinder 2.0.20
+   added to the recorded venv path):** gcc strict `-Werror -fanalyzer`
+   rc=0; cppcheck `--enable=all src/ include/` 0 error / 0 warning /
+   10 style (all exported APIs used from `tests/`, outside scan scope —
+   0 real defects); clang-tidy 155 findings, 0 real analyzer bugs, 0
+   concurrency findings; flawfinder `--minlevel=4` no hits;
+   `make test-run` rc=0; gguf_test 59/0; server_test 37/37;
+   test_count 142 vs baseline.
 
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
