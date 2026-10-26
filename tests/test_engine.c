@@ -876,7 +876,10 @@ static void test_neon_tf_row_dot(void)
     int all_match = 1;
     for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
         const uint32_t dim = dims[di];
-        uint8_t row[16];
+        /* = {0}: every byte initialized before the (runtime-bounded)
+         * fill loop below, so uninit analysis sees no path where the
+         * kernel reads an uninitialized element. */
+        uint8_t row[16] = {0};
         int8_t *x = (int8_t *)malloc(dim); /* exactly dim bytes (engine layout) */
         if (!x) { perror("malloc"); exit(1); }
         for (int it = 0; it < 256; ++it) {
@@ -1996,7 +1999,10 @@ static void test_avx2_tf_row_dot(void)
     int all_match = 1;
     for (size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
         const uint32_t dim = dims[di];
-        uint8_t row[16];
+        /* = {0}: every byte initialized before the (runtime-bounded)
+         * fill loop below, so uninit analysis sees no path where the
+         * kernel reads an uninitialized element. */
+        uint8_t row[16] = {0};
         int8_t *x = (int8_t *)malloc(dim); /* exactly dim bytes (engine layout) */
         if (!x) { perror("malloc"); exit(1); }
         for (int it = 0; it < 256; ++it) {
