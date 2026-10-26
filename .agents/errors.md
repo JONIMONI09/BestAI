@@ -48,6 +48,32 @@
   stdlib/library API doubt is verified by that check or on the web before
   the code ships — never by assumption.
 
+## 2026-10-26 (round 6) — CI red #4: clang `-Wtypedef-redefinition` in hydra_model.h (C99)
+
+- **Symptom:** the CI `lint` job (ci.yml gate 1b:
+  `clang -fsyntax-only -std=c99 -Wall -Wextra -Werror` over all 5 C
+  files) failed — on main AND on this branch (job log blob-blocked;
+  diagnosed by local reproduction, see below).
+- **Cause:** `include/hydra_model.h` defines the KV-cache type twice:
+  forward `typedef struct hydra_kv_cache hydra_kv_cache_t;` (line 153,
+  needed — the v3 API prototypes at lines 173/235 use the name before
+  the definition) and `typedef struct hydra_kv_cache { … }
+  hydra_kv_cache_t;` (line 287, the full definition). Typedef
+  redefinition is a **C11 feature**; under `-std=c99` clang warns
+  (`-Wtypedef-redefinition`, on by default below C11) and `-Werror`
+  fails. GCC accepts it silently (its diagnosis sits behind
+  `-Wpedantic`, which the gcc gate does not enable) — so the gcc gate
+  and every local C++-parse check stayed green while clang alone was red.
+  Introduced in round 4 (v3 KV cache), merged in PR #57.
+- **Fix:** the full definition is now a plain `struct hydra_kv_cache {
+  … };` (no repeated typedef); the name stays bound by the forward
+  declaration. Zero semantic change, 100 % C99.
+- **Prevention:** a real clang frontend now runs locally — `zig cc
+  -target x86_64-linux-gnu` with the exact ci.yml gate-1b flags (zig
+  bundles Clang; see `.agents/Environment.md` round-6 item) — plus the
+  existing aarch64 full compile. Two frontends, three targets, before
+  every push; `zig cc` reproduced this failure exactly.
+
 ## 2026-10-26 (round 6) — CI red #1: cppcheck `uninitvar` on the v3 test buffers
 
 - **Symptom:** CI gate 1c (cppcheck, warning+performance+portability)
@@ -67,19 +93,38 @@
   locally on every C change — this one would have been caught in 10
   seconds before the push.
 
-## 2026-10-26 (round 6) — missing import: `Modifier.weight` in HydraApp.kt
+## 2026-10-26 (round 6) — `Modifier.weight`: NO import needed (a misdiagnosis, corrected)
 
-- **Symptom:** local Kotlin stub check: `unresolved reference 'weight'` ×5
-  (HydraApp.kt lines 544/605/746/953/1000) — after the `.last/.first`
-  fix, this was the next red waiting in CI.
-- **Cause:** `Modifier.weight(1f)` is a *scope-extension* function
-  (`RowScope.Modifier.weight` / `ColumnScope.Modifier.weight` in package
-  `androidx.compose.foundation.layout`). Kotlin extension functions need
-  an explicit import — the file imported the other layout extensions
-  individually and omitted `weight`.
-- **Fix:** added `import androidx.compose.foundation.layout.weight`.
-- **Prevention:** same as the `.last/.first` entry — the local stub check
-  is the gate; a manual import diff is not.
+- **Symptom:** local Kotlin stub check reported
+  `unresolved reference 'weight'` ×5 in HydraApp.kt. First reaction:
+  "missing import" — `import androidx.compose.foundation.layout.weight`
+  was added. CI (K2 compiler) then answered:
+  `HydraApp.kt:19:43 Cannot access 'val RowColumnParentData?.weight:
+  Float': it is internal in file` — the import itself is the error.
+- **Cause (two layers):**
+  1. In the real Compose API, `weight` is a **member extension of the
+     RowScope/ColumnScope interfaces** (Compose source,
+     `RowColumnImpl.kt`: `fun RowScope.Modifier.weight(...)` /
+     `fun ColumnScope.Modifier.weight(...)`). Inside a `Row { }` /
+     `Column { }` content lambda it resolves through the implicit scope
+     receiver — **no import is required or permitted**. The explicit
+     import resolves to the file-private
+     `val RowColumnParentData?.weight: Float` in the same package and K2
+     rejects it (K1 used to silently tolerate the bad import).
+  2. The stub declared `weight` as a top-level extension — unfaithful to
+     the real API — which is what produced the original
+     "unresolved reference" and sent the fix in the wrong direction.
+- **Fix:** the import is removed (the original round-5 code was correct
+  on this point); the stub now declares `weight` as a member extension of
+  `RowScope`/`ColumnScope` (with a comment quoting the real-API shape),
+  so the stub check rejects the explicit import exactly like K2 does.
+- **Prevention:** before "fixing" a stub-check error by changing app
+  code, verify against the real API source (Compose sources are on
+  android.googlesource.com; `RowColumnImpl.kt` is decisive here). A stub
+  error is a signal that EITHER the app code OR the stub is wrong — the
+  real API is the tie-breaker. This entry supersedes the
+  "import added" statement in the first draft of the round-6 session
+  note.
 
 ## 2026-10-26 (round 6) — R stub generator corruption: `list.extend(string)`
 

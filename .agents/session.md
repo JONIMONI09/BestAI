@@ -2203,11 +2203,29 @@ code, update it at the end of the round; adjust Environment.md.
    `name: Code scanning alert handling`). After the merge, the old
    registration (path `code-scanning.yml`) is orphaned by the deletion and
    the new path registers from the known-good content.
-4. **Bonus (found only because a local type-check now exists):**
-   `HydraApp.kt` used `Modifier.weight(1f)` (5×) without importing
-   `androidx.compose.foundation.layout.weight` — a scope-extension function
-   that needs an explicit import. Would have been the NEXT red after #2.
-   Import added.
+4. **clang gate 1b: `-Wtypedef-redefinition` in hydra_model.h (C99).**
+   `hydra_kv_cache_t` was typedef'd twice (forward at line 153 + repeated
+   on the full definition at line 287) — legal in C11, a warning under
+   clang `-std=c99` → `-Werror` red. GCC is silent (its diagnosis sits
+   behind `-Wpedantic`), which is why every local gcc gate stayed green.
+   Introduced in round 4, merged in PR #57; the "lint" job of ci.yml was
+   red on main since the merge (timeline: 12:11 green, 13:37+ red).
+   Fix: full definition is now a plain `struct hydra_kv_cache { … };`
+   (the name stays bound by the forward declaration). Diagnosed by
+   reproducing gate 1b locally with `zig cc -target x86_64-linux-gnu`
+   (zig bundles a Clang frontend — new local capability, see
+   Environment.md round-6 item).
+5. **Kotlin `weight` — a false alarm, corrected after CI's K2 error.**
+   The local stub check flagged `Modifier.weight(1f)` (×5) as
+   unresolved; the first "fix" added
+   `import androidx.compose.foundation.layout.weight`. CI's K2 compiler
+   rejected the import: `Cannot access 'val RowColumnParentData?.weight:
+   Float': it is internal in file`. Real API (Compose source,
+   RowColumnImpl.kt): `weight` is a member extension of RowScope/
+   ColumnScope — resolvable inside the scope lambdas, import forbidden.
+   The import was removed (the round-5 code was right on this point);
+   the stub now declares `weight` as scope members, faithfully rejecting
+   the import form. Full story in `.agents/errors.md`.
 
 ### The local Kotlin type-check (the capability this round added)
 
@@ -2218,14 +2236,16 @@ COMPILER is on the npm registry:
 stub classpath (`tools/kotlin_stub_check/stubs/`, 40 files: android.*/
 androidx.*/compose/org.json + R generated from the real strings.xml) and a
 runner: `bash tools/kotlin_stub_check/kotlin_stub_check.sh` → compiles all
-10 app .kt files in ~20s. This caught root cause #2 and the missing
-weight import locally, before CI. Verified: **0 errors** on the fixed tree
+10 app .kt files in ~20s. This caught root cause #2 locally, before CI. Verified: **0 errors** on the fixed tree
 (only 3 warnings, 2 pre-existing redundant-`else`, 1 stub artifact).
 Stub-fidelity rules learned (see `.agents/errors.md`): verify API
 signatures on the web before stubbing (Compose `items` key lambda is
 single-parameter `(item: T) -> Any` — the two-parameter one is
-`itemsIndexed`); one package per stub file; fun-interface for Java SAMs;
-JVM signature clashes when stubbing var+fun pairs.
+`itemsIndexed`; `weight` is a scope MEMBER, not a top-level
+extension); one package per stub file; fun-interface for Java SAMs;
+JVM signature clashes when stubbing var+fun pairs. A stub error means
+app code OR stub is wrong — the real API is the tie-breaker (the
+`weight` episode proved it in both directions).
 
 ### .agents/ reorg (owner directive)
 
@@ -2253,13 +2273,20 @@ entries keep their dated old paths on purpose.
 - PyYAML full parse of all 5 workflows: clean (installed via pip — the
   stdlib-only fallback in workflow_yaml_check.sh cannot see syntax
   errors; it passed, so the rename risk is covered by both).
+- **clang gate-1b replica (local, new):** `zig cc -target x86_64-linux-gnu
+  -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Wall -Wextra
+  -Werror` on all 5 CI files → reproduced the #4 failure before the fix,
+  5/5 clean after.
+- **NEON path after the header change:** `zig cc -target aarch64-linux-gnu`
+  full compile of both src files → rc 0.
 
-**Files:** tests/test_engine.c, android/app/src/main/java/dev/hydrastone/
-ui/HydraApp.kt, tools/kotlin_stub_check/ (new), .agents/ (new folder: 5
-moved files + 8 moved docs + user.md + README.md), .github/workflows/
-code-scanning.yml → code-scanning-alert.yml, 44 reference updates.
+**Files:** tests/test_engine.c, include/hydra_model.h, android/app/src/
+main/java/dev/hydrastone/ui/HydraApp.kt (weight import removed — false
+alarm), tools/kotlin_stub_check/ (new; stubs corrected for scope-member
+weight), .agents/ (new folder: 5 moved files + 8 moved docs + user.md +
+README.md), .github/workflows/code-scanning.yml →
+code-scanning-alert.yml, 44 reference updates.
 
-**Open:** CI on this branch is check-only until a PR is opened (the
-push-tier workflows run on main/PR events). After merge: confirm
-code-scanning-alert registers clean (no more zero-job push runs) and the
-three formerly-red workflows go green.
+**Open:** PR #59 open. After merge: confirm code-scanning-alert
+registers clean (no more zero-job push runs) and all four workflows green
+on main.

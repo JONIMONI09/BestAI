@@ -16,7 +16,6 @@ interface Arrangement {
     interface Vertical : Arrangement
 }
 
-fun Modifier.weight(weight: Float, fill: Boolean = true): Modifier = this
 
 class PaddingValues {
     constructor()
@@ -42,7 +41,15 @@ class BoxWithConstraintsScope {
 @Composable
 fun BoxWithConstraints(modifier: Modifier = Modifier, content: @Composable BoxWithConstraintsScope.() -> Unit) {}
 
-interface RowScope
+/* Faithful to the real API (Compose source RowColumnImpl.kt): weight is a
+ * MEMBER extension of RowScope/ColumnScope - never importable at top level
+ * (an explicit `import androidx.compose.foundation.layout.weight` resolves
+ * to the file-private `val RowColumnParentData?.weight` and K2 rejects it:
+ * "Cannot access 'val RowColumnParentData?.weight: Float': it is internal
+ * in file"). */
+interface RowScope {
+    fun Modifier.weight(weight: Float, fill: Boolean = true): Modifier = this
+}
 interface ColumnScope {
     fun Modifier.weight(weight: Float, fill: Boolean = true): Modifier = this
 }

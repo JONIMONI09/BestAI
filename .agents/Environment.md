@@ -207,8 +207,13 @@
      `bash tools/kotlin_stub_check/kotlin_stub_check.sh`.
      **This is the local equivalent of the CI Kotlin-compile step** and is
      what caught the round-6 `ClosedFloatingPointRange.last/first` error
-     and the missing `androidx.compose.foundation.layout.weight` import
-     before CI. Limits (honest, R32): it verifies Kotlin type resolution
+     before CI. (A follow-up: the stub initially declared `weight` as a
+     top-level extension, producing a false "missing import" signal; the
+     real API has `weight` as a member extension of RowScope/ColumnScope
+     with no import permitted — the stub now mirrors that, and K2's
+     rejection of the explicit import is reproduced locally too. See
+     `.agents/errors.md`, 2026-10-26 round 6.) Limits (honest, R32): it
+     verifies Kotlin type resolution
      and signatures only — resources, manifest, the compose-compiler
      plugin and lint checks still need the real AGP build in CI. Stub
      fidelity rules that cost real iterations: verify every stubbed
@@ -270,3 +275,26 @@
      toolchain, pip for the lint venv). Anything that must survive
      between turns lives in the workspace — the stub classpath was
      committed to `tools/kotlin_stub_check/` for exactly this reason.
+  7. **A real Clang frontend, locally: `zig cc -target x86_64-linux-gnu`
+     (tested 2026-10-26).** The repo has no local `clang` binary and apt
+     is blocked, but the already-usable `ziglang` wheel bundles a Clang
+     C frontend — enough to run CI gate 1b exactly:
+     ```bash
+     /tmp/zvenv/bin/python-zig cc -target x86_64-linux-gnu \
+         -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+         -Wall -Wextra -Werror -I/home/user/BestAI/include \
+         -I/home/user/BestAI/src \
+         -I/home/user/BestAI/android/app/src/main/cpp \
+         -c src/hydra_engine.c -o /dev/null   # repeat per CI file
+     ```
+     This **reproduced the round-6 CI red exactly**
+     (`hydra_model.h:287 redefinition of typedef 'hydra_kv_cache_t' is a
+     C11 feature [-Werror,-Wtypedef-redefinition]`) — a failure the gcc
+     gate cannot see (GCC parks that diagnosis behind `-Wpedantic`).
+     Use it on every change to `src/`, `include/`, `tests/`:
+     `zig cc` x86_64 = clang gate-1b replica; `zig cc` aarch64 (existing
+     item 5) = NEON compile; gcc = gate 1a. Three frontends locally,
+     zero "CI will catch it". Caveat: zig's Clang is newer than the
+     runner's, so it is slightly *stricter* — a clean zig result is the
+     stronger claim, and a zig-only warning still needs a look before
+     pushing.
