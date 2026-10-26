@@ -1995,3 +1995,176 @@ outputs, "document everything".
 - [x] **Commit + push + PR (R17: owner merges)** — branch
       `arena/f2400a75-bestai` (session branch; main @ d6aeb0d already
       contains the round-3 merge of PR #56).
+
+## Round 2026-10-26 (round 5: UI/UX bugs + expanded settings — user request)
+
+User request: "find a way to make everything possible, expand settings with
+various functions (model-related, thinking etc.), make the UI better, find
+UI/UX bugs". Screenshots: Android app, landscape with keyboard open shows
+the composer at the TOP of the screen with zero visible chat. Attached
+"RepoInspect" PDF is INVALID for this repo (names Pydantic/LangChain/Poetry,
+`chains/llm_math/prompt.py`, "1,482 files / 918 contributors"; the repo has
+122 tracked files, C engine + stdlib Python, no such files) - ignored and
+told to the user.
+
+### Plan (verified in code before writing it)
+
+**A. UI/UX bug fixes (all with code evidence):**
+- [x] A1: "state 17 B" in the model row is the WRONG metric.
+      llama_jni.cpp:426 reports `llama_state_get_size(ctx)` - per the pinned
+      llama v0.5.0 header (line 818-822) that is the SERIALIZED state size at
+      the current position ("Only use when saving the state"), which is ~17 B
+      at n_past=0. The comment in the JNI ("logits plus KV cache ... a
+      measurement of the library's own allocation") is false. Fix: add
+      `kv_bytes` (2 * n_layer * n_ctx * n_embd * 2B - type_k/type_v default
+      GGML_TYPE_F16, confirmed in llama-context.cpp:3721-3722) and
+      `logits_bytes` (n_vocab * n_embd * 4B) to the load report; header row
+      shows "kv" instead of "state"; fix the comment.
+- [x] A2: the chat never auto-scrolls. MessageList (HydraApp.kt) is a
+      LazyColumn with no position effect - new/streaming tokens are invisible
+      until the user scrolls in a long conversation. Fix:
+      rememberLazyListState + LaunchedEffect keyed on (last message id, last
+      message text length); follow ONLY while the user is at the bottom (no
+      yanking back over history they read).
+- [x] A3: keyboard stays open after Send, covering the streaming answer.
+      Fix: hide the IME in sendMessage (FocusManager.clearFocus +
+      LocalSoftwareKeyboardController / WindowInsetsController).
+- [x] A4: the screenshot-2 layout is a REAL defect, not a transition artifact:
+      `imePadding()` sits on the InputRow, so on API 30+ (edge-to-edge,
+      ADJUST_NOTHING) the keyboard inset inflates ONLY the row and eats the
+      weighted space of AdaptiveHeaderSplit - in landscape (or any short
+      window) TopAppBar + nav bar + keyboard consume the whole window, the
+      split collapses to 0 and the composer renders directly under the
+      TopAppBar with no chat visible (exactly the screenshot). Fix: apply the
+      IME inset to the ChatTab root column so the WHOLE column (split +
+      telemetry + row) sits above the keyboard; the split keeps its visible
+      share.
+- [x] A5: RunTelemetryRow jumps in height on the first run (returns Unit
+      before) - reserve a min height.
+
+**B. Expanded settings (the explicit ask):**
+- [x] B1: real SettingsTab (replaces the "coming soon" block): Thinking /
+      chain-of-thought switch (model reasoning: prompts the model to show
+      step-by-step reasoning), system-prompt field, temperature 0..2 slider,
+      top-k 1..100, min-p 0..0.5, repetition penalty 1..2, max tokens
+      32..1024, context size 512..8192 (llama; needs reload, said so),
+      reset-to-defaults. Benchmark / engine info / new conversation / log
+      stay.
+- [x] B2: wire-through: EngineInterface.generate gets a GenerationParams
+      (temperature/topK/minP/repeatPenalty/maxTokens); llama_jni.cpp
+      build_sampler_chain becomes parameterized (top_k, min_p +
+      llama_sampler_init_rep_penalty - API confirmed in the pinned header),
+      chain rebuilt on key change (key = the tuple, not just temp);
+      LlamaBridge/LlamaEngine signatures follow; HydraEngine ignores the
+      sampling params (deterministic engine - documented on the interface).
+      System prompt + thinking prompt prepend in MainActivity, llama only
+      (EngineCapabilities.understandsTextPrompt). Context size -> n_ctx of
+      the llama load.
+- [x] B3: persistence: SharedPreferences for all settings + selected engine
+      + auto-run (survives process death, not just rotation).
+- [x] B4: real Models tab (replaces placeholder): current model facts
+      (name, size, format, engine detail), import button, and
+      "Remove imported model" (back to the bundled starter) - a delete the
+      app currently cannot do at all.
+
+**C. Verification (honest split):**
+- [x] C++: g++ -fsyntax-only of llama_jni.cpp against the PINNED llama v0.5.0
+      submodule headers (now initialized) + a minimal jni.h stub (no NDK in
+      this sandbox; stub limits the check to syntax/semantics of the llama
+      calls, stated as such).
+- [x] Kotlin: careful manual review - no kotlinc in the sandbox; the Android
+      CI tier (android-lint + APK) builds it, same as every previous round.
+- [x] strings.xml: XML well-formed check + every R.string referenced in the
+      new code exists (grep cross-check).
+- [x] C engine untouched: `make test-run` re-run before the commit.
+
+### Results (all executed, real outputs)
+
+**A. Bug fixes (shipped):**
+- [x] A1: load report now carries `kv_bytes` (2 * n_layer * n_ctx * n_embd
+      * 2 B, F16 KV default at the pin - verified in llama-context.cpp) and
+      `logits_bytes` (n_vocab * n_embd * 4 B) on top of `state_bytes`, which
+      is kept but documented for what it is (serialized-state size at
+      n_past=0, a few bytes of metadata - NOT RAM). The false JNI comment
+      ("logits plus KV cache") is replaced with the pinned-header citation.
+      Header row shows "kv" (detailFor), not "state".
+- [x] A2: MessageList now holds a rememberLazyListState; a LaunchedEffect
+      keyed on (last message id, last text length, lastIsUser) scrolls to the
+      bottom while the user is AT the bottom, and ALWAYS for the user's own
+      message. History you scrolled up to is never yanked away.
+- [x] A3: sendMessage hides the IME + clears focus (InputMethodManager,
+      Activity-level; no Compose plumbing needed).
+- [x] A4: .imePadding() + .navigationBarsPadding() moved from the InputRow to
+      the ChatTab root column. The weighted split now absorbs the keyboard
+      height instead of the row inflating and eating the split's space -
+      the screenshot-2 collapse (composer under the TopAppBar, zero chat)
+      cannot happen on any window shape.
+- [x] A5: RunTelemetryRow reserves height(28.dp) before the first run; no
+      layout jump when telemetry first appears.
+
+**B. Settings expansion (shipped):**
+- [x] B1: real SettingsTab: Thinking switch (prompt-based: a reasoning
+      instruction is prepended - no engine change, works for any instruct
+      GGUF), system-prompt field, sliders for temperature 0..2, top-k
+      0..100 (0=off), top-p 0.05..1 (1=off), min-p 0..0.5, max tokens
+      32..1024, context 512..8192 (llama, "applies on reload"), reset-to-
+      defaults. Sliders commit on release (local state, persist-on-commit -
+      no SharedPreferences storm during a drag).
+- [x] B2: EngineInterface.generate carries GenerationParams
+      (temperature/topK/topP/minP); EngineInterface.load carries a
+      contextWindow request (0 = engine default). llama_jni.cpp:
+      build_sampler_chain(SamplerKey) - conditional top_k -> top_p -> min_p
+      -> temp -> dist, rebuilt on tuple change, all four clamped+logged at
+      the JNI boundary. LlamaBridge/LlamaEngine follow (context clamped
+      256..8192 there, reported granted value back). HydraEngine accepts and
+      documents that it ignores both (deterministic by construction).
+      DEVIATION, stated: the pinned llama.cpp v0.5.0 chain has NO
+      repetition-penalty sampler (verified in the pinned header - the
+      inventory is greedy/dist/top_k/top_p/min_p/typical/temp/temp_ext/xtc/
+      top_n_sigma/mirostat1/2), so no rep-penalty control exists in Settings
+      rather than a slider that would change nothing.
+- [x] B3: SharedPreferences persistence for every setting + selected engine +
+      auto-run; restored in onCreate BEFORE prepareModel. BUG FOUND + FIXED
+      on the way: prepareModel() never looked at imported.gguf on relaunch,
+      so a persisted llama selection + imported GGUF silently ran the v1
+      starter - it now loads the GGUF through llama.cpp as the authority
+      (NOT the .hydra header rules - catching that reportModel would have
+      rejected a valid GGUF was itself the fix).
+- [x] B4: real Models tab: current model card (label + engine facts),
+      import button, "Remove imported model" (deletes the imported file
+      only - never the starter; falls back to the v1 engine + starter when
+      the selected engine loses its model).
+
+**C. Verification (real outputs, this turn):**
+- C++: `g++ -std=c++17 -fsyntax-only -Wall -Wextra` of llama_jni.cpp against
+      the PINNED v0.5.0 submodule headers + minimal jni.h/android/log.h
+      stubs (no NDK in the sandbox; stub declared as such): SYNTAX OK, zero
+      warnings. cppcheck (warning,performance,portability, std=c++17,
+      pinned includes): clean.
+- Kotlin: careful manual review of every changed hunk + brace-balance check
+      on all 10 .kt files (no kotlinc in the sandbox; the Android CI tier
+      builds, same as every previous round).
+- strings.xml: XML parses (all values/*.xml); 106 strings; every R.string /
+      R.plurals referenced in Kotlin exists (0 missing); no new string
+      unreferenced; tools/string_format_check.py: 37 passed, 0 failed, 4
+      unverified (all 4 pre-existing: err_version_human, log_model_imported,
+      log_model_starter, ok_version - templates formatted in code).
+- tools/compose_scroll_guard.py: "ok no nested scrollable containers"
+      (A2's LazyColumn stays the body's only scrollable).
+- JNI signatures cross-checked native<->Kotlin by type: load
+      (jstring,jint), generate (jstring,jint,jfloat,jint,jfloat,jfloat,
+      jobject), cancel(), unload() - all match.
+- C engine untouched: make test-run -> `=== 174 Tests, 0 failures ===` +
+      `86 checks, 0 failed` + `7 checks, 0 failed` + `73 checks, 0 failed`
+      (identical to the round-4 baseline).
+- Web console (reviewed, same mandate): node tools/server_test.js ->
+      37/37 pass; node tools/console_train_test.js -> all assertions passed.
+      Code audit found no new UI/UX bugs (abort + server-side cancel
+      protocol, single-flight busy guard, no innerHTML, encoded paths all
+      in place from the earlier audit rounds).
+
+**Files:** android/app/src/main/cpp/llama_jni.cpp,
+android/app/src/main/java/dev/hydrastone/{EngineInterface,HydraEngine,
+LlamaBridge,LlamaEngine,MainActivity}.kt,
+android/app/src/main/java/dev/hydrastone/ui/HydraApp.kt,
+android/app/src/main/res/values/strings.xml.

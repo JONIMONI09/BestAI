@@ -43,13 +43,19 @@ object LlamaBridge {
      *             creates can differ from this, so the reply reports the real
      *             value rather than the requested one.
      * @return JSON with ok, architecture, n_ctx, n_ctx_train, n_embd, n_layer,
-     *         size_bytes, state_bytes and quant_type, or ok:false with an
-     *         error the user can act on.
+     *         size_bytes, state_bytes (the serialized-state size at load, i.e.
+     *         a few bytes of metadata - NOT the RAM figure), kv_bytes (the KV
+     *         cache the context actually allocates), logits_bytes and
+     *         quant_type, or ok:false with an error the user can act on.
      */
     external fun load(path: String, nCtx: Int): String
 
     /**
      * Generates from [prompt], streaming to [callback]. Blocks until done.
+     *
+     * The sampling controls are the Settings-tab values, clamped again on the
+     * native side: the JNI boundary is where untrusted numbers enter, and a
+     * clamp on this side alone would be a lie about what actually runs.
      *
      * @return JSON with ok, generated, cancelled, truncated, n_past and n_ctx.
      *         `cancelled` is not an error: it means the user pressed Stop.
@@ -58,6 +64,9 @@ object LlamaBridge {
         prompt: String,
         maxTokens: Int,
         temperature: Float,
+        topK: Int,
+        topP: Float,
+        minP: Float,
         callback: Callback
     ): String
 

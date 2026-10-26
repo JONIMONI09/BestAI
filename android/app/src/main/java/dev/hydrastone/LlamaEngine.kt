@@ -40,15 +40,24 @@ class LlamaEngine : EngineInterface {
     override var capabilities: EngineCapabilities = EngineCapabilities()
         private set
 
-    override fun load(modelPath: String): EngineLoadResult {
+    override fun load(modelPath: String, contextWindow: Int): EngineLoadResult {
         if (!java.io.File(modelPath).isFile) {
             return EngineLoadResult(false, "Model file not found")
         }
 
+        // Zero means "the engine's default". The UI's control lives in
+        // 256..8192; a request outside that range is clamped rather than
+        // passed through, because the KV cache is allocated per context
+        // token (2 * n_layer * n_ctx * n_embd * 2 bytes at this pin's F16
+        // KV default) and 32k tokens on a small model is how phones get
+        // killed by lmkd. The actually granted value is read back below.
+        val requested = if (contextWindow <= 0) DEFAULT_CONTEXT
+        else contextWindow.coerceIn(MIN_CONTEXT, MAX_CONTEXT)
+
         // llama.cpp maps the file directly, so this must be a real path. The
         // SAF import copies for exactly this reason.
         val json = try {
-            LlamaBridge.load(modelPath, DEFAULT_CONTEXT)
+            LlamaBridge.load(modelPath, requested)
         } catch (e: Throwable) {
             Log.e(TAG, "native load failed", e)
             return EngineLoadResult(
@@ -78,14 +87,27 @@ class LlamaEngine : EngineInterface {
             put("n_embd", obj.optInt("n_embd", 0).toString())
             put("n_layer", obj.optInt("n_layer", 0).toString())
             put("size_bytes", obj.optLong("size_bytes", 0L).toString())
-            // llama.cpp's own state size, not a formula we invented.
+            // The KV cache the context allocates, from the bridge: 2 *
+            // n_layer * n_ctx * n_embd * 2 bytes (F16 K and V at this pin).
+            // This is the RAM figure the header shows, not an estimate.
+            put("kv_bytes", obj.optLong("kv_bytes", 0L).toString())
+            // One f32 per vocabulary entry, per output position.
+            put("logits_bytes", obj.optLong("logits_bytes", 0L).toString())
+            // The serialized state at load (n_past = 0): sampler/RNG
+            // metadata, a few bytes. Kept because it is llama.cpp's own
+            // number; the header labels it accordingly.
             put("state_bytes", obj.optLong("state_bytes", 0L).toString())
         }
 
         return EngineLoadResult(true, detail = modelInfo)
     }
 
-    override fun generate(prompt: String, maxTokens: Int, callbacks: GenerationCallbacks) {
+    override fun generate(
+        prompt: String,
+        maxTokens: Int,
+        callbacks: GenerationCallbacks,
+        params: GenerationParams
+    ) {
         if (loadedPath == null) {
             callbacks.onComplete(GenerationSummary(0, false, "No model loaded"))
             return
@@ -108,8 +130,19 @@ class LlamaEngine : EngineInterface {
             override fun onDone() = Unit
         }
 
+        // The Settings values pass through untouched on purpose: the native
+        // side clamps with the same bounds and logs every clamp, so a number
+        // that cannot run is reported rather than silently altered here.
         val json = try {
-            LlamaBridge.generate(prompt, maxTokens, TEMPERATURE, bridgeCallback)
+            LlamaBridge.generate(
+                prompt,
+                maxTokens,
+                params.temperature,
+                params.topK,
+                params.topP,
+                params.minP,
+                bridgeCallback
+            )
         } catch (e: Throwable) {
             running = false
             callbacks.onComplete(
@@ -183,6 +216,8 @@ class LlamaEngine : EngineInterface {
          */
         const val DEFAULT_CONTEXT = 2048
 
-        const val TEMPERATURE = 0.7f
+        /** Bounds of the Settings context control, see [load]. */
+        const val MIN_CONTEXT = 256
+        const val MAX_CONTEXT = 8192
     }
 }

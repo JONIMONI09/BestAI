@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -39,12 +41,17 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -56,6 +63,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import dev.hydrastone.ChatMessage
 import dev.hydrastone.ChatState
+import dev.hydrastone.GenerationSettings
 import dev.hydrastone.Role
 import dev.hydrastone.R
 
@@ -126,12 +134,15 @@ data class MainUiState(
     val lastRun: RunStats? = null,
     /**
      * Human-readable model facts from the engine's load result, e.g.
-     * "quant" -> "Q8_0", "weights" -> "1.2 MB", "state" -> "3.4 MB".
+     * "quant" -> "Q8_0", "weights" -> "1.2 MB", "kv" -> "3.4 MB" (the KV
+     * cache the context allocates, not the serialized-state size).
      * The values are already formatted by the owner (MainActivity), which
      * is the only place that knows the raw numbers - the UI renders them,
      * it does not re-derive them.
      */
-    val modelDetail: Map<String, String> = emptyMap()
+    val modelDetail: Map<String, String> = emptyMap(),
+    /** The persisted generation settings the Settings tab edits. */
+    val settings: GenerationSettings = GenerationSettings()
 ) {
     /** Convenience for the banner and the model row. */
     val selectedEngine: EngineInfo?
@@ -164,7 +175,9 @@ data class MainActions(
     val onImportModel: () -> Unit = {},
     val onAutoRunChanged: (Boolean) -> Unit = {},
     val onBenchmark: () -> Unit = {},
-    val onEngineSelected: (String) -> Unit = {}
+    val onEngineSelected: (String) -> Unit = {},
+    val onSettingsChanged: (GenerationSettings) -> Unit = {},
+    val onRemoveImportedModel: () -> Unit = {}
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -190,12 +203,7 @@ fun HydraApp(state: MainUiState, actions: MainActions) {
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             when (state.selectedTab) {
                 Tab.CHAT -> ChatTab(state, actions)
-                Tab.MODELS -> PlaceholderTab(
-                    R.string.tab_models,
-                    R.string.models_empty_title,
-                    R.string.models_empty_body,
-                    onImportModel = actions.onImportModel
-                )
+                Tab.MODELS -> ModelsTab(state, actions)
                 Tab.DATA -> PlaceholderTab(
                     R.string.tab_data,
                     R.string.data_empty_title,
@@ -256,7 +264,22 @@ private fun PlaceholderTab(
 
 @Composable
 private fun ChatTab(state: MainUiState, actions: MainActions) {
-    Column(modifier = Modifier.fillMaxSize()) {
+    // A4: the IME and navigation-bar insets belong to the WHOLE tab, not to
+    // the input row. With .imePadding() on the row only, the keyboard inset
+    // inflated just that one row, and on a short window (landscape, split
+    // screen, API 30+ edge-to-edge) the TopAppBar plus system bars plus the
+    // inflated row consumed the entire window - the weighted chat split
+    // above the row collapsed to zero and the composer rendered directly
+    // under the app bar with no conversation visible at all. Applied to the
+    // root column, the inset shrinks the column instead: the split gives up
+    // exactly the keyboard's height, the row keeps its natural size, and
+    // every height the window actually has is laid out, not dropped.
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .navigationBarsPadding()
+    ) {
         // The rows above the conversation share the space with it through
         // AdaptiveHeaderSplit: the header keeps its natural height while it
         // fits, and scrolls internally once it hits its share. That is what
@@ -427,7 +450,13 @@ private fun EngineStatusRow(state: MainUiState) {
  */
 @Composable
 private fun RunTelemetryRow(state: MainUiState) {
-    val run = state.lastRun ?: return
+    val run = state.lastRun
+    // A5: the row reserves its height even before the first run. The old
+    // early return removed the row entirely until the first run finished,
+    // so the composer jumped up by the row's height the moment telemetry
+    // appeared - a layout shift on the most-watched row of the app.
+    Box(modifier = Modifier.fillMaxWidth().height(28.dp)) {
+        if (run == null) return@Box
     // getQuantityString, not stringResource: in this Compose version the
     // stringResource(id, vararg) overload wins over the plurals overload in
     // overload resolution, which lint then rejects as ResourceType
@@ -464,6 +493,7 @@ private fun RunTelemetryRow(state: MainUiState) {
             fontFamily = FontFamily.Monospace,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+    }
     }
 }
 
@@ -611,7 +641,27 @@ private fun MessageList(messages: List<ChatMessage>, lastTurnCancelled: Boolean)
     // fills a bounded constraint. A fixed minimum would overflow the
     // window exactly when the window is smallest - keyboard open on a
     // short screen - and push the composer off screen.
+    //
+    // A2: follow the generation only while the user is already at the
+    // bottom. Without a scroll state the list stayed pinned at its initial
+    // position, so a multi-hundred-token run rendered below the visible
+    // area and the chat looked dead. The rule is the one chat screens use:
+    // your own message always scrolls into view (you just sent it); the
+    // engine's reply follows while you are at the bottom, and stops
+    // following the moment you scroll up to read history.
+    val listState = rememberLazyListState()
+    val last = messages.lastOrNull()
+    val lastIsUser = last?.role == Role.USER
+    val atBottom = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.let {
+        it.index == listState.layoutInfo.totalItemsCount - 1
+    } ?: true
+    LaunchedEffect(last?.id, last?.text?.length, lastIsUser) {
+        if (messages.isNotEmpty() && (lastIsUser || atBottom)) {
+            listState.animateScrollToItem(messages.lastIndex)
+        }
+    }
     LazyColumn(
+        state = listState,
         modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -683,15 +733,10 @@ private fun InputRow(state: MainUiState, actions: MainActions) {
 
     Row(
         modifier = Modifier
+            // The IME inset lives on the ChatTab root column, not here: see
+            // the A4 note there. On the row only, the keyboard collapsed the
+            // conversation on short windows.
             .fillMaxWidth()
-            // On API 30+ the window is edge-to-edge with ADJUST_NOTHING
-            // (see MainActivity), so the IME inset is what lifts this row:
-            // imePadding() adds exactly the keyboard's height, whatever it
-            // is (split keyboard, emoji row, swipe-up). Below 30 the
-            // platform resizes the window instead (adjustResize) and this
-            // modifier is a no-op.
-            .imePadding()
-            .navigationBarsPadding()
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Bottom
     ) {
@@ -724,6 +769,8 @@ private fun InputRow(state: MainUiState, actions: MainActions) {
 
 @Composable
 private fun SettingsTab(state: MainUiState, actions: MainActions) {
+    val settings = state.settings
+    val llamaActive = state.selectedEngineId == "llama"
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -764,11 +811,114 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
             }
         )
         HorizontalDivider()
+
         Text(
-            text = stringResource(R.string.coming_soon),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            text = stringResource(R.string.settings_generation),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold
         )
+        // The sampling controls configure a sampler, and the v1 engine does
+        // not have one: it is deterministic by construction. Showing the
+        // sliders with an honest note beats hiding them (the user cannot
+        // tell which engine they would apply to) or showing them enabled
+        // (values that change nothing would be a lie).
+        if (!llamaActive) {
+            Text(
+                text = stringResource(R.string.settings_llama_only),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        // Thinking mode and the system prompt are prompt-level features:
+        // they only take effect on engines that understand text, which is
+        // exactly llama.cpp in this app - so they are shown with the same
+        // gate as the sampling controls.
+        if (llamaActive) {
+            SwitchRow(
+                label = stringResource(R.string.thinking_switch),
+                summary = stringResource(R.string.thinking_summary),
+                checked = settings.thinking,
+                onCheckedChange = {
+                    actions.onSettingsChanged(settings.copy(thinking = it))
+                }
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = stringResource(R.string.setting_system_prompt),
+                    style = MaterialTheme.typography.labelMedium
+                )
+                OutlinedTextField(
+                    value = settings.systemPrompt,
+                    onValueChange = {
+                        actions.onSettingsChanged(settings.copy(systemPrompt = it))
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text(stringResource(R.string.setting_system_prompt_hint)) },
+                    maxLines = 3
+                )
+            }
+        }
+
+        SettingSlider(
+            label = stringResource(R.string.setting_temperature),
+            value = settings.temperature,
+            range = 0f..2f,
+            step = 0.05f,
+            format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
+            enabled = llamaActive,
+            onCommit = { actions.onSettingsChanged(settings.copy(temperature = it)) }
+        )
+        SettingSlider(
+            label = stringResource(R.string.setting_top_k),
+            value = settings.topK.toFloat(),
+            range = 0f..100f,
+            step = 1f,
+            format = { it.toInt().toString() },
+            enabled = llamaActive,
+            onCommit = { actions.onSettingsChanged(settings.copy(topK = it.toInt())) }
+        )
+        SettingSlider(
+            label = stringResource(R.string.setting_top_p),
+            value = settings.topP,
+            range = 0.05f..1f,
+            step = 0.05f,
+            format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
+            enabled = llamaActive,
+            onCommit = { actions.onSettingsChanged(settings.copy(topP = it)) }
+        )
+        SettingSlider(
+            label = stringResource(R.string.setting_min_p),
+            value = settings.minP,
+            range = 0f..0.5f,
+            step = 0.01f,
+            format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
+            enabled = llamaActive,
+            onCommit = { actions.onSettingsChanged(settings.copy(minP = it)) }
+        )
+        SettingSlider(
+            label = stringResource(R.string.setting_max_tokens),
+            value = settings.maxTokens.toFloat(),
+            range = 32f..1024f,
+            step = 32f,
+            format = { it.toInt().toString() },
+            enabled = true,
+            onCommit = { actions.onSettingsChanged(settings.copy(maxTokens = it.toInt())) }
+        )
+        SettingSlider(
+            label = stringResource(R.string.setting_context_size),
+            value = settings.contextSize.toFloat(),
+            range = 512f..8192f,
+            step = 256f,
+            format = { it.toInt().toString() },
+            enabled = llamaActive,
+            onCommit = { actions.onSettingsChanged(settings.copy(contextSize = it.toInt())) }
+        )
+        TextButton(onClick = { actions.onSettingsChanged(GenerationSettings()) }) {
+            Text(stringResource(R.string.settings_reset))
+        }
+
+        HorizontalDivider()
         TextButton(onClick = actions.onNewConversation) {
             Text(stringResource(R.string.chat_new_conversation))
         }
@@ -779,5 +929,148 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
                 fontFamily = FontFamily.Monospace
             )
         }
+    }
+}
+
+/**
+ * One labelled control: title, optional summary line, trailing Switch.
+ *
+ * Used for the thinking-mode toggle; the switch commits immediately (a
+ * toggle is a discrete decision, not a drag), so it needs no local state.
+ */
+@Composable
+private fun SwitchRow(
+    label: String,
+    summary: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(text = label, style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+/**
+ * One labelled slider with the committed value shown to the left of the
+ * control.
+ *
+ * The drag lives in LOCAL state and the commit goes out on release
+ * (onValueChangeFinished): the Settings owner persists every change into
+ * SharedPreferences, and persisting on every pixel of a drag would write
+ * the file faster than the user's finger moves. The local state is
+ * remembered keyed on the COMMITTED value, so an external change (the
+ * reset button) snaps the thumb back, while a drag in flight is never
+ * reset by its own commits.
+ */
+@Composable
+private fun SettingSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    step: Float,
+    format: (Float) -> String,
+    enabled: Boolean,
+    onCommit: (Float) -> Unit
+) {
+    var local by remember(value) { mutableStateOf(value) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(text = label, style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = format(local),
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Slider(
+            value = local,
+            onValueChange = { local = it },
+            onValueChangeFinished = { onCommit(local) },
+            valueRange = range,
+            steps = ((range.last - range.first) / step - 1).toInt().coerceAtLeast(0),
+            enabled = enabled,
+            modifier = Modifier.widthIn(min = 160.dp)
+        )
+    }
+}
+
+/**
+ * The Models tab: the model that is actually on disk, its facts from the
+ * engine's own load result, and the two model operations the app performs -
+ * import a new one, remove the imported one.
+ *
+ * The facts come from [MainUiState.modelDetail], already formatted by
+ * MainActivity; this tab renders them and derives nothing, so the numbers
+ * here and in the chat header cannot disagree.
+ */
+@Composable
+private fun ModelsTab(state: MainUiState, actions: MainActions) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            text = stringResource(R.string.model_current),
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = if (state.hasModel) state.modelLabel
+                    else stringResource(R.string.model_none),
+                    style = MaterialTheme.typography.titleMedium
+                )
+                state.modelDetail.forEach { (k, v) ->
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = k,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.widthIn(min = 72.dp)
+                        )
+                        Text(text = v, style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+            }
+        }
+        Button(onClick = actions.onImportModel) {
+            Text(stringResource(R.string.action_import_model))
+        }
+        FilledTonalButton(onClick = actions.onRemoveImportedModel) {
+            Text(stringResource(R.string.model_remove_imported))
+        }
+        Text(
+            text = stringResource(R.string.models_tab_body),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }

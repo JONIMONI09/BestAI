@@ -42,7 +42,13 @@ class HydraEngine : EngineInterface {
     override var capabilities: EngineCapabilities = EngineCapabilities()
         private set
 
-    override fun load(modelPath: String): EngineLoadResult {
+    override fun load(modelPath: String, contextWindow: Int): EngineLoadResult {
+        // Deliberately ignored: the v1 engine is a two-state recurrence over a
+        // fixed-size weight file. It has no context, no KV cache and no
+        // window to size, so the argument is accepted for interface uniformity
+        // and documented as having no effect - a "context size" label above
+        // an engine that has no context would be a control that does nothing
+        // presented as one.
         // The native loader mmaps the path and reports failure through the
         // inference result, not through an exception. Validate the header the
         // same way the C loader does so the user gets a message before a run is
@@ -68,7 +74,17 @@ class HydraEngine : EngineInterface {
         )
     }
 
-    override fun generate(prompt: String, maxTokens: Int, callbacks: GenerationCallbacks) {
+    override fun generate(
+        prompt: String,
+        maxTokens: Int,
+        callbacks: GenerationCallbacks,
+        // Deliberately unused: this engine is deterministic by construction -
+        // a fixed recurrence over the weight file, no sampler exists that the
+        // Settings values could reach. The parameter is accepted for interface
+        // uniformity, and the UI says so (isExperimental surfaces it), instead
+        // of presenting sliders whose values would change nothing.
+        @Suppress("UNUSED_PARAMETER") params: GenerationParams
+    ) {
         val path = loadedPath
         if (path == null) {
             callbacks.onComplete(GenerationSummary(0, false, "No model loaded"))

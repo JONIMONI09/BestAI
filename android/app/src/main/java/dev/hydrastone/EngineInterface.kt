@@ -32,6 +32,59 @@ data class EngineLoadResult(
 )
 
 /** Outcome of a finished [EngineInterface.generate] call. */
+/**
+ * The sampling controls the Settings tab exposes for one generation.
+ *
+ * Defaults are the values the sampler chain historically used, so "the
+ * Settings were never touched" and "the defaults were applied" are the same
+ * run: nothing about an existing conversation changes just because the tab
+ * now exists.
+ *
+ * The pinned llama.cpp (v0.5.0) has no repetition-penalty chain sampler, so
+ * that control deliberately does not exist here; see the native
+ * build_sampler_chain for the pin's sampler inventory.
+ */
+data class GenerationParams(
+    val temperature: Float = DEFAULT_TEMPERATURE,
+    val topK: Int = DEFAULT_TOP_K,
+    val topP: Float = DEFAULT_TOP_P,
+    val minP: Float = DEFAULT_MIN_P
+) {
+    companion object {
+        const val DEFAULT_TEMPERATURE = 0.7f
+        const val DEFAULT_TOP_K = 40
+        const val DEFAULT_TOP_P = 1.0f
+        const val DEFAULT_MIN_P = 0.05f
+    }
+}
+
+/**
+ * The user-adjustable generation settings behind the Settings tab.
+ *
+ * The owner (MainActivity) persists this in SharedPreferences on every
+ * change; the values are clamped again on the native side where they matter.
+ *
+ *  - [thinking] and [systemPrompt] are prompt-level features: they are
+ *    prepended to the prompt and only take effect on engines that understand
+ *    text ([EngineCapabilities.understandsTextPrompt]).
+ *  - [temperature], [topK], [topP], [minP] feed [GenerationParams] on every
+ *    run; an engine without a sampler ignores them (documented per engine).
+ *  - [maxTokens] bounds one run for every engine; an engine with a smaller
+ *    hard bound runs its own bound.
+ *  - [contextSize] is a REQUEST passed to [EngineInterface.load]; the engine
+ *    reports the granted size through [EngineCapabilities].
+ */
+data class GenerationSettings(
+    val thinking: Boolean = false,
+    val systemPrompt: String = "",
+    val temperature: Float = GenerationParams.DEFAULT_TEMPERATURE,
+    val topK: Int = GenerationParams.DEFAULT_TOP_K,
+    val topP: Float = GenerationParams.DEFAULT_TOP_P,
+    val minP: Float = GenerationParams.DEFAULT_MIN_P,
+    val maxTokens: Int = 256,
+    val contextSize: Int = 2048
+)
+
 data class GenerationSummary(
     val generatedTokens: Int,
     val cancelled: Boolean,
@@ -91,19 +144,32 @@ interface EngineInterface {
     /**
      * Loads a model from an absolute path.
      *
+     * [contextWindow] is the requested context size in tokens. Zero means
+     * "the engine's own default" - it is a REQUEST, not a command: the engine
+     * reports the value it actually granted through [EngineCapabilities], and
+     * an engine for which a context window is meaningless (the Hydra v1
+     * automaton has none) ignores the argument and documents that.
+     *
      * Returns rather than throws: an unsupported architecture, a corrupt header
      * and a full disk are all ordinary outcomes with a user-facing message.
      */
-    fun load(modelPath: String): EngineLoadResult
+    fun load(modelPath: String, contextWindow: Int = 0): EngineLoadResult
 
     /**
-     * Generates from [prompt] for at most [maxTokens] tokens.
+     * Generates from [prompt] for at most [maxTokens] tokens, sampling with
+     * [params].
+     *
+     * [params] carries the user-facing sampling controls (Settings tab). An
+     * engine that has no sampler to configure - the Hydra v1 automaton is
+     * deterministic by construction - ignores it, and says so in its
+     * documentation rather than pretending the values apply: a control that
+     * changes nothing must not be presented as one.
      *
      * Returns immediately; progress arrives through [callbacks] on a background
      * thread and [GenerationCallbacks.onComplete] always fires exactly once.
      * A call while another is running is a programming error and is rejected.
      */
-    fun generate(prompt: String, maxTokens: Int, callbacks: GenerationCallbacks)
+    fun generate(prompt: String, maxTokens: Int, callbacks: GenerationCallbacks, params: GenerationParams = GenerationParams())
 
     /** Asks the running generation to stop. Safe to call when idle. */
     fun cancel()
