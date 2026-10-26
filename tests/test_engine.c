@@ -614,7 +614,39 @@ static void test_seed_roundtrip_variance(void)
     unlink(path);
 }
 
+/* Shared version-2 helpers (defined before both the NEON and the AVX2
+ * comparison blocks so the SIMT/v2 unpack tests on either architecture
+ * can use them; the original wr_header_version lived lower in the file
+ * and is moved up here rather than duplicated). */
+static void wr_header_version(FILE *f, uint16_t version, uint16_t vocab,
+                              uint32_t dim, uint32_t layers, uint32_t off,
+                              uint32_t wlen)
+{
+    wr_u32le(f, HYDRA_MAGIC);
+    wr_u16le(f, version);
+    wr_u16le(f, vocab);
+    wr_u32le(f, dim);
+    wr_u32le(f, layers);
+    wr_u32le(f, off);
+    wr_u32le(f, wlen);
+}
+
+/* Independent scalar reference of the v2 plane unpack (4 weights per
+ * byte, weight j at bits 2j..2j+1): the SAME code table as the engine
+ * (00=0, 01=+1, 10=-1, 11=0), written from docs/FORMAT.md, not from
+ * hydra_build_aggregation_v1_1. */
+static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
+{
+    static const int8_t map[4] = {0, 1, -1, 0};
+    for (size_t i = 0; i < dim / 4; ++i) {
+        const uint8_t byte = plane[i];
+        for (int j = 0; j < 4; ++j)
+            agg[i * 4 + j] += map[(byte >> (2 * j)) & 0x03];
+    }
+}
+
 #ifdef __ARM_NEON
+#include "../src/hydra_neon.h"
 /* Skalare Referenzimplementierung von step() — unabhaengig vom NEON-Pfad.
  * Wird im selben Build gegen die Engine gefahren (BUG-1), damit die
  * Vorzeichen-Inversion im NEON-Dekoder nicht mehr unbemerkt bleibt. */
@@ -834,6 +866,180 @@ static void test_neon_matches_scalar(void)
     CHECK(tokens_match, "NEON-Pfad == skalare Referenz (Token-Sequenz, gleicher Build)");
     CHECK(state_match, "NEON-Pfad == skalare Referenz (State-Vektor, gleicher Build)");
 }
+
+/* M1 completion: the NEON version-2 plane unpack (in-register 2-bit
+ * decode of the load path, counterpart of the AVX2 kernel in
+ * src/hydra_simd.h) vs the independent scalar reference. Same pattern
+ * as test_avx2_v2_unpack; runs only in NEON builds (the CI
+ * qemu-aarch64-static leg). */
+static void test_neon_v2_unpack(void)
+{
+    /* Random planes over 3 layers (the multi-layer ADD path of the
+     * kernel) at dim=64 (the engine's supported case, 16-byte
+     * planes). */
+    {
+        const size_t dim = 64;
+        int32_t ref[HYDRA_EMBED_DIM] = {0};
+        int32_t neo[HYDRA_EMBED_DIM] = {0};
+        uint8_t plane_a[16], plane_b[16];
+        for (uint32_t l = 0; l < 3; ++l) {
+            for (size_t i = 0; i < dim / 4; ++i) {
+                plane_a[i] = lcg_byte();
+                plane_b[i] = lcg_byte();
+            }
+            ref_unpack_v2_plane(ref, plane_a, dim);
+            hydra_neon_unpack_v2_plane(neo, plane_a, dim);
+            ref_unpack_v2_plane(ref, plane_b, dim);
+            hydra_neon_unpack_v2_plane(neo, plane_b, dim);
+        }
+        CHECK(memcmp(ref, neo, dim * sizeof(int32_t)) == 0,
+              "NEON v2 unpack == scalar reference (dim 64, 3 random layers)");
+    }
+
+    /* All-code sweep: every 2-bit code repeated in all 4 slots of a
+     * byte must sum to 4 * map(code) per dimension — the code table
+     * itself, pinned per code (a sign inversion or a nibble-order swap
+     * would move this off its hand-pinned value). */
+    for (int code = 0; code < 4; ++code) {
+        const size_t dim = 64;
+        int32_t ref[HYDRA_EMBED_DIM] = {0};
+        int32_t neo[HYDRA_EMBED_DIM] = {0};
+        uint8_t plane[16];
+        const uint8_t byte = (uint8_t)(code | (code << 2) | (code << 4) | (code << 6));
+        for (size_t i = 0; i < dim / 4; ++i) plane[i] = byte;
+        ref_unpack_v2_plane(ref, plane, dim);
+        hydra_neon_unpack_v2_plane(neo, plane, dim);
+        const int8_t map[4] = {0, 1, -1, 0};
+        int ok = (memcmp(ref, neo, dim * sizeof(int32_t)) == 0);
+        for (size_t i = 0; ok && i < dim; ++i)
+            if (neo[i] != map[code]) ok = 0;
+        if (code == 1)
+            CHECK(ok, "NEON v2 unpack: code 01 -> +1 in all 4 slots/dim, table exact");
+        else if (code == 2)
+            CHECK(ok, "NEON v2 unpack: code 10 -> -1 in all 4 slots/dim, table exact");
+        else if (code == 0)
+            CHECK(ok, "NEON v2 unpack: code 00 -> 0 in all 4 slots/dim, table exact");
+        else
+            CHECK(ok, "NEON v2 unpack: code 11 (reserved) -> 0 in all 4 slots/dim, table exact");
+    }
+
+    /* Multi-chunk: dim 128 (2 x 64) exercises the kernel's d += 64
+     * loop — the engine caps dim at 64, so without this call the loop
+     * body would only ever have run once in a test. */
+    {
+        const size_t dim = 128;
+        int32_t ref[128] = {0};
+        int32_t neo[128] = {0};
+        uint8_t plane[32];
+        for (size_t i = 0; i < dim / 4; ++i) plane[i] = lcg_byte();
+        ref_unpack_v2_plane(ref, plane, dim);
+        hydra_neon_unpack_v2_plane(neo, plane, dim);
+        CHECK(memcmp(ref, neo, dim * sizeof(int32_t)) == 0,
+              "NEON v2 unpack: dim 128 (2 chunks) == scalar reference");
+    }
+}
+
+/* End-to-end load cross-check (R9): a seeded version-2 model loaded
+ * through the engine — where the NEON unpack runs on this build — must
+ * carry aggregates BIT-IDENTICAL to an in-test scalar decode of the
+ * same raw file bytes, and the 32-token stream the engine produces
+ * from those aggregates must match a reference simulation driven by
+ * the independently decoded A/B. A systematic kernel error (nibble
+ * order, sign, plane swap) cannot hide: the reference never sees the
+ * kernel. */
+static void test_neon_v2_load_matches_scalar(void)
+{
+    char path[64];
+    tmp_path_new(path, sizeof(path));
+    const uint32_t dim = 64, layers = 3;
+    const uint16_t vocab = 512;
+
+    lcg_seed(0x5EED5EEDu);
+    uint8_t *pa = (uint8_t *)malloc(dim / 4);
+    uint8_t *pb = (uint8_t *)malloc(dim / 4);
+    if (!pa || !pb) { perror("malloc"); exit(1); }
+    for (uint32_t l = 0; l < layers; ++l)
+        for (size_t i = 0; i < dim / 4; ++i) {
+            pa[l * (dim / 4) + i] = lcg_byte();
+            pb[l * (dim / 4) + i] = lcg_byte();
+        }
+
+    /* Proof that the model exercises every code — without this the
+     * "all codes" claim would be a hope, not a measurement. */
+    int seen[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < dim / 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            seen[(pa[i] >> (2 * j)) & 0x03u] = 1;
+            seen[(pb[i] >> (2 * j)) & 0x03u] = 1;
+        }
+    CHECK(seen[0] && seen[1] && seen[2] && seen[3],
+          "NEON v2 load model contains all four 2-bit codes");
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("fopen"); exit(1); }
+    wr_header_version(f, 2u, vocab, dim, layers,
+                      (uint32_t)sizeof(HydraModelHeader), (dim / 4) * layers * 2u);
+    for (uint32_t l = 0; l < layers; ++l) {
+        fwrite(pa + l * (dim / 4), 1, dim / 4, f);
+        fwrite(pb + l * (dim / 4), 1, dim / 4, f);
+    }
+    fclose(f);
+
+    /* Independent scalar decode of the SAME raw bytes. */
+    int32_t ref_a[HYDRA_EMBED_DIM] = {0}, ref_b[HYDRA_EMBED_DIM] = {0};
+    for (uint32_t l = 0; l < layers; ++l) {
+        ref_unpack_v2_plane(ref_a, pa + l * (dim / 4), dim);
+        ref_unpack_v2_plane(ref_b, pb + l * (dim / 4), dim);
+    }
+
+    HydraEngine e;
+    int rc = hydra_engine_load(&e, path);
+    CHECK(rc == 0, "NEON v2 load: seeded version-2 model loads");
+    if (rc == 0) {
+        CHECK(memcmp(e.agg_a, ref_a, dim * sizeof(int32_t)) == 0,
+              "NEON v2 load: agg_a bit-identical to in-test scalar decode");
+        CHECK(memcmp(e.agg_b, ref_b, dim * sizeof(int32_t)) == 0,
+              "NEON v2 load: agg_b bit-identical to in-test scalar decode");
+
+        /* 32-token stream: the documented step formula (state clamp
+         * +/-127, token from acc[0]) driven by the independently
+         * decoded A/B must reproduce the engine's stream. */
+        int8_t state[HYDRA_EMBED_DIM] = {0};
+        uint16_t tok = 7;
+        int stream_ok = 1;
+        for (int t = 0; t < 32 && stream_ok; ++t) {
+#ifdef HYDRA_TOKENV_MASK
+            const int32_t token_val = (int32_t)(tok & 0x7Fu);
+#else
+            const int32_t token_val = (int32_t)tok;
+#endif
+            int64_t raw = ((int64_t)ref_a[0] * token_val
+                           + (int64_t)ref_b[0] * (int32_t)state[0]) % vocab;
+            if (raw < 0) raw += vocab;
+            /* token_in (NOT token_val) in the final term — mirrors
+             * hydra_engine_step() exactly (tok < vocab here, so the
+             * engine's token_in normalization is a no-op). */
+            const uint16_t ref_tok = (uint16_t)((raw + (int32_t)tok + 1) % vocab);
+            uint16_t got = 0;
+            if (hydra_engine_step(&e, tok, &got) != 0 || got != ref_tok) {
+                stream_ok = 0;
+                break;
+            }
+            for (uint32_t i = 0; i < dim; ++i) {
+                int64_t acc = (int64_t)ref_a[i] * token_val
+                            + (int64_t)ref_b[i] * (int32_t)state[i];
+                if (acc > 127) acc = 127; else if (acc < -127) acc = -127;
+                state[i] = (int8_t)acc;
+            }
+            tok = ref_tok;
+        }
+        CHECK(stream_ok, "NEON v2 load: 32-token stream matches reference aggregates");
+        hydra_engine_unload(&e);
+    }
+    free(pa);
+    free(pb);
+    unlink(path);
+}
 #endif /* __ARM_NEON */
 
 /* Version 2 (4 weights per byte, docs/FORMAT.md): positive parity test and
@@ -848,19 +1054,9 @@ static void test_neon_matches_scalar(void)
  *   first step, token=5, state=0: acc = [5,5,0,10], out = (5+5+1) % 64 = 11
  * The equivalent v1 file (8 bytes, 2 weights per byte) must produce the
  * identical aggregates and the identical 40-step token stream: the two
- * versions are the same model with different packing. */
-static void wr_header_version(FILE *f, uint16_t version, uint16_t vocab,
-                              uint32_t dim, uint32_t layers, uint32_t off,
-                              uint32_t wlen)
-{
-    wr_u32le(f, HYDRA_MAGIC);
-    wr_u16le(f, version);
-    wr_u16le(f, vocab);
-    wr_u32le(f, dim);
-    wr_u32le(f, layers);
-    wr_u32le(f, off);
-    wr_u32le(f, wlen);
-}
+ * versions are the same model with different packing.
+ * (wr_header_version is defined above, before the NEON block: the
+ * version-2 load test there needs it.) */
 
 /* Runs `steps` steps with generated-token feedback; returns 0 on success and
  * stores the generated stream in `out`. */
@@ -1594,20 +1790,8 @@ static void test_avx2_step_kernel(void)
     CHECK(exact, "AVX2 step kernel: layer-cap extremes (A=4096, t=1023, B=-4096, s=127) exakt");
 }
 
-/* Independent scalar reference of the v2 plane unpack (4 weights per
- * byte, weight j at bits 2j..2j+1): the SAME code table as the engine
- * (00=0, 01=+1, 10=-1, 11=0), written from docs/FORMAT.md, not from
- * hydra_build_aggregation_v1_1. */
-static void ref_unpack_v2_plane(int32_t *agg, const uint8_t *plane, size_t dim)
-{
-    static const int8_t map[4] = {0, 1, -1, 0};
-    for (size_t i = 0; i < dim / 4; ++i) {
-        const uint8_t byte = plane[i];
-        for (int j = 0; j < 4; ++j)
-            agg[i * 4 + j] += map[(byte >> (2 * j)) & 0x03];
-    }
-}
-
+/* (ref_unpack_v2_plane is defined above, before the NEON block, so the
+ * AVX2 and NEON v2-unpack tests share one independent reference.) */
 static void test_avx2_v2_unpack(void)
 {
     if (!hydra_simd_has_avx2()) {
@@ -1954,6 +2138,8 @@ int main(void)
 #ifdef __ARM_NEON
     test_neon_matches_scalar();
     test_neon_all_ternary_codes();
+    test_neon_v2_unpack();
+    test_neon_v2_load_matches_scalar();
 #else
     printf("SKIP: NEON-Vergleichstest (nur auf ARM builds mit __ARM_NEON)\n");
 #endif

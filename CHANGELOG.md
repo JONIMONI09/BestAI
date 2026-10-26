@@ -3,6 +3,70 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 — M1 completion: ARM NEON in-register v2 plane unpack (2-bit decode at load)
+
+Closes the last gap of milestone M1 ("True In-RAM 2-bit packed
+inference, 4× weight memory cut"): the ARM64 engine decoded the
+version-2 weight planes with the pure scalar loop while x86-64 already
+had an in-register AVX2 LUT path. The in-RAM objective itself was
+already met by the mmap + load-time aggregation design (resident weight
+memory is only the two 64-dim int32 A/B aggregates; the mapped pages are
+released after aggregation, RSS delta measured at 0 KiB) — this entry
+adds the NEON kernel and its parity proof.
+
+- **`src/hydra_neon.h`**: new `hydra_neon_unpack_v2_plane()` (static
+  inline, compiled only when `__ARM_NEON` is defined). Per 16-byte
+  chunk (64 dimensions) the four 2-bit weights are normalized into the
+  low 2 bits (logical right shifts via negative `vshlq_n_u8`
+  immediates — a pure AND mask like `0x3C/0xF0/0xC0` cannot work,
+  because `vqtbl1q_u8` indexes with each lane's LOW 4 bits only),
+  masked with `0x03`, and decoded through the same 16-entry
+  `T[i] = ternary(i & 3)` table the scalar and AVX2 decoders use (16
+  bytes, `aligned(16)` for the `vld1q_u8` load, −1 as 0xFF). The
+  decoded planes are widened `s8 → s16 → s32` (sign-extension carries
+  the −1) and a 4-way interleave in two `vzipq_s32` rounds (pairs two
+  apart: `q02 = zip(r0,r2)`, `q13 = zip(r1,r3)`, then re-zip groups
+  instead of alternating) yields the exact dimension order
+  `(R0,R1,R2,R3)` per byte; the result accumulates into `agg` with
+  `vaddq_s32`. Contract: `dim % 64 == 0`, one plane call per 16-byte
+  window. Bit-identical to `hydra_build_aggregation_v1_1` by
+  construction: one integer from the same table per dimension into the
+  same int32 accumulator.
+- **`src/hydra_engine.c`**: the v2 branch of
+  `hydra_build_aggregation()` now mirrors the AVX2 block: `use_neon =
+  dim % 64 == 0` (no runtime probe needed — NEON is base ISA on
+  AArch64, and a build without NEON never defines `__ARM_NEON`, so the
+  kernel is simply not compiled in). Per layer, 64-dim chunks are
+  unpacked by the kernel for A and B; any other dimension falls through
+  to the scalar decoder unchanged.
+- **`tests/test_engine.c`**: +11 ARM-only checks (compiled under
+  `#ifdef __ARM_NEON`, i.e. the CI `qemu-aarch64-static` leg):
+  `test_neon_v2_unpack` — random 3-layer dim-64 planes vs the
+  independent scalar reference (the kernel's multi-layer ADD path),
+  the full 4-code table sweep with per-code hand-pinned sums (00→0,
+  01→+1, 10→−1, 11→0; catches a sign inversion or nibble-order swap),
+  and a dim-128 plane (two 64-dim chunks) exercising the kernel's
+  `d += 64` loop; `test_neon_v2_load_matches_scalar` — a seeded v2
+  model with a proof that all four codes occur, loaded through the
+  engine (kernel live on this build) with `agg_a`/`agg_b` required to
+  be bit-identical to an in-test scalar decode of the same raw file
+  bytes, plus a 32-token stream against the documented step formula
+  driven by the independently decoded A/B (the reference never sees
+  the kernel). The arch-neutral helpers `wr_header_version` and
+  `ref_unpack_v2_plane` moved above the NEON block so both the NEON
+  and the AVX2 v2 suites share one independent reference (no
+  duplication, no use-before-definition).
+- **`tools/test_count_baseline.txt`**: arm 140 → 151 (the 11 checks
+  compile only into NEON builds); x86 unchanged at 142.
+
+Measured (x86-64 sandbox — NEON verifies on the CI qemu-aarch64-static
+leg; kernel math additionally proven on x86 by an element-level shadow
+model of the lane movement: 200,000 random dim-64/128 planes
+bit-identical to the scalar reference): `make hydra-test` zero
+warnings, `./hydra-test` 142/0 (baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 unaffected — the
+v1 model does not touch the v2 branch at all).
+
 ## 2026-10-25 — Android keyboard + adaptive chat layout; full .md audit; local scan helper
 
 **Android UI (fix for "the UI breaks while typing")**

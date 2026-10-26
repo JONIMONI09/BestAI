@@ -49,6 +49,17 @@
 # slide, sink permanence, OOB/NaN-partial/degenerate-init controls).
 # x86 re-measured at 142, ARM = 119 + 21 = 140 (re-measure on the ARM
 # CI leg).
+#
+# 2026-10-26 (M1 completion): +11 ARM-ONLY checks (NEON v2 plane
+# unpack vs the independent scalar reference: random 3-layer dim-64
+# planes, the 4-code table sweep with per-code pinned values, a
+# dim-128 two-chunk plane; and the end-to-end load cross-check:
+# all-four-codes-present proof, load success, agg_a/agg_b bit-identical
+# to an in-test scalar decode of the same raw bytes, 32-token stream
+# against independently decoded A/B). These compile only into NEON
+# builds (src/hydra_neon.h kernel, exercised by the CI
+# qemu-aarch64-static leg), so ARM = 140 + 11 = 151 and x86 stays at
+# 142 (re-measure on the ARM CI leg).
 
 x86: 142
-arm: 140
+arm: 151

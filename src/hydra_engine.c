@@ -199,14 +199,22 @@ static void hydra_build_aggregation(HydraEngine *engine)
         memset(engine->agg_a, 0, sizeof(engine->agg_a));
         memset(engine->agg_b, 0, sizeof(engine->agg_b));
 
-        /* AVX2 load-time unpack (M3): the 2-bit LUT decode of 64 dims
+        /* SIMD load-time unpack: the 2-bit LUT decode of 64 dims
          * (16 bytes) per iteration, bit-identical to the scalar
          * accumulation (same integer adds per dimension). Requires
          * dim % 64 == 0 (the standard dim=64); other dimensions take
-         * the scalar path unchanged. */
+         * the scalar path unchanged.
+         *
+         * AVX2 needs a RUNTIME CPU probe (a -mavx2 build may run on a
+         * non-AVX2 CPU). NEON needs none: on AArch64 it is part of the
+         * base ISA, and an ARM build without NEON never defines
+         * __ARM_NEON, so the kernel is simply not compiled in. */
 #if defined(__AVX2__)
         const int use_avx2 = hydra_simd_has_avx2()
                             && engine->header.dim % 64 == 0;
+#endif
+#if defined(__ARM_NEON)
+        const int use_neon = engine->header.dim % 64 == 0;
 #endif
 
         for (uint32_t l = 0; l < engine->header.layers; ++l) {
@@ -217,6 +225,15 @@ static void hydra_build_aggregation(HydraEngine *engine)
                 for (size_t d = 0; d < engine->header.dim; d += 64) {
                     hydra_avx2_unpack_v2_plane(engine->agg_a + d, packed_a + d / 4, 64);
                     hydra_avx2_unpack_v2_plane(engine->agg_b + d, packed_b + d / 4, 64);
+                }
+                continue;
+            }
+#endif
+#if defined(__ARM_NEON)
+            if (use_neon) {
+                for (size_t d = 0; d < engine->header.dim; d += 64) {
+                    hydra_neon_unpack_v2_plane(engine->agg_a + d, packed_a + d / 4, 64);
+                    hydra_neon_unpack_v2_plane(engine->agg_b + d, packed_b + d / 4, 64);
                 }
                 continue;
             }
