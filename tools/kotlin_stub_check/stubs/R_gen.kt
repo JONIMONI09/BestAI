@@ -104,7 +104,6 @@ object R {
         const val model_current: Int = 0
         const val model_remove_imported: Int = 0
         const val models_tab_body: Int = 0
-        const val log_context_applied: Int = 0
         const val log_model_removed: Int = 0
         const val log_model_nothing_to_remove: Int = 0
     }
@@ -115,5 +114,6 @@ object R {
         const val log_bench_start: Int = 0
         const val log_size: Int = 0
         const val log_running: Int = 0
+        const val log_context_applied: Int = 0
     }
 }

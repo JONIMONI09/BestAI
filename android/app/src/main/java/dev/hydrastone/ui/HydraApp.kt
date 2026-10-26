@@ -49,6 +49,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -991,7 +992,7 @@ private fun SettingSlider(
     // ClosedFloatingPointRange exposes no .first/.last accessors (those
     // belong to the integer ranges), so the step count is derived here
     // from the values the caller already has.
-    var local by remember(value) { mutableStateOf(value) }
+    var local by remember(value) { mutableFloatStateOf(value) }
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically

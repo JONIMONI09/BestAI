@@ -14,6 +14,7 @@ class MutableState<T>(initial: T) : State<T> {
 }
 
 fun <T> mutableStateOf(value: T): MutableState<T> = MutableState(value)
+fun mutableFloatStateOf(value: Float): MutableState<Float> = MutableState(value)
 
 @Suppress("UNCHECKED_CAST")
 inline fun <T> remember(vararg keys: Any?, calculation: @Composable () -> T): T =

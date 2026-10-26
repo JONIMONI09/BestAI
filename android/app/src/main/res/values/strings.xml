@@ -140,7 +140,10 @@
     <string name="model_current">Current model</string>
     <string name="model_remove_imported">Remove imported model</string>
     <string name="models_tab_body">A .gguf is run by llama.cpp, a .hydra by the v1 engine. Removing the imported model returns to the bundled starter.</string>
-    <string name="log_context_applied">Context size applied: %1$d tokens</string>
+    <plurals name="log_context_applied">
+        <item quantity="one">Context size applied: %1$d token</item>
+        <item quantity="other">Context size applied: %1$d tokens</item>
+    </plurals>
     <string name="log_model_removed">Removed %1$s</string>
     <string name="log_model_nothing_to_remove">No imported model to remove</string>
 </resources>
