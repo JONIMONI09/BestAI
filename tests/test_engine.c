@@ -878,6 +878,7 @@ static void test_neon_tf_row_dot(void)
         const uint32_t dim = dims[di];
         uint8_t row[16];
         int8_t *x = (int8_t *)malloc(dim); /* exactly dim bytes (engine layout) */
+        if (!x) { perror("malloc"); exit(1); }
         for (int it = 0; it < 256; ++it) {
             for (uint32_t i = 0; i < dim / 4; ++i) row[i] = lcg_byte();
             for (uint32_t i = 0; i < dim; ++i)
@@ -1997,6 +1998,7 @@ static void test_avx2_tf_row_dot(void)
         const uint32_t dim = dims[di];
         uint8_t row[16];
         int8_t *x = (int8_t *)malloc(dim); /* exactly dim bytes (engine layout) */
+        if (!x) { perror("malloc"); exit(1); }
         for (int it = 0; it < 256; ++it) {
             for (uint32_t i = 0; i < dim / 4; ++i) row[i] = lcg_byte();
             for (uint32_t i = 0; i < dim; ++i)
