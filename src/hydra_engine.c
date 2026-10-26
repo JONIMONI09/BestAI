@@ -369,8 +369,9 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
                 engine->header.magic, HYDRA_MAGIC);
         rc = -5; goto fail;
     }
-    if (engine->header.version != HYDRA_VERSION && engine->header.version != 2) {
-        fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u oder 2)\n",
+    if (engine->header.version != HYDRA_VERSION && engine->header.version != 2 &&
+        engine->header.version != 3) {
+        fprintf(stderr, "[Hydra] Falsche Version: %u (Erwartet: %u, 2 oder 3)\n",
                 (unsigned)engine->header.version, (unsigned)HYDRA_VERSION);
         rc = -7; goto fail;
     }
@@ -386,9 +387,11 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * truncated by `dim / 4` in hydra_build_aggregation() and the leftover
      * dimensions would silently carry an aggregation of zero instead of their
      * real weights. Refused, not rounded (rules.md R11, R14). */
-    if (engine->header.version == 2 && engine->header.dim % 4 != 0) {
-        fprintf(stderr, "[Hydra] Version 2 needs dim %% 4 == 0, got dim=%u\n",
-                engine->header.dim);
+    if ((engine->header.version == 2 || engine->header.version == 3) &&
+        engine->header.dim % 4 != 0) {
+        fprintf(stderr,
+            "[Hydra] Version %u needs dim %% 4 == 0, got dim=%u\n",
+            (unsigned)engine->header.version, engine->header.dim);
         rc = -8; goto fail;
     }
     /* Sicherheits-Check 1: Layer-Cap. Ohne diese Grenze signed-overflowt
@@ -428,7 +431,15 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * former behaviour. */
     {
         uint64_t needed_pairs;
-        if (engine->header.version == 2) {
+        if (engine->header.version == 3) {
+            /* v3: per layer Wg (dim*dim/4) + Wu (dim*dim/4) + w1 (dim/4)
+             * + scale (2 bytes), plus the final W_out block (dim*dim/4).
+             * dim % 4 == 0 is guaranteed by the guard above. */
+            const uint64_t d = engine->header.dim;
+            const uint64_t layer_bytes = d * d / 2 + d / 4 + 2;
+            needed_pairs = (uint64_t)engine->header.layers * layer_bytes
+                         + d * d / 4;
+        } else if (engine->header.version == 2) {
             /* dim % 4 == 0 is guaranteed by the guard above, so dim / 2 is
              * exact: two planes of dim/4 bytes each, per layer. */
             needed_pairs = (uint64_t)engine->header.layers * (engine->header.dim / 2);
@@ -440,6 +451,43 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
                     (unsigned long long)needed_pairs, engine->header.weights_len);
             rc = -10; goto fail;
         }
+    }
+
+    /* Sicherheits-Check 5 (v3): kein Layer darf Scale 0 haben - die
+     * Forward-Pass-Teilung durch (scale/256) waere eine Division durch
+     * Null. Der Check laeuft direkt ueber die gemappten Bytes. */
+    if (engine->header.version == 3) {
+        const uint8_t *w3 = engine->mapped_weights + engine->header.weights_offset;
+        const size_t lb = (size_t)engine->header.dim * engine->header.dim / 2
+                       + engine->header.dim / 4 + 2;
+        for (uint32_t l = 0; l < engine->header.layers; ++l) {
+            const uint8_t *sc = w3 + (size_t)l * lb + (size_t)lb - 2;
+            if (sc[0] == 0 && sc[1] == 0) {
+                fprintf(stderr,
+                        "[Hydra] v3 Layer %u hat Scale 0 (Division durch Null)\n",
+                        (unsigned)l);
+                rc = -15; goto fail;
+            }
+        }
+        /* v3 baut KEINE Aggregation: der Layer-Loop mit den
+         * zwischen-Layer-Nichtlinearitaeten ist nicht zu einer
+         * Load-Zeit-Summe kollabierbar (Beweis:
+         * test_tf_multilayer_not_reducible_by_loadtime_sums).
+         * agg_a/agg_b bleiben null; die Legacy-Steps verweigern v3. */
+        memset(engine->agg_a, 0, sizeof(engine->agg_a));
+        memset(engine->agg_b, 0, sizeof(engine->agg_b));
+        engine->weights_bytes =
+            (size_t)engine->header.layers * (size_t)lb
+            + (size_t)engine->header.dim * engine->header.dim / 4;
+        engine->rss_kb_before_load = rss_before;
+        engine->resident_kb_after_load = hydra_resident_kb();
+        engine->load_ms = 0.0;
+        fprintf(stderr,
+                "[Hydra] v3-Modell geladen: Layers: %u, Dim: %u, Vocab: %u "
+                "(per-layer non-linear pass, keine Aggregation)\n",
+                (unsigned)engine->header.layers, (unsigned)engine->header.dim,
+                (unsigned)engine->header.vocab_size);
+        return 0;
     }
 
     /* Library-Logs ausschliesslich auf stderr, damit stdout fuer
@@ -502,6 +550,12 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
 {
     if (!engine || !token_out) return -1;
     if (engine->header.magic != HYDRA_MAGIC) return -2;
+    if (engine->header.version == 3) {
+        fprintf(stderr,
+            "[Hydra] v3-Modell: hydra_engine_step ist der Legacy-Pfad (v1/v2); "
+            "verwende hydra_engine_step_tf (per-layer non-linear pass)\n");
+        return -14;
+    }
     const int32_t vocab = (int32_t)engine->header.vocab_size;
     if (token_in >= engine->header.vocab_size) token_in %= engine->header.vocab_size;
 
@@ -603,6 +657,12 @@ int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *tok
 {
     if (!engine || !token_out) return -1;
     if (engine->header.magic != HYDRA_MAGIC) return -2;
+    if (engine->header.version == 3) {
+        fprintf(stderr,
+            "[Hydra] v3-Modell: kein Aggregat vorhanden (per-layer non-linear "
+            "pass); verwende hydra_engine_step_tf\n");
+        return -14;
+    }
     const int32_t vocab = (int32_t)engine->header.vocab_size;
     if (token_in >= engine->header.vocab_size) token_in %= engine->header.vocab_size;
 
@@ -830,6 +890,191 @@ int hydra_kv_cache_sink(const hydra_kv_cache_t *c, uint32_t i,
 }
 
 /* -------------------------------------------------------------------
+ * M5: Version 3 forward pass (per-layer non-linear ternary pass).
+ *
+ * Design: docs/FORMAT.md "Version 3" + docs/ARCHITECTURE.md "Version 3
+ * forward pass". Quantization reference: BitNet b1.58 (W1.58A8) -
+ * ternary weights via absmean, int8 activations (our state domain,
+ * +-127), integer-exact mat-vecs (only add/sub on the {0, +-1} weight
+ * codes). Zero heap: every buffer below is stack-local; the ternary
+ * blocks are read straight from the mmap, no copies.
+ *
+ * Return codes beyond the shared ones: -14 legacy step on v3 / step_tf
+ * on v1/v2, -16 non-finite intermediate (defensive, cannot occur from
+ * integer inputs), -17 KV append failed (invalid cache / non-finite).
+ * ------------------------------------------------------------------- */
+
+/* Code table of the 2-bit packing (format: 00=0, 01=+1, 10=-1, 11=0). */
+static const int8_t HYDRA_T3[4] = {0, 1, -1, 0};
+
+/* One row (dim weights) of a 2-bit packed block dotted with the int8
+ * state. Row i of a dim*dim block lives at base + i*(dim/4). Integer
+ * exact: |result| <= dim * 127. */
+static int32_t tf_row_dot(const uint8_t *row, const int8_t *x, uint32_t dim)
+{
+    int32_t acc = 0;
+    for (uint32_t b = 0; b < dim; b += 4) {
+        const uint32_t by = row[b / 4]; /* uint32: the shifts below are
+                                          * unsigned (bugprone-signed-
+                                          * bitwise stays out of this
+                                          * hot loop's diagnostics) */
+        acc += (int32_t)HYDRA_T3[by & 0x03u] * (int32_t)x[b];
+        acc += (int32_t)HYDRA_T3[(by >> 2u) & 0x03u] * (int32_t)x[b + 1];
+        acc += (int32_t)HYDRA_T3[(by >> 4u) & 0x03u] * (int32_t)x[b + 2];
+        acc += (int32_t)HYDRA_T3[(by >> 6u) & 0x03u] * (int32_t)x[b + 3];
+    }
+    return acc;
+}
+
+/* Byte size of one v3 layer block: Wg + Wu + w1 + u16 scale.
+ * (dim % 4 == 0 is enforced at load, so all divisions are exact.) */
+static size_t tf_layer_bytes(uint32_t dim)
+{
+    return (size_t)dim * dim / 2 + (size_t)dim / 4 + 2;
+}
+
+static const uint8_t *tf_layer_base(const HydraEngine *engine, uint32_t l)
+{
+    return engine->mapped_weights + engine->header.weights_offset
+         + (size_t)l * tf_layer_bytes(engine->header.dim);
+}
+
+static const uint8_t *tf_wout_base(const HydraEngine *engine)
+{
+    return engine->mapped_weights + engine->header.weights_offset
+         + (size_t)engine->header.layers * tf_layer_bytes(engine->header.dim);
+}
+
+/* Final cross-dimension logit mix: y[i] = sum_j W_out[i][j] * state[j].
+ * Shared by the step and the v3 sampler, so the sampler probes EXACTLY
+ * the arithmetic the engine decodes from (the "probe the engine"
+ * contract of hydra_sample_token). Integer exact. */
+static void tf_final_logits(const HydraEngine *engine, int32_t *y)
+{
+    const uint32_t dim = engine->header.dim;
+    const uint8_t *wout = tf_wout_base(engine);
+    for (uint32_t i = 0; i < dim; ++i)
+        y[i] = tf_row_dot(wout + (size_t)i * (dim / 4), engine->state_vector, dim);
+}
+
+/* int32 -> int8 state domain, round-half-away + +-127 clamp.
+ * (Same clamping rule as the v1 recurrence; exact and deterministic.) */
+static int8_t tf_clamp127(double v)
+{
+    int64_t q = (v >= 0.0) ? (int64_t)(v + 0.5) : (int64_t)(v - 0.5);
+    if (q > 127) q = 127;
+    else if (q < -127) q = -127;
+    return (int8_t)q;
+}
+
+int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
+                         uint16_t *token_out, hydra_kv_cache_t *kv)
+{
+    if (!engine || !token_out) return -1;
+    if (engine->header.magic != HYDRA_MAGIC) return -2;
+    if (engine->header.version != 3) {
+        fprintf(stderr,
+            "[Hydra] hydra_engine_step_tf ist der Version-3-Pfad; die Engine "
+            "ist Version %u (verwende hydra_engine_step)\n",
+            (unsigned)engine->header.version);
+        return -14;
+    }
+
+    const uint32_t dim = engine->header.dim;
+    const uint32_t vocab = engine->header.vocab_size;
+    if (token_in >= vocab) token_in = (uint16_t)(token_in % vocab);
+    const int32_t token_val = (int32_t)token_in;
+
+    /* Zero-heap stack buffers for the non-linear stages. */
+    float gf[HYDRA_EMBED_DIM], uf[HYDRA_EMBED_DIM];
+    float hf[HYDRA_EMBED_DIM], nf[HYDRA_EMBED_DIM];
+    float onew[HYDRA_EMBED_DIM];
+    float ktmp[HYDRA_EMBED_DIM] = {0}, vtmp[HYDRA_EMBED_DIM] = {0};
+    float kvec[HYDRA_EMBED_DIM] = {0}; /* indexed 0..dim-1 before use */
+    for (uint32_t i = 0; i < dim; ++i) onew[i] = 1.0f;
+
+    for (uint32_t l = 0; l < engine->header.layers; ++l) {
+        const uint8_t *base = tf_layer_base(engine, l);
+        const uint8_t *wu   = base + (size_t)dim * dim / 4;
+        const uint8_t *w1p  = wu + (size_t)dim * dim / 4;
+        /* scale sits AFTER the w1 plane (docs/FORMAT.md v3 layout:
+         * Wg | Wu | w1 | u16 scale); reading it at w1p[0..1] would
+         * decode the w1 bytes as the scale. */
+        const uint8_t *scp  = w1p + (size_t)dim / 4;
+        const uint16_t scale =
+            (uint16_t)(((uint32_t)scp[0]) | (((uint32_t)scp[1]) << 8u));
+        const double sf = (double)scale / (double)HYDRA_TF_SCALE_FP;
+
+        /* (1) Token injection into the residual (transformer embedding
+         *     pattern: both projections see the token, not only the
+         *     gate - with gate-only injection a zero state can never
+         *     leave zero, because up = Wu*0 = 0), clamped back into
+         *     the int8 W1.58A8 activation domain, then cross-
+         *     dimension BitLinear mat-vecs (integer exact), rescaled
+         *     with the layer's absmean scale. */
+        int8_t xeff[HYDRA_EMBED_DIM];
+        for (uint32_t i = 0; i < dim; ++i) {
+            const uint8_t code =
+                ((uint32_t)w1p[i / 4] >> (2u * (i & 3u))) & 0x03u;
+            const int32_t inj = (int32_t)HYDRA_T3[code] * token_val;
+            xeff[i] = tf_clamp127((double)(int32_t)engine->state_vector[i]
+                                  + (double)inj);
+        }
+        for (uint32_t i = 0; i < dim; ++i) {
+            int32_t g = tf_row_dot(base + (size_t)i * (dim / 4), xeff, dim);
+            int32_t u = tf_row_dot(wu + (size_t)i * (dim / 4), xeff, dim);
+            gf[i] = (float)((double)g / sf);
+            uf[i] = (float)((double)u / sf);
+        }
+
+        /* (2) The between-layer non-linearities, in the format's fixed
+         *     order: SwiGLU -> RMSNorm -> RoPE (pos = step_count). */
+        if (hydra_swiglu(gf, uf, dim, hf) != 0) return -16;
+        if (hydra_rmsnorm(hf, onew, dim, HYDRA_TF_RMSNORM_EPS, nf) != 0)
+            return -16;
+        if (hydra_rope_inplace(nf, dim, engine->step_count,
+                               HYDRA_TF_ROPE_THETA) != 0)
+            return -16;
+
+        /* (3) Back into the int8 state domain (itself a non-linearity
+         *     and the W1.58A8 contract for the next layer). */
+        for (uint32_t i = 0; i < dim; ++i)
+            engine->state_vector[i] = tf_clamp127((double)nf[i] * HYDRA_TF_QUANT_GAIN);
+    }
+
+    /* (4) Memory channel (optional, per TOKEN, caller-owned cache):
+     *     the permanent sink-0 value is added back in the exact int8
+     *     domain (float is a lossless int8 carrier), then the resulting
+     *     state is appended with k = v. The first transformed state
+     *     therefore persists for the whole run (streaming-LLM
+     *     attention-sink pattern); the ring window keeps recent ones. */
+    if (kv) {
+        if (kv->count > 0 && hydra_kv_cache_sink(kv, 0, ktmp, vtmp) == 0) {
+            for (uint32_t i = 0; i < dim; ++i) {
+                const int32_t v = (int32_t)engine->state_vector[i]
+                                + (int32_t)lroundf(vtmp[i]);
+                engine->state_vector[i] = tf_clamp127((double)v);
+            }
+        }
+        for (uint32_t i = 0; i < dim; ++i)
+            kvec[i] = (float)engine->state_vector[i];
+        if (hydra_kv_cache_append(kv, kvec, kvec) != 0) return -17;
+    }
+
+    /* (5) Full cross-dimension logit mix over the final state; greedy
+     *     decode over the WHOLE vector (no column-0 restriction). */
+    int32_t y[HYDRA_EMBED_DIM];
+    tf_final_logits(engine, y);
+    int32_t best = y[0];
+    uint32_t bi = 0;
+    for (uint32_t i = 1; i < dim; ++i)
+        if (y[i] > best) { best = y[i]; bi = i; }
+    *token_out = (uint16_t)(bi % vocab);
+    engine->step_count++;
+    return 0;
+}
+
+/* -------------------------------------------------------------------
  * M2: Sampling (greedy guard + repetition penalty + min-p).
  * ------------------------------------------------------------------- */
 static uint64_t hydra_xorshift64(uint64_t *state)
@@ -845,10 +1090,91 @@ static uint64_t hydra_xorshift64(uint64_t *state)
 int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
                        const hydra_sampler_config_t *cfg,
                        const uint16_t *recent_tokens, size_t recent_len,
+                       hydra_kv_cache_t *kv,
                        uint16_t *token_out)
 {
     if (!engine || !cfg || !token_out) return -1;
     if (engine->header.magic != HYDRA_MAGIC) return -2;
+
+    /* --- Version 3 mode ------------------------------------------------
+     * The logit vector is the full cross-dimension mix of the CURRENT
+     * state (tf_final_logits - exactly what the step decodes from).
+     * Candidates are the dim STATE BINS; a recent token t penalises
+     * every bin i with i % vocab == t (the inverse of the decode
+     * mapping). The chosen bin advances the real engine through
+     * step_tf with its token (bin % vocab), so the state machine stays
+     * identical to the greedy path - only the selection is stochastic.
+     * ------------------------------------------------------------------ */
+    if (engine->header.version == 3) {
+        const uint32_t dim = engine->header.dim;
+        const uint32_t vocab = engine->header.vocab_size;
+        int32_t y[HYDRA_EMBED_DIM];
+        double p[HYDRA_EMBED_DIM];
+        tf_final_logits(engine, y);
+        for (uint32_t i = 0; i < dim; ++i) p[i] = (double)y[i];
+
+        if (cfg->temperature <= 0.0f || cfg->min_p >= 1.0f)
+            return hydra_engine_step_tf(engine, token_in, token_out, kv);
+        if (vocab < 2) return -3;
+        if (cfg->temperature > 20.0f) return -4;
+        if (cfg->repetition_penalty < 1.0f) return -1; /* no discounting */
+        if (recent_len > 0 && !recent_tokens) return -1;
+
+        if (cfg->repetition_penalty != 0.0 && recent_tokens != NULL &&
+            recent_len > 0) {
+            for (size_t k = 0; k < recent_len; ++k)
+                for (uint32_t i = (uint32_t)recent_tokens[k] % vocab;
+                     i < dim; i += vocab) {
+                    if (p[i] > 0.0) p[i] /= cfg->repetition_penalty;
+                    else if (p[i] < 0.0) p[i] *= cfg->repetition_penalty;
+                }
+        }
+
+        const double t = (double)cfg->temperature;
+        double maxp = p[0];
+        for (uint32_t i = 1; i < dim; ++i) if (p[i] > maxp) maxp = p[i];
+        double sum = 0.0;
+        for (uint32_t i = 0; i < dim; ++i) { p[i] = exp(p[i] / t - maxp / t); sum += p[i]; }
+        if (sum <= 0.0 || !isfinite(sum)) {
+            int32_t best = y[0]; uint32_t bi = 0;
+            for (uint32_t i = 1; i < dim; ++i) if (y[i] > best) { best = y[i]; bi = i; }
+            *token_out = (uint16_t)(bi % vocab);
+            return 0;
+        }
+        for (uint32_t i = 0; i < dim; ++i) p[i] /= sum;
+
+        const double thr = (cfg->min_p >= 1.0) ? 1.0 : (cfg->min_p <= 0.0) ? 0.0 : cfg->min_p;
+        if (thr > 0.0 && thr < 1.0) {
+            double maxn = p[0];
+            for (uint32_t i = 1; i < dim; ++i) if (p[i] > maxn) maxn = p[i];
+            const double cut = thr * maxn;
+            double nsum = 0.0;
+            for (uint32_t i = 0; i < dim; ++i) if (p[i] >= cut) nsum += p[i];
+            if (nsum > 0.0) {
+                for (uint32_t i = 0; i < dim; ++i)
+                    p[i] = (p[i] >= cut) ? p[i] / nsum : 0.0;
+            } else {
+                uint32_t bi = 0;
+                for (uint32_t i = 1; i < dim; ++i) if (p[i] > p[bi]) bi = i;
+                for (uint32_t i = 0; i < dim; ++i) p[i] = (i == bi) ? 1.0 : 0.0;
+            }
+        }
+
+        const uint64_t s0 = engine->rng_state ? engine->rng_state :
+            ((cfg->rng_seed != 0) ? (uint64_t)cfg->rng_seed : 0x9E3779B97F4A7C15ULL);
+        uint64_t st = s0;
+        double r = 0.0, acc = 0.0;
+        uint32_t bi = dim - 1;
+        for (uint32_t i = 0; i < dim; ++i) {
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            r = (double)(st >> 11) * (1.0 / 9007199254740992.0);
+            acc += p[i];
+            if (r < acc) { bi = i; break; }
+        }
+        engine->rng_state = st;
+        const uint16_t chosen = (uint16_t)(bi % vocab);
+        return hydra_engine_step_tf(engine, chosen, token_out, kv);
+    }
 
     /* Greedy guard: keep the deterministic path bit-identical.
      * temperature <= 0 or min_p >= 1 means "no sampling": the native
@@ -962,7 +1288,12 @@ int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n)
      * Prompt-Implementierung, die von step() abweichen koennte. */
     for (size_t i = 0; i + 1 < n; ++i) {
         uint16_t discarded = 0;
-        if (hydra_engine_step(engine, tokens[i], &discarded) != 0) return -3;
+        if (engine->header.version == 3) {
+            if (hydra_engine_step_tf(engine, tokens[i], &discarded, NULL) != 0)
+                return -3;
+        } else {
+            if (hydra_engine_step(engine, tokens[i], &discarded) != 0) return -3;
+        }
     }
     return 0;
 }

@@ -2,6 +2,86 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 (round 4) — true per-layer execution (format version 3), full-dimension decode, converter v3 modes, 672-B pin
+
+1. **The aggregated recurrence is now a legacy mode, not the
+   architecture.** The loader accepts a new format **version 3**
+   (same 24-byte header): per layer it stores ternary weight matrices
+   `Wg`/`Wu` (dim×dim, 2-bit packed, 4 weights/byte), a token-injection
+   `w1` plane, and a u16 LE per-layer absmean scale; after all layers a
+   final `W_out` dim×dim block. `hydra_engine_step_tf()` executes a
+   real forward pass per token, directly from the mmap (zero heap,
+   stack-only working set): `xeff = clamp127(state + w1·token)` →
+   ternary BitLinear mat-vecs `gate = Wg·xeff`, `up = Wu·xeff`
+   (int32-exact add/sub, BitNet b1.58 W1.58A8 pattern: ternary weights
+   × int8 ±127 activations, per-layer absmean rescale) → SwiGLU →
+   RMSNorm → RoPE(`step_count`) → int8 state; once per token the KV
+   cache's sink-0 residual is added and the final state is appended;
+   then the **full-dimension** logit mix `y = W_out·state` is decoded
+   (greedy `argmax mod vocab`; `hydra_sample_token()` v3 mode feeds the
+   same vector through the existing repetition/softmax/min-p/seeded
+   sampler). **The v1 column-0 bottleneck is gone in v3**: every weight
+   in every dimension influences the output. `tests/test_engine.c`
+   proves it two ways — a dim-`d>0` weight flip changes the v3 token
+   stream (`test_tf_dim_positive_weight_changes_stream`) while the
+   same-flipped v1 twin is bit-identical, and a 4-layer v3 model is NOT
+   reproducible by any load-time sum of its planes
+   (`test_tf_multilayer_not_reducible_by_loadtime_sums`).
+2. **A real engine bug was found and fixed by the new tests.**
+   `step_tf` read the per-layer u16 scale from the w1 plane's start
+   instead of after it (`w1p[0..1]` vs `w1p + dim/4`), silently using
+   sf=1/256. The POS hand-built model passed by accident (SiLU
+   saturation + RMSNorm scale invariance); the NEG model's sigmoid
+   underflowed to a dead state. Fixed with the correct offset plus a
+   comment; the hand-built 2-bit decode tests (POS state +64, NEG state
+   −64, hand-derived tokens) are the regression guard.
+3. **The legacy path is isolated, not silent.** `hydra_engine_step()`
+   and `hydra_engine_step_fast()` refuse v3 engines with `-14`,
+   `hydra_engine_step_tf()` refuses v1/v2 with the same code; the CLI
+   routes v3 models to the per-layer pass (bench + generation) and
+   reports `--fast` as N/A on v3. Loader additions: v3 body-size
+   validation (−10), per-layer scale-0 refusal (−15, walks the mapped
+   scale words at load), non-finite forward pass (−16), KV append
+   failure (−17).
+4. **Both converters write v3.** `tools/gguf_to_hydra.py --v3
+   [--v3-layers N]` and `tools/safetensors_to_hydra.py --v3
+   [--v3-layers N]`: gate/up blocks are the ternarised top-left
+   dim×dim slices of real candidate tensors (cycled deterministically,
+   two distinct tensors per layer), `w1` from cycling embedding rows,
+   `W_out` from the first tensor; the per-layer scale is the
+   absmean(·256) of the source (max of gate/up), clamped to
+   [1, 65535]. Each writer runs a **stdlib-only write-time roundtrip
+   check** (re-read the file, re-decode the first scale + the whole
+   `W_out` block, abort on mismatch). The JSON report names every
+   source tensor, its γ, its density and any zero-padding — the
+   converter states "dim×dim slice of a larger tensor" instead of
+   pretending to be the full model. `tools/gguf_test.py` gained 14 v3
+   gates (59 → 73): byte-level layout verification for both converters,
+   non-zero scales, non-zero W_out, two-run engine determinism, and
+   refusal of `--dim 10` / `--v3-layers 0`.
+5. **`sizeof(HydraEngine)` 664 → 672 B (LP64).** The v3 RoPE position
+   counter `step_count` (u32 + 4 B trailing padding) was added; the
+   compile-time pin in `include/hydra_model.h` moved 664 → 672 and the
+   Memory Model table in `docs/ARCHITECTURE.md` (and the README) now
+   derive the 672 B field by field.
+6. **Everything documented.** `docs/FORMAT.md` "Version 3" is the
+   canonical spec (layout, field semantics, forward-pass contract,
+   error codes); `docs/ARCHITECTURE.md` gained the "Version 3 forward
+   pass" section and the v1 "algebraically free" section is scoped to
+   v1/v2; new `docs/RESEARCH.md` records the web-verified BitNet b1.58
+   (W1.58A8, absmean γ, int8 ±127) and bitnet.cpp I2_S facts, the
+   repository's 2-bit code-table decision (kept for file compatibility;
+   any 3-of-4 permutation is valid), and what is and is not reproduced
+   from the 2B-4T recipe.
+7. **Verified locally, all gates green:** `make test-run`
+   → **174/0** (x86 baseline raised 142 → 174, ARM baseline 151 → 183
+   in `tools/test_count_baseline.txt`, +32 arch-independent v3 checks);
+   `tools/gguf_test.py` → 73/0; `gcc -fanalyzer` clean; cppcheck
+   (src/ + include/) 0 defects; clang-tidy clean; flawfinder
+   --minlevel=4 no new findings; `python3 -m py_compile` on both
+   converters and the test gate.
+
+## 2026-10-26 (round 3) — macOS release fix + PR-tier portability scan, size pin, full audit
 ## 2026-10-26 (round 3) — macOS release fix + PR-tier portability scan, size pin, full audit
 
 1. **release.yml macOS build failure fixed (root cause: feature-test

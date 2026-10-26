@@ -14,9 +14,9 @@
 Offset  Size  Field           Type
 ──────  ────  ──────────────  ─────────────────
 0       4     magic           uint32  = 0x48594452 ("HYDR", little-endian)
-4       2     version         uint16  = 1 (or 2, see "Version 2")
+4       2     version         uint16  = 1 (or 2, see "Version 2"; or 3, see "Version 3")
 6       2     vocab_size      uint16  (1..1024)
-8       4     dim             uint32  (1..64; version 2 requires dim % 4 == 0)
+8       4     dim             uint32  (1..64; versions 2 and 3 require dim % 4 == 0)
 12      4     layers          uint32
 16      4     weights_offset  uint32  (byte offset of the weights in the file)
 20      4     weights_len     uint32  (byte length of the weights)
@@ -91,26 +91,157 @@ value for value. The test suite also produces its own version-2 fixtures
 (`test_version_two_format` in `tests/test_engine.c`, `run_safetensors` in
 `tools/gguf_test.py`).
 
+## Version 3 (per-layer non-linear blocks)
+
+The loader also accepts `version == 3` in this same 24-byte header. Unlike
+v1/v2 it does **not** describe an aggregated recurrence: it stores a full
+per-layer non-linear ternary forward pass (BitNet b1.58 style: ternary
+weights, int8 activations, cross-dimension BitLinear projections), which
+`hydra_engine_step_tf()` executes layer by layer from the mapped bytes at
+token time. The load-time `agg_a/agg_b` shortcut is **not** built for v3
+models (the aggregation would no longer be an equivalent, because
+non-linearities are applied between layers — see
+`docs/ARCHITECTURE.md`, "Version 3 forward pass").
+
+### Weight body layout
+
+Same 2-bit packing and code table as v2 (`00`=0, `01`=+1, `10`=−1,
+`11`=0; weight `j` of a 4-wide group lives in bits `2j..2j+1`). Per layer
+`l`, four consecutive fields:
+
+```
+[ dim*dim/4 bytes: Wg block  - gate projection, row i = bytes i*(dim/4) ]
+[ dim*dim/4 bytes: Wu block  - up projection,   same row layout        ]
+[ dim/4 bytes:     w1 plane  - token-injection scalars, one per dim    ]
+[ 2 bytes:         scale     - uint16 LE, per-layer absmean scale * 256]
+```
+
+after all `layers` layers, one final block:
+
+```
+[ dim*dim/4 bytes: W_out block - logit-mixing projection ]
+```
+
+`layer_bytes = dim*dim/2 + dim/4 + 2`. Required weight body size:
+`layers * layer_bytes + dim*dim/4`.
+
+### Meaning of the fields
+
+- `Wg_l[i][j]`, `Wu_l[i][j]` in {−1, 0, +1}: the two SwiGLU projections of
+  layer `l`. Per token and per layer the engine computes, with the int8
+  state `x` (the W1.58A8 activation domain, ±127) and the integer-exact
+  ternary mat-vec:
+  `gate[i] = Σ_j Wg_l[i][j]·x[j]`, `up[i] = Σ_j Wu_l[i][j]·x[j]`.
+- `w1_l[i]` in {−1, 0, +1}: the token injection into the RESIDUAL:
+  `x_eff[i] = clamp127(state[i] + w1_l[i]·token_val)` BEFORE both
+  mat-vecs (transformer embedding pattern — the same ternary token
+  drive the v1 recurrence has, so seed/prefill semantics are
+  preserved). The clamp keeps the activation in the int8 W1.58A8
+  domain. Gate-only injection is deliberately NOT used: with `up =
+  Wu·0 = 0` for a zero state, `SwiGLU(gate, 0) = 0` and the engine
+  could never leave the zero state on its first token.
+- `scale` (u16, = absmean(source block)·256 rounded, minimum 1): the
+  per-layer absmean scale of the source tensor the converter ternarised
+  (b1.58: the ternary matrix is the source divided by its absmean and
+  round-clipped). The engine rescales the mat-vec results with it
+  (`gate_f = gate / (scale/256)`) before the SwiGLU non-linearity, so a
+  layer with a different source magnitude contributes at its real
+  relative size instead of every layer looking identical.
+- `W_out[i][j]` in {−1, 0, +1}: the final cross-dimension mix. After the
+  last layer, `y[i] = Σ_j W_out[i][j]·state[j]` — the full-dimension logit
+  vector. Decoding (greedy) takes `argmax_i y[i]` and maps it to a token
+  by `token = i mod vocab`. `hydra_sample_token()` (v3 mode) runs the same
+  y vector through the existing repetition-penalty / softmax / min-p /
+  seeded-CDF machinery, so **every** state dimension can influence the
+  output token (the v1 column-0 bottleneck does not exist in v3).
+
+### Forward pass (executed per token, zero heap, stack buffers only)
+
+For `l = 0 .. layers−1`:
+
+```
+xefx[i] = clamp127(state[i] + w1_l[i]·token_val)      (int8 domain)
+gate[i] = Σ_j Wg_l[i][j]·xefx[j]                      (int32, exact)
+up[i]   = Σ_j Wu_l[i][j]·xefx[j]                      (int32, exact)
+g_f[i]  = gate[i] / (scale_l/256)        (float)
+u_f[i]  = up[i]   / (scale_l/256)        (float)
+h       = SwiGLU(g_f, u_f)                           (hydra_swiglu)
+n       = RMSNorm(h, w=1, eps=1e-5)                  (hydra_rmsnorm)
+n       = RoPE(n, pos=step_count, theta=10000)       (hydra_rope_inplace)
+state[i] = clamp(round(n[i] * 32), ±127)   (back into the int8 domain)
+```
+
+The KV cache is applied **once per token, after the layer loop** (the
+attention-sink pattern, not per-layer attention): if `kv != NULL` and the
+cache already holds entries, `state[i] = clamp127(state[i] +
+lround(sink_value[0][i]))` (the value of permanent sink slot 0), then
+`hydra_kv_cache_append(kv, k = v = state)` — one entry per token,
+`-17` on append failure.
+
+Then `y = W_out · state` (int32, unscaled) and the decode above
+(`token = argmax_i y[i] mod vocab`), and `step_count++` (the RoPE
+position of the next token). The per-layer
+non-linearities (SwiGLU → RMSNorm → RoPE → int8 quantisation) are applied
+**between** layers, so the layer stack is NOT algebraically collapsible
+into load-time sums — `tests/test_engine.c`
+(`test_tf_multilayer_not_reducible_by_loadtime_sums`) proves a 4-layer v3
+model produces states/tokens that the summed-plane single pass cannot
+reproduce.
+
+### Constraints (all enforced in `hydra_engine_load`, tested)
+
+1. `dim % 4 == 0` (same guard as v2; error `-8`).
+2. `weights_len >= layers * layer_bytes + dim*dim/4` (error `-10`), plus
+   the generic `weights_offset + weights_len <= file_size` check.
+3. `scale == 0` in any layer is refused at load (`-15`) — a zero scale
+   would divide by zero in the forward pass.
+4. v3 models use `hydra_engine_step_tf()`; the legacy `hydra_engine_step()`
+   / `hydra_engine_step_fast()` refuse v3 engines with error `-14` (no
+   silent fallback to the aggregated path — that would be a different
+   model pretending to be this one).
+
+### What v3 is and is not
+
+v3 gives the engine real non-linear depth and cross-dimension mixing at
+the format's existing ceiling (dim ≤ 64, vocab ≤ 1024, layers ≤ 4096): a
+v3 model no longer compresses to 128 integers (its `layers * dim*dim/2`
+ternary weight bits are all individually reachable at inference). It is
+still not a 7B LLM: the state is 64 wide, the vocab is capped, and the
+converter slices real tensors into dim×dim blocks. That is stated in the
+converter report, not hidden.
+
 ## Reference Writer
 
-`tools/make_model.py` is the canonical Python reference:
+`tools/make_model.py` is the canonical Python reference for version 1:
 
 ```python
 header = struct.pack("<IHHIIII", MAGIC, VERSION, VOCAB, DIM, LAYERS,
                      weights_offset, num_packed_bytes)
 ```
 
+Version 3 files are written by `tools/gguf_to_hydra.py --v3` and
+`tools/safetensors_to_hydra.py --v3` (see "Version 3" above for the body
+layout both implement). Each writer runs a **write-time roundtrip check**
+in stdlib-only Python: after writing, it re-reads the file, re-decodes the
+first layer's scale and the full `W_out` block, and aborts on any
+mismatch, so a layout drift between writer and format fails at conversion
+time, not at engine load. The conversion report states per layer which
+tensor (and how much of it) each block comes from — the converter slices
+the top-left `dim × dim` corner of real tensors and zero-pads when the
+tensor is smaller; it does not pretend to be the full source model.
+
 ## Validation Rules (Loader, `src/hydra_engine.c`)
 
 1. `magic == 0x48594452`
-2. `version == 1` or `version == 2` (version 2 additionally requires `dim % 4 == 0`, see "Version 2")
+2. `version == 1`, `2` or `3` (versions 2 **and** 3 additionally require `dim % 4 == 0`, see their sections)
 3. `1 <= dim <= 64` and `1 <= vocab_size <= 1024`
 4. `layers <= 4096` (`HYDRA_MAX_LAYERS`) — bounds the worst-case accumulator magnitude to `4096 × 254`, well below `INT32_MAX`. (Discovered via proof-of-concept: without this rule, `layers = 16909321` with `dim = 1` and all weights `+1` overflows a signed accumulator after ~16.9 MB of file.)
 5. `weights_offset >= 24` — the weight region may not overlap the header, otherwise header bytes would be executed as weights.
 6. `weights_offset + weights_len <= file_size` — prevents out-of-bounds reads past the mmap. **The sum is computed in 64 bits**, even though both operands are `uint32`: in 32-bit arithmetic `0xFFFFF000 + 0x1000` wraps to `0`, the model looks valid, and the aggregation walk runs off the mapping. Measured: with a 32-bit sum, `tests/test_large_model.c` loses its child process with SIGSEGV.
-7. `layers * dim <= weights_len` — the **loader** reads exactly `layers × dim` packed bytes once, when building the aggregates, so the declared weight region must cover them. The per-token step does not traverse the weight region at all. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
+7. The required weight body must be covered by `weights_len`, sized per version: `layers * dim` (v1), `layers * dim / 2` (v2), `layers * (dim*dim/2 + dim/4 + 2) + dim*dim/4` (v3). The loader reads exactly those bytes — the v1/v2 aggregates once at load, v3 directly from the mapping at token time — so the declared weight region must cover them. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
+8. v3 only: no layer may carry `scale == 0` (a zero scale would divide by zero in the forward pass); the loader walks the mapped scale words once at load and refuses the file.
 
-If any rule is violated, the mapping is torn down immediately through a single cleanup path and a negative error code is returned (`-5` magic, `-7` version, `-8` dim/vocab, `-9` file bounds, `-10` weight region, `-11` layer cap, `-12` header overlap).
+If any load rule is violated, the mapping is torn down immediately through a single cleanup path and a negative error code is returned (`-5` magic, `-7` version, `-8` dim/vocab, `-9` file bounds, `-10` weight region, `-11` layer cap, `-12` header overlap, `-15` v3 zero scale). Runtime guards on top: `hydra_engine_step()`/`hydra_engine_step_fast()` refuse v3 engines with `-14` (and `hydra_engine_step_tf()` refuses v1/v2 engines with the same code), the TF forward pass returns `-16` on any non-finite intermediate, and a failed KV append returns `-17` (see the "Version 3" section above).
 
 ## Model Size vs RAM (and what "32-bit" actually limits)
 

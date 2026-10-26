@@ -1873,3 +1873,125 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       C++ parse, exact CI 1a) + suites green. RESEARCH.md section 10
       extended. (The PR tier catching both reds before merge is the
       intended behaviour.)
+- [x] **PR #56 final: 15/15 GREEN @ 95c6721** (owner merges per R17;
+      base for round 4). Post-merge: verify the main release build
+      (build-macos) is green.
+
+## Round 2026-10-26 (round 4: true per-layer execution — format v3, full-dim decode, converters, 672 pin)
+
+Owner directive (round 4): the "1D deterministic token automaton by
+construction" conclusion was REJECTED as lazy documentation — the
+per-layer non-linear forward pass is mandatory real engineering:
+"NO STUBS, NO FAKES, NO MOCKS, ZERO HEAP", web-verify BitNet b1.58 +
+bitnet.cpp I2_S, deterministic C tests (dim d>0 changes the stream;
+multi-layer NOT reducible to load-time sums), local gates with real
+outputs, "document everything".
+
+- [x] **Web research verified (2026-10-26):** b1.58 W1.58A8 —
+      arXiv 2402.17764 + 2504.12285 + HF bitnet-b1.58-2B-4T:
+      W̃=RoundClip(W/γ,±1), γ=absmean; A8 = per-token absmax int8 in
+      [−127,127]; kernel packs 4 ternary/byte, unpacks in SRAM, GEMV =
+      add/sub. bitnet.cpp I2_S (arXiv 2410.16144 Table 1, read
+      directly): codes 00=−1, 01=0, 10=+1, 11 unused, 128-element
+      block-interleaved layout (microsoft/BitNet #412). CONFLICT
+      RESOLVED: the repo's table (00=0, 01=+1, 10=−1, 11=0) is a
+      different but equally valid permutation — repo KEEPS its table
+      for v2/v3 file compatibility; no layout-identity claim anywhere
+      in the docs. Recorded in docs/RESEARCH.md (new).
+- [x] **Format version 3 (docs/FORMAT.md canonical):** same 24-byte
+      header, version=3, dim%4==0. Per layer: Wg (dim²/4 B) + Wu
+      (dim²/4 B) + w1 (dim/4 B) + scale u16 LE (absmean·256, min 1) —
+      the scale sits AFTER the w1 plane. Final W_out (dim²/4 B).
+      layer_bytes = dim²/2 + dim/4 + 2. Errors: -10 (body size),
+      -14 (cross-version step), -15 (scale 0), -16 (non-finite),
+      -17 (kv append).
+- [x] **Engine: `hydra_engine_step_tf()`** — per token: per layer
+      xeff[i]=clamp127(state[i]+w1·token) → ternary mat-vecs
+      gate=Wg·xefx, up=Wu·xefx (int32 exact, `tf_row_dot`) → /scale →
+      SwiGLU → RMSNorm → RoPE(step_count) → state=clamp127(n·32); once
+      per token KV sink-0 residual + append(k=v=state); then
+      y=W_out·state (UNscaled int32), greedy argmax over ALL dim
+      (token = i mod vocab); `hydra_sample_token()` v3 mode feeds y
+      into the existing repetition/softmax/min-p/seeded sampler.
+      Zero heap: stack arrays only, weights read from the mmap.
+      step/step_fast refuse v3 → -14 (and vice versa). Loader: v3
+      branch (no aggregation build; "v3-Modell geladen" log).
+      Struct: +step_count (u32) → **sizeof(HydraEngine) 664→672
+      (LP64 pin in include/hydra_model.h)**.
+- [x] **REAL engine bug found + fixed (scale offset):** step_tf read
+      the u16 scale at w1p[0..1] (the w1 bytes!) instead of
+      w1p+dim/4 → sf=1/256. POS test passed by accident (SiLU
+      saturation + RMSNorm scale invariance); NEG: g=−256 →
+      sigmoid float-underflow → dead state. Diagnosed via instrumented
+      /tmp copy (gcc -Isrc), fixed + comment. Hand-built 2-bit
+      decode tests (POS +64/token, NEG −64/token 1) guard it.
+- [x] **main.c:** v3 routes to step_tf in bench + generation (KV
+      loop, caller-owned storage), --fast reported N/A on v3.
+- [x] **tests/test_engine.c: +32 arch-independent checks (142→174):**
+      v3 writer helpers (byte-precise, hand-derived), flip contrast
+      (dim d>0 changes v3 stream; identical v1 twin invariant),
+      4-layer non-reducibility vs load-time plane sums, KV sink/
+      append semantics, 2-bit hand decode POS+NEG, validation
+      (scale 0 → -15, short body → -10, dim%4 → -8, healthy control),
+      cross-version refusals (±14), prefill == manual step_tf, seeded
+      sampling reproducible. Test-writer bugs found while building
+      these (v3_fill_block OR-smash: missing +j/4; OR-only pack
+      couldn't clear bits) — both fixed, mask-then-set.
+- [x] **tools/test_count_baseline.txt:** x86 142→174, arm 151→183
+      (+32, arch-independent; ARM re-measure on the CI leg).
+- [x] **Converters v3 (both):** --v3 + --v3-layers N. Gate/up =
+      ternarised top-left dim×dim slices of cycled decodable tensors
+      (cands[(2l)%n], cands[(2l+1)%n]); w1 = cycling embedding rows;
+      W_out = first tensor; per-layer scale = max(absmean_g,
+      absmean_u)·256 clamped [1,65535]; **stdlib-only write-time
+      roundtrip check** (re-read, re-decode first scale + full W_out,
+      abort on drift); report names every source tensor/γ/density +
+      honest "dim×dim slice" note. decode_rows returns a FLAT list
+      (rows concatenated) — caught when the w1 row read indexed a
+      float.
+- [x] **tools/gguf_test.py: +14 gates (59→73):** v3 GGUF + v3
+      safetensors conversions, byte-level layout (header, body len,
+      non-zero scales, non-zero W_out), two-run engine determinism,
+      --dim 10 / --v3-layers 0 refused (ap.error raises SystemExit —
+      caught explicitly, uncaught it kills the test process).
+- [x] **Docs:** FORMAT.md (v3 section: corrected forward-pass
+      pseudocode — token enters xeff BEFORE the mat-vecs, KV is
+      once-per-token after the loop; layout table; validation rules
+      incl. v3 errors; converter writers + roundtrip check),
+      ARCHITECTURE.md (new "Version 3 forward pass" section —
+      previously referenced but missing; M4 "not yet wired" → wired;
+      Memory Model 672 per-field table; v1 "algebraically free"
+      scoped to v1/v2; testing strategy +2 bullets), README
+      (672 B ×2, v3 feature bullet, roadmap item checked, math
+      section v3 note, project structure), CHANGELOG round-4 entry,
+      docs/RESEARCH.md new (BitNet b1.58 + I2_S facts + repo
+      decisions), this file.
+- [x] **Local gates (round 4, real outputs):**
+      `make test-run` → `73 checks, 0 failed` (gguf_test) +
+      `=== 174 Tests, 0 failures ===` (hydra-test) +
+      `86 checks, 0 failed` (jni-batch) + `7 checks, 0 failed`
+      (large-model), rc=0. `gcc -fanalyzer` (strict C99 -Werror for
+      engine+main; Makefile flags for the test TUs) → all 4 TUs rc=0.
+      cppcheck --enable=all src/ include/ → 0 error/warning/
+      performance/portability (12 style `staticFunction` = public M4
+      API used by the test TU, same classification as round 3).
+      flawfinder --minlevel=4 → `Hits@level [4] 0 [5] 0`.
+      test_count_check → `ok test count 174 (arch 'x86')`.
+      py_compile (both converters + gate) rc=0. clang-tidy 23.1.4
+      (PyPI wheel, venv) on engine+main: new v3 code 0 bugprone
+      findings (fixed: unsigned shift literals `2u/4u/6u`, uint32_t
+      scale decode, (size_t) offset casts — the checker's caret is
+      misleading, the SIGNED operand was the int literal); 26
+      pre-existing signed-bitwise (v2 unpack/RNG, benign, classified)
+      + 7 swappable-parameters remain, all in legacy code;
+      concurrency-*/security-analyzer: 0.
+- [x] **RepoInspect PDF (user-attached): INVALID for this repo.**
+      It names Pydantic/LangChain/Poetry (not used), "1,482 files /
+      918 contributors" (repo has 122 tracked files), and a CRITICAL
+      at `BestAI/chains/llm_math/prompt.py:40` — no `chains/` dir,
+      no `prompt.py`, no such dependency anywhere. Generic/placeholder
+      report (most panels "Calculating..."); findings ignored, told to
+      the user.
+- [x] **Commit + push + PR (R17: owner merges)** — branch
+      `arena/f2400a75-bestai` (session branch; main @ d6aeb0d already
+      contains the round-3 merge of PR #56).

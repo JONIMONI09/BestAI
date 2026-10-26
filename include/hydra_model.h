@@ -21,6 +21,21 @@
 #define HYDRA_TERNARY_POS  1u
 #define HYDRA_TERNARY_NEG  2u
 
+/* Version 3 (per-layer non-linear) design parameters. All fixed by the
+ * format, not per-model options: a v3 file decodes the same everywhere.
+ * See docs/FORMAT.md "Version 3" for the derivations.
+ *   TF_ROPE_THETA    standard RoPE base frequency.
+ *   TF_RMSNORM_EPS   RMSNorm stabiliser.
+ *   TF_QUANT_GAIN    float->int8 re-quantisation gain after RMSNorm:
+ *                    RMSNorm leaves the vector at RMS ~1, so x*32 keeps
+ *                    the typical |x| <= 3 in a healthy int8 range while
+ *                    the +-127 clamp acts as the saturation.
+ *   TF_SCALE_FP      the per-layer scale u16 stores absmean * 256. */
+#define HYDRA_TF_ROPE_THETA  10000.0
+#define HYDRA_TF_RMSNORM_EPS 1e-5f
+#define HYDRA_TF_QUANT_GAIN  32.0f
+#define HYDRA_TF_SCALE_FP    256
+
 /* Header der Binärmodell-Datei */
 #pragma pack(push, 1)
 typedef struct {
@@ -75,6 +90,11 @@ typedef struct {
      * sampler config's rng_seed on the first draw. Greedy decoding
      * never touches it, so the deterministic baseline is unaffected. */
     uint64_t rng_state;
+
+    /* Version 3 only: tokens consumed since load (the RoPE position).
+     * Always zero on v1/v2 engines (step functions refuse the other
+     * format versions, so the counter has no meaning there). */
+    uint32_t step_count;
 } HydraEngine;
 
 /* Compile-time pin of the context size on 64-bit (LP64) platforms
@@ -89,9 +109,11 @@ typedef struct {
  * the Android NDK build) use a smaller ILP32 layout, and pinning the
  * LP64 number unconditionally broke the 32-bit NDK compile
  * (2026-10-26, caught by the android-lint NDK step on PR #56). The
- * documented 664 B claim is a 64-bit statement. */
+ * documented size claim is a 64-bit statement. The size moved 664 ->
+ * 672 when step_count was added for the version-3 RoPE position
+ * (2026-10-26); ARCHITECTURE.md/README carry the updated derivation. */
 #if defined(__LP64__) || defined(_LP64) || defined(__LP64)
-typedef char hydra_engine_size_check[sizeof(HydraEngine) == 664 ? 1 : -1];
+typedef char hydra_engine_size_check[sizeof(HydraEngine) == 672 ? 1 : -1];
 #endif
 
 /* Engine-Funktionen */
@@ -125,6 +147,30 @@ int hydra_engine_step(HydraEngine *engine, uint16_t token_in, uint16_t *token_ou
  * staleness of state[1..dim-1], so this comment cannot drift away from the
  * behaviour without a test noticing. */
 int hydra_engine_step_fast(HydraEngine *engine, uint16_t token_in, uint16_t *token_out);
+/* Forward declaration: the full struct is defined further below in this
+ * header, but the version-3 API (step_tf / sampler) references the cache
+ * type before that point. */
+typedef struct hydra_kv_cache hydra_kv_cache_t;
+/* Version 3 forward pass: executes the per-layer non-linear ternary
+ * pass for one token (cross-dimension BitLinear mat-vecs, SwiGLU +
+ * RMSNorm + RoPE + KV-memory + int8 re-quantisation between every
+ * layer, full-dimension logit mix at the end). Zero heap: all
+ * intermediate buffers are stack-local; the weights are read straight
+ * from the mmap.
+ *
+ * kv is a caller-initialized hydra_kv_cache_t (see hydra_kv_cache_init)
+ * or NULL for no memory channel. When non-NULL, the transformed state
+ * of every executed token is appended (k = v = the post-RMSNorm/RoPE
+ * state) and the permanent sink-0 value is added back as a residual
+ * before re-quantisation, so the first transformed state persists for
+ * the whole run (streaming-LLM attention-sink pattern).
+ *
+ * v3 engines ONLY: returns -14 with a stderr note on a v1/v2 engine
+ * (use hydra_engine_step(); a silent fallback would be a different
+ * model pretending to be this one). 0 on success; *token_out is the
+ * argmax of the logit mix modulo vocab. Advances step_count. */
+int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
+                         uint16_t *token_out, hydra_kv_cache_t *kv);
 /* Prefill: faedt eine ganze Token-Sequenz durch die Engine, ohne sie
  * auszugeben. Danach ist der State so weit gelaufen, wie das Prompt ihn
  * getrieben hat, und hydra_engine_step() erzeugt die Fortsetzung.
@@ -179,9 +225,14 @@ typedef struct hydra_sampler_config {
 /* Returns 0 on success, -1 on invalid arguments, -3 if the vocabulary
  * is too small to sample (vocab < 2), -4 if the temperature is outside
  * the numerically safe range (0 < temperature > 20). */
+/* kv: version 3 only - the v3 sampling mode must advance the state
+ * with the same memory channel the direct step uses, so the sampler
+ * takes the same caller-owned KV cache as hydra_engine_step_tf()
+ * (NULL = no memory channel). Ignored on v1/v2 engines. */
 int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
                        const hydra_sampler_config_t *cfg,
                        const uint16_t *recent_tokens, size_t recent_len,
+                       hydra_kv_cache_t *kv,
                        uint16_t *token_out);
 
 /* -------------------------------------------------------------------
