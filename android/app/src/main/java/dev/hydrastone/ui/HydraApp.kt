@@ -266,27 +266,34 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
         AdaptiveHeaderSplit(
             modifier = Modifier.weight(1f),
             header = {
-                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                    if (state.engineIsExperimental) {
-                        ExperimentalBanner()
-                    }
-                    ModelRow(
-                        modelLabel = state.modelLabel,
-                        modelDetail = state.modelDetail,
-                        onImportModel = actions.onImportModel
-                    )
-                    // The active engine is always named, even when there is
-                    // only one to choose: a chip that only appears when a
-                    // choice exists cannot tell the user which engine is
-                    // producing the text they are reading.
-                    EngineStatusRow(state)
-                    if (state.engines.size > 1) {
-                        EngineSelector(state, actions)
-                    }
-                    HorizontalDivider()
-                    AutoRunRow(state.autoRun, actions.onAutoRunChanged)
-                    HorizontalDivider()
+                // No verticalScroll here: AdaptiveHeaderSplit already wraps
+                // this content in ITS capping, scrollable column. A second
+                // verticalScroll inside a verticalScroll is the crash, not
+                // the fix - the outer scrollable measures its children with
+                // an infinite max height, and Compose throws exactly on the
+                // inner one ("Vertically scrollable component was measured
+                // with an infinity maximum height constraints"), on every
+                // device, the moment the chat tab is composed. One scroll
+                // per axis: the split owns it.
+                if (state.engineIsExperimental) {
+                    ExperimentalBanner()
                 }
+                ModelRow(
+                    modelLabel = state.modelLabel,
+                    modelDetail = state.modelDetail,
+                    onImportModel = actions.onImportModel
+                )
+                // The active engine is always named, even when there is
+                // only one to choose: a chip that only appears when a
+                // choice exists cannot tell the user which engine is
+                // producing the text they are reading.
+                EngineStatusRow(state)
+                if (state.engines.size > 1) {
+                    EngineSelector(state, actions)
+                }
+                HorizontalDivider()
+                AutoRunRow(state.autoRun, actions.onAutoRunChanged)
+                HorizontalDivider()
             },
             body = {
                 if (state.chatMessages.isEmpty()) {
@@ -325,6 +332,16 @@ private fun ChatTab(state: MainUiState, actions: MainActions) {
  * size-callback state and no collapsed first frame. BoxWithConstraints
  * sits next to Box in the same foundation.layout package, both already
  * used by this file.
+ *
+ * INVARIANT (regression: the 2026-10-26 "infinity maximum height" crash):
+ * this column is the ONLY vertically scrollable node in the chat
+ * hierarchy. Its children are measured with an infinite max height -
+ * that is what verticalScroll does - and Compose throws the moment a
+ * second verticalScroll, or a LazyColumn, sits inside it. [header] and
+ * [body] must therefore contain no scrollable of their own; the body's
+ * LazyColumn is one level deeper, inside the non-scrollable weighted
+ * column, which is what keeps it legal. tools/compose_scroll_guard.py
+ * fails the build if the invariant is broken again.
  */
 @Composable
 private fun AdaptiveHeaderSplit(
@@ -338,18 +355,32 @@ private fun AdaptiveHeaderSplit(
         // the incoming maximum height already converted to Dp; the scope's
         // constraints are pixel-based (ui.unit.Constraints), so scaling
         // goes through the plain Float: value * fraction, then .dp.
-        val cap: Dp = if (constraints.hasBoundedHeight) {
+        val bounded = constraints.hasBoundedHeight
+        val cap: Dp = if (bounded) {
             (maxHeight.value * headerFraction).dp
         } else {
             Dp.Unspecified
         }
+        // Remembered unconditionally: remember calls keep a stable order
+        // whatever the modifier below turns out to be.
+        val scrollState = rememberScrollState()
         Column(Modifier.fillMaxSize()) {
             // Natural height while it fits in the cap; scrolls internally
             // once it would take more of the space.
+            //
+            // verticalScroll is applied only on bounded height: Compose
+            // throws when a vertically scrollable node is measured with an
+            // infinite max height, so an unbounded caller (however it ever
+            // gets composed) must receive a natural-height column instead
+            // of an app-killing exception. This is the second layer of the
+            // crash guard - the first is that this column is the ONLY
+            // vertical scroll in the chat hierarchy (the header content
+            // must never add its own; tools/compose_scroll_guard.py
+            // checks that).
             Column(
                 modifier = Modifier
                     .heightIn(max = cap)
-                    .verticalScroll(rememberScrollState())
+                    .then(if (bounded) Modifier.verticalScroll(scrollState) else Modifier)
             ) {
                 header()
             }
