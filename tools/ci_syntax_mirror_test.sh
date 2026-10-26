@@ -16,19 +16,23 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 extract_cmd() { # $1 = step name to locate; prints its `run: |` block
+  # mawk-portable awk (no match()/RSTART, no [[:space:]]): counts leading
+  # blanks via gsub+length; a block ends at the first non-blank line whose
+  # indent drops below the first content line's indent.
   awk -v pat="$1" '
     !in_step && $0 ~ "name: " pat { in_step = 1; next }
-    in_step && /run: \|/          { in_run  = 1; next }
-    in_run && /^[[:space:]]*$/     { next }
+    in_step && $1 == "run:" && $2 == "|" { in_run = 1; next }
+    in_run && /^[ 	]*$/      { next }
     in_run {
-      # leading-whitespace count of this line
-      line = $0; match(line, /[^[:space:]]/); ws = RSTART - 1
+      line = $0
+      t = line; gsub(/^[ 	]+/, "", t)
+      ws = length(line) - length(t)
       if (indent == 0) {
         indent = ws                       # first content line sets the bar
-        sub(/^[[:space:]]+/, ""); print; next
+        print t; next
       }
       if (ws < indent) exit               # back to YAML level: step over
-      sub(/^[[:space:]]+/, ""); print
+      print t
     }
   ' .github/workflows/ci.yml
 }
