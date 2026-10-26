@@ -1008,7 +1008,7 @@ private fun SettingSlider(
             onValueChange = { local = it },
             onValueChangeFinished = { onCommit(local) },
             valueRange = range,
-            steps = ((range.last - range.first) / step - 1).toInt().coerceAtLeast(0),
+            steps = ((range.endInclusive - range.start) / step - 1).toInt().coerceAtLeast(0),
             enabled = enabled,
             modifier = Modifier.widthIn(min = 160.dp)
         )
