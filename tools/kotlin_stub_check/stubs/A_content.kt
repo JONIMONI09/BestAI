@@ -6,10 +6,6 @@ open class Context {
     fun getSystemService(name: String): Any? = null
     open fun getString(resId: Int): String = throw UnsupportedOperationException("stub")
     open fun getString(resId: Int, vararg formatArgs: Any?): String = throw UnsupportedOperationException("stub")
-    // NOTE: kotlinc cannot express @StringRes vs @PluralsRes (that is a
-    // lint check, ResourceType). getString(R.plurals.*) compiles here but
-    // fails Android lint on CI - use getQuantityString for plurals.
-    open fun getQuantityString(resId: Int, quantity: Int, vararg formatArgs: Any?): String = throw UnsupportedOperationException("stub")
     fun startActivity(intent: Intent) {}
     open val filesDir: File get() = throw UnsupportedOperationException("stub")
     open val resources: Resources get() = throw UnsupportedOperationException("stub")
@@ -43,7 +39,7 @@ class SharedPreferences {
 }
 class Resources {
     fun getQuantityString(id: Int, quantity: Int): String = ""
-    fun getQuantityString(id: Int, quantity: Int, vararg formatArgs: Any): String = ""
+    open fun getQuantityString(id: Int, quantity: Int, vararg formatArgs: Any?): String = ""
     fun getString(id: Int): String = ""
     fun getString(id: Int, vararg formatArgs: Any?): String = ""
 }
@@ -66,6 +62,16 @@ class Intent(context: Context) {
 abstract class ContentResolver {
     fun openInputStream(uri: android.net.Uri): java.io.InputStream? = null
     fun query(uri: android.net.Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): android.database.Cursor? = null
+}
+class ClipboardManager {
+    fun setPrimaryClip(clip: ClipData) {}
+}
+class ClipData {
+    companion object {
+        fun newPlainText(label: CharSequence, text: CharSequence): ClipData = throw UnsupportedOperationException("stub")
+    }
+}
+ String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): android.database.Cursor? = null
 }
 class ClipboardManager {
     fun setPrimaryClip(clip: ClipData) {}
