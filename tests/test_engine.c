@@ -2552,8 +2552,10 @@ static void write_v3_zero_planted(const char *path, uint32_t dim,
         base[lb - 1] = 1;
     }
     memcpy(body + (size_t)layers * lb, Wout, (size_t)dim * dim / 4);
-    FILE *f = fopen(path, "wb");
-    if (!f) { perror("fopen"); exit(1); }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
     wr_header_version(f, 3, vocab, dim, layers,
                       (uint32_t)sizeof(HydraModelHeader), (uint32_t)body_len);
     fwrite(body, 1, body_len, f);
