@@ -268,3 +268,16 @@ gsub+length whitespace counting, no match()/RSTART, no POSIX classes).
 Lesson: a script that mirrors CI must be tested against CI's
 *interpreter*, not just the local one — and the mirror step in ci.yml
 now guarantees that: it runs in both environments.
+
+Resolution (same day, PR #55, third iteration): with the regex literal
+removed, the remaining suspect was the `-v` pattern
+`"Syntax check \(gcc"` — awk processes C-style escapes in `-v` values,
+so mawk can deliver the pattern backslash-stripped, making the dynamic
+regex an unterminated parenthesis (gawk tolerated it locally). The step
+name is now matched with `index()` (plain string search); the script
+now contains **no backslash escapes, no POSIX character classes, no
+match()/RSTART and no -v-embedded regexes at all**. Result: the mirror
+step passed on CI (`lint` job green, 23 s), the whole PR lint tier is
+green (14 pass / 4 heavy jobs skipped by design), and the heavy jobs
+(neon-test, build-test, gpu-bench, android-apk) now run only on the
+main push after merge.

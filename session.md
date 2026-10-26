@@ -1761,3 +1761,11 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       comparison, gsub+length), verified incl. clang branch via
       clang->gcc wrapper; negative control re-proven against 580acce
       files (rc=1). RESEARCH.md section 9 updated.
+- [x] **PR #55 third CI run: lint tier fully GREEN** (14 pass / 4 heavy
+      jobs skipped by design). Third mirror fix: the -v pattern
+      `Syntax check \(gcc` itself carried a backslash escape (awk
+      processes escapes in -v values; mawk strips it -> unterminated
+      regex). Now matched via index() - the script has zero regex
+      escapes / POSIX classes / match() left. RESEARCH.md section 9
+      records the full three-step resolution. Remaining after merge:
+      heavy jobs on the main push (R17 merge by owner).
