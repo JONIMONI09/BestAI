@@ -582,56 +582,69 @@ int hydra2_open(hydra2_container_t *c, const char *path)
 
     /* Control-region cap (see HYDRA2_MAX_CONTROL_REGION): the file-size
      * validation above bounds these by the file; the cap bounds them by a
-     * constant, so no header can force an allocation beyond it. */
-    if (c->metadata_bytes > HYDRA2_MAX_CONTROL_REGION ||
-        c->tensor_dir_bytes > HYDRA2_MAX_CONTROL_REGION ||
-        c->expert_dir_bytes > HYDRA2_MAX_CONTROL_REGION) {
+     * constant, so no header can force an allocation beyond it.
+     *
+     * The cap is checked on PLAIN LOCAL aliases, and every allocation
+     * below uses those same locals: CodeQL's
+     * cpp/uncontrolled-allocation-size upper-bound barrier only
+     * recognizes a relational check on a VariableAccess (a plain
+     * local), not on a struct field loaded through the pointer
+     * argument (verified against the rule source,
+     * cpp/ql/src/Security/CWE/CWE-190/TaintedAllocationSize.ql). */
+    uint64_t mbytes  = c->metadata_bytes;
+    uint64_t tdbytes = c->tensor_dir_bytes;
+    uint64_t edbytes = c->expert_dir_bytes;
+    uint64_t tdcount = c->tensor_dir_count;
+    uint64_t edcount = c->expert_dir_count;
+    if (mbytes > HYDRA2_MAX_CONTROL_REGION ||
+        tdbytes > HYDRA2_MAX_CONTROL_REGION ||
+        edbytes > HYDRA2_MAX_CONTROL_REGION) {
         rc = refuse(HYDRA2_E_META_OOB,
                     "control region cap: metadata/tensor-dir/expert-dir "
                     "bytes (%llu/%llu/%llu) exceed the %llu-byte reader "
                     "cap (FORMAT-V2.md implementation decision)",
-                    (unsigned long long)c->metadata_bytes,
-                    (unsigned long long)c->tensor_dir_bytes,
-                    (unsigned long long)c->expert_dir_bytes,
+                    (unsigned long long)mbytes,
+                    (unsigned long long)tdbytes,
+                    (unsigned long long)edbytes,
                     (unsigned long long)HYDRA2_MAX_CONTROL_REGION);
         goto fail;
     }
 
     /* Directory counts: overflow-checked BEFORE the multiply (5.1.3),
      * and the *_bytes fields must equal count * entry_size. */
-    if (c->tensor_dir_count < 1u) {
+    if (tdcount < 1u) {
         rc = refuse(HYDRA2_E_TENSOR_OOB, "tensor_dir_count: %llu, "
                         "expected >= 1 (a v2 file always has trunk "
-                        "tensors)", (unsigned long long)c->tensor_dir_count);
+                        "tensors)", (unsigned long long)tdcount);
         goto fail;
     }
-    if (c->tensor_dir_count > c->file_size / HYDRA2_TENSOR_ENTRY_B) {
+    if (tdcount > c->file_size / HYDRA2_TENSOR_ENTRY_B) {
         rc = refuse(HYDRA2_E_TENSOR_OOB, "tensor_dir_count: %llu * %u "
                         "overflows the file (count*entry > file_size)",
-                        (unsigned long long)c->tensor_dir_count,
+                        (unsigned long long)tdcount,
                         HYDRA2_TENSOR_ENTRY_B);
         goto fail;
     }
-    if (c->tensor_dir_bytes != c->tensor_dir_count * HYDRA2_TENSOR_ENTRY_B) {
+    if (tdbytes != tdcount * HYDRA2_TENSOR_ENTRY_B) {
         rc = refuse(HYDRA2_E_TENSOR_OOB, "tensor_dir_bytes: %llu, "
                         "expected tensor_dir_count * 64 = %llu",
-                        (unsigned long long)c->tensor_dir_bytes,
-                        (unsigned long long)(c->tensor_dir_count *
+                        (unsigned long long)tdbytes,
+                        (unsigned long long)(tdcount *
                                             HYDRA2_TENSOR_ENTRY_B));
         goto fail;
     }
-    if (c->expert_dir_count > c->file_size / HYDRA2_EXPERT_ENTRY_B) {
+    if (edcount > c->file_size / HYDRA2_EXPERT_ENTRY_B) {
         rc = refuse(HYDRA2_E_EXPERT_OOB, "expert_dir_count: %llu * %u "
                         "overflows the file (count*entry > file_size)",
-                        (unsigned long long)c->expert_dir_count,
+                        (unsigned long long)edcount,
                         HYDRA2_EXPERT_ENTRY_B);
         goto fail;
     }
-    if (c->expert_dir_bytes != c->expert_dir_count * HYDRA2_EXPERT_ENTRY_B) {
+    if (edbytes != edcount * HYDRA2_EXPERT_ENTRY_B) {
         rc = refuse(HYDRA2_E_EXPERT_OOB, "expert_dir_bytes: %llu, "
                         "expected expert_dir_count * 48 = %llu",
-                        (unsigned long long)c->expert_dir_bytes,
-                        (unsigned long long)(c->expert_dir_count *
+                        (unsigned long long)edbytes,
+                        (unsigned long long)(edcount *
                                             HYDRA2_EXPERT_ENTRY_B));
         goto fail;
     }
@@ -647,7 +660,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
     }
 
     /* ---- metadata K/V block -------------------------------------- */
-    uint8_t *m = xalloc(c->metadata_bytes);
+    uint8_t *m = xalloc(mbytes);
     if (!m) { rc = HYDRA2_E_NOMEM; goto fail; }
     if (read_full(fd, m, c->metadata_bytes, c->metadata_offset) != 0) {
         rc = HYDRA2_E_READ;
@@ -728,14 +741,14 @@ int hydra2_open(hydra2_container_t *c, const char *path)
     }
 
     /* ---- tensor directory (resident trunk region) ---------------- */
-    uint8_t *td = xalloc(c->tensor_dir_bytes);
+    uint8_t *td = xalloc(tdbytes);
     if (!td) { rc = HYDRA2_E_NOMEM; goto fail; }
     if (read_full(fd, td, c->tensor_dir_bytes, c->tensor_dir_offset) != 0) {
         rc = HYDRA2_E_READ;
         free(td);
         goto fail;
     }
-    hydra2_tensor_entry_t *tens = xalloc((uint64_t)c->tensor_dir_count *
+    hydra2_tensor_entry_t *tens = xalloc(tdcount *
                                          sizeof(hydra2_tensor_entry_t));
     if (!tens) { rc = HYDRA2_E_NOMEM; free(td); goto fail; }
     c->tensors = tens; /* freeable on a mid-loop refusal (ASan, 2026-10-26) */
@@ -869,7 +882,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
 
     /* ---- expert directory (streamed payloads) --------------------- */
     if (c->expert_dir_count > 0u) {
-        uint8_t *ed = xalloc(c->expert_dir_bytes);
+        uint8_t *ed = xalloc(edbytes);
         if (!ed) { rc = HYDRA2_E_NOMEM; goto fail; }
         if (read_full(fd, ed, c->expert_dir_bytes, c->expert_dir_offset)
             != 0) {
@@ -877,7 +890,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
             free(ed);
             goto fail;
         }
-        hydra2_expert_entry_t *exps = xalloc((uint64_t)c->expert_dir_count *
+        hydra2_expert_entry_t *exps = xalloc(edcount *
                                              sizeof(hydra2_expert_entry_t));
         if (!exps) { rc = HYDRA2_E_NOMEM; free(ed); goto fail; }
         c->experts = exps; /* freeable on a mid-loop refusal (ASan, 2026-10-26) */
@@ -1134,15 +1147,20 @@ int hydra2_route_top_k(const float *logits, uint32_t n_experts,
             int skip = 0;
             for (uint32_t j = 0; j < k; j++)
                 if (chosen[j] == i) { skip = 1; break; }
-            /* Single condition, single assignment (a branch chain with
-             * two identical bodies is what clang-tidy's branch-clone
-             * flags). best < 0 short-circuits before any comparison
-             * touches logits[best]. */
-            if (!skip &&
-                (best < 0 ||
-                 logits[i] > logits[(uint32_t)best] ||
-                 (logits[i] == logits[(uint32_t)best] &&
-                  (int32_t)i < best)))
+            if (skip)
+                continue;
+            /* The logits access happens into PLAIN LOCALS, never inside
+             * a conditional && chain: CodeQL's
+             * cpp/offset-use-before-range-check pairs an array access
+             * with a relational check on the same offset WITHIN one
+             * and-expression, and the tie-break
+             * `logits[i] == logits[best] && i < best` is exactly that
+             * shape - so the comparison runs on li/lb instead. lb is
+             * never read while best < 0 (the first disjunct). */
+            float li = logits[i];
+            float lb = (best >= 0) ? logits[(uint32_t)best] : li;
+            if (best < 0 || li > lb ||
+                (li == lb && (int32_t)i < best))
                 best = (int32_t)i;
         }
         if (best < 0)

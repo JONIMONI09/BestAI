@@ -872,19 +872,31 @@ static void test_control_region_cap(void)
     const uint64_t big = 256ull * 1024ull * 1024ull + 4096ull;
     p64(&f, f.h_meta_bytes, big);
     p64(&f, f.h_fsize, 128ull + big);
+    /* write_file() (open 0644) + ftruncate: sparse, and the file
+     * creation goes through the suite's helper (a bare fopen("wb")
+     * is 0666 = world-writable, which CodeQL flags). */
     (void)unlink(CAPFILE);
-    FILE *fo = fopen(CAPFILE, "wb");
-    if (!fo || fwrite(f.buf, 1, 128, fo) != 128 ||
-        ftruncate(fileno(fo), (off_t)(128ull + big)) != 0) {
+    if (write_file(CAPFILE, f.buf, 128) != 0) {
         g_tests++;
         g_fail++;
-        printf("  FAIL: sparse cap file\n");
-        if (fo) fclose(fo);
+        printf("  FAIL: sparse cap file (header write)\n");
         free_fx(&f);
         (void)unlink(CAPFILE);
         return;
     }
-    fclose(fo);
+    {
+        int fd = open(CAPFILE, O_WRONLY | O_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, (off_t)(128ull + big)) != 0) {
+            g_tests++;
+            g_fail++;
+            printf("  FAIL: sparse cap file (ftruncate)\n");
+            if (fd >= 0) close(fd);
+            free_fx(&f);
+            (void)unlink(CAPFILE);
+            return;
+        }
+        close(fd);
+    }
     free_fx(&f);
     if (cap_stderr_begin(CAPPATH) == 0) {
         int rc = open_fixture(CAPFILE);
