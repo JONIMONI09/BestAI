@@ -176,6 +176,7 @@ bash tools/llama_pin_negative_test.sh
 bash tools/docs_claim_check.sh             # banned unqualified claims in docs
 bash tools/ci_release_version_test.sh      # release versioning discipline (needs pyyaml)
 bash tools/compose_scroll_check.sh         # crash guard: nested same-axis vertical scrollables in Compose (self-testing, R25)
+bash tools/workflow_yaml_check.sh          # every .github YAML: syntax + duplicate keys (GitHub rejects what PyYAML accepts; self-testing, R25)
 
 # 5. Web console (if UI touched)
 npm ci && npm run lint                     # ESLint (dev-only dependency)

@@ -1684,4 +1684,17 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       Code-scanning alerts API: 403 for the Actions token on both
       endpoints (documented in RESEARCH.md §4; findings available via
       CodeQL job logs / Security tab).
-- [ ] Local gate suite + docs (CHANGELOG) + commit + PR (R17).
+- [x] Local gate suite (C 142/0, JNI 86/0, large-model 7/0, count vs
+      baseline, gguf 59/0, string-format + negative, node 37/0 + trainer
+      + contrast 17, all 11 guardrail gates incl. the new compose guard)
+      + docs (CHANGELOG, this file) + 3 commits + **PR #53 opened
+      (R17, user merges)**.
+- [x] CI on PR #53: first red = `lint.yml` run created with zero jobs
+      and failing in the same second (2026-10-26 10:30Z) — root cause:
+      duplicate `key:` line in the android-lint cache save (PyYAML
+      silently accepts duplicate keys, the GitHub workflow compiler
+      rejects them; the local parse check was too permissive for its
+      consumer). Fixed + permanent gate `tools/workflow_yaml_check.sh`
+      (CI gate 1h, negative-control fixture, both parser paths green) +
+      errors.md entry. All other jobs green (APK 6 m 56 s incl. the
+      Kotlin fix, cold cache).

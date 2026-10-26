@@ -19,6 +19,7 @@
 | 2026-10-26 | Issue auto-close from CI (2026 patterns) | `tools/issue_verify.py` + workflow shipped |
 | 2026-10-26 | Code-scanning API access from an Actions token | blocked; workaround channels documented |
 | 2026-10-26 | Sandbox tool inventory + install channels | measured; policy in AGENTS.md §6 |
+| 2026-10-26 | GitHub workflow compiler vs PyYAML (duplicate keys) | zero-job red run; gate 1h shipped |
 
 ---
 
@@ -158,3 +159,20 @@ Arena sandbox (Debian 12, uid 1001, passwordless `sudo` present):
 `registry.npmjs.org` and `pypi.org` (both verified PONG). **Try before
 declaring a tool missing** — and record in this file what worked and what
 didn't, with the exact commands.
+
+## 6. GitHub's workflow compiler is stricter than YAML (2026-10-26) — GATE SHIPPED
+
+The PR #53 push produced a `lint.yml` run with **zero jobs** that failed
+in the same second (created_at == updated_at, no check-runs, no job log).
+Cause: a duplicate `key:` line in the `actions/cache/save` mapping.
+**PyYAML's `safe_load` silently accepts duplicate mapping keys** (last
+one wins) — every local "YAML ok" check passed. GitHub's workflow
+compiler rejects duplicates at load time, before any job exists.
+
+Rule for this repo: any validator for a file format consumed by an
+external system must model the **strictest consumer**, not the common
+parser. Shipped regression: `tools/workflow_yaml_check.sh` (CI gate 1h)
++ fixture `tools/fixtures/workflow_yaml_bad.yml` (negative control, R25);
+PyYAML path (runners) and stdlib indent-scan path (no PyYAML) both
+verified green, including against the fixture. Full account: `errors.md`
+2026-10-26 (duplicate `key:` entry).

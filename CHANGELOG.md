@@ -82,6 +82,18 @@ Repo hinzu", missing tools, README audit, CI speed-up, auto-close).
    unimplemented, sink KV cache); one precision note added: the NEON v2
    unpack kernel is AArch64-only (32-bit ARM uses the bit-identical
    scalar decode).
+8. **Workflow-YAML duplicate-key gate (CI gate 1h).** The first push of
+   this PR turned `lint.yml` into a zero-job red run: its dependency-
+   cache save carried a duplicate `key:` line. PyYAML (and most YAML
+   tooling) silently accepts duplicate mapping keys — last one wins —
+   so a plain parse check reports ok, but GitHub's workflow compiler
+   rejects them at load time: the run is created with zero jobs and
+   fails in the same second, with no job log to read. `tools/
+   workflow_yaml_check.sh` parses every `.github/**/*.yml` with a
+   duplicate-key-rejecting loader (PyYAML on the runners, a stdlib
+   indent-scan fallback) and proves the detector with the
+   negative-control fixture `tools/fixtures/workflow_yaml_bad.yml`
+   (R25). Both parser paths verified green.
 
 ## 2026-10-26 — NEON v2 test heap overflow fix + 32-bit ARM gate (third CI red run)
 

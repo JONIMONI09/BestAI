@@ -499,7 +499,6 @@ jobs:
         with:
           path: ~/.gradle/caches
           key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
-          key: gradle-deps-${{ runner.os }}-gradle8.7-${{ hashFiles('android/**/*.kts', 'android/**/*.toml', 'android/gradle.properties') }}
 
       - uses: actions/upload-artifact@v4
         if: failure()

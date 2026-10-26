@@ -95,6 +95,17 @@ jobs:
       - name: Compose crash guard (nested scrollables)
         run: bash tools/compose_scroll_check.sh
 
+      # Gate 1h: workflow YAML validation, including duplicate mapping
+      # keys. Regression for the PR #53 red run (2026-10-26): a second
+      # `key:` line in the actions/cache save of lint.yml. PyYAML - and
+      # most YAML tooling - silently accepts duplicate keys (last one
+      # wins), so a plain parse check passes; GitHub's workflow compiler
+      # REJECTS them, the run is created with zero jobs and fails in the
+      # same second, and there is no job log to read. The only reliable
+      # local substitute is this gate, with its negative-control fixture.
+      - name: Workflow YAML (duplicate keys rejected by GitHub)
+        run: bash tools/workflow_yaml_check.sh
+
       # On any lint failure, upload the captured diagnostics as a
       # workflow artifact so the error text is attached to the run.
       - name: Upload lint error report
