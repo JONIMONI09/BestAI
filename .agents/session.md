@@ -654,7 +654,7 @@ can and cannot prove.
       container, sampler on all surfaces, SIMD map, the two new gates),
       README.md (CLI sampler flags if not already documented), CHANGELOG.md
       round 11, errors.md (as they happen), user.md directive 30.
-- [ ] R11-F: gates + PR — the full 5-part local gate (make clean && make &&
+- [x] R11-F (FERTIG): gates + PR — the full 5-part local gate (make clean && make &&
       make test && make test-run; static analysis; python; node; guardrails),
       v1 baseline stream [471 386 385 386 385 386 385 386] unchanged,
       docs_claim_check, test_count_check vs the new baseline, zig aarch64
@@ -700,6 +700,22 @@ can and cannot prove.
   Scope-Entscheidungen Container-Top-k/Floats), §3 (jni 109, server 43,
   beide neuen Gates), README (CLI-Sampler-Flags + Contract),
   CHANGELOG R11, docs/FORMAT-V2.md (SIMD-Status-Punkt).
-- **R11-F:** läuft — 5-Teil-Gate lokal, v1-Baseline
-  [471 386 385 386 385 386 385 386] muss byte-identical bleiben, dann
-  Commit → Push → PR (FACTS ONLY) → CI grün inkl. ARM-Leg.
+- **R11-F:** 5-Teil-Gate lokal GRÜN (alle Suites, Linter — inkl.
+  cppcheck 2.13.2 aus Quell-Build, exakter CI-Befehl, 0 Warnungen;
+  Python, Node, alle Guardrails, actionlint, session-check). v1-Legacy:
+  die [471 386 …]-Referenz ist ein Session-Log-Wert eines alten Modells
+  und KEIN Code-Pin (grep belegt: nur in session.md); der relevante
+  Proof ist die Bit-Identität gegen den Base-Commit-Build — gemessen:
+  v1-Stream (normal UND --fast, 32 Tokens) byte-identisch Base vs.
+  Branch. Commits e157480 + 5142045 (NULL-Checks, CI-cppcheck-2.13
+  nullPointerOutOfMemory) + 6b0797a (row[16]={0}, CI-cppcheck-2.13
+  uninitvar False-Positive, mit 2.13.2-Quellbuild reproduziert und
+  danach rc=0). PR #70 geöffnet (FACTS ONLY). CI auf dem PR: **16
+  passed / 0 failed**; 4 Jobs (neon-test QEMU, build-test, Android
+  APK, GPU bench) by design skipping im PR — Owner-Regel: PR = Fast-
+  Lint, main = voller Build. Der NEON-Runtime-Beweis (test_neon_
+  tf_row_dot, 234er-Baseline) läuft nach dem Merge auf main.
+  /tmp-Resets in dieser Runde: zvenv + lintenv neu aufgebaut
+  (Rezepte Environment.md); pyyaml via pip --break-system-packages;
+  llama.cpp-Submodule per `git submodule update --init` auf den Pin
+  ausgecheckt (sonst pin-check "working tree"-Meldung).

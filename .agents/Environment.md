@@ -459,3 +459,47 @@
   (build/bin/llama-cli + llama-server) — same build as rounds 8/9;
   if /tmp was reset, rebuild with the commands in the round-9
   section above.
+
+## 2026-10-26 (round 11) — /tmp resets again + the CI cppcheck version
+
+1. `/tmp` was wiped again: `/tmp/zvenv` (ziglang) and `/tmp/lintenv`
+   (cppcheck/clang-tidy/etc.) recreated with the recorded recipes
+   (zig: `python3 -m venv /tmp/zvenv && pip install ziglang`,
+   console script `python-zig`; linter: the 5-package venv recipe
+   above). `pyyaml` was missing for
+   `tools/ci_release_version_test.sh` → installed with
+   `pip3 install --break-system-packages pyyaml` (PEP 668 sandbox;
+   the gate calls the system `python3`).
+2. **llama.cpp submodule not checked out** on a fresh clone
+   (`git submodule status` showed the gitlink but the working tree
+   was absent/other) → `llama_pin_check.sh` reports
+   "checked-out submodule ... working tree is at <parent sha>" and
+   "LICENSE is missing" (2 of 5 failed) even though the pin itself
+   is correct. Fix: `git submodule update --init
+   android/app/src/main/cpp/llama` (github.com reachable, clone
+   ~25 s). Run this once per fresh checkout.
+3. **The CI lint job uses apt cppcheck (2.13.x on ubuntu-latest),
+   not the pip wheel (2.22).** The two versions disagree: 2.13.2
+   reports `uninitvar` for `memcpy(rp, row, dim/4)` when the caller
+   fills `row` in a runtime-bounded loop (it takes the dim==0 path),
+   while 2.22 accepts it. When the local 2.22 is green but CI's
+   Gate 1c is red, rebuild 2.13.2 from source and re-run the exact
+   command:
+   ```bash
+   curl -sL https://codeload.github.com/danmar/cppcheck/tar.gz/refs/tags/2.13.2 \
+       -o /tmp/cppcheck.tgz && tar xzf /tmp/cppcheck.tgz -C /tmp
+   make -C /tmp/cppcheck-2.13.2 -j4 cppcheck   # ~90 s, no cmake needed
+   /tmp/cppcheck-2.13.2/cppcheck --enable=warning,portability \
+       --inline-suppr --std=c99 --platform=unix64 -Iinclude \
+       --error-exitcode=2 src/ tests/          # the verbatim CI command
+   ```
+   Measured in this round: rc=2 before the `row[16] = {0}` fix,
+   rc=0 / 0 warnings after.
+4. **CI logs are not fetchable from this sandbox:** the
+   results-receiver (results-receiver.actions.githubusercontent.com)
+   and the artifact blob store (blob.core.windows.net) are outside
+   the allowed hosts — `gh run view --log-failed` and
+   `gh run download` fail with EOF. Diagnose from the check-run
+   annotations API (`gh api .../check-runs/<id>/annotations`) plus
+   the job page on github.com (lists which step failed), and
+   reproduce locally with the matching tool version (item 3).
