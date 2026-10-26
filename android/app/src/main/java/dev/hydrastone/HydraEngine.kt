@@ -69,7 +69,7 @@ class HydraEngine : EngineInterface {
                 "engine" to displayName,
                 "format" to ".hydra (v1)",
                 "vocab" to "1024 ids, no tokenizer",
-                "memory" to "mapped 2-bit weights; see .agents/docs/ANDROID-AUDIT.md"
+                "memory" to "mapped 2-bit weights; see docs/ANDROID-AUDIT.md"
             )
         )
     }

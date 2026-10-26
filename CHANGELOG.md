@@ -1,6 +1,6 @@
 # Changelog
 All notable changes to this project, per change, are recorded here and in
-`.agents/session.md` (.agents/rules.md R2). Newest entries first.
+`session.md` (rules.md R2). Newest entries first.
 
 ## 2026-10-26 (round 4) — true per-layer execution (format version 3), full-dimension decode, converter v3 modes, 672-B pin
 
@@ -68,7 +68,7 @@ All notable changes to this project, per change, are recorded here and in
    canonical spec (layout, field semantics, forward-pass contract,
    error codes); `docs/ARCHITECTURE.md` gained the "Version 3 forward
    pass" section and the v1 "algebraically free" section is scoped to
-   v1/v2; new `.agents/docs/RESEARCH.md` records the web-verified BitNet b1.58
+   v1/v2; new `docs/RESEARCH.md` records the web-verified BitNet b1.58
    (W1.58A8, absmean γ, int8 ±127) and bitnet.cpp I2_S facts, the
    repository's 2-bit code-table decision (kept for file compatibility;
    any 3-of-4 permutation is valid), and what is and is not reproduced
@@ -113,7 +113,7 @@ All notable changes to this project, per change, are recorded here and in
    664 at compile time on every platform
    (`hydra_engine_size_check`, C99-portable) — layout drift is now a
    build error.
-4. **Evidence-based audit (`.agents/docs/TECHNICAL-AUDIT.md`)**: verified the
+4. **Evidence-based audit (`.agent_memory/AUDIT.md`)**: verified the
    zero-heap engine claim (true for `src/hydra_engine.c`;
    `src/main.c:479` mallocs a ≤512 B CLI buffer), the SIMD parity
    tests (all present, suite green), and the hardening in `server.js`;
@@ -135,9 +135,9 @@ All notable changes to this project, per change, are recorded here and in
    test_count 142 vs baseline.
 
 All notable changes to this project, per change, are recorded here and in
-`.agents/session.md` (.agents/rules.md R2). Newest entries first.
+`session.md` (rules.md R2). Newest entries first.
 
-## 2026-10-26 — Local lint stack (no CI deferral), PR/main CI split, code-scanning alert handling, .agents/Environment.md
+## 2026-10-26 — Local lint stack (no CI deferral), PR/main CI split, code-scanning alert handling, Environment.md
 
 Owner round: "stop deferring C++ checks to CI" (with a tested pip path),
 "PR runs = linters only, no full builds/publishing", "CI reacts to code
@@ -161,7 +161,7 @@ environment record for all AI agents.
    `tools/workflow_yaml_check.sh`, and dead variables in
    `tools/string_format_negative_test.sh`. All suites re-run green after
    the fixes (142/0, 86/0, 7/0, count vs baseline). Remaining linter
-   output is classified in .agents/Environment.md (intentional bit ops, C++-style
+   output is classified in Environment.md (intentional bit ops, C++-style
    noise on a C99 codebase, by-design exported M4 primitives).
 2. **CI tier split: PR = lint-only, main = full build + publish.**
    `ci.yml` heavy jobs (`neon-test` QEMU, `build-test` x86/macos,
@@ -184,7 +184,7 @@ environment record for all AI agents.
    (de-duplicated by marker), job summary otherwise. Closure is native:
    GitHub resolves the alert as *fixed* when the next analysis no longer
    reports it — the fix commit closes it autonomously.
-4. **.agents/Environment.md (new, in-repo): the shared environment record for all
+4. **Environment.md (new, in-repo): the shared environment record for all
    AI agents.** Describes each sandbox (what it is, egress allowlist,
    present/blocked tools with date + exact error + workaround) and the
    *tested* local check paths per environment. Contract (AGENTS.md §6):
@@ -209,11 +209,11 @@ environment record for all AI agents.
    gate list updated.
 
 5. **AGENTS.md updated accordingly:** §3 adds the mandatory local
-   C/C++ static-analysis gate (1b) and the "read .agents/Environment.md first"
-   rule; §6 carries the .agents/Environment.md contract; §8 now documents the
+   C/C++ static-analysis gate (1b) and the "read Environment.md first"
+   rule; §6 carries the Environment.md contract; §8 now documents the
    code-scanning alert channel (and explicitly that CI reacts to
    scanning results, not to issues, and that results are never
-   hardcoded); §5 table lists .agents/Environment.md and the new workflow.
+   hardcoded); §5 table lists Environment.md and the new workflow.
 
 ## 2026-10-26 — Compose crash fix + regression guard, Android CI caches, issue auto-close, research memory in repo
 
@@ -274,7 +274,7 @@ Repo hinzu", missing tools, README audit, CI speed-up, auto-close).
    cannot close get a mapping entry. First entry: issue #52 (gates: the
    new compose guard + `make clean && make -j2 test-run`).
 5. **Research memory now lives in the repository.**
-   `.agents/docs/RESEARCH-LOG.md` is the permanent in-repo record of
+   `.agent_memory/RESEARCH.md` is the permanent in-repo record of
    investigations (crash line map, CI cache architecture, auto-close
    research, code-scanning access findings, sandbox tool inventory with
    the exact install channels that work/fail here). The `.gitignore`
@@ -863,7 +863,7 @@ Measured: `./hydra-test` 113/0 (x86); baseline run
   `.agent_memory/` and `RESEARCH.md`, so the local research mirror and
   Notion sync notes stay out of the repository.
 - The audit + derivations for this round are recorded in
-  `.agents/docs/RESEARCH-LOG.md` (local fallback mirror; Notion "AI
+  `.agent_memory/RESEARCH.md` (local fallback mirror; Notion "AI
   Notizen" sync follows at round close).
 - **Not done (deliberate):** the spec title mentions "AGPL-3.0", but
   the LICENSE file is GPL-3.0 and the spec body never asks for a
@@ -884,7 +884,7 @@ state + final docs across all folders, per user request.
   `"license": "MIT"`. All three references now say GPL-3.0. The
   LICENSE file itself is untouched — changing it is a legal decision
   for the user, not a documentation fix. (The MIT references in
-  AGENTS.md / .agents/docs/ANDROID-AUDIT.md describe the pinned llama.cpp
+  AGENTS.md / docs/ANDROID-AUDIT.md describe the pinned llama.cpp
   v0.5.0, which really is MIT, and stay as-is.)
 - **Broken cross-reference in the roadmap.** The `.hydra2` item
   pointed readers to a "*Roadmap status* section" of

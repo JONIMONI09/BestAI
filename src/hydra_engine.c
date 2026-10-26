@@ -386,7 +386,7 @@ int hydra_engine_load(HydraEngine *engine, const char *model_path)
      * 1..64; without this guard a v2 model with dim % 4 != 0 would be
      * truncated by `dim / 4` in hydra_build_aggregation() and the leftover
      * dimensions would silently carry an aggregation of zero instead of their
-     * real weights. Refused, not rounded (.agents/rules.md R11, R14). */
+     * real weights. Refused, not rounded (rules.md R11, R14). */
     if ((engine->header.version == 2 || engine->header.version == 3) &&
         engine->header.dim % 4 != 0) {
         fprintf(stderr,

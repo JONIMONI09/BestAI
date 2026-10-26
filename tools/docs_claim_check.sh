@@ -2,7 +2,7 @@
 # Documentation claim lint.
 #
 # WHY: an external audit found the project's own docs making claims its code
-# disproves (a "Zero-RAM" title while .agents/errors.md recorded "Zero-RAM was an
+# disproves (a "Zero-RAM" title while errors.md recorded "Zero-RAM was an
 # unproven claim"; a size table implying v1 holds 1.5 B parameters when the
 # format caps at 256 KiB). Prose decays silently - nothing fails when a doc
 # drifts. This gate makes specific banned claims fail CI.
@@ -22,12 +22,11 @@ FAIL=0
 # containing a space was split into words, grep failed on the non-existent
 # half, and 2>/dev/null swallowed the error - so the file was skipped and the
 # lint still reported success.
-FILES=("$ROOT"/README.md "$ROOT"/docs/*.md "$ROOT"/.agents/docs/*.md \
-       "$ROOT"/android/README.md \
+FILES=("$ROOT"/README.md "$ROOT"/docs/*.md "$ROOT"/android/README.md \
        "$ROOT"/tools/gpu_bench/README.md)
-# Skill files and .agents/rules.md are audited too: they are where a hard-coded test
+# Skill files and rules.md are audited too: they are where a hard-coded test
 # count survives longest.
-FILES+=("$ROOT"/.agents/rules.md "$ROOT"/.claude/skills/*/SKILL.md)
+FILES+=("$ROOT"/rules.md "$ROOT"/.claude/skills/*/SKILL.md)
 
 check() { # id  regex  human-explanation
   local id="$1" re="$2" why="$3" hits
@@ -48,7 +47,7 @@ check() { # id  regex  human-explanation
 }
 
 # 1. Zero-RAM is physically impossible: mapped file pages and page cache are
-#    real physical memory. .agents/errors.md has an entry saying exactly that.
+#    real physical memory. errors.md has an entry saying exactly that.
 check "no-zero-ram" \
   '(^|[^a-z-])(zero-ram|zero ram)([^a-z-]|$)' \
   'never claim zero RAM; say "no heap allocation for weights; residency is governed by the kernel page cache"'
@@ -60,7 +59,7 @@ check "no-all-models" \
   'name the supported architectures and tensor types explicitly instead of "all"'
 
 # 3. Hard-coded unit-test counts drift the moment a test is added and were the
-#    single most-repeated stale number in this repo (.agents/rules.md said "49" for
+#    single most-repeated stale number in this repo (rules.md said "49" for
 #    years; the real x86 count is parsed from the binary, not assumed).
 check "no-hardcoded-test-count" \
   '\b[0-9]{2,3} (unit )?tests\b|\b[0-9]{2,3} Tests,' \

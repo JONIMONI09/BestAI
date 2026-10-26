@@ -21,7 +21,7 @@ import java.io.File
  * `rename(2)`, which replaces an existing file atomically and leaves it
  * untouched when it fails. That property has to hold in the app's own storage
  * on the device the app ships to, not on a Linux build machine
- * (.agents/rules.md R23). Everything here therefore runs in the app's real
+ * (rules.md R23). Everything here therefore runs in the app's real
  * `filesDir` on a real Android runtime.
  *
  * WHAT IS ACTUALLY PROVEN
@@ -31,7 +31,7 @@ import java.io.File
  * 2. A failing rename leaves the previous model in place, byte for byte.
  *    The failure is injected rather than waited for - a real `rename` cannot
  *    be made to fail on demand, and a test that cannot fail is decoration
- *    (.agents/rules.md R25).
+ *    (rules.md R25).
  * 3. A negative control: the OLD order (delete, then rename) with the same
  *    injected failure really does destroy the model. Without this, "the test
  *    passes" would be consistent with the bug still being present.

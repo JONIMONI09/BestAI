@@ -2,7 +2,7 @@
 #
 # ONE reviewed number per architecture. This file is the only place a test
 # count is written down; the gate parses the real count from the test binary
-# and fails when it drifts (.agents/rules.md R21, R25).
+# and fails when it drifts (rules.md R21, R25).
 #
 # Measured on 2026-10-03 by running the binaries, not by counting call sites:
 #   x86-64 : ./hydra-test                                        -> 71

@@ -2,7 +2,7 @@ package fixture.compose
 
 /*
  * NEGATIVE CONTROL for detector 2 of tools/compose_scroll_guard.py
- * (.agents/rules.md R25), standing in for the git-history proof when the merge
+ * (rules.md R25), standing in for the git-history proof when the merge
  * commit is not in the clone (shallow checkouts).
  *
  * This is the 2026-10-26 Hydra-Stone crash shape, recreated standalone:

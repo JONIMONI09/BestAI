@@ -4,17 +4,16 @@
 > agent (or a human new to the tree) and is written so that following it is
 > a complete session: protocol first, architecture second, verification last.
 > All documentation and code comments in this repository are English
-> (.agents/rules.md R31).
+> (rules.md R31).
 
 ## 1. Mandatory skills and rules (read first, enforce always)
 
 | File | What it binds you to |
 |---|---|
-| `.agents/user.md` | The owner's standing directives (dated, verbatim). Highest priority after safety — read it in every session. |
-| `.agents/rules.md` | 32 standing rules (R1–R32). Highest priority is the session protocol (R1–R4). When rules conflict: safety > correctness > session protocol > documentation > convenience (.agents/rules.md §8). |
-| `.claude/skills/session-workflow/SKILL.md` | Read `.agents/session.md`, `.agents/errors.md`, `.agents/rules.md` BEFORE any code. Update `.agents/session.md` after every completed step. Log every error in `.agents/errors.md` the moment it is hit. A session is not complete without both files updated. |
+| `rules.md` | 32 standing rules (R1–R32). Highest priority is the session protocol (R1–R4). When rules conflict: safety > correctness > session protocol > documentation > convenience (rules.md §8). |
+| `.claude/skills/session-workflow/SKILL.md` | Read `session.md`, `errors.md`, `rules.md` BEFORE any code. Update `session.md` after every completed step. Log every error in `errors.md` the moment it is hit. A session is not complete without both files updated. |
 | `.claude/skills/engine-ci-verify/SKILL.md` | The local quality gates, in CI-identical order, before any commit touching `src/`, `include/`, `tests/` or `tools/`. |
-| `.claude/skills/android-ndk-build/SKILL.md` | The Android toolchain bootstrap, APK build, no-KVM emulator verification and the 8 known pitfalls. Full long form: `.agents/docs/ANDROID_SKILL.md`. |
+| `.claude/skills/android-ndk-build/SKILL.md` | The Android toolchain bootstrap, APK build, no-KVM emulator verification and the 8 known pitfalls. Full long form: `docs/ANDROID_SKILL.md`. |
 
 The non-negotiable substance, in one breath: no fake tests (R5), no claimed
 capabilities (R6), prove claims by execution (R7), PoC before and after every
@@ -120,7 +119,7 @@ throughput, peak RSS) — re-run it rather than quoting a stale number.
 `/api/{models,model,models/upload,models/import,models/inspect,infer,train,
 vocab,axiom,cancel,errors}`. All model paths go through realpath (R28);
 uploads are size-capped with a streaming guard that answers 413 **before**
-destroying the socket (.agents/errors.md: "The 413 that was never delivered");
+destroying the socket (errors.md: "The 413 that was never delivered");
 `/api/models/import` is single-active with HTTP 429 + `Retry-After` on the
 second caller. The heavy lifting — inference and training — runs in the
 compiled C engine and in `tools/hydra_train.js`, whose `step()` is a
@@ -135,7 +134,7 @@ therefore never has its own math to drift from the engine.
 - stdout is data, stderr is logs (R13): `--json` output must stay parseable.
 - No capability may be documented that is not wired up (R6) — and, equally,
   a wired-up path must not go undocumented (this session's finding F-1,
-  `.agents/session.md` 2026-10-25).
+  `session.md` 2026-10-25).
 - No internal detail in an error response (R27): the user gets an
   actionable sentence; paths/stacks go to the log.
 
@@ -146,7 +145,7 @@ optional ARM/NEON gates: `.claude/skills/engine-ci-verify/SKILL.md`.)
 
 ```bash
 # 0. Environment (once per machine)
-#    If a gate's tool is missing in your sandbox: read .agents/Environment.md
+#    If a gate's tool is missing in your sandbox: read Environment.md
 #    FIRST - another agent may have recorded a tested install path for
 #    exactly your environment (owner rule 2026-10-26: no silent deferral
 #    of C++/lint checks to CI; try the recorded path before giving up).
@@ -162,7 +161,7 @@ bash tools/test_count_check.sh ./hydra-test x86   # parsed count vs reviewed bas
 
 # 1b. C/C++ static analysis (mandatory locally on any src//include/ change —
 #     owner rule 2026-10-26: do NOT defer this to CI). Tool install paths
-#     per environment: .agents/Environment.md (in the Arena sandbox the tested
+#     per environment: Environment.md (in the Arena sandbox the tested
 #     path is the /tmp/lintenv pip venv: cppcheck 2.22, clang-tidy, ...).
 /tmp/lintenv/bin/cppcheck --enable=all --std=c99 --platform=unix64 \
     -Iinclude src/hydra_engine.c src/main.c
@@ -225,17 +224,17 @@ same tokens). Cross-platform claims require running both platforms.
 
 ## 4. How to work here (the short version)
 
-1. `.agents/session.md` → `.agents/errors.md` → `.agents/rules.md` → write your plan into
-   `.agents/session.md` (R1). No code before that.
+1. `session.md` → `errors.md` → `rules.md` → write your plan into
+   `session.md` (R1). No code before that.
 2. Make the change. Additive and honest: fix the rule that was wrong, not the
    document that described it, and never delete a working path to hide a
    problem (this repository's history is full of "removed dead code that was
-   the only proof" — .agents/errors.md: "Layer aggregation silently deleted the NEON
+   the only proof" — errors.md: "Layer aggregation silently deleted the NEON
    kernel").
 3. Every new gate ships with a negative control (R25). Every new expectation
    that changed ships with the old value kept as a symptom (R10).
-4. Run the gates (§3) until green. Update `.agents/session.md` (done/open) and
-   `.agents/errors.md` (every error hit), and both go into the commit (R4).
+4. Run the gates (§3) until green. Update `session.md` (done/open) and
+   `errors.md` (every error hit), and both go into the commit (R4).
 5. One logical change per PR, English, open for the user to merge (R17/R18/R31).
    Never merge, never close, never `git checkout` (R17/R20).
 
@@ -247,19 +246,17 @@ same tokens). Cross-platform claims require running both platforms.
 | `.hydra2` container (specification only, no loader) | `docs/FORMAT-V2.md` |
 | What GGUF import actually does | `docs/GGUF-IMPORT.md` |
 | Engine architecture + memory model | `docs/ARCHITECTURE.md` |
-| v2 research brief | `.agents/docs/HYDRA2-RESEARCH.md` |
-| GPU feasibility | `.agents/docs/gpu-feasibility.md` |
-| Android build/verify (long form) | `.agents/docs/ANDROID_SKILL.md` |
-| Android audit trail | `.agents/docs/ANDROID-AUDIT.md` |
-| Every error ever hit | `.agents/errors.md` |
-| Session-by-session history | `.agents/session.md` |
-| Owner's standing directives | `.agents/user.md` |
-| Index of this folder | `.agents/README.md` |
-| Crash root causes, CI decisions, research with follow-ups (permanent record) | `.agents/docs/RESEARCH-LOG.md` |
-| Sandbox/tool environments per AI agent (each agent updates its own section only) | `.agents/Environment.md` |
+| v2 research brief | `docs/HYDRA2-RESEARCH.md` |
+| GPU feasibility | `docs/gpu-feasibility.md` |
+| Android build/verify (long form) | `docs/ANDROID_SKILL.md` |
+| Android audit trail | `docs/ANDROID-AUDIT.md` |
+| Every error ever hit | `errors.md` |
+| Session-by-session history | `session.md` |
+| Crash root causes, CI decisions, research with follow-ups (permanent record) | `.agent_memory/RESEARCH.md` |
+| Sandbox/tool environments per AI agent (each agent updates its own section only) | `Environment.md` |
 | Code-scanning alert handling (event-driven, nothing hardcoded) | `.github/workflows/code-scanning.yml` |
 
-`.agents/docs/RESEARCH-LOG.md` is **in the repository on purpose** (owner
+`.agent_memory/RESEARCH.md` is **in the repository on purpose** (owner
 decision 2026-10-26; the old gitignore rule that kept it local was removed).
 It is the permanent evidence trail for crash root causes, CI architecture
 decisions and research whose obligations outlive the session. **Keep it
@@ -268,7 +265,7 @@ question, method, finding, resolution, pointer to the shipped artifact)
 before the session ends. Do not treat it as scratch and do not delete it.
 
 ## 6. Missing tools — install them, do not give up
-**.agents/Environment.md is the shared memory for this.** Before claiming a
+**Environment.md is the shared memory for this.** Before claiming a
 tool is missing, read the section that matches your sandbox: another
 agent may have recorded a *tested* install path (and the exact error
 of every failed one). Afterward you record your own findings — **in
@@ -291,7 +288,7 @@ ARM toolchain substitute is zig: `python3 -m venv /tmp/zvenv &&
 /tmp/zvenv/bin/pip install ziglang`, then `zig cc -target aarch64-linux-gnu`
 (see RESEARCH.md §5 for the full inventory and the exact failures). A
 "blocked, not measured" verdict is acceptable only after a real attempt was
-recorded in `.agents/docs/RESEARCH-LOG.md` — never as a default.
+recorded in `.agent_memory/RESEARCH.md` — never as a default.
 
 ## 7. Every crash gets a regression test (crash protocol)
 
@@ -311,7 +308,7 @@ symptom disappears. It is done when it **cannot return unnoticed**:
    unit test for behavioral ones.
 4. **Wire the detector into CI as a gate** so the class of bug is blocked
    for every future commit, and write the root cause + line map + shipped
-   artifacts into `.agents/docs/RESEARCH-LOG.md`.
+   artifacts into `.agent_memory/RESEARCH.md`.
 
 No crash section in RESEARCH.md without its regression test, and no
 regression test without a pre-fix red run recorded in the section.

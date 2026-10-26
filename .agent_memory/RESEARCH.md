@@ -21,7 +21,7 @@
 | 2026-10-26 | Sandbox tool inventory + install channels | measured; policy in AGENTS.md §6 |
 | 2026-10-26 | GitHub workflow compiler vs PyYAML (duplicate keys) | zero-job red run; gate 1h shipped |
 | 2026-10-26 | Auto-close target: issues → code-scanning alerts | issue-verify removed; event-driven workflow shipped |
-| 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in .agents/Environment.md |
+| 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in Environment.md |
 
 ---
 
@@ -176,7 +176,7 @@ external system must model the **strictest consumer**, not the common
 parser. Shipped regression: `tools/workflow_yaml_check.sh` (CI gate 1h)
 + fixture `tools/fixtures/workflow_yaml_bad.yml` (negative control, R25);
 PyYAML path (runners) and stdlib indent-scan path (no PyYAML) both
-verified green, including against the fixture. Full account: `.agents/errors.md`
+verified green, including against the fixture. Full account: `errors.md`
 2026-10-26 (duplicate `key:` entry).
 
 ## 7. Auto-close target changed: issues -> code-scanning alerts (2026-10-26)
@@ -211,7 +211,7 @@ Shipped:
 ## 8. Local lint stack from PyPI wheels (2026-10-26) — the "no deferral" path
 
 Owner rule: stop deferring C++ checks to CI; the sandbox has pip + gcc.
-Verified 2026-10-26 (full detail in `.agents/Environment.md`, Arena section):
+Verified 2026-10-26 (full detail in `Environment.md`, Arena section):
 `python3 -m venv /tmp/lintenv && /tmp/lintenv/bin/pip install cpplint
 yamllint shellcheck-py cppcheck clang-tidy` installs **pre-built wheels**
 for Cppcheck 2.22.0, clang-tidy (LLVM 23.1.4), ShellCheck 0.11.0,

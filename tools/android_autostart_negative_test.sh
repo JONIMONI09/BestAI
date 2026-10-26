@@ -11,7 +11,7 @@
 # REMOVING the behaviour it is supposed to protect and asserting that the
 # named check turns red.
 #
-# .agents/rules.md R25 requires a gate to fail once before it can be trusted. This
+# rules.md R25 requires a gate to fail once before it can be trusted. This
 # script is that proof, and it runs in CI so the proof cannot rot.
 #
 # It never touches the repository: each scenario copies the sources into a

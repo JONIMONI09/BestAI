@@ -88,7 +88,7 @@ jobs:
 
       # Gate 1f: documentation claim lint. An external audit found the
       # project's own prose contradicting its code ("Zero-RAM" in the
-      # README title while .agents/errors.md recorded it as an unproven claim; a
+      # README title while errors.md recorded it as an unproven claim; a
       # size table implying v1 holds 1.5 B parameters when the format
       # caps at 256 KiB of weights). Prose decays silently - nothing fails
       # when a doc drifts, so these specific claims now fail CI.
@@ -220,7 +220,7 @@ jobs:
 
       # Drift gate. The count is PARSED from the binary's own output and
       # compared against the reviewed baseline for this architecture - no
-      # number is hard-coded here (.agents/rules.md R21/R25). The ARM count is
+      # number is hard-coded here (rules.md R21/R25). The ARM count is
       # legitimately higher than x86 because the NEON-vs-scalar comparison
       # tests only exist in an NEON build.
       #
@@ -376,7 +376,7 @@ jobs:
       # Drift gate. The count is PARSED from the binary's own output and
       # compared against the reviewed baseline - no number is hard-coded
       # here. A silent test deletion now fails CI instead of shrinking the
-      # suite unnoticed (.agents/rules.md R21/R25).
+      # suite unnoticed (rules.md R21/R25).
       #
       # The architecture label comes from the HOST, not from the runner name.
       # macos-latest is an arm64 image, so its binary legitimately runs MORE
@@ -554,7 +554,7 @@ jobs:
       - name: Android autostart and packaged starter model
         run: bash tools/android_autostart_check.sh
 
-      # .agents/rules.md R25: a gate that cannot fail is decoration. The Compose
+      # rules.md R25: a gate that cannot fail is decoration. The Compose
       # rewrite changed what nine of the autostart checks assert, so every
       # check is proved here by removing its behaviour and requiring the
       # gate to go red. It is a separate step from the gate itself so a
@@ -571,7 +571,7 @@ jobs:
       - name: Android string format arguments match their call sites
         run: python3 tools/string_format_check.py
 
-      # .agents/rules.md R25 again: this gate is brand new, so each of its checks is
+      # rules.md R25 again: this gate is brand new, so each of its checks is
       # proved by breaking exactly the property it protects.
       - name: Negative control for the string format gate
         run: bash tools/string_format_negative_test.sh
@@ -599,7 +599,7 @@ jobs:
       - name: llama.cpp is pinned, and no GGUF weights are tracked
         run: bash tools/llama_pin_check.sh
 
-      # .agents/rules.md R25: a gate that has never failed is decoration. This gate
+      # rules.md R25: a gate that has never failed is decoration. This gate
       # was written in the same commit that introduced the submodule, so each
       # of its checks is proved by removing the property it protects and
       # requiring that specific check to turn red. Separate step from the gate

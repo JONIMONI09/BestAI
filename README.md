@@ -272,7 +272,7 @@ Both are covered by equivalence tests against a reference implementation
 that lives in the test file, plus negative controls. On the Android app the
 **Benchmark** button runs the same three-path measurement across JNI
 (`HydraBridge.benchmark()`). Whether a GPU would beat any of this is
-analysed — with a measurement — in [`.agents/docs/gpu-feasibility.md`](.agents/docs/gpu-feasibility.md).
+analysed — with a measurement — in [`docs/gpu-feasibility.md`](docs/gpu-feasibility.md).
 
 ## Error reporting
 
@@ -339,15 +339,15 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── docs/FORMAT.md             .hydra binary format specification
 ├── docs/GGUF-IMPORT.md        GGUF import, absmean ternarisation, limits
 ├── docs/FORMAT-V2.md          .hydra2 sparse-MoE format — CANONICAL v2 spec, no loader yet
-├── .agents/docs/HYDRA2-RESEARCH.md    research spec: bounded measured memory, load strategies, ternary math
-├── .agents/docs/RESEARCH.md           external research: BitNet b1.58 (W1.58A8), bitnet.cpp I2_S 2-bit packing
-├── .agents/docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
+├── docs/HYDRA2-RESEARCH.md    research spec: bounded measured memory, load strategies, ternary math
+├── docs/RESEARCH.md           external research: BitNet b1.58 (W1.58A8), bitnet.cpp I2_S 2-bit packing
+├── docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
 ├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
 ├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
 ├── .github/workflows/release.yml tag → installable APK + CLI binaries
-├── .agents/errors.md                  Every bug: symptom / cause / fix / prevention
-├── .agents/rules.md                   Standing working rules
-├── .agents/session.md                 Live session plan and history
+├── errors.md                  Every bug: symptom / cause / fix / prevention
+├── rules.md                   Standing working rules
+├── session.md                 Live session plan and history
 └── LICENSE                    GPL-3.0
 ```
 
@@ -400,7 +400,7 @@ matrices themselves (`Wg`/`Wu` per layer, a token-injection `w1`, a u16
 absmean scale, and a final `W_out` logit mix — all 2-bit packed, 4
 weights/byte), which `hydra_engine_step_tf()` executes layer by layer
 with SwiGLU/RMSNorm/RoPE between the projections (BitNet b1.58 W1.58A8
-style, see [`.agents/docs/RESEARCH.md`](.agents/docs/RESEARCH.md)). Both converters
+style, see [`docs/RESEARCH.md`](docs/RESEARCH.md)). Both converters
 (`tools/gguf_to_hydra.py --v3`, `tools/safetensors_to_hydra.py --v3`)
 write v3 from real tensor slices, with a stdlib-only write-time
 roundtrip check.

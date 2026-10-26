@@ -32,7 +32,7 @@ target_link_libraries(hydra ${log-lib})
 # ===========================================================================
 # llama.cpp - the real inference engine
 #
-# Pinned by submodule tag. The audit (.agents/docs/ANDROID-AUDIT.md, section 3)
+# Pinned by submodule tag. The audit (docs/ANDROID-AUDIT.md, section 3)
 # records the pin and the exact API this file is written against:
 #     tag    v0.5.0
 #     commit 7fe450e19305b828c199d602c23a8337aaa1f03b
@@ -40,12 +40,12 @@ target_link_libraries(hydra ${log-lib})
 #
 # Every option below is set explicitly rather than left at its default.
 # An upstream default can change between releases; a pinned option cannot.
-# .agents/rules.md R15.
+# rules.md R15.
 # llama.cpp is built for arm64-v8a and x86_64.
 #
 # arm64-v8a is where real phones are. x86_64 is added because it is the only
-# way the engine can be EXERCISED here: .agents/rules.md R23 requires a new platform
-# target to be verified on that platform, and .agents/rules.md R32 forbids claiming a
+# way the engine can be EXERCISED here: rules.md R23 requires a new platform
+# target to be verified on that platform, and rules.md R32 forbids claiming a
 # result that was not measured. The only emulator available is x86_64
 # (API 24, TCG software emulation, no KVM), so an arm64-only llama.cpp would
 # leave the entire engine unverified - every number would be "NOT MEASURED"

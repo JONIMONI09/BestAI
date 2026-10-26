@@ -11,7 +11,7 @@
 # llama_jni.cpp rather than at the pin.
 #
 # So the pin is asserted, not assumed: the submodule must be recorded at
-# exactly this commit. .agents/rules.md R15.
+# exactly this commit. rules.md R15.
 #
 # Usage: bash tools/llama_pin_check.sh
 # Exit 0 when the pin matches, 1 otherwise.

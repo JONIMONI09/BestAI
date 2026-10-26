@@ -277,18 +277,14 @@ int hydra_swiglu(const float *g, const float *u, size_t dim, float *out);
  * overwrites its oldest non-sink entry once full, so the resident
  * set is always: sinks (append order) + the last (capacity - sinks)
  * tokens. */
-/* Defined as a plain struct (NOT a repeated typedef): the name
- * hydra_kv_cache_t is bound to this tag by the forward declaration
- * above, and C99 forbids redefining a typedef (clang
- * -Wtypedef-redefinition under -std=c99 -Werror). */
-struct hydra_kv_cache {
+typedef struct hydra_kv_cache {
     float *k;            /* capacity * dim floats (caller storage)  */
     float *v;            /* capacity * dim floats (caller storage)  */
     uint32_t dim;        /* key/value vector length                 */
     uint32_t capacity;   /* total slots (sinks + window)            */
     uint32_t num_sinks;  /* permanent sink slots (<= capacity)      */
     uint32_t count;      /* total appends since init                */
-};
+} hydra_kv_cache_t;
 
 /* Initialize on caller-provided storage. num_sinks <= capacity.
  * Returns 0 on success, -1 on invalid arguments (cache left zeroed). */

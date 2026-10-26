@@ -5,7 +5,7 @@ measurement that would answer it could not be taken. No Snapdragon 8 Elite
 tablet and no emulator were reachable from the environment this document was
 written in (`adb` is not installed, no device is attached). Everything
 below separates *measured here* from *not measured* — nothing is estimated
-and presented as a result (rule R32 in `.agents/rules.md`).
+and presented as a result (rule R32 in `rules.md`).
 
 ## 1. What was measured, and where
 

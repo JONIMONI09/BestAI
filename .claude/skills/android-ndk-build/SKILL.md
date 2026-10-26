@@ -6,7 +6,7 @@ description: "Build and verify the Hydra-Stone Android APK via NDK/JNI: toolchai
 # Android NDK Build — Hydra-Stone
 
 Build and verify the Android APK that wraps the Hydra-Stone C engine
-via JNI. Full experience-based guide: `.agents/docs/ANDROID_SKILL.md`.
+via JNI. Full experience-based guide: `docs/ANDROID_SKILL.md`.
 
 ## When to use
 
@@ -112,7 +112,7 @@ When done:
 adb emu kill
 ```
 
-## Known pitfalls (all hit and fixed — details in .agents/docs/ANDROID_SKILL.md)
+## Known pitfalls (all hit and fixed — details in docs/ANDROID_SKILL.md)
 
 1. **CMake source path**: repo root is 5 `..` from `app/src/main/cpp`, use
    `get_filename_component(HYDRA_ROOT ... ABSOLUTE)`.

@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * The engine under test is `libllama_jni.so`, linked into this APK and reachable
  * only through JNI from inside the app process. A host-side test could compile
  * against the headers and still prove nothing about whether the shipped library
- * loads a model, emits tokens, or stops when cancelled (.agents/rules.md R23, R32).
+ * loads a model, emits tokens, or stops when cancelled (rules.md R23, R32).
  * So this runs where the library actually lives.
  *
  * WHAT IT ASSERTS, AND WHAT IT DELIBERATELY DOES NOT
