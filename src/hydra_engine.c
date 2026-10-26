@@ -982,6 +982,9 @@ int hydra_engine_step_tf(HydraEngine *engine, uint16_t token_in,
 
     const uint32_t dim = engine->header.dim;
     const uint32_t vocab = engine->header.vocab_size;
+    /* The stack buffers below are HYDRA_EMBED_DIM wide and the state is
+     * dim wide: a cache of any other dimension would overrun them. */
+    if (kv && kv->dim != dim) return -1;
     if (token_in >= vocab) token_in = (uint16_t)(token_in % vocab);
     const int32_t token_val = (int32_t)token_in;
 
@@ -1115,6 +1118,7 @@ int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
 
         if (cfg->temperature <= 0.0f || cfg->min_p >= 1.0f)
             return hydra_engine_step_tf(engine, token_in, token_out, kv);
+        if (kv && kv->dim != dim) return -1;
         if (vocab < 2) return -3;
         if (cfg->temperature > 20.0f) return -4;
         if (cfg->repetition_penalty < 1.0f) return -1; /* no discounting */
@@ -1163,13 +1167,13 @@ int hydra_sample_token(HydraEngine *engine, uint16_t token_in,
         const uint64_t s0 = engine->rng_state ? engine->rng_state :
             ((cfg->rng_seed != 0) ? (uint64_t)cfg->rng_seed : 0x9E3779B97F4A7C15ULL);
         uint64_t st = s0;
-        double r = 0.0, acc = 0.0;
+        const uint64_t draw = hydra_xorshift64(&st);
+        const double u = (double)draw / 18446744073709551616.0; /* [0, 1) */
+        double acc = 0.0;
         uint32_t bi = dim - 1;
         for (uint32_t i = 0; i < dim; ++i) {
-            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
-            r = (double)(st >> 11) * (1.0 / 9007199254740992.0);
             acc += p[i];
-            if (r < acc) { bi = i; break; }
+            if (u < acc) { bi = i; break; }
         }
         engine->rng_state = st;
         const uint16_t chosen = (uint16_t)(bi % vocab);
