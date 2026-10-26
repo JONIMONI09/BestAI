@@ -1807,3 +1807,49 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       escapes / POSIX classes / match() left. RESEARCH.md section 9
       records the full three-step resolution. Remaining after merge:
       heavy jobs on the main push (R17 merge by owner).
+
+## Round 2026-10-26 (round 3: macOS release red, PR-tier portability scan, size pin, audit)
+
+- [x] **release.yml `build-macos` red nach #55-Merge diagnosed + fixed:**
+      in-file `_POSIX_C_SOURCE` enables on glibc but *restricts* on
+      Darwin (hides O_NOFOLLOW + MADV_SEQUENTIAL — neither is POSIX).
+      Fix: `#if !defined(__APPLE__) && !defined(__MACH__)` around the
+      defines in both src files. All modes re-verified (strict C99,
+      exact CI 1a, C++ parse, 142/0+86/0+7/0, zig aarch64 rc=0).
+- [x] **macos-strict-scan job (PR tier, ci.yml):** exact release-macos
+      command `-fsyntax-only` (no artifact) + new
+      tools/apple_portability_check.sh (R25 self-test, preprocessor
+      asserts + broken-pattern fixture). Measured: -D__APPLE__ on
+      glibc is NOT a Darwin simulation (recorded, honest split).
+- [x] **sizeof(HydraEngine) = 664** (README said 656 = pre-rng_state
+      size, stale): README fixed ×2, ARCHITECTURE.md got the full
+      per-field derivation, hydra_model.h pins 664 compile-time
+      (C99-portable typedef assert, verified x86-64 + zig aarch64).
+- [x] **User's exact local commands executed + outputs captured:**
+      pip wheels (venv incl. new flawfinder 2.0.20), gcc strict
+      -Werror -fanalyzer rc=0, cppcheck --enable=all src/ include/
+      (0 err/wrn, 10 style = test-only APIs, 0 real), clang-tidy
+      (+concurrency-*: 0 findings; 155 total, all classified),
+      flawfinder --minlevel=4 "No hits found", make test-run rc=0,
+      gguf_test 59/0, server_test 37/37, test_count_check (needs
+      <binary> <arch> args by design — run as-is: usage error,
+      recorded; with args: 142 vs baseline ok) + jni_signature
+      (SKIP javac, said out loud; CI covers).
+- [x] **Audit `.agent_memory/AUDIT.md` (5 sections, file:line
+      citations):** zero-heap verified (main.c:479 ≤512 B CLI malloc
+      noted), 664 B measured, SIMD parity tests named, server.js
+      hardening verified; math: 4096 layers ⇒ 128 integers (≈208 B)
+      effective capacity, column-0 decode (hydra_engine_step line
+      568) + 1D sampler logit, GGUF converter keeps ≤0.0075 % of 7B;
+      M4 primitives unit-tested/NOT wired (38 test refs, 0 prod refs);
+      .hydra2 spec-only (honest doc, naming-collision risk noted);
+      hazards ranked (mmap TOCTOU SIGBUS = accepted design cost);
+      P0-P3 plan (honesty layer → cross-dim mix + full-state decode →
+      wire M4/attention per FORMAT-V2 spec → hardening).
+- [x] Environment.md: venv line + flawfinder 2.0.20, zig ABSOLUTE
+      -I quirk recorded (relative -Iinclude fails under zig cc).
+- [x] RESEARCH.md §10 (Darwin inversion root cause + lesson),
+      CHANGELOG round-3 entry, PR #55 body rewritten (facts only,
+      per owner rule: no conversation/connector content in PRs).
+- [ ] Commit + push + PR (owner merges per R17); watch the new
+      macos-strict-scan job on the PR.

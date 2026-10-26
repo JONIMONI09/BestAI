@@ -281,3 +281,50 @@ step passed on CI (`lint` job green, 23 s), the whole PR lint tier is
 green (14 pass / 4 heavy jobs skipped by design), and the heavy jobs
 (neon-test, build-test, gpu-bench, android-apk) now run only on the
 main push after merge.
+
+## 10. Darwin feature-test inversion: _POSIX_C_SOURCE hides, not enables (2026-10-26, release.yml red)
+
+PR #55 merged to main; release.yml's `build-macos` job
+(`clang -O3 -Wall -Wextra -Iinclude src/hydra_engine.c src/main.c -lm`,
+macOS arm64, NO -D flags) failed with exactly:
+`O_NOFOLLOW` undeclared, `madvise` implicit declaration,
+`MADV_SEQUENTIAL` undeclared (3 errors).
+
+Root cause: the "self-containment" fix from that morning
+(in-file `#define _POSIX_C_SOURCE 200809L` / `_DEFAULT_SOURCE`) is
+**glibc-centric**. glibc interprets the macros as *enablement* of
+POSIX symbols; **Darwin headers interpret `_POSIX_C_SOURCE` as a
+restriction** and hide BSD extensions — `O_NOFOLLOW` is not in any
+POSIX version, `MADV_SEQUENTIAL` is not in any POSIX version either.
+So the same in-file define enabled the needed symbols on Linux and
+disabled them on macOS. Android/Bionic is tolerant (the android-apk
+job passed), which is why only the macOS leg went red.
+
+Fix + permanent guard:
+- `src/hydra_engine.c` + `src/main.c`: the define block is now wrapped
+  in `#if !defined(__APPLE__) && !defined(__MACH__)` (with the reason
+  in a comment). Linux standalone, Linux with CI's -D flags (guarded
+  #ifndef), Bionic and Darwin all verified rc=0 where measurable;
+  Darwin measured on CI.
+- `tools/apple_portability_check.sh` (new, R25 self-testing): asserts
+  via `gcc -E -dD` that in Apple configuration the TU self-defines
+  neither macro (0), in plain configuration it self-defines both
+  (≥2), plus a fixture of the old broken pattern that must be
+  detected (vacuous-parse guard).
+- `macos-strict-scan` job added to ci.yml's **PR tier** (runs on
+  pull_request, not main-only): the exact release-macos command with
+  `-fsyntax-only` (no binary, no artifact — a scan, per the owner's
+  "PR must find these errors and verify release-readiness without
+  publishing a release") + the apple portability check. This class of
+  break now fails a PR instead of a release.
+- Measured negative control: forcing `-D__APPLE__` on a glibc host is
+  NOT a valid Darwin simulation (glibc in strict -std=c99 hides
+  O_CLOEXEC/O_NOFOLLOW/madvise even with no feature macro at all — a
+  different restriction than Darwin's); the local check therefore
+  covers the macro logic only and says so. The Darwin-header proof is
+  the CI job.
+
+Lesson (R32): a "portability fix" that hardcodes one libc's
+feature-test semantics is a portability *bug* on every other libc;
+platform-conditional feature macros need a per-platform compile proof,
+and the proof belongs in the PR tier.

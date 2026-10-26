@@ -25,7 +25,7 @@ Hydra-Stone is a C99 engine that maps a `.hydra` file of ternary weights ({-1, 0
 | **total while stepping** | | **1088 B ≈ 1.06 KiB** | |
 | load-time scratch (released) | `int64_t[64]` × 2 | 1024 B | stack in `hydra_build_aggregation()` |
 
-`sizeof(HydraEngine)` is 656 B in total — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header and the load-measurement fields. Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
+`sizeof(HydraEngine)` is 664 B in total — the three arrays above plus the file descriptor, the mapping pointer, the 24-byte header, the load-measurement fields and the sampler RNG state (pinned at compile time by `hydra_engine_size_check` in `include/hydra_model.h`). Nothing in that list grows with `layers` or with the file size. Full derivation and the guarantees/limits are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Memory Model*.
 
 The weight pages are **not** counted there, because they are not the engine's memory: they live in the **kernel page cache**, appear in `dumpsys meminfo` as *Private Clean*, and are reclaimed by the OS under memory pressure. The engine therefore cannot and does not keep the model's resident set size at zero. Build with `-DHYDRA_DROP_CACHE` to explicitly hand touched pages back after every step.
 
@@ -158,7 +158,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 
 ## Features
 
-- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path, and the engine's own working set is fixed and measured: a 656-byte context, of which 576 bytes (two `int32[64]` aggregates + one `int8[64]` state) is what the per-token step touches
+- ✅ **Zero-heap inference** — weights are never copied, only mapped; `src/hydra_engine.c` contains no allocator call in any path, and the engine's own working set is fixed and measured: a 664-byte context, of which 576 bytes (two `int32[64]` aggregates + one `int8[64]` state) is what the per-token step touches
 - ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 4 bits of file per weight** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The v2 header variant packs 4 weights per byte — exactly the 2-bit code of each weight, no reserved bits — which **halves the file** — implemented, tested and documented in `docs/FORMAT.md` ("Version 2"); it is the same 24-byte header, not the `.hydra2` container.
 - ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action

@@ -110,11 +110,13 @@
      ```bash
      python3 -m venv /tmp/lintenv
      /tmp/lintenv/bin/pip install --disable-pip-version-check \
-         cpplint yamllint shellcheck-py cppcheck clang-tidy
+         cpplint yamllint shellcheck-py cppcheck clang-tidy flawfinder
      ```
      Verified 2026-10-26: installs **Cppcheck 2.22.0** (wheel),
      **clang-tidy (LLVM 23.1.4)** (wheel), **ShellCheck 0.11.0**,
-     **yamllint 1.38.0**, **cpplint 2.0.2** — all from PyPI, no apt.
+     **yamllint 1.38.0**, **cpplint 2.0.2**, **flawfinder 2.0.20**
+     (PyPI re-implementation, `flawfinder --minlevel=4 src/ include/`
+     → "No hits found" at that level, 2026-10-26) — all from PyPI, no apt.
   2. **C/C++ static analysis (run on every change to `src/`, `include/`,
      `tests/`):**
      ```bash
@@ -156,8 +158,13 @@
      ```bash
      python3 -m venv /tmp/zvenv && /tmp/zvenv/bin/pip install ziglang
      mkdir -p ~/.cache/zig
-     /tmp/zvenv/bin/python-zig cc -target aarch64-linux-gnu -Iinclude -Wall -Wextra \
-         src/hydra_engine.c src/main.c -o /tmp/hydra_arm   # full compile, rc=0
+     # NOTE: zig needs ABSOLUTE -I paths (a relative -Iinclude is not
+     # resolved against the cwd and dies with "hydra_model.h: No such
+     # file or directory", 2026-10-26)
+     /tmp/zvenv/bin/python-zig cc -target aarch64-linux-gnu \
+         -I/home/user/BestAI/include -Wall -Wextra \
+         /home/user/BestAI/src/hydra_engine.c /home/user/BestAI/src/main.c \
+         -o /tmp/hydra_arm   # full compile, rc=0 (incl. the 664-byte size pin)
      ```
      (2026-10-26, ziglang 0.17.0 wheel. Two 0.17 quirks measured: the
      console script is **`python-zig`, not `zig`**, and

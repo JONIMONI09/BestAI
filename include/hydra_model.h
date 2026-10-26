@@ -77,6 +77,15 @@ typedef struct {
     uint64_t rng_state;
 } HydraEngine;
 
+/* Compile-time pin of the context size on every platform (C99-portable
+ * static assert; the codebase compiles with -std=c99, so C11
+ * static_assert is not available). Measured 2026-10-26: 664 bytes on
+ * x86-64 - the full per-field derivation is in docs/ARCHITECTURE.md,
+ * section "Memory Model". The README once claimed 656 B, the size from
+ * before rng_state existed; this assert makes any future layout drift
+ * a build error on every target instead of a stale doc number. */
+typedef char hydra_engine_size_check[sizeof(HydraEngine) == 664 ? 1 : -1];
+
 /* Engine-Funktionen */
 int hydra_engine_load(HydraEngine *engine, const char *model_path);
 void hydra_engine_unload(HydraEngine *engine);

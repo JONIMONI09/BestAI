@@ -4,12 +4,19 @@
  * relying on every build adding -D_POSIX_C_SOURCE=200809L
  * -D_DEFAULT_SOURCE (same finding as in hydra_engine.c,
  * guarded against command-line redefinition, 2026-10-26). */
+#if !defined(__APPLE__) && !defined(__MACH__)
+/* glibc (Linux) + Bionic (Android): under a strict compile these enable
+ * the POSIX symbols the code uses. On Apple this block must stay OFF:
+ * Darwin headers interpret _POSIX_C_SOURCE as a restriction and hide
+ * the BSD extensions O_NOFOLLOW and MADV_SEQUENTIAL (neither is in any
+ * POSIX version), which broke release.yml's macOS build 2026-10-26. */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
+#endif /* !__APPLE__ && !__MACH__ */
 
 #include "hydra_model.h"
 #include <errno.h>
