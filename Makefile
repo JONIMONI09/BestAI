@@ -20,12 +20,12 @@ endif
 
 all: hydra-run
 
-hydra-run: src/hydra_engine.c src/main.c include/hydra_model.h src/hydra_simd.h
+hydra-run: src/hydra_engine.c src/main.c include/hydra_model.h src/hydra_simd.h src/hydra_neon.h
 	$(CC) $(CFLAGS) -o hydra-run src/hydra_engine.c src/main.c $(LDFLAGS)
 
 test: hydra-test jni-batch-test large-model-test
 
-hydra-test: src/hydra_engine.c tests/test_engine.c include/hydra_model.h src/hydra_simd.h
+hydra-test: src/hydra_engine.c tests/test_engine.c include/hydra_model.h src/hydra_simd.h src/hydra_neon.h
 	$(CC) $(CFLAGS) -o hydra-test src/hydra_engine.c tests/test_engine.c $(LDFLAGS)
 
 # The JNI batching policy (android/app/src/main/cpp/hydra_batch.h) is shared
@@ -37,7 +37,7 @@ jni-batch-test: tests/test_jni_batch.c android/app/src/main/cpp/hydra_batch.h
 # Multi-GiB models and 32-bit offset arithmetic. The big file is sparse, so
 # this needs neither 5 GiB of disk nor 5 GiB of RAM - that is exactly the
 # property being tested.
-large-model-test: src/hydra_engine.c tests/test_large_model.c include/hydra_model.h src/hydra_simd.h
+large-model-test: src/hydra_engine.c tests/test_large_model.c include/hydra_model.h src/hydra_simd.h src/hydra_neon.h
 	$(CC) $(CFLAGS) -o large-model-test src/hydra_engine.c tests/test_large_model.c $(LDFLAGS)
 
 # GGUF -> .hydra conversion. The gate builds a real GGUF, converts it, and

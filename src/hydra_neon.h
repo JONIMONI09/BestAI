@@ -32,6 +32,18 @@
 #include <arm_neon.h>
 #include <stdint.h>
 
+/* The in-register version-2 plane unpack below uses the 128-bit
+ * table-lookup intrinsic vqtbl1q_u8, which exists only in the AArch64
+ * (64-bit) arm_neon.h headers; the 32-bit ARM headers provide
+ * vtbl1_u8 with a different lane shape instead. The Android NDK builds
+ * this header for armeabi-v7a as well, so the kernel is compiled for
+ * AArch64 only. On 32-bit ARM the engine takes the scalar v2 decode at
+ * load time (hydra_build_aggregation) — bit-identical result, the
+ * difference is one model load instead of every token. */
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#define HYDRA_NEON_V2_UNPACK 1
+#endif
+
 /**
  * acc[i] += A[i]*token + B[i]*state[i]  fuer genau 16 Werte.
  *
@@ -71,5 +83,153 @@ static inline void hydra_neon_accumulate_agg(
     }
 }
 
+#if defined(HYDRA_NEON_V2_UNPACK)
+
+/* Bit-pattern redefinition of uint8x16_t as int8x16_t.
+ *
+ * The AArch64 arm_neon.h headers of BOTH CI toolchains (GCC's
+ * gcc-12-aarch64-linux-gnu and Apple clang on macos-latest) use the
+ * source-suffixed spelling vreinterpretq_s8_u8; the unsuffixed
+ * vreinterpretq_s8 belongs to the 32-bit ARM headers and is not
+ * declared for AArch64 (proven by the CI compile of gcc-12:
+ * "implicit declaration of function 'vreinterpretq_s8'; did you
+ * mean 'vreinterpretq_u8_s8'?"). The suffixed name is the one
+ * spelling every AArch64 toolchain declares. */
+#define hydra_neon_u8x16_as_s8(v) vreinterpretq_s8_u8(v)
+
+/**
+ * Load-time kernel for a version-2 plane (4 ternary weights per byte,
+ * weight j at bits 2j..2j+1 of byte j/4), NEON counterpart of
+ * hydra_avx2_unpack_v2_plane in src/hydra_simd.h.
+ *
+ * The 2-bit -> signed decode is fully in-register: per 16-byte chunk
+ * (= 64 dimensions) the four weight positions (2 bits each) are
+ * right-shifted into the low 2 bits, masked with 0x03, and looked up in
+ * a 16-byte table T[i] = ternary(i & 3) with vqtbl1q_u8 (the table's
+ * low-4-bit index identity — the same table the scalar and AVX2
+ * decoders use; code table 00=0, 01=+1, 10=-1, 11=0, -1 stored as 0xFF
+ * and sign-extended on the widening).
+ *
+ * Layout: the decoded value for byte k, nibble j belongs to dimension
+ * 4k + j. After widening, plane j gives four registers R_j (r = 0..3,
+ * lane n) with R_j[r][n] = byte 4r+n, nibble j. Output block m covers
+ * dimensions 16m..16m+15 (bytes 4m..4m+3) and needs, per byte, the
+ * four nibbles in order: dim 16m+4b+c = R_c[m][b]. A 4-way interleave
+ * is two rounds of 2-way vzipq_s32 with the pairs two apart (zip
+ * alternates lanes, so pairing 0/2 with 1/3 and re-zipping groups):
+ *   q02 = zip(R0_m, R2_m), q13 = zip(R1_m, R3_m)
+ *   o01 = zip(q02[0], q13[0]) -> dims of bytes 4m, 4m+1
+ *   o23 = zip(q02[1], q13[1]) -> dims of bytes 4m+2, 4m+3
+ *
+ * BIT-IDENTICAL to the scalar hydra_build_aggregation_v1_1: for every
+ * dimension exactly ONE integer (0/+1/-1) from the same table is added
+ * to the same int32 accumulator; integer addition of the same values
+ * is independent of instruction shape. tests/test_engine.c proves it
+ * (test_neon_v2_unpack, test_neon_v2_load_matches_scalar).
+ *
+ * Contract: dim % 64 == 0 (the engine's dim is 64). Processes the
+ * whole plane: dim/4 bytes.
+ */
+static inline void hydra_neon_unpack_v2_plane(
+    int32_t *agg,
+    const uint8_t *plane,
+    size_t dim)
+{
+    /* T[i] = ternary value of code (i & 3) as unsigned byte; 0xFF for
+     * -1, sign-extended on the s8 -> s16 -> s32 widening below. 16
+     * entries so any 4-bit index of the masked weights selects the
+     * right low-2-bit class. aligned(16): vld1q_u8 faults on
+     * misaligned addresses and a 16-byte static array is only
+     * guaranteed 1-byte aligned by the C standard. */
+    static const uint8_t T[16] __attribute__((aligned(16))) = {
+        0x00, 0x01, 0xFF, 0x00, 0x00, 0x01, 0xFF, 0x00,
+        0x00, 0x01, 0xFF, 0x00, 0x00, 0x01, 0xFF, 0x00
+    };
+    const uint8x16_t tv = vld1q_u8(T);
+
+    for (size_t d = 0; d < dim; d += 64) {
+        const uint8x16_t bytes = vld1q_u8(plane + d / 4);
+
+        /* Normalize each weight to the low 2 bits (logical right
+         * shifts), then mask with 0x03: vqtbl1q_u8 indexes with each
+         * lane's LOW 4 bits only, so the weight must sit in bits 0-1
+         * of the index (a pure AND mask like 0x3C/0xF0/0xC0 would
+         * leave the weight in bits 2-7 and decode planes 1-3 as 0).
+         *
+         * vshrq_n_u8, not negative vshlq_n_u8 immediates: for
+         * uint8 lanes a negative shift has the same bit pattern as a
+         * positive logical right shift, but the negative form is not
+         * accepted by all arm_neon.h implementations (their fixed
+         * static-immediate macro/builtin rejects values outside the
+         * positive encode range) — proven by aarch64 clang/GCC
+         * builds. vshrq_n_u8 with 2/4/6 is in the legal 0..31 range
+         * of the AArch64 LSR instruction on every implementation. */
+        const uint8x16_t m3 = vdupq_n_u8(0x03);
+        const uint8x16_t d0 = vqtbl1q_u8(tv, vandq_u8(bytes, m3));
+        const uint8x16_t d1 = vqtbl1q_u8(tv, vandq_u8(vshrq_n_u8(bytes, 2), m3));
+        const uint8x16_t d2 = vqtbl1q_u8(tv, vandq_u8(vshrq_n_u8(bytes, 4), m3));
+        const uint8x16_t d3 = vqtbl1q_u8(tv, vandq_u8(vshrq_n_u8(bytes, 6), m3));
+
+        /* Widen each decoded plane to 16 int32 (four int32x4 lanes):
+         * Rj_r lane n = decoded weight for byte 4r+n, nibble j. */
+        const int8x16_t s0 = hydra_neon_u8x16_as_s8(d0);
+        const int8x16_t s1 = hydra_neon_u8x16_as_s8(d1);
+        const int8x16_t s2 = hydra_neon_u8x16_as_s8(d2);
+        const int8x16_t s3 = hydra_neon_u8x16_as_s8(d3);
+        const int16x8_t s0a = vmovl_s8(vget_low_s8(s0));
+        const int16x8_t s0b = vmovl_s8(vget_high_s8(s0));
+        const int16x8_t s1a = vmovl_s8(vget_low_s8(s1));
+        const int16x8_t s1b = vmovl_s8(vget_high_s8(s1));
+        const int16x8_t s2a = vmovl_s8(vget_low_s8(s2));
+        const int16x8_t s2b = vmovl_s8(vget_high_s8(s2));
+        const int16x8_t s3a = vmovl_s8(vget_low_s8(s3));
+        const int16x8_t s3b = vmovl_s8(vget_high_s8(s3));
+
+        for (int m = 0; m < 4; ++m) {
+            const int32x4_t r0 = m == 0 ? vmovl_s16(vget_low_s16(s0a))
+                             : m == 1 ? vmovl_s16(vget_high_s16(s0a))
+                             : m == 2 ? vmovl_s16(vget_low_s16(s0b))
+                                      : vmovl_s16(vget_high_s16(s0b));
+            const int32x4_t r1 = m == 0 ? vmovl_s16(vget_low_s16(s1a))
+                             : m == 1 ? vmovl_s16(vget_high_s16(s1a))
+                             : m == 2 ? vmovl_s16(vget_low_s16(s1b))
+                                      : vmovl_s16(vget_high_s16(s1b));
+            const int32x4_t r2 = m == 0 ? vmovl_s16(vget_low_s16(s2a))
+                             : m == 1 ? vmovl_s16(vget_high_s16(s2a))
+                             : m == 2 ? vmovl_s16(vget_low_s16(s2b))
+                                      : vmovl_s16(vget_high_s16(s2b));
+            const int32x4_t r3 = m == 0 ? vmovl_s16(vget_low_s16(s3a))
+                             : m == 1 ? vmovl_s16(vget_high_s16(s3a))
+                             : m == 2 ? vmovl_s16(vget_low_s16(s3b))
+                                      : vmovl_s16(vget_high_s16(s3b));
+
+            /* 4-way interleave in two rounds of 2-way vzipq. The first
+             * round pairs the planes two apart: vzipq alternates lanes,
+             * so zipping (0,2) and (1,3) and then re-zipping GROUPS the
+             * nibbles in dimension order instead of alternating them.
+             *   o01.val[0] = (r0[0],r1[0],r2[0],r3[0]) = dims of byte 4m
+             *   o01.val[1] = (r0[1],r1[1],r2[1],r3[1]) = dims of byte 4m+1
+             *   o23.val[0] = (r0[2],r1[2],r2[2],r3[2]) = dims of byte 4m+2
+             *   o23.val[1] = (r0[3],r1[3],r2[3],r3[3]) = dims of byte 4m+3
+             */
+            const int32x4x2_t q02 = vzipq_s32(r0, r2);
+            const int32x4x2_t q13 = vzipq_s32(r1, r3);
+            const int32x4x2_t o01 = vzipq_s32(q02.val[0], q13.val[0]);
+            const int32x4x2_t o23 = vzipq_s32(q02.val[1], q13.val[1]);
+
+            const size_t base = d + (size_t)m * 16;
+            vst1q_s32(agg + base + 0,
+                      vaddq_s32(vld1q_s32(agg + base + 0), o01.val[0]));
+            vst1q_s32(agg + base + 4,
+                      vaddq_s32(vld1q_s32(agg + base + 4), o01.val[1]));
+            vst1q_s32(agg + base + 8,
+                      vaddq_s32(vld1q_s32(agg + base + 8), o23.val[0]));
+            vst1q_s32(agg + base + 12,
+                      vaddq_s32(vld1q_s32(agg + base + 12), o23.val[1]));
+        }
+    }
+}
+
+#endif /* HYDRA_NEON_V2_UNPACK */
 #endif /* __ARM_NEON */
 #endif /* HYDRA_NEON_H */

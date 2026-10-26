@@ -3,6 +3,192 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 — NEON v2 test heap overflow fix + 32-bit ARM gate (third CI red run)
+
+The new in-step `::error::` diagnostics did their job and named both
+remaining failures precisely.
+
+1. **Runtime heap overflow in `test_neon_v2_load_matches_scalar`
+   (macOS arm64 + qemu-aarch64, same bug).** The ASan rebuild added to
+   the macOS unit-test step reported
+   `heap-buffer-overflow: WRITE of size 1 at 0 bytes after 16-byte
+   region, test_engine.c (v2 load test)`: the test allocated
+   `malloc(dim / 4)` = 16 bytes for each of `pa`/`pb` but wrote
+   `layers * dim / 4` = 48 bytes (3 layers × 16). The plain binary
+   survived the overflow until the heap metadata was hit (macOS:
+   "Trace/BPT trap", exit 133; qemu/glibc: `malloc(): corrupted top
+   size` + SIGABRT in the neon-test job). Fixed: allocate
+   `layers * (dim / 4)`. All other `malloc`s in the test file were
+   audited (v1 models correctly use `dim * layers`).
+2. **Android `armeabi-v7a` (32-bit ARM) cannot compile the v2
+   kernel.** The APK build compiles `src/hydra_neon.h` for the 32-bit
+   target and failed with
+   `call to undeclared function 'vqtbl1q_u8'`: the 128-bit
+   table-lookup intrinsic exists only in the AArch64 headers (32-bit
+   ARM provides the differently shaped `vtbl1_u8` instead). The v2
+   unpack kernel is therefore compiled for AArch64 only, via a new
+   `HYDRA_NEON_V2_UNPACK` macro in `src/hydra_neon.h` (defined when
+   `__ARM_NEON` and `__aarch64__`/`__arm64__`/`_M_ARM64`). On 32-bit
+   ARM the engine takes the existing SCALAR v2 decode at load time —
+   bit-identical result; the difference is one model load, not every
+   token. The existing step kernel (hot path, dual-ABI intrinsics) is
+   unchanged and still runs on 32-bit ARM.
+   - `src/hydra_neon.h`: `HYDRA_NEON_V2_UNPACK` macro; the v2 kernel
+     + `hydra_neon_u8x16_as_s8` gated with it.
+   - `src/hydra_engine.c`: the `use_neon` wiring uses
+     `HYDRA_NEON_V2_UNPACK` instead of `__ARM_NEON` (32-bit ARM falls
+     to the scalar decode).
+   - `tests/test_engine.c`: the two v2 tests and the shared
+     `ref_unpack_v2_plane` helper are gated with
+     `HYDRA_NEON_V2_UNPACK`/`__AVX2__` (the helper must not be
+     compiled where no caller exists — the same `-Wunused-function`
+     trap the CI clang gate caught on x86). Test counts are
+     UNCHANGED: the qemu-aarch64 (151) and macOS (151) builds define
+     the macro, the x86 build (142) never did.
+- **`tests/test_engine.c`**: `pa`/`pb` allocated `layers * (dim / 4)`
+  (was `dim / 4`).
+
+Verified locally: x86 gate green (142/0, jni 86/0, large 7/0, zero
+warnings), CI clang-syntax config clean (both TUs, no-AVX2 x86,
+`-Werror`), baseline `[471, 386, 385, 386, 385, 386, 385, 386]` @ 42
+unchanged, clean zig-clang aarch64 build of both TUs with all 11 v2
+assertion strings present in the binary (0 in the x86 binary).
+
+## 2026-10-26 — NEON kernel portability fix (real ARM compilers reject the intrinsics as written) + CI failure diagnostics
+
+CI run on `5c1f145`: the `lint` job failed because `ref_unpack_v2_plane`
+became an unconditional static in `tests/test_engine.c` but is only
+called from the `__ARM_NEON`/`__AVX2__` test blocks — the x86 no-AVX2
+clang syntax check sees it as unused (`-Werror -Wunused-function`; gcc
+is silent under `-fsyntax-only` because it only emits that warning
+during codegen). Fixed by guarding the helper with
+`#if defined(__ARM_NEON) || defined(__AVX2__)` (`e1c6c3b`).
+
+The following run then exposed the real defect: `neon-test`
+(aarch64-linux-gnu-gcc-12) and the macos-latest `build-test` leg
+(Apple clang, arm64) both fail to COMPILE the new kernel, while the
+x86 leg never compiles NEON at all. The kernel's intrinsics were
+written against the ARM instruction set but not against what the
+two CI toolchains' `arm_neon.h` headers actually accept:
+
+1. **Negative `vshlq_n_u8` immediates are not portable.**
+   `vshlq_n_u8(bytes, -2/-4/-6)` is rejected by the AArch64
+   `arm_neon.h` implementations (the static-immediate macro/builtin
+   only encodes a positive range — `argument value -2 is outside the
+   valid range [0, 7]`). Replaced by `vshrq_n_u8(bytes, 2/4/6)` —
+   the logical right shift, in the legal `LSR` immediate range of
+   every AArch64 implementation. Semantics are unchanged: for the
+   LUT index only `shifted & 0x03` matters, and the low 2 bits after
+   a shift are identical for the arithmetic and the logical variant
+   (the sign-fill bits always land above the mask) — confirmed by
+   the 200,000-plane shadow proof against the scalar decoder, which
+   used logical shifts.
+2. **The unsuffixed `vreinterpretq_s8` does not exist in the AArch64
+   headers of either CI toolchain.** The first fix attempt selected
+   the spelling by `__clang__` (unsuffixed for GCC) and the next CI
+   run proved that wrong with the actual compiler error:
+   aarch64-linux-gnu-gcc-12 reports
+   "implicit declaration of function 'vreinterpretq_s8'; did you
+   mean 'vreinterpretq_u8_s8'?" — GCC's AArch64 `arm_neon.h` also
+   uses only the source-suffixed names (the unsuffixed spelling is a
+   32-bit-ARM header convention). The kernel now calls
+   `vreinterpretq_s8_u8` unconditionally via the
+   `hydra_neon_u8x16_as_s8()` macro — the one spelling both AArch64
+   toolchains declare.
+
+The defects were found by reproducing the aarch64 compile locally
+with a zig-bundled clang toolchain (`pip install ziglang`; the
+sandbox has no aarch64 gcc) — it emits exactly the errors the CI
+compilers report. Verification after the fix: clean aarch64
+cross-compile of both TUs (`-O2 -Wall -Wextra`), full x86 gate
+re-run green (142/0, jni 86/0, large 7/0), baseline
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42 unchanged, test
+counts untouched (x86 142 / arm 151).
+
+- **`src/hydra_neon.h`**: `vshlq_n_u8(bytes, -N)` →
+  `vshrq_n_u8(bytes, N)` (2/4/6); `vreinterpretq_s8(v)` →
+  `hydra_neon_u8x16_as_s8(v)` = `vreinterpretq_s8_u8(v)` (the only
+  spelling both AArch64 toolchains declare).
+- **`tests/test_engine.c`**: `ref_unpack_v2_plane` now compiled only
+  where it is used (`__ARM_NEON || __AVX2__`) — CI syntax gate green
+  on the x86 no-AVX2 clang check again.
+- **`.github/workflows/ci.yml`**: the `neon-test` build+run step and
+  the `build-test` build/run steps now capture the real compiler /
+  test output and, on failure, mirror it into check-run `::error::`
+  annotations before exiting — the log/blob hosts are not reachable
+  from every network, and the check-run annotation API is the
+  reliable read path for these jobs (proven: the real GCC error
+  above arrived through exactly this channel). On top of that, the
+  macos-arm64 unit-test step now rebuilds the same sources with
+  `-fsanitize=address,undefined` on a runtime failure and mirrors the
+  ASan report (faulting instruction + stack) into annotations — the
+  plain binary's buffered stdout is lost in a segfault, so the
+  report is the only channel that shows WHERE the fault happened.
+
+## 2026-10-26 — M1 completion: ARM NEON in-register v2 plane unpack (2-bit decode at load)
+
+Closes the last gap of milestone M1 ("True In-RAM 2-bit packed
+inference, 4× weight memory cut"): the ARM64 engine decoded the
+version-2 weight planes with the pure scalar loop while x86-64 already
+had an in-register AVX2 LUT path. The in-RAM objective itself was
+already met by the mmap + load-time aggregation design (resident weight
+memory is only the two 64-dim int32 A/B aggregates; the mapped pages are
+released after aggregation, RSS delta measured at 0 KiB) — this entry
+adds the NEON kernel and its parity proof.
+
+- **`src/hydra_neon.h`**: new `hydra_neon_unpack_v2_plane()` (static
+  inline, compiled only when `__ARM_NEON` is defined). Per 16-byte
+  chunk (64 dimensions) the four 2-bit weights are normalized into the
+  low 2 bits (logical right shifts via negative `vshlq_n_u8`
+  immediates — a pure AND mask like `0x3C/0xF0/0xC0` cannot work,
+  because `vqtbl1q_u8` indexes with each lane's LOW 4 bits only),
+  masked with `0x03`, and decoded through the same 16-entry
+  `T[i] = ternary(i & 3)` table the scalar and AVX2 decoders use (16
+  bytes, `aligned(16)` for the `vld1q_u8` load, −1 as 0xFF). The
+  decoded planes are widened `s8 → s16 → s32` (sign-extension carries
+  the −1) and a 4-way interleave in two `vzipq_s32` rounds (pairs two
+  apart: `q02 = zip(r0,r2)`, `q13 = zip(r1,r3)`, then re-zip groups
+  instead of alternating) yields the exact dimension order
+  `(R0,R1,R2,R3)` per byte; the result accumulates into `agg` with
+  `vaddq_s32`. Contract: `dim % 64 == 0`, one plane call per 16-byte
+  window. Bit-identical to `hydra_build_aggregation_v1_1` by
+  construction: one integer from the same table per dimension into the
+  same int32 accumulator.
+- **`src/hydra_engine.c`**: the v2 branch of
+  `hydra_build_aggregation()` now mirrors the AVX2 block: `use_neon =
+  dim % 64 == 0` (no runtime probe needed — NEON is base ISA on
+  AArch64, and a build without NEON never defines `__ARM_NEON`, so the
+  kernel is simply not compiled in). Per layer, 64-dim chunks are
+  unpacked by the kernel for A and B; any other dimension falls through
+  to the scalar decoder unchanged.
+- **`tests/test_engine.c`**: +11 ARM-only checks (compiled under
+  `#ifdef __ARM_NEON`, i.e. the CI `qemu-aarch64-static` leg):
+  `test_neon_v2_unpack` — random 3-layer dim-64 planes vs the
+  independent scalar reference (the kernel's multi-layer ADD path),
+  the full 4-code table sweep with per-code hand-pinned sums (00→0,
+  01→+1, 10→−1, 11→0; catches a sign inversion or nibble-order swap),
+  and a dim-128 plane (two 64-dim chunks) exercising the kernel's
+  `d += 64` loop; `test_neon_v2_load_matches_scalar` — a seeded v2
+  model with a proof that all four codes occur, loaded through the
+  engine (kernel live on this build) with `agg_a`/`agg_b` required to
+  be bit-identical to an in-test scalar decode of the same raw file
+  bytes, plus a 32-token stream against the documented step formula
+  driven by the independently decoded A/B (the reference never sees
+  the kernel). The arch-neutral helpers `wr_header_version` and
+  `ref_unpack_v2_plane` moved above the NEON block so both the NEON
+  and the AVX2 v2 suites share one independent reference (no
+  duplication, no use-before-definition).
+- **`tools/test_count_baseline.txt`**: arm 140 → 151 (the 11 checks
+  compile only into NEON builds); x86 unchanged at 142.
+
+Measured (x86-64 sandbox — NEON verifies on the CI qemu-aarch64-static
+leg; kernel math additionally proven on x86 by an element-level shadow
+model of the lane movement: 200,000 random dim-64/128 planes
+bit-identical to the scalar reference): `make hydra-test` zero
+warnings, `./hydra-test` 142/0 (baseline run
+`[471, 386, 385, 386, 385, 386, 385, 386]` @ 42/8 unaffected — the
+v1 model does not touch the v2 branch at all).
+
 ## 2026-10-25 — Android keyboard + adaptive chat layout; full .md audit; local scan helper
 
 **Android UI (fix for "the UI breaks while typing")**

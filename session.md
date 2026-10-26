@@ -85,6 +85,109 @@
 
 ## Current task
 
+**2026-10-26 — M1 completion: ARM NEON in-register v2 (2-bit) unpack
+path (branch `arena/5774a639-bestai`, main @ 3cf4c85 post-PR-#50).**
+User re-issued the 5-milestone spec (post-`dccac28` audit) and asked to
+continue. No `todo_write` tool exists in this environment — milestones
+are tracked here, `completed` only after build + tests pass.
+
+**Audit of the spec's claims against current main (verified, not
+assumed):**
+- "2-bit weights still expanded to 8-bit int8_t in RAM during load" —
+  **stale.** `hydra_build_aggregation()` decodes the packed bytes
+  directly into the int32 A/B aggregation (scalar `…_v1_1` + the
+  AVX2 LUT `hydra_avx2_unpack_v2_plane`); there is no expanded
+  int8 weight buffer anywhere. The file is mmapped + MADV_SEQUENTIAL,
+  measured RSS delta 0 after load (see the block comment in
+  `src/hydra_engine.c`). Runtime resident weight memory is the 512
+  bytes of agg_a/agg_b — below the spec's "4x less" target by design.
+- "6 of 7 Roadmap items unimplemented" — **stale.** 5 of 7 done
+  (min-p sampling, safetensors import, AVX2 kernel, v2 packing,
+  ring-buffer KV). Remaining: full transformer forward pass (the
+  primitives exist but are not wired — a separate roadmap item, not
+  one of the spec's 5 milestones) and the `.hydra2` sparse-MoE
+  container (explicitly "no part implemented").
+- "hydra_stone_model_engine.zip still in root" — **gone** (M1 agent
+  hygiene round).
+- "CLAUDE.md still missing" — **exists** (M1 agent hygiene round).
+
+**The one real M1 gap (this round's scope):** the spec's M1.2/M1.3
+require a SIMD in-register unpack kernel in `src/hydra_neon.h`
+alongside the AVX2 one; M1.4 requires bit-identical tests across
+scalar/NEON/AVX2. Currently the NEON architecture aggregates v2 models
+with the pure scalar loop — only the x86 build has a vectorised v2
+decode.
+
+**Plan (milestones, each completed only after its build + tests pass):**
+- [x] M1a: `hydra_neon_unpack_v2_plane()` in `src/hydra_neon.h` —
+      fully vectorised 2-bit→signed decode of a v2 plane (16 bytes =
+      64 dims per chunk). FINAL FORM (after two review-caught design
+      errors): weights normalized to the low 2 bits via logical right
+      shifts (`vshlq_n_u8` negative immediates — a pure AND mask
+      CANNOT work: `vqtbl1q_u8` indexes with the lane's LOW 4 bits
+      only, so 0x3C/0xF0/0xC0 masks would decode planes 1-3 as 0),
+      masked 0x03, decoded through the 16-entry `T[i]=ternary(i&3)`
+      LUT (loaded once via `vld1q_u8` from an `aligned(16)` static —
+      a raw array is not a `uint8x16_t` and needs 16-byte alignment),
+      widened s8→s16→s32 (sign-extension carries −1=0xFF), 4-way
+      interleave in TWO `vzipq_s32` rounds with the pairs two apart
+      (q02=zip(r0,r2), q13=zip(r1,r3), re-zip groups instead of
+      alternating — the first draft's vswpq attempt had the wrong
+      lane order and a wrong m*8 store base; fixed to m*16),
+      `vaddq_s32` into the aggregation. Bit-identical by
+      construction: exactly one integer per dimension, same table.
+      Math proven on x86 by an element-level shadow model
+      (/tmp/neon_shadow.c, not committed): 200,000 random dim-64/128
+      planes bit-identical to the scalar reference; intrinsic
+      spellings verify in the CI qemu leg (no cross toolchain in the
+      sandbox — no root for apt, no aarch64 gcc).
+- [x] M1b: wired into `hydra_build_aggregation()`'s v2 branch
+      (`use_neon = dim % 64 == 0` under `#if defined(__ARM_NEON)`;
+      NO runtime probe — NEON is base ISA on AArch64, a build
+      without NEON never defines the macro so the kernel is simply
+      absent; per layer: 64-dim chunks for A+B, `continue`; scalar
+      fallback for other dims). Makefile: `src/hydra_neon.h` added
+      to the hydra-run/hydra-test/large-model-test dependencies
+      (rebuild correctness on the CI ARM leg).
+- [x] M1c: `tests/test_engine.c` under `#ifdef __ARM_NEON`:
+      `test_neon_v2_unpack` (6 checks: random 3-layer dim-64 planes
+      vs `ref_unpack_v2_plane`, 4-code sweep ×4 hand-pinned,
+      dim-128 two-chunk) + `test_neon_v2_load_matches_scalar` (5
+      checks: all-4-codes-present proof, load rc, agg_a/agg_b
+      bit-exact vs in-test scalar decode of the same raw bytes,
+      32-token stream vs the documented formula driven by the
+      independent aggregates — the reference never sees the kernel).
+      Arch-neutral helpers `wr_header_version` +
+      `ref_unpack_v2_plane` moved ABOVE the NEON block (shared by
+      NEON + AVX2 suites; no use-before-definition, no duplication).
+      +11 ARM-only checks → baseline arm 140→151, x86 142 (updated
+      in this commit, dated comment; ARM re-measured by the CI qemu
+      leg).
+- [x] M1d: docs + records — CHANGELOG.md entry, README (v2 packing
+      roadmap line: three bit-identical load paths + parity gates;
+      NEON bullet: unpack kernel added), this file,
+      `.agent_memory/RESEARCH.md` (new: design, the two caught
+      design errors, shadow proof, CI facts). Notion sync: pending
+      the CI green (recorded there once the qemu leg confirms 151).
+- [x] M1e: full verification matrix GREEN (x86 sandbox; NEON executes
+      only in CI): make clean/make/test 0 warnings; hydra-test
+      142/0; jni-batch 86/0; large-model 7/0; baseline
+      `[471,386,385,386,385,386,385,386]` @ 42/8 UNCHANGED (v1 model
+      never enters the v2 branch); gguf_test 59/0; gguf_speed ok;
+      string_format_check 35/0/4; server_test ok;
+      console_train_test pass; contrast_check 17 AA; all 10
+      guardrail scripts PASS (llama_pin 5/0 + negative 7 proved —
+      needed a submodule re-init, pre-existing empty-clone state);
+      test_count_check ok (142, x86 baseline); release-version test
+      all cases (via /tmp/yvenv PyYAML); npm run lint 0; git status
+      clean apart from the 8 intended files.
+- [ ] M1f: push + PR (R17: user merges) + CI polling until the
+      **ARM neon-test leg** (qemu-aarch64-static) is green — that
+      leg is the only place the NEON kernel executes.
+
+## Previous task (2026-10-25 implementation round + Android keyboard/CI —
+merged as PR #47/#48/#49/#50)
+
 **2026-10-25 — Implementation round: Min-P sampling & repetition penalty,
 AVX2 x86-64 kernel, transformer primitives (RMSNorm/RoPE/SwiGLU),
 streaming ring-buffer KV cache with attention sinks, safetensors import

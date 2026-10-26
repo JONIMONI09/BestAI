@@ -124,10 +124,28 @@ jobs:
 
       - name: Build + run tests for aarch64 (NEON path active)
         run: |
+          set +e
           aarch64-linux-gnu-gcc-12 -O2 -static -Wall -Wextra \
               -Iinclude \
-              src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm
-          qemu-aarch64-static ./hydra-test-arm
+              src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm \
+              > /tmp/neon-build.log 2>&1
+          brc=$?
+          qemu-aarch64-static ./hydra-test-arm > /tmp/neon-run.log 2>&1
+          rrc=$?
+          set -e
+          if [ $brc -ne 0 ] || [ $rrc -ne 0 ]; then
+            # The log/blob hosts are not reachable from every network,
+            # so mirror the real failure output into check-run
+            # annotations (readable through the Checks API) before
+            # failing.
+            echo "::error::neon-test: build exit $brc, run exit $rrc"
+            { echo '--- build log (tail) ---'; tail -n 80 /tmp/neon-build.log;
+              echo '--- run log (tail) ---';  tail -n 40 /tmp/neon-run.log; } \
+              | while IFS= read -r line; do
+                  printf '::error::%s\n' "$line"
+                done
+            exit 1
+          fi
 
       # Drift gate. The count is PARSED from the binary's own output and
       # compared against the reviewed baseline for this architecture - no
@@ -207,10 +225,77 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build engine + tests
-        run: make all && make test
+        run: |
+          # Capture make's output so a failure can be mirrored into
+          # check-run annotations (the log/blob hosts are not
+          # reachable from every network; see the neon-test step).
+          set +e
+          make all > /tmp/hydra-build.log 2>&1
+          brc=$?
+          set -e
+          if [ $brc -ne 0 ]; then
+            echo "::error::build-test: 'make all' failed on $(uname -m)"
+            tail -n 80 /tmp/hydra-build.log \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            exit 1
+          fi
+          set +e
+          make test >> /tmp/hydra-build.log 2>&1
+          brc=$?
+          set -e
+          if [ $brc -ne 0 ]; then
+            echo "::error::build-test: 'make test' failed on $(uname -m)"
+            tail -n 80 /tmp/hydra-build.log \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            exit 1
+          fi
 
       - name: Run unit tests
-        run: ./hydra-test
+        run: |
+          set +e
+          ./hydra-test > /tmp/hydra-test-run.log 2>&1
+          rrc=$?
+          set -e
+          if [ $rrc -ne 0 ]; then
+            echo "::error::build-test: unit tests failed on $(uname -m), exit $rrc"
+            tail -n 40 /tmp/hydra-test-run.log \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            # On a segfault the buffered stdout of the test binary is
+            # lost and the stderr tail only shows the last model load —
+            # not where the fault happened. On ARM runners rebuild the
+            # same translation units with ASan+UBSan (same sources, no
+            # source change) and run again: the report names the
+            # exact faulting instruction and stack frames.
+            if [ "$(uname -m)" = "arm64" ]; then
+              echo "::error::build-test: rebuilding with -fsanitize=address,undefined for a crash trace"
+              set +e
+              cc -O1 -g -fsanitize=address,undefined -Iinclude \
+                 src/hydra_engine.c tests/test_engine.c -lm \
+                 -o /tmp/hydra-test-asan > /tmp/hydra-asan-build.log 2>&1
+              arc=$?
+              set -e
+              if [ $arc -eq 0 ]; then
+                set +e
+                /tmp/hydra-test-asan > /tmp/hydra-asan-run.log 2>&1
+                arcr=$?
+                set -e
+                echo "::error::build-test: ASan run exit $arcr"
+                if grep -q "ERROR: " /tmp/hydra-asan-run.log; then
+                  grep -n -m 1 -A 40 "ERROR: " /tmp/hydra-asan-run.log \
+                    | head -n 60 \
+                    | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+                else
+                  tail -n 30 /tmp/hydra-asan-run.log \
+                    | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+                fi
+              else
+                echo "::error::build-test: ASan build failed"
+                tail -n 20 /tmp/hydra-asan-build.log \
+                  | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+              fi
+            fi
+            exit 1
+          fi
 
       # Drift gate. The count is PARSED from the binary's own output and
       # compared against the reviewed baseline - no number is hard-coded
