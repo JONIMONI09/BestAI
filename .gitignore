@@ -40,11 +40,9 @@ __pycache__/
 .vscode/
 .idea/
 
-# Local agent workspace (session research, mirrors of external notes).
-# Deliberately never committed: it is working memory, not a deliverable, and
-# a mirror of a Notion page in git would drift from the original.
-.agent_memory/
-RESEARCH.md
+# .agent_memory/ and the top-level RESEARCH.md are IN the repo on purpose
+# (owner decision 2026-10-26, AGENTS.md §5): permanent research record that
+# must be kept current — an agent may append to it, never ignore or delete it.
 # Console artefacts (generated models, vocabularies)
 models/trained/
 models/vocab/

@@ -1,0 +1,160 @@
+# RESEARCH.md — permanent research record (in-repo on purpose)
+
+> **This file lives in the repository by owner decision (2026-10-26).** It is
+> the long-term home for investigations that must survive across sessions:
+> crash root causes, CI architecture, research with follow-up obligations.
+>
+> **Keep it current (AGENTS.md §5):** every non-trivial investigation appends
+> one section here before the session ends — date, question, method
+> (commands / links), finding, resolution, pointer to the permanent artifact
+> (guard, test, doc). Do not turn this into a changelog — `CHANGELOG.md` is
+> the user-facing log; this is the evidence trail.
+
+## Index
+
+| Date | Topic | Outcome |
+|---|---|---|
+| 2026-10-26 | Compose chat-tab crash (infinite max height) | fixed + regression guard = CI gate |
+| 2026-10-26 | CI speed (measured bottleneck, not the obvious one) | Android toolchain caches shipped |
+| 2026-10-26 | Issue auto-close from CI (2026 patterns) | `tools/issue_verify.py` + workflow shipped |
+| 2026-10-26 | Code-scanning API access from an Actions token | blocked; workaround channels documented |
+| 2026-10-26 | Sandbox tool inventory + install channels | measured; policy in AGENTS.md §6 |
+
+---
+
+## 1. Compose chat-tab crash (2026-10-26) — RESOLVED
+
+**Question:** user crash on Android 15 (arm64, API 35), Hydra-Stone 1.0.25/1.0.26,
+every chat-tab composition: `IllegalStateException: … measured with an infinite
+max height and Compose doesn't support this` inside
+`Scroll.kt → CheckScrollableContainerConstraints → onRemeasure →
+RowColumnMeasurePolicy.kt:119 → Column.kt:208 → BoxWithConstraints.kt:67/70 →
+LazyColumn measure` (foundation **1.7.3** via Compose BOM 2024.09.03).
+
+**Method:** fetched the foundation v1.7.3 sources from the JetBrains
+`compose-multiplatform-core` mirror (tags v1.7.0–v1.7.3; identical line maps)
+and mapped every crash frame 1:1 to the code:
+`CheckScrollableContainerConstraints.kt:35` (the throwing check),
+`Scroll.kt:407/416` (verticalScroll passes `maxHeight = 1e9` into a parent with
+infinite max constraint), `Size.kt:699/838` (constraint propagation),
+`RowColumnMeasurePolicy.kt:119` (Column child measurement), `Column.kt:208`,
+`BoxWithConstraints.kt:67/70` (infinite constraint passthrough).
+
+**Root cause (PR #50 regression, `HydraApp.kt`):** the ChatTab header —
+itself `Modifier.verticalScroll { ... }` — was nested **lexically** inside the
+chat list's `Column { verticalScroll { LazyColumn { … } } }` body. The header
+measures with an infinite max height ⇒ the inner `verticalScroll` throws at
+measure time, on every composition. A *purely lexical* scanner misses this
+class: the crash pair crosses a composable boundary (the header is a lambda
+passed as a parameter, defined at file level). **Lesson: nesting detectors for
+this crash class must cross composable boundaries (call-site × same-file
+definition), not just count parentheses.**
+
+**Shipped (regression is permanent, per the crash protocol AGENTS.md §7):**
+
+| Artifact | Role |
+|---|---|
+| `android/.../ui/HydraApp.kt` | the fix: header de-scrolled; `AdaptiveHeaderSplit` keeps the header inside a bounded `BoxWithConstraints` height cap with `verticalScroll` applied only when the cap binds — exactly one vertical scrollable per column, invariant documented in its KDoc |
+| `tools/compose_scroll_guard.py` | detector: (a) lexical same-axis nesting in strict source regions, (b) same-axis nesting across a composable boundary (call-site × definition in the same file) |
+| `tests/fixtures/compose/scroll_nested_bad.kt` (4 findings), `scroll_lambda_bad.kt` (the crash shape), `scroll_ok.kt` (6 legal shapes, 0), `scroll_lambda_ok.kt` (the fix shape, 0) | negative + positive controls (R25) |
+| `tools/compose_scroll_check.sh` | CI gate 1g (lint job): scans all 13 real sources, self-tests against the fixtures, aborts the build on any finding or missing file |
+
+Verified before shipping: the **pre-fix** file (commit `d0c7679`) is detected
+with exactly the real pair (`header()` call/def) and the true finding counts on
+all fixtures. Guard output is parse-stable (`PASS/FAIL <path>:<line>:` lines).
+
+**How to reproduce the gate:** `bash tools/compose_scroll_check.sh`
+(exit 0 = clean; exit 1 = finding or broken fixture).
+
+## 2. CI speed (2026-10-26) — MEASURED, CACHES SHIPPED
+
+**Question:** user report "QEMU > 15 min per run". **Measurement**
+(runs 40302888855 / 40302888863): the QEMU leg is **23 s** — the real costs
+were the two **uncached** Android jobs: **APK 7 m 23 s** (fresh SDK + Gradle
+every run) and **lint 4 m 38 s** (second fresh SDK). CodeQL/remaining jobs
+< 1 m 15 s each.
+
+**Shipped (cache miss = byte-identical to the old path ⇒ zero-risk):**
+
+- `.github/actions/setup-android/action.yml` rewritten: SDK → `$HOME/android-sdk`,
+  Gradle → `$HOME/gradle-dist/gradle-8.7` (cacheable `$HOME` roots instead of
+  `$RUNNER_TEMP`), skip-all-downloads guard when every pinned package is
+  already present (exit 0 after `sdkmanager --list_installed`), `gradle`
+  input (lint.yml passes `false` — it needs the SDK but not the distribution),
+  same env contract (`ANDROID_HOME`, `GRADLE_BIN`).
+- `ci.yml` android-apk + `lint.yml` android-lint: `actions/cache/restore@v4`
+  (SDK key **identical** in both jobs ⇒ one shared warm cache; deps key
+  `gradle-deps-…-gradle8.7-<hash of android build files>` with restore-keys
+  prefix) before setup; saves at job end (`SDK: if cache-hit != 'true'`;
+  `deps: if success() && cache-hit != 'true'` — a red build never poisons a
+  good dependency cache).
+- Partial restores are safe by construction: the guard only skips when *all*
+  pins are present; otherwise `sdkmanager`/Gradle add only what is missing.
+
+**Expected:** first run after merge ≈ today (extra: one cache upload); every
+subsequent Android run skips all downloads. QEMU stays as is (23 s, not worth
+complicating).
+
+## 3. Issue auto-close from CI (2026-10-26) — RESEARCHED, SHIPPED
+
+**Question:** close issues automatically when their fix is verified.
+
+**Research (2026 patterns):** (1) the standard mechanism is the
+`gh` CLI — `gh issue close <n> --comment "…"` with
+`GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and job-level
+`permissions: issues: write` (the default token is read-only); third-party
+"close-issue" actions are deprecated in favor of the CLI. (2) Reference
+implementation 2026: amd/gaia PR #5408 — a *bot-alert* issue is closed only
+when the check behind it actually ran and passed in the resolving run;
+repeat failures edit the one open issue instead of filing new ones; a failed
+lookup fails loudly, a failed resolve closes nothing. (3) GitHub-native
+"Closes #N" in the PR body is the default for feature/fix issues — no
+workflow at all.
+
+**Shipped (follows the gaia semantics, no third-party action):**
+
+- `tools/issue_verify.py` (stdlib; PyYAML optional with a flat-parser
+  fallback that is itself the contract) reads `.github/issue-verifications.yml`,
+  finds each mapped **open** issue via `gh api`, runs every mapped gate via
+  `bash -o pipefail -c` (log → `/tmp/issue-verify.log`), and closes **only
+  when every gate passed** with an audit comment (issue summary, `main@<sha>`,
+  run URL, gate list, "reopen with context" note). `--dry-run` runs the gates
+  but never closes. Not-found/CLOSED issues skip.
+- `.github/workflows/issue-verify.yml`: `push` → main + `workflow_dispatch`,
+  permissions `contents: read, issues: write`.
+- `.github/issue-verifications.yml`: the mapping (first entry: issue 52).
+
+**Convention (AGENTS.md §8):** human feature/fix issues close natively via
+`Closes #N` in the PR body. Only issues that cannot be closed by a PR body
+(bot-style alerts, "check for problems" requests) get a mapping entry — and a
+mapping entry is a *promise*: the gates must be the actual proof, because the
+close is irreversible.
+
+## 4. Code-scanning API access from an Actions token (2026-10-26) — BLOCKED, WORKAROUNDS
+
+`gh api /repos/JONIMONI09/BestAI/code-scanning/alerts` **and**
+`/code-scanning/analyses` → **403** "Resource not accessible by integration"
+(the repo Actions token lacks security-events read; a PAT from the UI would
+need `Security: read`). Working channels for findings: (a) the CodeQL job logs
+of the last run (annotations are printed there), (b) the Security tab in the
+repo UI pasted into the issue/chat, (c) a `SECURITY_COMMAND_TOKEN`-style
+fine-grained PAT if the owner adds one as a secret (not requested — do not
+add secrets unilaterally).
+
+## 5. Sandbox tool inventory + install channels (2026-10-26) — MEASURED
+
+Arena sandbox (Debian 12, uid 1001, passwordless `sudo` present):
+
+| Tool | State | Working install channel |
+|---|---|---|
+| gcc / g++ / python3 / node / npm | present | — |
+| **Docker** (daemon + CLI) | absent, **not installable here** | apt blocked by egress policy (`deb.debian.org` unreachable); static binaries need `download.docker.com` (also off-allowlist); unprivileged runtime anyway. Re-test on a new sandbox: `sudo apt-get install -y docker.io && dockerd --version` |
+| QEMU user-static (aarch64) | absent, not installable here | same egress block; CI's `qemu-user-static` leg remains the ARM runtime |
+| aarch64 cross-compiler | absent, not installable here | **ziglang via pip works** (`python3 -m venv /tmp/zvenv && /tmp/zvenv/bin/pip install ziglang` → `zig cc -target aarch64-linux-gnu`) — proven NEON toolchain in this sandbox |
+| clang / javac / java | absent, not installable here | apt block; the JNI gate's SKIP-with-disclosure path is the honest local state |
+| PyYAML | present via `/tmp/yvenv` | `python3 -m venv /tmp/yvenv && /tmp/yvenv/bin/pip install pyyaml` (PEP 668 ⇒ venv) |
+
+**Policy (AGENTS.md §6):** reachable package channels in this sandbox are
+`registry.npmjs.org` and `pypi.org` (both verified PONG). **Try before
+declaring a tool missing** — and record in this file what worked and what
+didn't, with the exact commands.

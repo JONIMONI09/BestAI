@@ -1614,4 +1614,74 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       `-Werror`, cppcheck, ASan+UBSan 61/0, ESLint clean, `node --test`
       18/18, trainer test, JNI gate (2 native methods), gradle
       `assembleDebug assembleRelease lintDebug` = *No issues found*.
-- [ ] PR + merge — **user approval needed** (R14)
+- [x] PR #51 opened (2026-10-25), **merged by the user at `d0c7679`
+      (2026-10-26), tag `v1.0.26`** — CI on the merge commit 19/19 green
+      (all jobs incl. `neon-test` under qemu-aarch64-static, `build-test`,
+      `gpu-bench`, `jni-signatures`, `llama-pin`, `android-apk`, `android-lint`,
+      semgrep, CodeQL c-cpp + js-ts, `release-config`). M1 complete.
+
+## Round 2026-10-26 (post-M1: Compose crash, regression guard, CI caches, auto-close, memory in repo)
+
+- [x] **User crash report (10:57, Android 15 / arm64 / API 35, build
+      1.0.25/1.0.26): chat tab throws on every composition** — `measured
+      with an infinite max height and Compose doesn't support this`
+      (foundation 1.7.3, BOM 2024.09.03). Every crash frame mapped 1:1 to
+      the foundation source (line map verified identical v1.7.0–v1.7.3):
+      root cause = PR #50's `HydraApp.kt` — the ChatTab **header** (itself
+      `verticalScroll`) is nested inside the list body's
+      `Column { verticalScroll { LazyColumn } }` across a composable
+      boundary ⇒ inner scrollable measures with infinite max height ⇒
+      `CheckScrollableContainerConstraints` throws.
+- [x] **Fix (`HydraApp.kt`):** header de-scrolled; `AdaptiveHeaderSplit`
+      bounds the header in a `BoxWithConstraints` height cap and applies
+      `verticalScroll` only when the cap binds — invariant (one vertical
+      scrollable per column) documented in the KDoc. Verified by the guard
+      against the pre-fix source (compile in CI — no SDK in the sandbox).
+- [x] **Regression guard (crash protocol, AGENTS.md §7):**
+      `tools/compose_scroll_guard.py` (two detectors: lexical strict-region
+      nesting + lambda call-site × same-file definition — the boundary case
+      a lexical-only scanner misses) with 4 fixtures
+      (`tests/fixtures/compose/`: 2 bad [4 findings + the crash shape],
+      2 good [0]); gate `tools/compose_scroll_check.sh` = CI gate **1g**
+      (lint job). Verified 7/7: real 13 sources clean, pre-fix `d0c7679`
+      detected with the true pair, fixture counts exact (negative control
+      R25).
+- [x] **CI speed — measured, then fixed.** The reported "QEMU 15 min" is
+      not the CI reality (measured: neon-test 23 s); the real cost = two
+      uncached Android jobs (APK 7 m 23 s, lint 4 m 38 s). Shipped:
+      `setup-android` rewritten ($HOME roots, skip-if-pinned guard,
+      `gradle` input) + `actions/cache` in both Android jobs with one
+      shared SDK key and a deps key; cache miss = today's exact path
+      (zero risk); red builds never poison the deps cache.
+- [x] **Issue auto-close (2026 research, see RESEARCH.md §3):**
+      `tools/issue_verify.py` (stdlib, PyYAML optional) +
+      `.github/issue-verifications.yml` +
+      `.github/workflows/issue-verify.yml` (push→main + dispatch,
+      `issues: write`): runs the mapped gates, closes only when ALL pass,
+      audit comment with run URL; `--dry-run` verified end-to-end (both
+      gates green ⇒ #52 would close). Convention (AGENTS.md §8): normal
+      issues close natively via `Closes #N` in the PR body.
+- [x] **README roadmap audit (owner request):** all 7 roadmap claims
+      verified against the code (forward pass unwired, min-P, safetensors
+      stdlib-only, AVX2 + "no AVX-512", v2 packing + parity gates,
+      `.hydra2` unimplemented, KV cache) — all true; one precision note
+      added (NEON v2 unpack is AArch64-only).
+- [x] **Memory into the repo (owner request):** `.agent_memory/RESEARCH.md`
+      created as the permanent in-repo research record (5 sections, incl.
+      crash line map, CI cache architecture, tool inventory); the
+      gitignore rule that kept it local removed; AGENTS.md §5 says the
+      path must be kept current. New AGENTS.md §6 (missing tools →
+      install, with the measured sandbox channels), §7 (crash protocol),
+      §8 (issue conventions).
+- [x] **Sandbox tool inventory (owner request "schau dir alle an"):**
+      gcc/g++/python3/node/npm present; Docker/QEMU/aarch64-gcc/clang/java
+      absent and **not installable in this sandbox** (apt egress blocked;
+      verified, RESEARCH.md §5) — Docker cannot be installed here, and no
+      gate needs a container runtime; zig-via-pip is the proven ARM
+      toolchain substitute.
+- [x] Issues audit: the only open issue is #52 "Problems?" (2026-10-26) —
+      the in-issue version of this round's request; mapped for auto-close.
+      Code-scanning alerts API: 403 for the Actions token on both
+      endpoints (documented in RESEARCH.md §4; findings available via
+      CodeQL job logs / Security tab).
+- [ ] Local gate suite + docs (CHANGELOG) + commit + PR (R17).
