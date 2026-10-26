@@ -94,7 +94,7 @@
 # compile on every architecture - re-measure on the ARM CI leg.
 #
 # The M-G .hydra2 container suite (tests/test_hydra2_container.c,
-# 118 checks) runs as its own binary `hydra2-test` (like
+# 120 checks) runs as its own binary `hydra2-test` (like
 # large-model-test / jni-batch-test) and is executed + failure-gated in
 # CI; it is deliberately NOT folded into this one-number-per-arch
 # baseline, which tracks the main suite only.

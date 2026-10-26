@@ -37,6 +37,15 @@
 
 #include "hydra_v2_container.h"
 
+/* The reader loads exactly three regions whole into RAM (metadata K/V
+ * block, tensor directory, expert directory); trunk and expert payloads
+ * are streamed with pread. Hostile multi-giB headers could otherwise
+ * demand multi-giB allocations bounded only by file size; this cap is
+ * far above any real control region (a 1 MiB expert directory holds
+ * ~21,000 entries) and bounds what a header can force. Recorded in
+ * FORMAT-V2.md as an implementation decision (2026-10-26). */
+#define HYDRA2_MAX_CONTROL_REGION (256u * 1024u * 1024u)
+
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -117,6 +126,7 @@ static int refuse(int rc, const char *fmt, ...)
     va_list ap;
     fprintf(stderr, "[Hydra2] ");
     va_start(ap, fmt);
+    /* flawfinder: ignore - CWE-134 false positive: every refuse() call site passes a compile-time literal format string (arguments are values, never the format; verified by grep). */
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
@@ -568,6 +578,23 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                             "exist");
             goto fail;
         }
+    }
+
+    /* Control-region cap (see HYDRA2_MAX_CONTROL_REGION): the file-size
+     * validation above bounds these by the file; the cap bounds them by a
+     * constant, so no header can force an allocation beyond it. */
+    if (c->metadata_bytes > HYDRA2_MAX_CONTROL_REGION ||
+        c->tensor_dir_bytes > HYDRA2_MAX_CONTROL_REGION ||
+        c->expert_dir_bytes > HYDRA2_MAX_CONTROL_REGION) {
+        rc = refuse(HYDRA2_E_META_OOB,
+                    "control region cap: metadata/tensor-dir/expert-dir "
+                    "bytes (%llu/%llu/%llu) exceed the %llu-byte reader "
+                    "cap (FORMAT-V2.md implementation decision)",
+                    (unsigned long long)c->metadata_bytes,
+                    (unsigned long long)c->tensor_dir_bytes,
+                    (unsigned long long)c->expert_dir_bytes,
+                    (unsigned long long)HYDRA2_MAX_CONTROL_REGION);
+        goto fail;
     }
 
     /* Directory counts: overflow-checked BEFORE the multiply (5.1.3),
@@ -1107,11 +1134,15 @@ int hydra2_route_top_k(const float *logits, uint32_t n_experts,
             int skip = 0;
             for (uint32_t j = 0; j < k; j++)
                 if (chosen[j] == i) { skip = 1; break; }
-            if (skip) continue;
-            if (best < 0) { best = (int32_t)i; continue; }
-            if (logits[i] > logits[(uint32_t)best] ||
-                (logits[i] == logits[(uint32_t)best] &&
-                 (int32_t)i < best))
+            /* Single condition, single assignment (a branch chain with
+             * two identical bodies is what clang-tidy's branch-clone
+             * flags). best < 0 short-circuits before any comparison
+             * touches logits[best]. */
+            if (!skip &&
+                (best < 0 ||
+                 logits[i] > logits[(uint32_t)best] ||
+                 (logits[i] == logits[(uint32_t)best] &&
+                  (int32_t)i < best)))
                 best = (int32_t)i;
         }
         if (best < 0)

@@ -2985,11 +2985,20 @@ static void test_v4_reproducible_and_kv_progression(void)
     /* (a) reproducibility: two fresh engines, identical setup. */
     HydraEngine a, b;
     int ok = hydra_engine_load(&a, pa) == 0 && hydra_engine_load(&b, pa) == 0;
+    /* Chained stream: input of step s is the output of step s-1,
+     * starting from token 5. (The older form sa[s] ? sa[s-1] : 5 was
+     * runtime-safe via ternary short-circuit but read as an
+     * out-of-bounds access to static analyzers - cppcheck negativeIndex,
+     * CI red 2026-10-26; this form is the same semantics, no guard
+     * expression to get wrong.) */
     uint16_t sa[24] = {0}, sb[24] = {0};
+    uint16_t ina = 5, inb = 5;
     for (int s = 0; s < 24 && ok; ++s) {
-        if (hydra_transformer_forward_step(&a, sa[s] ? sa[s-1] : 5, &sa[s], NULL) != 0 ||
-            hydra_transformer_forward_step(&b, sb[s] ? sb[s-1] : 5, &sb[s], NULL) != 0)
+        if (hydra_transformer_forward_step(&a, ina, &sa[s], NULL) != 0 ||
+            hydra_transformer_forward_step(&b, inb, &sb[s], NULL) != 0)
             ok = 0;
+        ina = sa[s];
+        inb = sb[s];
     }
     CHECK(ok && memcmp(sa, sb, sizeof(sa)) == 0,
           "v4: frische Engines -> bit-identischer 24-Token-Stream");

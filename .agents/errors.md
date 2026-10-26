@@ -37,7 +37,7 @@
   self-contained (two flat frees) and is called before **every**
   failure return in `parse_metadata`; (3) the branched allocation
   above. All three are covered by `tests/test_hydra2_container.c`
-  (118 checks, ASan+UBSan clean, zero leaks) and by the CI
+  (120 checks, ASan+UBSan clean, zero leaks) and by the CI
   `gcc -fanalyzer` step on all three C files.
 - **Prevention:** every failure path that formats file data must
   capture the bytes into locals before any free — the message is

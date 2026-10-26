@@ -436,7 +436,7 @@ jobs:
       - name: Hydra2 container (validation, routing, streaming)
         run: |
           python3 tools/make_model.py .hydra2-pyfix.hydra2 --v2
-          HYDRA2_PY_FIXTURE="$PWD/.hydra2-pyfix.hydra2" ./hydra2-test
+          ./hydra2-test "$PWD/.hydra2-pyfix.hydra2"
 
       - name: Runtime smoke test
         run: |

@@ -210,6 +210,17 @@ diagram says regions are "aligned" without a value; the reader enforces
 `tensor_dir_offset`, `expert_dir_offset`, `trunk_offset`, `experts_offset`)
 and for every tensor payload offset inside the trunk. Expert payload offsets
 are not aligned individually — they are contiguous in directory order, which
+
+**Reader cap `[CODE]` (implementation decision, 2026-10-26).** The reader
+loads exactly three regions whole into RAM — the metadata K/V block, the
+tensor directory and the expert directory (trunk payloads and expert
+payloads are streamed, one `pread` each). A hostile multi-giB header could
+therefore demand multi-giB allocations bounded only by the file size; the
+reader caps each of those three regions at **256 MiB** and refuses larger
+headers with a specific message. Real control regions stay far below the
+cap (a 1 MiB expert directory already holds ~21,000 entries), so the cap
+only rejects files no real model can be. It is checked at header
+validation, before any region is read.
 is the property that makes one expert one `pread`.
 
 ```

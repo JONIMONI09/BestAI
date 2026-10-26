@@ -46,13 +46,15 @@
 
 static int g_tests = 0, g_fail = 0;
 
-#define CHECK(cond, ...) do { \
+/* Non-variadic on purpose: the format string at the printf call must be
+ * a compile-time constant (flawfinder CWE-134, the same discipline as
+ * test_engine.c). CHECKs that need values format them into a buffer
+ * first (the snprintf call next to the CHECK). */
+#define CHECK(cond, msg) do { \
     g_tests++; \
     if (!(cond)) { \
         g_fail++; \
-        printf("  FAIL %s:%d: ", __FILE__, __LINE__); \
-        printf(__VA_ARGS__); \
-        printf("\n"); \
+        printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
     } \
 } while (0)
 
@@ -367,6 +369,7 @@ static int file_contains(const char *path, const char *needle)
 #define V1PATH  "/tmp/hydra2_v1ref.hydra"
 #define SYMLINK "/tmp/hydra2_link.hydra2"
 #define CAPPATH "/tmp/hydra2_cap.stderr"
+#define CAPFILE "/tmp/hydra2_capfile.hydra2"
 
 static void make_dirs(void)
 {
@@ -409,15 +412,16 @@ static int open_mutated(mutate_fn fn)
 static void test_crc_known_answers(void)
 {
     section("crc32 known answers");
-    CHECK(hydra2_crc32((const uint8_t *)"", 0) == 0x00000000u,
-          "empty crc should be 0, got 0x%08X", hydra2_crc32((const uint8_t *)"", 0));
-    CHECK(hydra2_crc32((const uint8_t *)"123456789", 9) == 0xCBF43926u,
-          "crc32('123456789') should be 0xCBF43926, got 0x%08X",
-          hydra2_crc32((const uint8_t *)"123456789", 9));
+        char mb_412[160];
+    snprintf(mb_412, sizeof(mb_412), "empty crc should be 0, got 0x%08X", hydra2_crc32((const uint8_t *)"", 0));
+    CHECK(hydra2_crc32((const uint8_t *)"", 0) == 0x00000000u, mb_412);
+        char mb_414[160];
+    snprintf(mb_414, sizeof(mb_414), "crc32('123456789') should be 0xCBF43926, got 0x%08X", hydra2_crc32((const uint8_t *)"123456789", 9));
+    CHECK(hydra2_crc32((const uint8_t *)"123456789", 9) == 0xCBF43926u, mb_414);
     /* "abc" -> 0x352441C2 (IEEE) */
-    CHECK(hydra2_crc32((const uint8_t *)"abc", 3) == 0x352441C2u,
-          "crc32('abc') should be 0x352441C2, got 0x%08X",
-          hydra2_crc32((const uint8_t *)"abc", 3));
+        char mb_418[160];
+    snprintf(mb_418, sizeof(mb_418), "crc32('abc') should be 0x352441C2, got 0x%08X", hydra2_crc32((const uint8_t *)"abc", 3));
+    CHECK(hydra2_crc32((const uint8_t *)"abc", 3) == 0x352441C2u, mb_418);
 }
 
 static void test_happy_path(void)
@@ -427,7 +431,9 @@ static void test_happy_path(void)
 
     hydra2_container_t c;
     int rc = hydra2_open(&c, FIXPATH);
-    CHECK(rc == HYDRA2_OK, "open of a valid fixture failed: %d", rc);
+        char mb_430[160];
+    snprintf(mb_430, sizeof(mb_430), "open of a valid fixture failed: %d", rc);
+    CHECK(rc == HYDRA2_OK, mb_430);
     if (rc != HYDRA2_OK) return;
 
     CHECK(c.version_major == 2 && c.version_minor == 0, "version != 2.0");
@@ -435,21 +441,27 @@ static void test_happy_path(void)
     {
         struct stat fst;
         CHECK(stat(FIXPATH, &fst) == 0, "stat fixture");
-        CHECK(c.file_size == (uint64_t)fst.st_size,
-              "file_size %llu != real size %lld",
-              (unsigned long long)c.file_size, (long long)fst.st_size);
+                char mb_438[160];
+        snprintf(mb_438, sizeof(mb_438), "file_size %llu != real size %lld", (unsigned long long)c.file_size, (long long)fst.st_size);
+        CHECK(c.file_size == (uint64_t)fst.st_size, mb_438);
     }
-    CHECK(c.tensor_dir_count == 4, "tensor_dir_count %llu != 4",
-          (unsigned long long)c.tensor_dir_count);
-    CHECK(c.expert_dir_count == 8, "expert_dir_count %llu != 8",
-          (unsigned long long)c.expert_dir_count);
-    CHECK(c.top_k == FX_TOPK, "top_k %u != %u", c.top_k, (unsigned)FX_TOPK);
-    CHECK(c.experts_per_layer == FX_EXPERTS, "epl %u != %u",
-          c.experts_per_layer, (unsigned)FX_EXPERTS);
+        char mb_442[160];
+    snprintf(mb_442, sizeof(mb_442), "tensor_dir_count %llu != 4", (unsigned long long)c.tensor_dir_count);
+    CHECK(c.tensor_dir_count == 4, mb_442);
+        char mb_444[160];
+    snprintf(mb_444, sizeof(mb_444), "expert_dir_count %llu != 8", (unsigned long long)c.expert_dir_count);
+    CHECK(c.expert_dir_count == 8, mb_444);
+        char mb_446[160];
+    snprintf(mb_446, sizeof(mb_446), "top_k %u != %u", c.top_k, (unsigned)FX_TOPK);
+    CHECK(c.top_k == FX_TOPK, mb_446);
+        char mb_447[160];
+    snprintf(mb_447, sizeof(mb_447), "epl %u != %u", c.experts_per_layer, (unsigned)FX_EXPERTS);
+    CHECK(c.experts_per_layer == FX_EXPERTS, mb_447);
     CHECK(c.layers == FX_LAYERS && c.moe_layers == FX_LAYERS, "layers wrong");
     CHECK(c.router_runs_ahead == 1, "router_runs_ahead != 1");
-    CHECK(strcmp(c.architecture, "moe-transformer-v1") == 0,
-          "architecture '%s' wrong", c.architecture);
+        char mb_451[160];
+    snprintf(mb_451, sizeof(mb_451), "architecture '%s' wrong", c.architecture);
+    CHECK(strcmp(c.architecture, "moe-transformer-v1") == 0, mb_451);
 
     const hydra2_tensor_entry_t *t;
     CHECK(hydra2_find_tensor(&c, "router.0", &t) == HYDRA2_OK, "find router.0");
@@ -469,12 +481,13 @@ static void test_happy_path(void)
     uint8_t tbuf[32] = {0};
     CHECK(hydra2_read_tensor(&c, t, tbuf, sizeof(tbuf)) == HYDRA2_OK,
           "read_tensor router.0");
-    CHECK(tbuf[0] == 7 && tbuf[15] == (uint8_t)((15 * 31 + 7) & 0xFF),
-          "trunk payload bytes wrong (got %02X %02X)", tbuf[0], tbuf[15]);
+        char mb_472[160];
+    snprintf(mb_472, sizeof(mb_472), "trunk payload bytes wrong (got %02X %02X)", tbuf[0], tbuf[15]);
+    CHECK(tbuf[0] == 7 && tbuf[15] == (uint8_t)((15 * 31 + 7) & 0xFF), mb_472);
     /* too-small buffer */
-    CHECK(hydra2_read_tensor(&c, t, tbuf, 8) == HYDRA2_E_CAP,
-          "read_tensor with cap 8 should be E_CAP, got %d",
-          hydra2_read_tensor(&c, t, tbuf, 8));
+        char mb_475[160];
+    snprintf(mb_475, sizeof(mb_475), "read_tensor with cap 8 should be E_CAP, got %d", hydra2_read_tensor(&c, t, tbuf, 8));
+    CHECK(hydra2_read_tensor(&c, t, tbuf, 8) == HYDRA2_E_CAP, mb_475);
 
     /* stream expert (0,0): 64 bytes, CRC must pass on read */
     const hydra2_expert_entry_t *e0;
@@ -483,9 +496,9 @@ static void test_happy_path(void)
     CHECK(hydra2_read_expert(&c, e0, ebuf, sizeof(ebuf)) == HYDRA2_OK,
           "read_expert (0,0)");
     /* payload[0] byte pattern: (i*97 + b*13 + 5), i=0 -> b*13+5 */
-    CHECK(ebuf[0] == 5 && ebuf[1] == 18 && ebuf[63] == (uint8_t)((63 * 13 + 5) & 0xFF),
-          "expert payload bytes wrong (got %02X %02X %02X)",
-          ebuf[0], ebuf[1], ebuf[63]);
+        char mb_486[160];
+    snprintf(mb_486, sizeof(mb_486), "expert payload bytes wrong (got %02X %02X %02X)", ebuf[0], ebuf[1], ebuf[63]);
+    CHECK(ebuf[0] == 5 && ebuf[1] == 18 && ebuf[63] == (uint8_t)((63 * 13 + 5) & 0xFF), mb_486);
     CHECK(hydra2_crc32(ebuf, 64) == e0->crc32,
           "streamed expert CRC disagrees with the directory");
     CHECK(hydra2_read_expert(&c, e0, ebuf, 32) == HYDRA2_E_CAP,
@@ -495,12 +508,17 @@ static void test_happy_path(void)
     float logits[4] = {0.5f, 3.0f, 1.25f, -2.0f};
     uint32_t sel[2]; float w[2];
     rc = hydra2_route_top_k(logits, 4, 2, sel, w);
-    CHECK(rc == HYDRA2_OK, "route_top_k failed: %d", rc);
+        char mb_498[160];
+    snprintf(mb_498, sizeof(mb_498), "route_top_k failed: %d", rc);
+    CHECK(rc == HYDRA2_OK, mb_498);
     if (rc == HYDRA2_OK) {
-        CHECK(sel[0] == 1 && sel[1] == 2,
-              "top-2 should be experts {1,2}, got {%u,%u}", sel[0], sel[1]);
+                char mb_500[160];
+        snprintf(mb_500, sizeof(mb_500), "top-2 should be experts {1,2}, got {%u,%u}", sel[0], sel[1]);
+        CHECK(sel[0] == 1 && sel[1] == 2, mb_500);
         float sum = w[0] + w[1];
-        CHECK(fabsf(sum - 1.0f) < 1e-6f, "weights sum %f != 1", sum);
+                char mb_503[160];
+        snprintf(mb_503, sizeof(mb_503), "weights sum %f != 1", sum);
+        CHECK(fabsf(sum - 1.0f) < 1e-6f, mb_503);
         CHECK(w[0] > w[1], "weight of the larger logit should be bigger");
     }
 
@@ -521,8 +539,9 @@ static void test_happy_path(void)
     float tie[4] = {2.0f, 1.0f, 2.0f, 0.0f};
     uint32_t ts[2]; float tw[2];
     CHECK(hydra2_route_top_k(tie, 4, 2, ts, tw) == HYDRA2_OK, "tie route");
-    CHECK(ts[0] == 0 && ts[1] == 2,
-          "tie should pick {0,2} (lower id first), got {%u,%u}", ts[0], ts[1]);
+        char mb_524[160];
+    snprintf(mb_524, sizeof(mb_524), "tie should pick {0,2} (lower id first), got {%u,%u}", ts[0], ts[1]);
+    CHECK(ts[0] == 0 && ts[1] == 2, mb_524);
 
     /* top_k == n_experts selects all */
     float all4[4] = {0.1f, 0.2f, 0.3f, 0.4f};
@@ -729,7 +748,9 @@ static void test_expert_refusals(void)
             hydra2_find_expert(&c, 0, 0, &e);
             uint8_t b[128];
             int r = hydra2_read_expert(&c, e, b, sizeof(b));
-            CHECK(r == HYDRA2_E_CRC, "read with bad stored crc should be E_CRC, got %d", r);
+                        char mb_732[160];
+            snprintf(mb_732, sizeof(mb_732), "read with bad stored crc should be E_CRC, got %d", r);
+            CHECK(r == HYDRA2_E_CRC, mb_732);
             hydra2_close(&c);
         }
     }
@@ -764,7 +785,9 @@ static void test_expert_read_crc(void)
             CHECK(file_contains(CAPPATH, "layer 0, expert 0"),
                   "CRC refusal did not name the expert");
         }
-        CHECK(r == HYDRA2_E_CRC, "corrupted expert byte should be E_CRC, got %d", r);
+                char mb_767[160];
+        snprintf(mb_767, sizeof(mb_767), "corrupted expert byte should be E_CRC, got %d", r);
+        CHECK(r == HYDRA2_E_CRC, mb_767);
         hydra2_close(&c);
     }
 }
@@ -790,7 +813,9 @@ static void test_mutual_v1_v2_refusal(void)
     if (cap_stderr_begin(CAPPATH) == 0) {
         int rc = hydra_engine_load(&eng, FIXPATH);
         cap_stderr_end();
-        CHECK(rc == -5, "v1 loader on v2 file should return -5, got %d", rc);
+                char mb_793[160];
+        snprintf(mb_793, sizeof(mb_793), "v1 loader on v2 file should return -5, got %d", rc);
+        CHECK(rc == -5, mb_793);
         CHECK(file_contains(CAPPATH, "HYDRA2"),
               "v1 loader did not name the v2 magic");
         if (eng.mapped_weights) {
@@ -810,7 +835,9 @@ static void test_missing_and_symlink(void)
     CHECK(fresh_fixture() == 0, "fixture for symlink test");
     (void)unlink(SYMLINK);
     if (symlink(FIXPATH, SYMLINK) != 0) {
-        CHECK(0, "could not create symlink: %s", strerror(errno));
+                char mb_813[160];
+        snprintf(mb_813, sizeof(mb_813), "could not create symlink: %s", strerror(errno));
+        CHECK(0, mb_813);
         return;
     }
     CHECK(open_fixture(SYMLINK) == HYDRA2_E_OPEN,
@@ -824,34 +851,92 @@ static void test_missing_and_symlink(void)
  * (make test-run, CI) always set HYDRA2_PY_FIXTURE to a freshly
  * generated file; running the binary without it is a local mistake and
  * this test fails loudly instead of silently skipping. */
+/* The reader's control-region cap (HYDRA2_MAX_CONTROL_REGION): a header
+ * that fits inside the file but exceeds the cap must be refused before
+ * any region is read (that is what bounds the allocation CodeQL's
+ * untrusted-size check asks for). The file is sparse - header plus
+ * ftruncate: the refusal happens before the first region read, so the
+ * zero-filled remainder is never touched. The header CRC is deliberately
+ * left stale: the cap check runs BEFORE header-CRC verification, and if
+ * a future reorder changes that, this test turns red (good). */
+static void test_control_region_cap(void)
+{
+    section("control region cap (256 MiB reader cap)");
+    fx f;
+    if (build_fx(&f) != 0) {
+        g_tests++;
+        g_fail++;
+        printf("  FAIL: build fixture for cap test\n");
+        return;
+    }
+    const uint64_t big = 256ull * 1024ull * 1024ull + 4096ull;
+    p64(&f, f.h_meta_bytes, big);
+    p64(&f, f.h_fsize, 128ull + big);
+    (void)unlink(CAPFILE);
+    FILE *fo = fopen(CAPFILE, "wb");
+    if (!fo || fwrite(f.buf, 1, 128, fo) != 128 ||
+        ftruncate(fileno(fo), (off_t)(128ull + big)) != 0) {
+        g_tests++;
+        g_fail++;
+        printf("  FAIL: sparse cap file\n");
+        if (fo) fclose(fo);
+        free_fx(&f);
+        (void)unlink(CAPFILE);
+        return;
+    }
+    fclose(fo);
+    free_fx(&f);
+    if (cap_stderr_begin(CAPPATH) == 0) {
+        int rc = open_fixture(CAPFILE);
+        char mb1[160];
+        snprintf(mb1, sizeof(mb1), "cap: expected E_META_OOB, got %d", rc);
+        cap_stderr_end();
+        CHECK(rc == HYDRA2_E_META_OOB, mb1);
+        CHECK(file_contains(CAPPATH, "control region cap"),
+              "cap refusal did not name the cap");
+    }
+    (void)unlink(CAPFILE);
+}
+
+static const char *g_fixture = NULL; /* argv[1], set in main */
+
 static void test_python_fixture_cross_check(void)
 {
     section("cross-implementation: tools/make_model.py --v2 fixture");
-    const char *path = getenv("HYDRA2_PY_FIXTURE");
+    /* The fixture path is argv[1], not an environment variable: argv is
+     * the supported entry point (the Makefile/CI pass it explicitly) and
+     * keeps the path out of the env-taint class static analysis flags
+     * for env-derived open() arguments. */
+    const char *path = g_fixture;
     if (!path) {
         g_tests++;
         g_fail++;
-        printf("  FAIL: HYDRA2_PY_FIXTURE is not set - generate a fixture "
-               "first (make test-run does this; a bare ./hydra2-test is "
-               "not a supported entry point)\n");
+        printf("  FAIL: no fixture path argument - pass the "
+               "python-generated fixture as argv[1] (make test-run and "
+               "CI do this; a bare ./hydra2-test is not a supported "
+               "entry point)\n");
         return;
     }
     hydra2_container_t c;
     int rc = hydra2_open(&c, path);
-    CHECK(rc == HYDRA2_OK, "python-generated fixture refused: %d", rc);
+        char mb_841[160];
+    snprintf(mb_841, sizeof(mb_841), "python-generated fixture refused: %d", rc);
+    CHECK(rc == HYDRA2_OK, mb_841);
     if (rc != HYDRA2_OK) return;
     CHECK(c.version_major == 2 && c.version_minor == 0, "py fixture version");
-    CHECK(strcmp(c.architecture, "moe-transformer-v1") == 0,
-          "py fixture architecture '%s'", c.architecture);
-    CHECK(c.top_k >= 1 && c.top_k <= c.experts_per_layer,
-          "py fixture top_k %u > epl %u", c.top_k, c.experts_per_layer);
-    CHECK(c.tensor_dir_count == (uint64_t)(c.layers + 2),
-          "py fixture tensors %llu != layers+2 (%u)",
-          (unsigned long long)c.tensor_dir_count, (unsigned)c.layers);
+        char mb_844[160];
+    snprintf(mb_844, sizeof(mb_844), "py fixture architecture '%s'", c.architecture);
+    CHECK(strcmp(c.architecture, "moe-transformer-v1") == 0, mb_844);
+        char mb_846[160];
+    snprintf(mb_846, sizeof(mb_846), "py fixture top_k %u > epl %u", c.top_k, c.experts_per_layer);
+    CHECK(c.top_k >= 1 && c.top_k <= c.experts_per_layer, mb_846);
+        char mb_848[160];
+    snprintf(mb_848, sizeof(mb_848), "py fixture tensors %llu != layers+2 (%u)", (unsigned long long)c.tensor_dir_count, (unsigned)c.layers);
+    CHECK(c.tensor_dir_count == (uint64_t)(c.layers + 2), mb_848);
+        char mb_851[160];
+    snprintf(mb_851, sizeof(mb_851), "py fixture experts %llu != layers*epl", (unsigned long long)c.expert_dir_count);
     CHECK(c.expert_dir_count ==
-          (uint64_t)(c.layers * c.experts_per_layer),
-          "py fixture experts %llu != layers*epl",
-          (unsigned long long)c.expert_dir_count);
+          (uint64_t)(c.layers * c.experts_per_layer), mb_851);
     /* every expert is exactly the nominal size declared in the metadata */
     uint64_t nominal = c.expert_bytes_typ;
     int all_nominal = 1;
@@ -882,14 +967,16 @@ static void test_python_fixture_cross_check(void)
     hydra2_close(&c);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 1) g_fixture = argv[1];
     make_dirs();
     test_crc_known_answers();
     test_happy_path();
     test_header_refusals();
     test_directory_count_refusals();
     test_metadata_refusals();
+    test_control_region_cap();
     test_tensor_refusals();
     test_expert_refusals();
     test_expert_read_crc();

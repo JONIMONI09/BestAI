@@ -155,7 +155,7 @@ jobs:
           python3 tools/make_model.py .hydra2-sanfix.hydra2 --v2
           ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
           UBSAN_OPTIONS=print_stacktrace=1 \
-            HYDRA2_PY_FIXTURE="$PWD/.hydra2-sanfix.hydra2" ./hydra2-test-san
+            ./hydra2-test-san "$PWD/.hydra2-sanfix.hydra2"
           rm -f .hydra2-sanfix.hydra2
 
       - name: Run CLI under sanitizers

@@ -62,7 +62,7 @@ test-run: hydra-test jni-batch-test large-model-test gguf-test hydra2-test
 	./jni-batch-test
 	./large-model-test
 	python3 tools/make_model.py $(CURDIR)/.hydra2-pyfix.hydra2 --v2
-	HYDRA2_PY_FIXTURE=$(CURDIR)/.hydra2-pyfix.hydra2 ./hydra2-test
+	./hydra2-test "$(CURDIR)/.hydra2-pyfix.hydra2"
 	rm -f $(CURDIR)/.hydra2-pyfix.hydra2
 
 # GPU feasibility benchmark, CPU reference only. The device build adds
