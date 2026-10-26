@@ -328,3 +328,21 @@ Lesson (R32): a "portability fix" that hardcodes one libc's
 feature-test semantics is a portability *bug* on every other libc;
 platform-conditional feature macros need a per-platform compile proof,
 and the proof belongs in the PR tier.
+
+First run of the macos-strict-scan job (PR #56) then found the third
+instance of the same drift class, inside the guard itself: step 3
+(the exact release-macos compile, syntax-only) **passed** - the
+Darwin fix is proven - but step 4 (apple_portability_check.sh)
+failed, because assertion (2) was host-centric: it demanded that a
+*plain* compile self-define both feature macros, which is correct on
+a glibc host but false on an Apple host, where the plain
+configuration IS the Apple configuration and must self-define
+nothing. Reworked, twice: first host-aware (Apple vs non-Apple
+branches, both proven by forced simulation), then **control-based** -
+the assertions compare against a control TU with the same includes
+and no defines, because even glibc's features.h re-emits marker
+defines of `_POSIX_C_SOURCE`/`_DEFAULT_SOURCE` once its own feature
+selection is active (measured: a plain Linux compile of
+hydra_engine.c carries 4 such lines, 2 of them glibc's markers).
+Only the difference to the control counts now; the assertions are
+header-agnostic and host-consistent.

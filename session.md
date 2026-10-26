@@ -1856,3 +1856,12 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       first time. Note: this session's branch is arena/be94e6b7-bestai
       (the earlier arena/91276612-bestai remote branch was deleted by
       GitHub when PR #55 merged).
+- [x] **PR #56 first CI run:** everything green EXCEPT the new
+      macos-strict-scan - and inside it: step 3 (exact release-macos
+      compile, syntax-only) PASSED = Darwin fix proven on real
+      headers; step 4 failed because apple_portability_check.sh was
+      host-centric (plain-compile assertion written for glibc is false
+      on Apple). Reworked: host-aware + control-based (control TU with
+      same includes sets the baseline; glibc marker defines measured
+      and handled); both branches proven by forced simulation.
+      RESEARCH.md section 10 extended.
