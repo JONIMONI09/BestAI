@@ -6,7 +6,7 @@
 > document says a benchmark will decide something, the benchmark has not been
 > run and the question is open.
 >
-> The canonical format specification is [`FORMAT-V2.md`](FORMAT-V2.md). This
+> The canonical format specification is [`FORMAT-V2.md`](../../docs/FORMAT-V2.md). This
 > document explains *why* that format, and what would have to be true for it to
 > be worth building.
 
@@ -415,5 +415,5 @@ Primary sources, fetched and read while writing this document:
 | `MADV_DONTNEED` on a shared mapping may not free pages immediately, but RSS drops | man7 `madvise(2)` — <https://man7.org/linux/man-pages/man2/madvise.2.html> |
 
 In-repository code cited above is listed by file and symbol in
-[`FORMAT-V2.md`](FORMAT-V2.md) § *Provenance rule*; the format itself is a
+[`FORMAT-V2.md`](../../docs/FORMAT-V2.md) § *Provenance rule*; the format itself is a
 specification and nothing in it is implemented.

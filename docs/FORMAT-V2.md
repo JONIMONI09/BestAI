@@ -47,7 +47,7 @@ The sparse-MoE design, by contrast, is the only one that changes **what is
 possible**: it makes models larger than RAM viable, because weights that are not
 resident are fetched on demand instead of demanded up front. That is the whole
 reason v2 exists (see §1), and the brief for the format is
-[`.agents/docs/HYDRA2-RESEARCH.md`](.agents/docs/HYDRA2-RESEARCH.md).
+[`.agents/docs/HYDRA2-RESEARCH.md`](../.agents/docs/HYDRA2-RESEARCH.md).
 
 **So:** the two passages above are kept, and clearly marked, rather than deleted
 — deleting a documented observation because it lost an argument is how a
@@ -70,7 +70,7 @@ Stated plainly, because the tensor table in §3.2 used to imply otherwise:
   format that converts to a **v1** `.hydra`. It is not a v2 reader and does not
   become one by being listed here.
 - The **research** that motivates the sparse-MoE path is in
-  [`.agents/docs/HYDRA2-RESEARCH.md`](.agents/docs/HYDRA2-RESEARCH.md). Its benchmark plan is
+  [`.agents/docs/HYDRA2-RESEARCH.md`](../.agents/docs/HYDRA2-RESEARCH.md). Its benchmark plan is
   explicitly **not yet run**; nothing in it may be quoted as a result.
 
 ## Provenance rule for this document

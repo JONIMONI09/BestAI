@@ -131,6 +131,18 @@ jobs:
       - name: Workflow lint (actionlint)
         run: bash tools/workflow_lint_check.sh
 
+      # Gate 1j (rules R33): the current round section of
+      # .agents/session.md must carry the session-start marker
+      # ('**Session start (R33):** <date>. Read: <files>'). The read
+      # protocol as prose (R1, AGENTS.md) was skipped in practice
+      # (owner report 2026-10-26); 2026 context research: prose-only
+      # rules are followed probabilistically and skip rates grow with
+      # session/context size - "only enforcement guarantees it". The
+      # gate makes a skipped read a red check and proves its detector
+      # with a negative-control fixture in-gate (R25).
+      - name: Session-start marker (R33)
+        run: bash tools/session_start_check.sh
+
       # On any lint failure, upload the captured diagnostics as a
       # workflow artifact so the error text is attached to the run.
       - name: Upload lint error report

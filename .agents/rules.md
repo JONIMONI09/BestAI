@@ -1,7 +1,7 @@
 # Working Rules — Hydra-Stone
 
 > Standing rules for the agent working in this repository.
-> Protocol details: `.claude/skills/session-workflow/SKILL.md`.
+> Protocol details: `.agents/skills/session-workflow/SKILL.md`.
 > Rules are added or changed when agreed with the user or learned from
 > a mistake (cross-reference the `errors.md` entry that motivated it).
 
@@ -100,7 +100,7 @@
     `aarch64-linux-gnu-gcc-12 -static` under `qemu-aarch64-static`
     for ARM without a device) and compare the actual outputs.
 
-## 6. Skills (`.claude/skills/*/SKILL.md`)
+## 6. Skills (`.agents/skills/*/SKILL.md`, tool discovery via `.claude/skills`)
 
 25. **R25 — A new lint gate must fail once.** Before a linter or CI gate
     counts as protection, it must be proven to fail on a deliberately
@@ -121,9 +121,6 @@
     `path.resolve` is lexical and follows no symlink; use `realpath` (or
     `O_NOFOLLOW`) so a symlink inside the allowed directory cannot point
     outside it. (→ errors.md: symlink model path)
-
-## 7. Skills (`.claude/skills/*/SKILL.md`)
-
 29. **R29 — Every SKILL.md starts with YAML frontmatter** delimited by
     `---` lines, containing at minimum `name` and `description`. A
     skill without valid frontmatter is rejected by the UI.
@@ -135,8 +132,11 @@
 30. **R30 — Validate frontmatter before committing**: parse the YAML,
     check `name` matches the directory name, check `description` is
     present and one sentence long, assert the frontmatter block is
-    ASCII-only.
-
+    ASCII-only. Skills follow the open Agent Skills format (2026):
+    frontmatter = always-loaded metadata (~100 tokens), body < 5000
+    tokens loaded on demand, longer material in `references/`/linked
+    docs loaded only when needed. Canonical location: `.agents/skills/`;
+    `.claude/skills` is a symlink for tool auto-discovery.
 31. **R31 — Every change goes through a pull request, in English.** No
     work is pushed straight to `main`: create a branch, open a PR, let the
     user merge (R14). All commit messages, PR titles, PR bodies, code
@@ -153,6 +153,29 @@
     the measurement cannot be taken in the current environment (no device,
     no emulator), the report says "blocked, not measured" - never an
     estimate dressed as a result.
+
+## 7. Session start, verifiable (added 2026-10-26)
+
+33. **R33 — The session-start read is mandatory AND verifiable.**
+    Before the first code-editing tool call of a session, the agent
+    reads, in this order: `AGENTS.md` → `.agents/session.md`
+    (current round only — the history lives in
+    `docs/SESSION-ARCHIVE.md`) → `.agents/errors.md` (top 3 entries)
+    → `.agents/rules.md` → `.agents/user.md` → `.agents/Environment.md`
+    (own section) → the `SKILL.md` of every skill the task touches.
+    Then, BEFORE the first code edit, the agent writes a session-start
+    marker into the current round section of `session.md`:
+    `**Session start (R33):** <date> (branch …). Read: <file list>.`
+    2026 evidence why this exists: rule files that are prose-only are
+    followed probabilistically and are skipped more often the longer
+    the session runs (context dilution; arXiv 2026-05: per-function
+    compliance drop); always-loaded docs over ~200 lines make agents
+    ignore instructions; "instructions raise the probability of the
+    behaviour you want; only enforcement guarantees it". The marker
+    makes skipping visible, and `tools/session_start_check.sh` (CI
+    gate, with in-gate negative control) turns a missing marker into a
+    red check. (→ errors.md: 2026-10-26 "the .agents read rule was
+    skipped")
 
 ## 8. When rules conflict
 

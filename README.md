@@ -291,7 +291,15 @@ address where `navigator.clipboard` does not exist.
 
 ## Quality Gates
 
-Every push and pull request runs the following. Each gate was verified locally **and** proven to fail on a deliberately reverted fix before being adopted — a linter that cannot fail is worthless.
+Every push and pull request runs the following, split into two tiers:
+**PRs and branch pushes run the lint/verify tier** (syntax checks,
+static analysis, sanitizers, Android Lint, the unit suite, the workflow
+gates 1h/1i/1j); the **heavy tier** (qemu NEON parity, full build +
+tests, the GPU bench, the Android APK) runs on **main pushes only** —
+a PR is mergeable when the lint tier is green, and main additionally
+carries the heavy tier. Each gate was verified locally **and** proven
+to fail on a deliberately reverted fix before being adopted — a linter
+that cannot fail is worthless.
 
 | Surface | Gate | Catches |
 |---|---|---|
@@ -316,7 +324,10 @@ Every push and pull request runs the following. Each gate was verified locally *
 | Security | CodeQL (`c-cpp`, `javascript-typescript`, `security-extended`) | taint flows from HTTP input into `open()`/`execFile` |
 | Security | Semgrep | pattern-based security rules |
 
-Local reproduction is documented in the `/engine-ci-verify` skill.
+Local reproduction is documented in the
+`.agents/skills/engine-ci-verify/SKILL.md` skill (the CI-identical
+gate order) and `.agents/skills/ci-triage/SKILL.md` (reading a red run
+without log access).
 
 ## Project Structure
 
@@ -339,15 +350,17 @@ Local reproduction is documented in the `/engine-ci-verify` skill.
 ├── docs/FORMAT.md             .hydra binary format specification
 ├── docs/GGUF-IMPORT.md        GGUF import, absmean ternarisation, limits
 ├── docs/FORMAT-V2.md          .hydra2 sparse-MoE format — CANONICAL v2 spec, no loader yet
+├── .agents/                     everything an agent reads: rules, errors, session, skills, docs
+├── .agents/rules.md                   33 standing rules (R1–R33)
+├── .agents/errors.md                  Every bug: symptom / cause / fix / prevention
+├── .agents/session.md                 Live session plan (old rounds: .agents/docs/SESSION-ARCHIVE.md)
+├── .agents/skills/                    Agent Skills (2026 spec); .claude/skills is a symlink here
 ├── .agents/docs/HYDRA2-RESEARCH.md    research spec: bounded measured memory, load strategies, ternary math
 ├── .agents/docs/RESEARCH.md           external research: BitNet b1.58 (W1.58A8), bitnet.cpp I2_S 2-bit packing
 ├── .agents/docs/ANDROID_SKILL.md      Android NDK/JNI integration guide (from experience)
 ├── .github/workflows/ci.yml       build, tests, ARM/NEON parity
 ├── .github/workflows/lint.yml     linters, sanitizers, CodeQL, Semgrep, Android Lint
 ├── .github/workflows/release.yml tag → installable APK + CLI binaries
-├── .agents/errors.md                  Every bug: symptom / cause / fix / prevention
-├── .agents/rules.md                   Standing working rules
-├── .agents/session.md                 Live session plan and history
 └── LICENSE                    GPL-3.0
 ```
 

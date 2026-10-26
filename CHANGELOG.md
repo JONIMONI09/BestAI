@@ -2,6 +2,166 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-26 (round 7) — rule adaptation (R33 + gate 1j), canonical Agent Skills in `.agents/skills/`, session.md slimming, all-.md audit
+
+1. **The read-before-work rule is now enforced, not prose.** Rule **R33**
+   (`.agents/rules.md`): at session start the agent reads
+   `AGENTS.md` → the current round of `.agents/session.md` →
+   `.agents/errors.md` (top entries) → `rules.md` → `user.md` →
+   `Environment.md` (own section) → the task-relevant skills, and writes
+   a verifiable marker `**Session start (R33):** <date> (branch …).
+   Read: <files>.` into the current round section BEFORE the first code
+   edit. New CI **gate 1j** (`tools/session_start_check.sh`, wired into
+   `ci.yml` after 1i) fails the build when the current round section
+   lacks the marker; the detector is proven by a negative-control
+   fixture inside the gate (R25). Basis: 2026 context-engineering
+   research — prose-only rules are followed probabilistically ("only
+   enforcement guarantees it"), and compliance odds drop ~5.6% per
+   additional function in the instruction set (arXiv May-2026 study of
+   1650 sessions).
+2. **`.agents/skills/` is now the canonical skills home** (2026 Agent
+   Skills spec: `name` == directory, quoted `description` with what +
+   when, body < 5000 tokens). The 3 skills that existed in
+   `.claude/skills/` moved there via `git mv`
+   (`session-workflow`, `engine-ci-verify`, `android-ndk-build`) and 4
+   new ones were added, written from verified repo knowledge only:
+   `ci-triage` (check-run annotations, the zero-job compile-failure
+   signature, local gate replicas), `kotlin-stub-check` (setup + the
+   stub-fidelity rules learned the hard way), `android-lint-gate`
+   (reading the lint job's annotations, the lint-only classes
+   ResourceType / PluralsCandidate / AutoboxingStateCreation /
+   UnusedResources and the correct APIs), `repo-docs-audit` (the
+   repeatable audit of every Markdown file). `.claude/skills` is now a
+   relative symlink to `../.agents/skills` so tool auto-discovery keeps
+   working while all agent docs stay in `.agents/` (R30).
+3. **`session.md` slimmed for the context budget:** every round before
+   round 6 moved verbatim to `.agents/docs/SESSION-ARCHIVE.md`
+   (append-only, nothing deleted); the live file now holds the summary
+   tables + the open rounds (~385 lines instead of ~2490).
+4. **All-Markdown audit (every folder):** stale PR states, a dead
+   reference to the deleted `.github/workflows/code-scanning.yml` in
+   `AGENTS.md` §8 (rewritten to the verified reality: no
+   alert-handling workflow can exist — `code_scanning_alert` is a
+   webhook event, not a workflow trigger event), broken cross-links
+   `docs/FORMAT-V2.md` ↔ `.agents/docs/HYDRA2-RESEARCH.md`, the root
+   `README.md` repo tree, `.agents/README.md` index, the
+   `session-workflow` skill's format template, and a
+   `RESEARCH-LOG.md` §7 correction (the event-triggered workflow shipped
+   that morning could never have run; deleted the same evening — native
+   alert closure stands). Superseded PR #62 (red leftover of the #59
+   merge incident; its red = the stage-2 API error fixed by merged PR
+   #64) closed as superseded.
+
+## 2026-10-26 (round 6 follow-up) — stage-2 plurals fix, phantom-run root cause, gate 1i (PR #64, main 19df869)
+
+1. **Stage-2 plurals fix:** `MainActivity.kt` line 658 called
+   `context.getQuantityString(…)` — `Unresolved reference` on CI's
+   Kotlin compile (the method is on **`Resources`**, not `Context`;
+   verified against the official API reference:
+   `Resources.getQuantityString(int, int, Object…)` since API 1).
+   Fixed to `resources.getQuantityString(R.plurals.log_context_applied,
+   new.contextSize, new.contextSize)` — the pattern the same file
+   already used at three other call sites. The stage-1 attempt had
+   papered over the same error by **inventing** a `Context.
+   getQuantityString` member in the Kotlin stub — removed; stubs may
+   only carry real API surface (`tools/kotlin_stub_check/`, errors.md).
+2. **Root cause of ALL zero-job phantom runs:** `on: code_scanning_alert`
+   is a Webhook event, **not** a workflow trigger event — GitHub's
+   workflow compiler rejects any file naming it as a trigger: the run is
+   created with zero jobs, fails in the same second, and the run's name
+   is the file path (the "corrupted registration" theory was wrong).
+   The alert-handling workflow was deleted; alert closure is native
+   GitHub behaviour (a CodeQL/Semgrep finding resolves as *fixed* when
+   the next default-branch analysis no longer reports it).
+3. **Gate 1i (new):** `tools/workflow_lint_check.sh` runs actionlint
+   over every workflow file (npm WASM, /tmp, self-recreating) with an
+   in-gate negative-control fixture (R25) — it fails on invalid trigger
+   events, which PyYAML (gate 1h, duplicate keys) structurally cannot
+   see. PR #64 CI: 15 pass / 4 skipped / 0 fail.
+
+## 2026-10-26 (round 6) — CI red fix, local Kotlin type-check, `.agents/` reorg
+
+1. **Five red-CI root causes fixed** (all four workflows on main were
+   red): (a) cppcheck `uninitvar` ×2 in the v3 roundtrip test (buffer
+   now zero-initialized per codebase convention); (b) `HydraApp.kt`
+   `SettingSlider` used `.last`/`.first` on
+   `ClosedFloatingPointRange` (IntRange-only members) — the slider now
+   takes `start: Float, end: Float` + step, 6 call sites converted;
+   (c) the zero-job phantom runs of the code-scanning workflow (true
+   root cause and fix: see the round-6-follow-up entry above); (d)
+   clang gate 1b `-Werror,-Wtypedef-redefinition` on
+   `hydra_kv_cache_t` (C99: the typedef was declared twice; the full
+   definition is now a plain `struct`, name kept by the forward
+   declaration) — GCC was silent (the diagnosis sits behind
+   `-Wpedantic`), so it needed the new local `zig cc` Clang replica to
+   reproduce; (e) the Kotlin `weight` import "fix" was a FALSE ALARM —
+   `weight` is a member extension of RowScope/ColumnScope, the import
+   is rejected by K2; the import was removed and the stub corrected to
+   mirror the real API (both directions recorded in errors.md).
+2. **New local capability: Kotlin type-check without the Android SDK**
+   — `tools/kotlin_stub_check/` (kotlinc 2.4.21 via npm + a 40-file
+   stub classpath mirroring the exact android/androidx/compose/
+   org.json API surface, R generated from the real
+   `res/values/strings.xml`): `bash
+   tools/kotlin_stub_check/kotlin_stub_check.sh` type-checks all 10 app
+   .kt files in ~20s. This is the local equivalent of the CI Kotlin
+   compile step and is what found root cause (b) locally. Stub
+   fidelity rules: verify every signature against the real API first,
+   one package per stub file, a stub error means *app OR stub* is
+   wrong — the real API is the tie-breaker.
+3. **`.agents/` reorg (owner directive):** all agent-specific docs
+   moved into `.agents/` (`rules.md`, `errors.md`, `session.md`,
+   `Environment.md`, `CLAUDE.md` + 8 docs; `.agent_memory/` dissolved
+   into `docs/{TECHNICAL-AUDIT,RESEARCH-LOG}.md`); the root keeps
+   `README.md` + `AGENTS.md`, `docs/` keeps the product specs. All
+   path references updated repo-wide (44 files). New:
+   `.agents/user.md` (owner's standing directives, dated) and
+   `.agents/README.md` (index + maintenance rules).
+4. **Verification (all local, real outputs):** `make test-run`
+   174/0 + 86/0 + 7/0 + 73/0 unchanged; cppcheck `--enable=all` 0
+   issues; stub check 0 errors; docs-claim gate clean; workflow-YAML
+   gate (1h, duplicate keys) + PyYAML full parse of all 5 workflows;
+   string-format check 39 ok; `zig cc` gate-1b replica 5/5 files clean
+   (reproduced the red before the fix); NEON path full compile rc 0.
+
+## 2026-10-26 (round 5) — UI/UX bug fixes + expanded Android settings
+
+1. **UI/UX bugs (all with code evidence; the attached "RepoInspect" PDF
+   was verified INVALID for this repo and ignored):** (a) the model
+   row's "state 17 B" metric was the *serialized* llama state size at
+   n_past=0 (misleading); the load report now carries `kv_bytes`
+   (2·n_layer·n_ctx·n_embd·2B, F16 KV, per the pinned v0.5.0 headers)
+   and `logits_bytes` (n_vocab·n_embd·4B); (b) the chat never
+   auto-scrolled — `rememberLazyListState` + a `LaunchedEffect` keyed on
+   (last message id, text length), following only while the user is at
+   the bottom; (c) the keyboard stayed open after Send — now hidden via
+   focus-clear + keyboard controller; (d) the landscape-with-keyboard
+   layout collapse (composer at the top, chat invisible) was a REAL
+   inset bug: `imePadding()` on the input row alone — the IME inset now
+   applies to the ChatTab root column; (e) the telemetry row reserves a
+   minimum height (no first-run jump).
+2. **Expanded settings (the explicit ask):** a real SettingsTab
+   (replacing "coming soon"): thinking/chain-of-thought switch,
+   system-prompt field, temperature 0–2, top-k 1–100, min-p 0–0.5,
+   repetition penalty 1–2, max tokens 32–1024, context size 512–8192
+   (llama, needs reload — said so in the UI), reset-to-defaults.
+   Wire-through: `EngineInterface.generate` gains a
+   `GenerationParams`; `llama_jni.cpp` `build_sampler_chain` is
+   parameterized (top_k, min_p, rep penalty — API confirmed in the
+   pinned header) with the chain rebuilt on key change; the
+   deterministic HydraEngine ignores sampling params (documented on the
+   interface); system prompt + thinking prompt prepend for the text
+   engine. All settings + engine choice + auto-run persist via
+   SharedPreferences. A real Models tab (replacing the placeholder):
+   current-model facts, import, and removal of an imported model
+   (back to the bundled starter).
+3. **Verification (honest split):** `g++ -fsyntax-only` of
+   `llama_jni.cpp` against the PINNED llama v0.5.0 submodule headers +
+   a minimal `jni.h` stub (no NDK locally — the stub limits the check
+   to the llama-API surface); Kotlin stub check 0 errors; the full CI
+   tier green in the PR (the round-6 entry documents the two lint
+   findings CI then surfaced and their fixes).
+
 ## 2026-10-26 (round 4) — true per-layer execution (format version 3), full-dimension decode, converter v3 modes, 672-B pin
 
 1. **The aggregated recurrence is now a legacy mode, not the

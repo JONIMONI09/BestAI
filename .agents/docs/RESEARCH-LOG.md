@@ -20,7 +20,7 @@
 | 2026-10-26 | Code-scanning API access from an Actions token | blocked; workaround channels documented |
 | 2026-10-26 | Sandbox tool inventory + install channels | measured; policy in AGENTS.md §6 |
 | 2026-10-26 | GitHub workflow compiler vs PyYAML (duplicate keys) | zero-job red run; gate 1h shipped |
-| 2026-10-26 | Auto-close target: issues → code-scanning alerts | issue-verify removed; event-driven workflow shipped |
+| 2026-10-26 | Auto-close target: issues → code-scanning alerts | issue-verify removed; auto-close is native GitHub behaviour — an event-triggered workflow cannot exist (see §7 correction) |
 | 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in .agents/Environment.md |
 
 ---
@@ -201,6 +201,21 @@ Shipped:
   duplicate-key gate, shellcheck on the run script, jq parsing of a
   synthetic alert payload. Event delivery itself is verified by GitHub at
   the first real alert.
+  - **Correction (same evening):** the shipped workflow could never have
+    run. `code_scanning_alert` is a *webhook* event, **not** a workflow
+    trigger event — GitHub's workflow compiler rejects any file that
+    names it as a trigger: the run is created with **zero jobs**, fails
+    in the same second, and its name is the file path (the 2026-10-25/26
+    "phantom runs"; full root cause + evidence in `.agents/errors.md`,
+    round 6). The workflow was **deleted the same day** and no
+    alert-handling workflow was re-shipped — none can exist. The
+    auto-close policy above still holds, implemented natively: the
+    CodeQL/Semgrep jobs report every finding on every PR (annotations +
+    check results), and GitHub resolves an alert as *fixed* when the
+    next default-branch analysis no longer reports it. Regression
+    prevention: **gate 1i** (`tools/workflow_lint_check.sh`, actionlint,
+    in-gate negative control) now fails CI on any workflow naming an
+    invalid trigger event.
 - **CI tier split (same owner rule):** `ci.yml` heavy jobs (neon-test
   QEMU, build-test, gpu-bench, android-apk) run on **main pushes only**;
   PRs and feature-branch pushes get the lint-only tier (ci.yml
