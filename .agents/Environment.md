@@ -434,3 +434,28 @@
      - Fetched spec sources (also wiped by the reset; re-fetch from
        github raw if needed): ggml `include/ggml.h` (the ggml_type
        enum) and `docs/gguf.md` (the GGUF spec) from ggml-org/ggml.
+
+## 2026-10-26 (round 10) — the real-model environment
+
+- The real model used for the 11.7 verification: `/tmp/llama68m.gguf`
+  (llama-68m-chat-v1 Q8_0, 73 018 688 B, arch llama, 2 layers, dim
+  768, ctx 2048, 32k vocab, 21 tensors). /tmp is ephemeral — re-fetch
+  with the recipe in docs/GGUF-IMPORT.md 11.7 (codeload tarball of
+  BodhiSearch/BodhiApp, extract `*Llama-68M-Chat-v1-GGUF*blobs*`, the
+  snapshot entry is a symlink into `blobs/<sha256>`).
+- Network reality (2026-10-26): outbound access limited to
+  github.com, codeload.github.com, api.github.com, registry.npmjs.org,
+  pypi.org, files.pythonhosted.org. huggingface.co, raw./media./
+  objects.githubusercontent.com are unreachable (curl 000). GitHub
+  LFS (>=100 MB model files) is therefore NOT downloadable here;
+  model files <100 MB travel as plain blobs inside codeload tarballs
+  — verify by extracting (a 133-byte .gguf is an LFS pointer).
+- `gh` API notes: `search/code` finds binary GGUF files by filename;
+  its `size` filter and the contents-API `size`/`lfs` fields are
+  unreliable for LFS (see errors.md round-10 entry) — the codeload
+  tarball decides.
+- The pinned llama.cpp build is at
+  /tmp/lc/llama.cpp-7fe450e19305b828c199d602c23a8337aaa1f03b
+  (build/bin/llama-cli + llama-server) — same build as rounds 8/9;
+  if /tmp was reset, rebuild with the commands in the round-9
+  section above.

@@ -455,8 +455,10 @@ tar xzf /tmp/llama.tar.gz
 LLAMA=llama.cpp-7fe450e19305b828c199d602c23a8337aaa1f03b
 cmake -S $LLAMA -B $LLAMA/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build $LLAMA/build --parallel 2 --target llama-cli
-# give the CLI an open stdin, or its REPL loop busy-spins (below):
-(sleep 10 | timeout 10 OMP_NUM_THREADS=1 \
+# give the CLI an open stdin, or its REPL loop busy-spins (below);
+# the env var goes through env - timeout would take OMP_NUM_THREADS=1
+# as the command to run:
+(sleep 10 | timeout 10 env OMP_NUM_THREADS=1 \
   $LLAMA/build/bin/llama-cli -m /tmp/smoke.gguf -p "a" -c 64 -n 8 -t 1 --temp 0)
 ```
 
@@ -530,3 +532,77 @@ and the pipeline — not fidelity.
 - the offline converter never emits `.hydra2`: GGUF import writes
   v1 (or `--v3`, the RoPE-capable variant), and `.hydra2` fixtures
   come from `tools/make_model.py --v2`.
+
+### 11.7 Real-model verification (a downloaded model, not the fixture)
+
+2026-10-26: a **real model was downloaded and run through the pinned
+llama.cpp** — the same source (v0.5.0, `7fe450e…`) the app's NDK
+build compiles into `libllama_jni.so`. Model: **llama-68m-chat-v1,
+Q8_0 quant, 73 018 688 bytes (73.0 MB)**, architecture `llama`,
+2 layers, dim 768, context 2048, 32 000 tokens, 21 tensors
+(16 × Q8_0 + 5 × F32), magic bytes `47 47 55 46`. Source (GitHub,
+plain git blob, no LFS): `BodhiSearch/BodhiApp`, HF-cache layout
+`crates/server_core/tests/data/live/huggingface/hub/
+models--afrideva--Llama-68M-Chat-v1-GGUF/snapshots/…/
+llama-68m-chat-v1.q8_0.gguf`.
+
+Download recipe (codeload is the no-clone way; the file travels as a
+plain blob inside the tarball):
+
+```bash
+SHA=$(gh api repos/BodhiSearch/BodhiApp/commits?per_page=1 --jq '.[0].sha')
+curl -sL -o /tmp/bodhi.tar.gz \
+  https://codeload.github.com/BodhiSearch/BodhiApp/tar.gz/$SHA
+tar xzf /tmp/bodhi.tar.gz --wildcards \
+  "*models--afrideva--Llama-68M-Chat-v1-GGUF*blobs*"
+# the snapshot entry is a symlink into blobs/; copy the blob:
+cp <extracted blob> /tmp/llama68m.gguf
+# run the gate + the pinned CLI:
+python3 tools/gguf_test.py --engine ./hydra-run --real-model /tmp/llama68m.gguf
+(sleep 45 | timeout 40 env OMP_NUM_THREADS=2 \
+  /tmp/lc/llama.cpp-7fe450e*/build/bin/llama-cli -m /tmp/llama68m.gguf \
+  -p "The capital of France is" -c 512 -n 64 -t 2 --temp 0)
+```
+
+Measured on this box (2 cores, `OMP_NUM_THREADS=2`, 2026-10-26):
+
+```
+> The capital of France is
+The capital of France is France.<|im_end|>
+
+[ Prompt: 109.4 t/s | Generation: 6.6 t/s ]
+```
+
+plus two further runs (longer prompt, greedy: prompt 172.7 t/s,
+generation 4.4 t/s; sampling `--temp 0.7`: generation 8.2 t/s). The
+68M model is a toy by construction — it writes grammatical but thin
+prose; the point of this section is that the **full pipeline runs on
+a real file**: load, tokenization, transformer decode over all 21
+tensors (Q8_0 dequantized), sampling, detokenization, streaming.
+A 68M model is the largest real writing model this sandbox's network
+policy can deliver: GitHub stores model files ≥100 MB via LFS, and
+the LFS endpoint is not reachable here — larger real models (e.g.
+Gemma-3-270M Q8_0 at 291.5 MB, Qwen2.5-0.5B-Instruct Q4_K_M) are
+reachable from a normal machine and run through the identical
+commands above; the app and the engine place no size or
+architecture restriction of their own (the architecture question is
+delegated to the pinned llama.cpp loader, see the README).
+
+What each tool proved with this file (all regression-covered):
+
+- `tools/gguf_inspect.py` + the reader: v3 header, all 22 metadata
+  keys, the whole tensor directory, all 21 decodable tensors, the
+  32 000-token tokenizer, `convertible: yes`.
+- `tools/gguf_test.py --real-model /tmp/llama68m.gguf` (the new
+  opt-in gate, 6 checks, CI default stays offline): magic, parse,
+  every decodable tensor decodes, the converter projects it to a
+  `.hydra` v3 file (dim 64, 2 layers, vocab 1024, 30 976 tokens
+  dropped — the honest projection, §4), and the C engine runs that
+  projection deterministically (`0 2 0 2 0 2 2 0 2 0 0 0 0 2 2 2`,
+  two runs byte-identical).
+- the pinned llama-cli: the runs above.
+
+Not measured (R32, no device in the sandbox): `libllama_jni.so`
+inside the APK on a real phone or emulator — the Android CI tier
+compiles the exact JNI source, and the x86_64 emulator is the
+documented device-side verification path (`android/README.md`).

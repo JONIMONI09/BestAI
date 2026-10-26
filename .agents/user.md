@@ -124,3 +124,13 @@
     and run them for real; fix what they find. Standing: "KEINE Stubs
     oder Fake" — no stubs, no fake results, no fake checkboxes (this is
     directive 10 restated for this round).
+29. **(2026-10-26)** "prüfe CI und alles auf englisch dort übersetzen,
+    dann alle .md dateien analysieren und bearbeiten … lade dir
+    wirklich ein Modell herunter, was evtl so 300 MB ist und was
+    schreiben kann … ermögliche alles auf der app" — artifacts (docs,
+    CI, workflows) in English (German kept only in verbatim owner
+    quotes and the v1 product's CLI strings); every .md audited; a
+    REAL downloadable model verified through the pinned engine (the
+    sandbox network caps it at <100 MB plain blobs — documented, with
+    the recipe for bigger models on a normal machine); the app path
+    (JNI -> pinned llama.cpp loader) proven with that model.

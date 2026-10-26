@@ -1024,6 +1024,67 @@ def run_behavior(engine, out):
     return ok
 
 
+def run_real_model(path, engine, tmp):
+    """Optional deep check of a REAL downloaded model (opt-in, --real-model).
+
+    The default gate set is fully self-contained (fixtures this repo
+    generates), so CI stays fast and offline. When a real model file is
+    passed, this gate proves the repo's tooling understands it: the
+    reader parses the whole file (header, metadata, tensor directory,
+    tokenizer, every decodable tensor) and the converter projects it
+    into a .hydra v3 file the C engine then runs deterministically.
+    Real generation quality is the pinned llama.cpp's job (the same
+    binary the app bundles) - the recipe for that is documented in
+    docs/GGUF-IMPORT.md 11.7.
+
+    Verified 2026-10-26 against llama-68m-chat-v1.q8_0.gguf (73 MB,
+    arch llama, 2 layers, dim 768, 32k vocab, 21 tensors).
+    """
+    print('\n== real model: %s' % path)
+    if not os.path.exists(path):
+        return check('the real model file exists (--real-model)', False, path)
+    data = open(path, 'rb').read()
+    ok = check('the real model carries the GGUF magic (bytes 47 47 55 46)',
+               data[:4] == b'GGUF', 'got %s' % data[:4].hex())
+    g = gguf_reader.GgufFile(data)
+    arch = g.architecture()
+    dec = [t for t in g.tensors if t.is_decodable]
+    ok &= check('the real model parses (v%d, arch %s, %d tensors, %d tokens, %d decodable)'
+                % (g.version, arch, len(g.tensors), len(g.tokens()), len(dec)),
+                g.version in (2, 3) and bool(arch) and len(g.tensors) > 0
+                and len(g.tokens()) > 0 and len(dec) == len(g.tensors))
+    if dec:
+        total = 0
+        for t in dec:
+            r, c = t.shape() or (0, 0)
+            total += len(g.decode_rows(t, 0, max(1, min(r, 2))))
+        ok &= check('every decodable real-model tensor decodes (%d tensors sampled)'
+                    % len(dec), total > 0)
+    out = os.path.join(tmp, 'real_converted.hydra')
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = gguf_to_hydra.main([path, '--out', out, '--json', '--v3',
+                                 '--v3-layers', '2', '--dim', '64'])
+    ok &= check('the converter projects the real model (v3, dim 64)',
+                rc == 0, buf.getvalue()[-300:] if rc else '')
+    if rc != 0 or not engine:
+        if not engine:
+            print('SKIP: the real-model engine check needs a built ./hydra-run')
+        return ok
+    runs = []
+    for _ in range(2):
+        proc = subprocess.run([engine, out, '7', '16', '--json'],
+                              capture_output=True, text=True, shell=False)
+        runs.append(json.loads(proc.stdout)['tokens']
+                    if proc.returncode == 0 else [])
+    ok &= check('the real-model projection is deterministic (two engine runs)',
+                len(runs[0]) == 16 and runs[0] == runs[1],
+                '%s' % runs[0][:8])
+    ok &= check('the real-model projection is not degenerate',
+                len(set(runs[0])) >= 2, 'stream %s' % runs[0][:16])
+    return ok
+
+
 def run_type_names(tmp):
     """The quantised-layout name table is a user-facing diagnostic. A
     file whose tensors are TQ1_0 must be NAMED TQ1_0 - a stale label is
@@ -1336,6 +1397,11 @@ def main():
     ap.add_argument('--engine', default=os.path.join(ROOT, 'hydra-run'),
                     help='the compiled CLI; pass an empty string to skip the C check')
     ap.add_argument('--keep', action='store_true', help='keep the temporary directory')
+    ap.add_argument('--real-model', default='',
+                    help='optional path to a REAL downloaded .gguf: runs the '
+                         'reader/converter/engine deep check on it (docs '
+                         'GGUF-IMPORT.md 11.7); the default gate set stays '
+                         'offline and fast')
     args = ap.parse_args()
 
     engine = args.engine if (args.engine and os.path.exists(args.engine)) else None
@@ -1345,6 +1411,8 @@ def main():
     tmp = tempfile.mkdtemp(prefix='hydra-gguf-')
     try:
         ok = run(engine, tmp)
+        if args.real_model:
+            ok &= run_real_model(args.real_model, engine, tmp)
     finally:
         if args.keep:
             print('kept %s' % tmp)

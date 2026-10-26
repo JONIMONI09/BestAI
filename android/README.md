@@ -49,11 +49,16 @@ cd android
 gradle assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The APK contains `libhydra.so` (the bundled engine) and
-`libllama_jni.so` (the imported-GGUF engine, linked against the pinned
-llama.cpp submodule) for `arm64-v8a`, `armeabi-v7a` (the legacy 32-bit
-target from the original spec) and `x86_64` (emulators), plus the
-starter model as an asset.
+The APK contains `libhydra.so` (the bundled engine, all three ABIs)
+and `libllama_jni.so` (the imported-GGUF engine, linked against the
+pinned llama.cpp submodule) for **`arm64-v8a` and `x86_64` only**:
+`armeabi-v7a` (the legacy 32-bit target in the APK's `abiFilters`)
+has no verified build environment, so CMake skips llama.cpp there and
+those devices run the Hydra engine only; `x86_64` exists so the engine
+can be exercised on the x86_64 emulator (rules.md R23) but the UI
+selector deliberately offers llama.cpp on **arm64-v8a devices only**
+(`MainActivity.kt`, `CMakeLists.txt`). Plus the starter model as an
+asset.
 
 ### Import limits
 

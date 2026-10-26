@@ -2,6 +2,68 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-26 (round 10) — the documented smoke recipe bug, the all-.md English pass, real-model verification, the opt-in real-model gate
+
+1. **The documented §11.4 smoke recipe never ran llama-cli (Qodo
+   issue, confirmed and fixed).** The line was
+   `timeout 10 OMP_NUM_THREADS=1 $LLAMA/…/llama-cli …`: `timeout`
+   executes its first non-option argument *as the command*, so it
+   tried to run the literal string `OMP_NUM_THREADS=1` (reproduced:
+   `timeout: failed to run command 'OMP_NUM_THREADS=1'`). It is now
+   `timeout 10 env OMP_NUM_THREADS=1 …`, and the fixed recipe was
+   executed verbatim from a clean cwd (fixture output
+   `1'aV+uE~`, prompt 34 410.1 t/s, generation 6 323.4 t/s).
+2. **All artifacts translated to English (owner directive).**
+   `.github/workflows/lint.yml` (6 comment blocks), `release.yml`
+   (15), the `Makefile` (1 line), and
+   `.agents/docs/SESSION-ARCHIVE.md` (rounds 3-6 + the doc-audit
+   section, ~90 lines of German prose). Deliberately kept: verbatim
+   owner directives quoted in `user.md`/`session.md`/`errors.md`, the
+   MIT licence string, and the v1 product's German CLI output
+   (product identity, quoted by the docs; the string-format gates
+   enforce it). All workflow YAML re-validated.
+3. **A real model was downloaded and run through the pinned
+   llama.cpp** — the same v0.5.0 source the app's NDK build compiles
+   into `libllama_jni.so`. **llama-68m-chat-v1, Q8_0, 73 018 688 B
+   (73.0 MB)**, arch `llama`, 2 layers, dim 768, ctx 2048, 32k vocab,
+   21 tensors (16 Q8_0 + 5 F32), from `BodhiSearch/BodhiApp` (HF-cache
+   layout, plain git blob) via the codeload tarball. The pinned CLI
+   (open stdin) ran it: "The capital of France is" →
+   "The capital of France is France.<|im_end|>", prompt 109.4 t/s,
+   generation 6.6 t/s (2 threads); a longer greedy prompt 172.7 /
+   4.4 t/s; `--temp 0.7` generation 8.2 t/s. This is the **largest
+   real writing model this sandbox's network can deliver**: the
+   sandbox only reaches github/codeload/api/npm/pypi, and GitHub
+   stores model files ≥100 MB via LFS (the LFS endpoint is
+   unreachable) — proven for gemma-3-270m-it-Q8_0 (291.5 MB),
+   qwen2.5-0.5b-instruct-q4_k_m and smollm2-135m (every copy an
+   LFS pointer). The 11.7 recipe works unchanged for a ~300 MB model
+   on a normal machine.
+4. **The app path is proven with that model.** `LlamaBridge.load`
+   → JNI → `llama_model_load_from_file` (pinned v0.5.0) →
+   generate/cancel/unload is a thin wrapper with no size/arch/quant
+   restriction of its own; architecture is delegated to the pinned
+   loader (the README claim, now backed by a real model). The
+   model's ctx 2048 fits the app's clamp 256..8192. Not measured
+   (R32, no device): the `.so` inside the APK on a phone/emulator —
+   the Android CI tier compiles the exact JNI source; the x86_64
+   emulator is the documented device-side path.
+5. **The opt-in real-model gate** — `tools/gguf_test.py --real-model
+   <path>` (6 checks, off by default so CI stays offline and fast):
+   the GGUF magic (bytes `47 47 55 46`), a full parse, every
+   decodable tensor decodes, the converter projects the model to a
+   `.hydra` v3 file (dim 64, 2 layers, vocab 1024, 30 976 tokens
+   dropped — the honest projection), and the C engine runs that
+   projection deterministically (two runs byte-identical, non-
+   degenerate). On llama-68m: **107 checks, 0 failed**; the default
+   offline set stays 101.
+6. **Docs** — `docs/GGUF-IMPORT.md` 11.7 (source, download + gate
+   recipe, measured numbers, what each tool proved, the size ceiling
+   and what is not measured), `README.md` (GGUF bullet + tools tree),
+   `.agents/{session,errors,Environment,user}.md` (round 10, the two
+   new mistakes — the `timeout` env-var trap and the GitHub LFS
+   API ambiguity — the model location + re-fetch recipe, directive 29).
+
 ## 2026-10-26 (round 9) — GGUF verification: the quant type table bug, the pinned llama.cpp smoke test, the converted-model behavior gate, the `.hydra2` GGUF boundary
 
 Answer to "can GGUF models really be used, with their full

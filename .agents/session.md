@@ -525,3 +525,74 @@ can and cannot prove.
       Qodo's optional suggestion, 10–15 min per PR. The manual
       recipe is documented in §11.4; re-run it whenever the pin
       changes.
+
+## Round 2026-10-26 (round 10: the documented smoke recipe bug, all-.md English pass, real-model verification, the opt-in real-model gate)
+
+**Session start (R33):** 2026-10-26 (branch `arena/75337031-bestai`, base `634a4fb`). Read before the first edit: AGENTS.md, .agents/session.md (rounds 8-9 + R9-I addendum), .agents/errors.md (top entries), .agents/rules.md (R2/R14/R23/R25/R26/R32/R33), .agents/user.md (directive list), .agents/Environment.md (round-9 section), docs/GGUF-IMPORT.md (full, esp. 11.4 recipe), README.md (GGUF + Android bullets, tools tree), CHANGELOG.md (round 9), docs/FORMAT-V2.md, the GitHub issue the owner linked (the `timeout` recipe bug, GGUF-IMPORT.md 458-460), and — for the English pass — every *.md in the repo (systematic scan, 33 files) plus .github/workflows/{lint,release,ci}.yml and the Makefile; for the real-model work: tools/gguf_test.py (main/run_behavior/run_v3), tools/gguf_to_hydra.py (dim/vocab handling), tools/gguf_reader.py (is_decodable/decode_rows), android/app/src/main/java/dev/hydrastone/{LlamaBridge,LlamaEngine}.kt + android/app/src/main/cpp/llama_jni.cpp (the load path).
+
+**Owner directive (verbatim intent):** "prüfe folgendes [the Qodo issue: the documented smoke command makes `timeout` treat `OMP_NUM_THREADS=1` as an executable], und prüfe CI und alles auf englisch dort übersetzen, dann alle .md dateien analysieren und bearbeiten, prüfe die tests, lade dir wirklich ein Modell herunter, was evtl so 300 MB ist und was schreiben kann, und finetune alles, ermögliche alles auf der app."
+
+- [x] R10-A: recipe bug fixed + verified — the §11.4 line was
+      `(sleep 10 | timeout 10 OMP_NUM_THREADS=1 $LLAMA/…/llama-cli …)`:
+      `timeout` takes `OMP_NUM_THREADS=1` as the command to run, so the
+      documented recipe NEVER launched llama-cli (reproduced:
+      `timeout: failed to run command 'OMP_NUM_THREADS=1'`). Now
+      `timeout 10 env OMP_NUM_THREADS=1 …`; the fixed recipe was
+      executed verbatim from a clean cwd and printed the fixture
+      output (`1'aV+uE~`, prompt 34 410.1 t/s, generation 6 323.4 t/s).
+      errors.md entry added.
+- [x] R10-B: all .md + CI in English. Systematic scan (word-boundary
+      regex, umlauts + strict German function words; the first scan
+      was a false-positive disaster — "commit" contains "mit").
+      Translated: .github/workflows/lint.yml (6 blocks), release.yml
+      (15 blocks), Makefile (1 line), .agents/docs/SESSION-ARCHIVE.md
+      (rounds 3-6 + doc-audit section, ~90 lines of German prose).
+      Kept deliberately: verbatim owner directives quoted in
+      user.md/session.md/errors.md (they record what the owner said),
+      the MIT licence string, and the v1 product's German CLI output
+      (product identity, quoted by the docs; string-format gates).
+      YAML re-validated; the C/Kotlin runtime strings stay German
+      (documented scope decision).
+- [x] R10-C: real model downloaded + verified. The sandbox network
+      allows only github.com/codeload/api.github.com/npm/pypi — Hugging
+      Face, raw.githubusercontent.com and the GitHub LFS endpoint are
+      all unreachable, and GitHub stores model files >= 100 MB via
+      LFS, so the "300 MB" target is not deliverable here (proven for
+      gemma-3-270m-it-Q8_0 291.5 MB, qwen2.5-0.5b-instruct-q4_k_m,
+      smollm2-135m — every copy found was an LFS pointer, 133/134 B).
+      The largest real writing model obtainable: **llama-68m-chat-v1
+      Q8_0, 73 018 688 B (73.0 MB)**, arch llama, 2 layers, dim 768,
+      ctx 2048, 32k vocab, 21 tensors (16 Q8_0 + 5 F32), from
+      BodhiSearch/BodhiApp (HF-cache layout, plain git blob) via the
+      codeload tarball. Run on the PINNED llama-cli v0.5.0 (open
+      stdin): "The capital of France is" -> "...France.<|im_end|>",
+      prompt 109.4 t/s, generation 6.6 t/s (2 threads); longer prompt
+      greedy 172.7 / 4.4 t/s; temp 0.7 generation 8.2 t/s. Honest
+      ceiling: a 68M model writes thin prose; the pipeline (load,
+      tokenize, full decode incl. Q8_0, sampling, detokenize, stream)
+      is what is proven.
+- [x] R10-D: the app path. LlamaBridge.load(path, nCtx) -> JNI ->
+      `llama_model_load_from_file` (pinned v0.5.0) -> generate/
+      cancel/unload: a thin wrapper, no size/arch/quant restriction of
+      our own, architecture delegated to the pinned loader (the
+      README claim, now backed by a real model). The model's ctx
+      2048 fits the app clamp 256..8192. NOT measured (R32): the
+      .so inside the APK on a device/emulator — the Android CI tier
+      compiles the exact JNI source; the x86_64 emulator is the
+      documented device-side path.
+- [x] R10-E: the opt-in real-model gate. `tools/gguf_test.py
+      --real-model <path>` (6 checks, off by default so CI stays
+      offline + fast): magic bytes 47 47 55 46, full parse, every
+      decodable tensor decodes, the converter projects it to .hydra
+      v3 (dim 64, 2 layers, vocab 1024, 30 976 tokens dropped), the C
+      engine runs the projection deterministically (two runs
+      byte-identical, 16 tokens, non-degenerate). llama-68m: 107
+      checks, 0 failed; the default set stays 101.
+- [x] R10-F: docs — GGUF-IMPORT.md 11.7 (the full section: source,
+      recipe, numbers, what each tool proved, what is not measured,
+      the size ceiling + how a normal machine runs a ~300 MB model
+      through the identical commands), README (GGUF bullet + tools
+      tree), CHANGELOG round 10, Environment.md (model location +
+      re-fetch recipe), user.md (directive 29). Gate sweep green,
+      commit + push (PR #68 updated).
+

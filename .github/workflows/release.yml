@@ -63,9 +63,9 @@ jobs:
       create_tag: ${{ steps.v.outputs.create_tag }}
       create_release: ${{ steps.v.outputs.create_release }}
     steps:
-      # Alle Tags des Repos, eine Zeile pro Tag: "v1.2.3 <sha>".
-      # Wird fuer den main-Push gebraucht, um festzustellen, ob es
-      # ueberhaupt schon eine Version gibt und auf welchem Commit sie steht.
+      # All tags of the repository, one line per tag: "v1.2.3 <sha>".
+      # Needed for the push to main to determine whether a version exists at
+      # all and on which commit it points.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -80,8 +80,9 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # Werte kommen ueber env, nicht per ${{ }} im Skript: sonst wuerde ein
-      # frei eingegebener Tag als Shell-Code ausgefuehrt (Script Injection).
+      # Values arrive via env, not via ${{ }} in the script: otherwise a
+      # freely entered tag would be executed as shell code (script
+      # injection).
       - name: Derive version from tag
         id: v
         env:
@@ -101,12 +102,12 @@ jobs:
 
           if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
             # ---- Automatic release on every push to main -------------
-            # Hoechste existierende vMAJOR.MINOR.PATCH bestimmen. Nur
-            # streng numerische Tags zaehlen; "v0.0.0-ci.<run>" ist eine
-            # Dry-Run-Marke und darf nie zur Basis werden.
+            # Determine the highest existing vMAJOR.MINOR.PATCH. Only
+            # strictly numeric tags count; "v0.0.0-ci.<run>" is a dry-run
+            # marker and must never become the base.
             BEST=""; BEST_SHA=""
-            # Pro Zeile genau ein Tag: read -r name sha wuerde den Rest
-            # einer Zeile in sha schieben und die Folgezeilen verschlucken.
+            # Exactly one tag per line: read -r name sha would push the rest
+            # of a line into sha and swallow the following lines.
             while read -r line; do
               [ -n "${line:-}" ] || continue
               name="${line%% *}"; sha="${line##* }"
@@ -114,7 +115,7 @@ jobs:
               [[ "$name" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
               cur="${name#v}"
               if [ -z "$BEST" ]; then BEST="$name"; BEST_SHA="$sha"; continue; fi
-              # semver-Vergleich ohne sort -V (nicht ueberall gleich)
+              # semver comparison without sort -V (not consistent everywhere)
               IFS=. read -r bm bi bp <<< "${BEST#v}"
               IFS=. read -r cm ci cp <<< "$cur"
               if [ "$cm" -gt "$bm" ] || { [ "$cm" -eq "$bm" ] && [ "$ci" -gt "$bi" ]; } \
@@ -129,9 +130,9 @@ jobs:
               CREATE_RELEASE=true
               echo "::notice::No version tag exists - creating $TAG for main@${HEAD_SHA:0:7}"
             elif [ "$BEST_SHA" = "$HEAD_SHA" ]; then
-              # Tag steht bereits auf diesem main-Commit: Release
-              # existiert oder wird erzwungen neu aufgebaut und
-              # hochgeladen (upsert, s.u.). Kein neuer Tag noetig.
+              # The tag already points at this main commit: the release
+              # exists or is forced to be rebuilt and re-uploaded (upsert,
+              # below). No new tag needed.
               TAG="$BEST"
               CREATE_TAG=false
               CREATE_RELEASE=true
@@ -151,7 +152,7 @@ jobs:
             TAG="${INPUT_TAG:-}"
             PUBLISH="${INPUT_PUBLISH:-false}"
             if [ -z "$TAG" ]; then
-              # Dry-Run: synthetisches Tag, kein Push noetig, nichts publiziert.
+              # Dry run: synthetic tag, no push needed, nothing published.
               TAG="v0.0.0-ci.${RUN_NUMBER}"
               PUBLISH=false
               echo "::notice::No tag given - dry run with ${TAG}. No release will be published."
@@ -175,10 +176,10 @@ jobs:
           echo "create_release=$CREATE_RELEASE" >> "$GITHUB_OUTPUT"
           echo "Release ${TAG} -> versionCode ${CODE}, publish=${PUBLISH}"
 
-  # Legt den Tag an, den der main-Push gerade berechnet hat. Der Push
-  # erfolgt bewusst ueber die GitHub-Refs-API und nicht ueber "git push":
-  # ein Token-Push loest keinen weiteren push:-Tags-Workflow aus, sonst
-  # laeuft derselbe Build doppelt.
+  # Creates the tag the push to main just computed. The push deliberately
+  # goes through the GitHub refs API instead of "git push": a token push
+  # does not trigger another push:-Tags workflow, otherwise the same build
+  # would run twice.
   ensure-tag:
     name: Create version tag
     needs: version
@@ -190,9 +191,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Checkout persistiert die Repository-Credentials, deshalb reicht
-      # ein normaler Push. Ein Push mit diesem Token loest keinen weiteren
-      # push:-Tags-Workflow aus - der Build laeuft genau einmal.
+      # The checkout persists the repository credentials, so a normal push
+      # is enough. A push with this token does not trigger another
+      # push:-Tags workflow - the build runs exactly once.
       - name: Point the tag at this commit (idempotent)
         env:
           TAG: ${{ needs.version.outputs.tag }}
@@ -230,8 +231,8 @@ jobs:
           aarch64-linux-gnu-gcc-12 -O3 -static -Wall -Wextra \
               -Iinclude src/hydra_engine.c src/main.c -lm -o dist/hydra-run-linux-arm64
 
-      # Beide Binaries MUESSEN dasselbe Ergebnis liefern wie der skalare
-      # Host — sonst waere die NEON-Gleichheitsaussage wieder unbelegt.
+      # Both binaries MUST produce the same results as the scalar host -
+      # otherwise the NEON equality claim would be unproven again.
       - name: Verify x64 vs arm64 parity
         run: |
           python3 tools/make_model.py parity.hydra
@@ -293,9 +294,9 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      # submodules: true ist Pflicht, keine Optimierung: der native Build
-      # ruft add_subdirectory(llama) auf. Ohne Submodul bricht CMake die
-      # Konfiguration ab und dieser Job liefert kein APK.
+      # submodules: true is mandatory, not an optimisation: the native build
+      # calls add_subdirectory(llama). Without the submodule CMake aborts
+      # the configuration and this job delivers no APK.
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -304,12 +305,11 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # Gleiche Reihenfolge wie in lint.yml: eigenes SDK-Root, cmdline-tools
-      # explizit installieren (android-actions/setup-android scheitert am
-      # nicht mehr existierenden Paket "tools") und ausschliesslich die
-      # gepinnten Pakete laden, damit der Release-Build exakt der lokal
-      # verifizierten Toolchain entspricht.
-      - name: Android SDK isoliert aufsetzen (nur API 34)
+      # Same order as in lint.yml: own SDK root, install cmdline-tools
+      # explicitly (android-actions/setup-android fails on the no-longer-
+      # existing package "tools") and load only the pinned packages, so the
+      # release build matches the locally verified toolchain exactly.
+      - name: Set up the Android SDK in isolation (API 34 only)
         run: |
           set -e
           SDK="$RUNNER_TEMP/android-sdk"
@@ -441,14 +441,14 @@ jobs:
           sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      # Der Release-Text wird als Datei geschrieben und dann per gh-CLI
-      # hochgeladen. Das ist der entscheidende Schritt fuer "aktualisieren
-      # statt neu anlegen": gh release upload --clobber ersetzt jedes
-      # vorhandene Asset gleichen Namens, und gh release edit aktualisiert
-      # Titel/Text, ohne dass der Release geloescht werden muss.
-      # Quoted heredoc ('EOF'): Backticks und $ im Markdown koennen so
-      # nicht als Shell-Code interpretiert werden. Versionsangaben kommen
-      # aus env, nicht aus ${{ }} (Script-Injection-Schutz).
+      # The release text is written to a file and then uploaded via the gh
+      # CLI. This is the decisive step for "updating instead of creating
+      # anew": gh release upload --clobber replaces any existing asset of
+      # the same name, and gh release edit updates the title/text without
+      # the release having to be deleted. Quoted heredoc ('EOF'): backticks
+      # and $ in the markdown cannot be interpreted as shell code. Version
+      # values come from env, not from ${{ }} (script injection
+      # protection).
       - name: Release notes
         env:
           TAG: ${{ needs.version.outputs.tag }}
@@ -522,14 +522,13 @@ jobs:
           EOF
           head -3 notes.md
 
-      # Idempotenter Upsert. Genau diese Abfrage entscheidet zwischen
-      # "create" und "update" - und sie fragt die Release-API ab, nicht
-      # irgendeinen lokalen Zustand:
-      #   * Release existiert nicht -> create (mit Target-Commit)
-      #   * Release existiert        -> edit (Titel/Text) + upload --clobber
-      # Der abschliessende Check beweist, dass danach wirklich alle
-      # erwarteten Assets haengen; ein Release ohne APK waere ein Fehler,
-      # kein Erfolg.
+      # Idempotent upsert. Exactly this query decides between "create" and
+      # "update" - and it asks the release API, not any local state:
+      #   * release does not exist -> create (with target commit)
+      #   * release exists         -> edit (title/text) + upload --clobber
+      # The final check proves that afterwards all expected assets really
+      # are attached; a release without an APK would be an error, not a
+      # success.
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}

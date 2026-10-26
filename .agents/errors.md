@@ -4,6 +4,60 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-10-26 (round 10) — the documented smoke recipe never ran llama-cli: `timeout` treated `OMP_NUM_THREADS=1` as the executable (Qodo issue, confirmed)
+
+- **Symptom:** docs/GGUF-IMPORT.md 11.4 said
+  `(sleep 10 | timeout 10 OMP_NUM_THREADS=1 $LLAMA/build/bin/llama-cli
+  …)`. A user running the recipe gets no model run at all — `timeout`
+  executes its first non-option argument AS the command, so it tried
+  to run the literal string `OMP_NUM_THREADS=1`:
+  `timeout: failed to run command 'OMP_NUM_THREADS=1': No such file or
+  directory`. The recipe "worked" in my head because I had always
+  invoked the CLI with `timeout 10 env OMP_NUM_THREADS=1 …` directly.
+- **Cause:** an environment-variable prefix is a SHELL feature (the
+  shell puts VAR=value into the environment of the command it parses);
+  `timeout` is a program that spawns its argv verbatim, so it sees the
+  variable as the executable name. Classic "the command I typed in the
+  shell is not the command the program receives."
+- **Fix:** the recipe now reads
+  `(sleep 10 | timeout 10 env OMP_NUM_THREADS=1 $LLAMA/build/bin/
+  llama-cli …)` — `env` is a real executable that does the assignment
+  for the spawned process — and the fixed line was executed verbatim
+  from a clean cwd and produced the fixture output.
+- **Prevention:** any command that is DOCUMENTED (recipe, README,
+  CI) must be run verbatim from a clean shell at least once after
+  editing; and in general: `timeout`/`setsid`/`execve`-style programs
+  only take real program names as argv[0] — environment variables go
+  through `env`.
+
+## 2026-10-26 (round 10) — GitHub's content API reported LFS model files as plain blobs with their full size (three dead-end tarballs)
+
+- **Symptom:** hunting for a real GGUF to download (the sandbox only
+  reaches github.com/codeload/api.github.com/npm/pypi), the contents
+  API said e.g. `smollm2-135m.gguf size=381566656` with `lfs: null`
+  and a media-host download URL — looked like a plain git blob
+  (codeload would carry it). Every such file extracted from the
+  codeload tarball was a 133/134-byte git-lfs pointer instead:
+  brookcs3/aiGn-cli (364 MB smollm2), GoogleChrome/webai-compute-
+  benchmark (291.5 MB gemma-3-270m), 0624jwjwjw-cmd/2nd5TeamProject
+  (qwen2.5-0.5b), stateforward/emel.cpp (distilgpt2), bitanath/pixy.
+  Five repos, five dead ends.
+- **Cause:** the contents API's `size`/`download_url` fields do not
+  reliably flag LFS objects (the `lfs` sub-object was absent in my
+  queries even when the blob was a pointer), and GitHub's plain-file
+  push limit (100 MB) makes >=100 MB files overwhelmingly LFS — so
+  "big file with a media-host URL" is a prior for LFS, not plain.
+- **Fix:** the codeload tarball is the only source of truth for what
+  actually travels in the archive; extract and check the bytes before
+  believing the API. That test finally found a plain blob:
+  BodhiSearch/BodhiApp's HF-cache `blobs/…` entry
+  (llama-68m-chat-v1.q8_0.gguf, 73 018 688 B, magic 47 47 55 46).
+  Also note the HF-cache layout: the snapshot path is a SYMLINK into
+  `blobs/<sha256>` — extract the blob, not the symlink name.
+- **Prevention:** "is this file downloadable from an allowed host?"
+  is answered by one 30-second codeload extract + `head -c 4`, never
+  by API fields. And: a 133-byte .gguf is a pointer, not a model.
+
 ---
 
 ## 2026-10-26 (round 9) — the quantised-type name table silently disagreed with the official ggml_type enum (user-facing mislabel, found by audit)
