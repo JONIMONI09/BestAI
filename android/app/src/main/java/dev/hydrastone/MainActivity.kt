@@ -1033,6 +1033,15 @@ class MainActivity : ComponentActivity() {
             "weights_len" to len
         )
 
+        /* A .hydra2 header starts with "HYDR", whose little-endian u32 is
+         * different from the v1 magic. Check it before the v1 rejection so
+         * the dedicated format error is not hidden behind "unknown magic". */
+        if (magic == HYDRA2_HEAD_U32 && u32(4) == HYDRA2_TAIL_U32) {
+            val hydra2Advice = getString(R.string.err_magic_hydra2)
+            rules += HeaderRule("format", false, hydra2Advice)
+            return HeaderReport(size, fields, "HYDRA2", hydra2Advice, rules)
+        }
+
         val (detected, advice) = describeMagic(magic)
         if (magic != HYDRA_MAGIC) {
             rules += HeaderRule(
@@ -1042,18 +1051,6 @@ class MainActivity : ComponentActivity() {
             return HeaderReport(size, fields, detected, advice, rules)
         }
         rules += HeaderRule("magic", true, "magic matches .hydra")
-
-        /* A .hydra2 container ("HYDRA2\0\0") starts with the SAME four
-         * "HYDR" bytes, so the magic rule above cannot tell the two
-         * apart. Without this the user gets "magic matches .hydra" plus
-         * a generic version error for a file that is a perfectly valid
-         * .hydra2 container - the gate's own promise is to name the
-         * format the user actually picked. The v2 reader
-         * (src/hydra_v2_container.c) refuses the same way, with the
-         * magic named. */
-        if (u32(4) == HYDRA2_TAIL_U32) {
-            rules += HeaderRule("format", false, getString(R.string.err_magic_hydra2))
-        }
 
         rules += HeaderRule(
             "version", version == HYDRA_VERSION,
@@ -1367,16 +1364,9 @@ class MainActivity : ComponentActivity() {
         const val MAX_GGUF_BYTES = 4L * 1024 * 1024 * 1024
         const val HYDRA_MAGIC = 0x48594452L
         const val HYDRA_VERSION = 1L
-        /**
-         * The .hydra2 container's magic is "HYDRA2\0\0" (8 bytes,
-         * include/hydra_v2_container.h HYDRA2_MAGIC_STR): the FIRST four
-         * bytes are the same "HYDR" as the v1 model, so the magic rule
-         * alone can never tell the two apart. Bytes 4..7 ("A2\0\0",
-         * little-endian u32 0x00003241) are the discriminator. tools/
-         * android_header_check.sh re-derives this constant from the C
-         * header, so a format change there cannot rot this check
-         * silently.
-         */
+        /** The .hydra2 magic has an 8-byte header; both words are checked
+         * so a v2 header is named instead of reported as unknown magic. */
+        const val HYDRA2_HEAD_U32 = 0x52445948L
         const val HYDRA2_TAIL_U32 = 0x00003241L
 
         /** In the companion so the nested [HeaderReport] can format too. */

@@ -60,20 +60,37 @@ check "an unknown magic still states both values" "$STRINGS" "err_magic_unknown"
 
 # --- the v2 header path, verified alongside the v1 header path ----------
 # A .hydra2 container ("HYDRA2\0\0", include/hydra_v2_container.h
-# HYDRA2_MAGIC_STR) starts with the SAME four "HYDR" bytes as a v1
-# model, so the v1 magic rule alone misreports it ("magic matches
-# .hydra" + a generic version error). The Kotlin side must carry the
-# discriminator (bytes 4..7 as a little-endian u32) and name the format.
-# The constant is RE-DERIVED from the C header, so a format change in
+# HYDRA2_MAGIC_STR) has a different little-endian head word from v1.
+# The Kotlin side must check both the head (bytes 0..3) and discriminator
+# (bytes 4..7) before naming the format.
+# Both constants are RE-DERIVED from the C header, so a format change in
 # include/hydra_v2_container.h turns this gate red instead of rotting
-# the Kotlin constant silently (the same cross-surface discipline the
-# C-loader rule ids above pin against MainActivity.kt).
+# the Kotlin constants silently.
 C_V2_HDR="$(cd "$(dirname "$0")/.." && pwd)/include/hydra_v2_container.h"
+check "the v2 head constant exists in MainActivity.kt" "$MAIN" "HYDRA2_HEAD_U32"
 check "the v2 tail constant exists in MainActivity.kt" "$MAIN" "HYDRA2_TAIL_U32"
-check "the v2 naming rule exists" "$MAIN" 'HeaderRule("format", false, getString(R.string.err_magic_hydra2))'
+check "the v2 header checks both words" "$MAIN" "magic == HYDRA2_HEAD_U32 && u32(4) == HYDRA2_TAIL_U32"
+check "the v2 naming rule exists" "$MAIN" 'HeaderRule("format", false, hydra2Advice)'
 check "the v2 message exists" "$STRINGS" "err_magic_hydra2"
 check "the v2 message names .hydra2" "$STRINGS" ".hydra2 container"
 if command -v python3 > /dev/null; then
+  expected_v2_head=$(python3 - "$C_V2_HDR" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'#define\s+HYDRA2_MAGIC_STR\s+"((?:[^"\\]|\\.)*)"', src)
+if not m:
+    sys.exit("HYDRA2_MAGIC_STR not found")
+raw = m.group(1).encode("utf-8").decode("unicode_escape").encode("latin-1")
+print("0x%08XL" % int.from_bytes(raw[0:4], "little"))
+PY
+  )
+  if [ -n "${expected_v2_head:-}" ]; then
+    check "the Kotlin v2-head constant matches the C header ($expected_v2_head)" "$MAIN" "const val HYDRA2_HEAD_U32 = $expected_v2_head"
+  else
+    checks=$((checks + 1))
+    echo "FAIL: could not derive the v2 head from $C_V2_HDR"
+    fail=1
+  fi
   expected_v2_tail=$(python3 - "$C_V2_HDR" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
