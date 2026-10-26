@@ -596,3 +596,110 @@ can and cannot prove.
       re-fetch recipe), user.md (directive 29). Gate sweep green,
       commit + push (PR #68 updated).
 
+
+## Round 2026-10-26 (round 11: post-merge audit completion — JNI sampler config tests, web-console sampler, Android v2 header diagnostics, tf_row_dot SIMD)
+
+**Session start (R33):** 2026-10-26 (branch `arena/476154f4-bestai`, base `fd1848a` = merge of PR #68). Read before the first edit: AGENTS.md (full), .agents/session.md (rounds 6-10), .agents/errors.md (top entries), .agents/user.md (directive list, tail), .agents/Environment.md (ARM/toolchain section: APT block, zig compile-only path, no qemu), .gitignore (safety check: .agents/ fully tracked, 23 files, owner-decision comment — NOT touched), the root inventory (no HYDRA2-RESEARCH.md at root — it lives at .agents/docs/HYDRA2-RESEARCH.md; no docs/HYDRA2.md — v2 format docs are docs/FORMAT-V2.md), the Makefile (full: targets, AVX2 probe, jni-batch-test deps), .github/workflows/ci.yml (jni-signatures job: jni_signature_check runs for BOTH bridges; android_header_check job), android/app/src/main/cpp/hydra_jni.c (full: 5 JNI exports, runInferenceSampled validation inline), android/app/src/main/cpp/hydra_batch.h (the single-source header pattern), tests/test_jni_batch.c (structure + includes), tools/jni_signature_check.sh (parameterised, negative-control via args), tools/android_header_check.sh (full check list), android/app/src/main/java/dev/hydrastone/MainActivity.kt (analyseHydraFile + describeMagic), android/app/src/main/res/values/strings.xml (err_magic_*), server.js (/api/infer handler, runInference, constants), public/app.js (run flow: POST /api/infer sends {path,prompt,steps,request_id} only), public/index.html (opt-* settings block), tools/server_test.js (structure, node:test), tools/hydra_train.js (deterministic hill climbing — no sampling), src/hydra_engine.c (M2 sampler, v3 step_tf, v4 hydra_transformer_forward_step, tf_row_dot scalar core, sampler step), src/hydra_simd.h + src/hydra_neon.h (existing AVX2/NEON kernels: accumulate_agg + v2 plane unpack), src/hydra_v2_container.c (open/magic, route_top_k, tensor types) + include/hydra_v2_container.h (HYDRA2_MAGIC_STR "HYDRA2\0\0", public API) + include/hydra_model.h (sampler ctx), android/app/build.gradle + android/CMakeLists.txt (hydra_v2_container.c is HOST-ONLY, not in the app build), tests/test_engine.c (M-E sampler suite, sampled-loop section, AVX2/NEON parity test patterns), tools/test_count_baseline.txt (x86 219 / arm 228, hydra2 122 separate).
+
+**Owner directive (verbatim intent):** the post-merge audit from the owner: update test_jni_batch.c to also test the new JNI sampler configuration; the JNI signature gate should strictly cross-check all native methods across both bridges including a negative control; update tools/android_header_check.sh to verify include/hydra_v2_container.h alongside include/hydra_model.h; new CLI sampler flags (temperature, min_p, repetition penalty) (ALREADY PRESENT in src/main.c — verified: --temp/--min-p/--rep-penalty/--rep-window with validation; documented as such, not re-implemented); web console: new controls for temperature/min_p/rep_penalty + new sampler flags for the training backend if applicable (trainer is deterministic hill climbing — no sampling — documented as N/A with evidence); SIMD the v2-container expert decode paths and the new format v4 (evidence-based scope: tf_row_dot is the v3/v4 forward's scalar integer-exact core -> AVX2+NEON; the container's expert decode is a documented O(k^2 n) comparison-based selection + double softmax with no data-parallel arithmetic -> documented, not changed); update the docs to reflect the new features. PLUS the owner's emphatic reply (2026-10-26): "Mache so, dass du gewissenhaft weißt, dass du nichts kaputt machst! Also gitignor und die wichtigsten Agenten Files session.md etc. IMMER EGAL WAS ICH SAGE wahre und beschützt und sie stets aktualisierst!! Bitte prüfen und sicher fortfahren!" — STANDING RULE for this round (highest priority after safety): .agents/ files (session.md, errors.md, user.md, Environment.md, rules.md, docs/) are SACROSANCT — never delete them, never add them to .gitignore, keep them current in every round, regardless of any other instruction; .gitignore itself is not touched. Proceed thoroughly: legacy behaviour stays bit-identical (greedy default unchanged, v1 baseline stream untouched, all existing gates green) and every local gate runs before any commit.
+
+- [x] R11-A (FERTIG): JNI sampler config — extract runInferenceSampled's validation into
+      android/app/src/main/cpp/hydra_sample_cfg.h (the hydra_batch.h single-source
+      pattern: one header compiled into both libhydra.so and the host test);
+      hydra_jni.c calls it (messages + check order unchanged); new section in
+      tests/test_jni_batch.c (boundaries: temp 0/20.0, minP 0/1.0, rp 1.0/2.0
+      accepted; temp -0.1/20.001/NaN/Inf, minP -0.001/1.001, rp 0.9999 rejected;
+      greedy-default proof); Makefile jni-batch-test dep + new count;
+      tools/sampler_contract_check.sh (cross-surface: main.c CLI, JNI header,
+      server.js share the same range rules; negative control) wired into the
+      ci.yml jni-signatures job; tools/jni_signature_negative_test.sh (missing
+      negative control, pattern: android_autostart_negative_test.sh).
+- [x] R11-B (FERTIG): web console sampler — server.js /api/infer accepts
+      temperature/minP/repetitionPenalty/repWindow, validates with the SAME
+      rules as the JNI header (400 + clear message, non-finite rejected),
+      passes --temp/--min-p/--rep-penalty/--rep-window as execFile array args
+      (no shell); legacy request (no fields) emits NO flags -> greedy -> the
+      existing 37 server_test.js cases stay green bit-identical; index.html +
+      app.js: sampler controls (defaults = off = legacy behaviour);
+      server_test.js new live HTTP tests (legacy bit parity, temp=0 == greedy
+      stream, temp>0+seed changes the stream = no-op negative control, 400 for
+      every invalid value/type); trainer (tools/hydra_train.js) untouched —
+      deterministic hill climbing has no sampling stage (documented).
+- [x] R11-C (FERTIG): Android v2 header diagnostics — a .hydra2 file (magic
+      "HYDRA2\0\0": first 4 bytes are the SAME "HYDR" as v1, the tail
+      "A2\0\0" distinguishes) currently reports "magic matches .hydra" + a
+      generic version error; MainActivity.kt names the HYDRA2 container by
+      name (strings.xml entry, mirroring the v2 reader's own refusal);
+      tools/android_header_check.sh gains the v2 checks INCLUDING a
+      cross-surface check that the Kotlin constant equals bytes 4-7 of
+      HYDRA2_MAGIC_STR in include/hydra_v2_container.h (the v2 header path
+      verified alongside the v1 header path, as audited).
+- [x] R11-D (FERTIG): SIMD — tf_row_dot (the 2-bit ternary x int8 dot that v3 step_tf
+      and v4 hydra_transformer_forward_step call ~384x/token) gets
+      hydra_avx2_tf_row_dot (src/hydra_simd.h, 128-bit: zero-padded 16-byte
+      load + pshufb unpack x4 + maddubs + int32 sum — INTEGER EXACT, so the
+      pinned streams stay valid) and hydra_neon_tf_row_dot (src/hydra_neon.h,
+      vtbl1 + vmlsabdq); dispatch in hydra_engine.c (AVX2 runtime probe as in
+      M3, NEON compile-time as in the load path); parity tests in
+      tests/test_engine.c (x86: LCG-random rows/vectors over dims 4..64 +
+      all-code sweep + extremes vs an independent scalar reference, the M3
+      pattern; NEON: same, compiled-only locally per Environment.md (no qemu),
+      executed on the ARM CI leg); tools/test_count_baseline.txt x86/arm lines
+      updated in the SAME commit (R21). Container SIMD: NOT done, with the
+      evidence (route_top_k is comparison-based selection + double softmax,
+      the container has no data-parallel arithmetic, plane unpack is already
+      AVX2/NEON); float ops (rmsnorm/rope/swiglu/attention) stay scalar
+      (bit-exact pinned streams).
+- [x] R11-E (FERTIG): docs — AGENTS.md (v3/v4 transformer + per-layer KV, .hydra2
+      container, sampler on all surfaces, SIMD map, the two new gates),
+      README.md (CLI sampler flags if not already documented), CHANGELOG.md
+      round 11, errors.md (as they happen), user.md directive 30.
+- [ ] R11-F: gates + PR — the full 5-part local gate (make clean && make &&
+      make test && make test-run; static analysis; python; node; guardrails),
+      v1 baseline stream [471 386 385 386 385 386 385 386] unchanged,
+      docs_claim_check, test_count_check vs the new baseline, zig aarch64
+      compile check of the NEON path (Environment.md's recorded substitute),
+      then commit on arena/476154f4-bestai, push, PR with facts only, CI green
+      including the ARM leg.
+
+### R11 results (measured, 2026-10-26)
+
+- **R11-A:** `hydra_sample_cfg.h` (single source: ranges temp 0..20 / minP
+  0..1 / rp >= 1.0 / window 0..4096, isfinite, order temp→minP→rp, codes
+  0–3, defaults 0/0/1.0/64). jni-batch-test **109 checks, 0 failed** (was
+  86). `sampler_contract_check.sh` **34/34 GRÜN** + negative control rc=1
+  (drift "C header '25.0' vs server.js '20'"). `jni_signature_negative_test.sh`
+  local SKIP rc=0 (no javac in sandbox — said so), S1 phantomMethod /
+  S2 load-Arität / sed-Guard; CI proof on JDK 17. Both wired into the
+  ci.yml jni-signatures job; `workflow_yaml_check.sh` green (5 workflows).
+- **R11-B:** server.js strict validation (`typeof v !== 'number' ||
+  !Number.isFinite(v)`, window additionally integer); field-less request
+  appends NO flags (legacy bit-exact). ECHTER BUG gefangen vom eigenen
+  Test: `Number(null) === 0` ließ NaN-serialisiertes Feld als temp 0
+  durch — jetzt 400. server_test **43/43** (was 37). `hydra_train.js`
+  unangetastet (deterministisch, dokumentiert).
+- **R11-C:** MainActivity.kt `HYDRA2_TAIL_U32 = 0x00003241L` +
+  HeaderRule("format", …) + `err_magic_hydra2` (strings.xml).
+  android_header_check **28/28 GRÜN** (was 21) inkl. 2 computed
+  cross-surface pins (python3 rechnet die Kotlin-Konstanten aus den C
+  Magic-Strings) + Negativ rc=1 (0x00009999L). R_gen.kt-Stub →
+  kotlin_stub_check OK 0 errors.
+- **R11-D:** AVX2- + NEON-Kernel für `tf_row_dot` (Design: 1 Row-Byte =
+  4× 2-Bit-Codes ⇒ 8-dim-Chunk = 2 Row-Bytes + 8 x-Bytes; T3={0,1,-1,0};
+  integer-exakt, Lane-Bound 2·127, Total-Bound 64·127=8128 ⇒
+  bit-identische Streams, kein Re-Pinning). Parity:
+  `/tmp/par_check.c` (recreatable: gcc -O2 -mavx2 -Iinclude,
+  scalar-Referenz + LCG, dims 4..64 × 2000, x exakt dim groß) **ALL OK**
+  + **ASan-CLEAN** (x exakt dim groß). `hydra-test` **225/225 x86**
+  (was 219; +6 AVX2-Parity-Checks); ARM-Baseline 228 → **234** (progn.
+  +6 NEON-Checks, CI-ARM-Leg misst). Pinned v3/v4-Streams gültig (die
+  beiden Stream-Tests haben die erste Kernel-Version gefangen). NEON:
+  zig-aarch64-Full-Compile (engine + tests) rc=0, kein lokaler ARM-Run
+  (kein QEMU — Environment.md-Rezept; CI neon-test = Ausführungsbeweis).
+- **R11-E:** AGENTS.md §2.1 (v3/v4 + SIMD-Dispatch + dokumentierte
+  Scope-Entscheidungen Container-Top-k/Floats), §3 (jni 109, server 43,
+  beide neuen Gates), README (CLI-Sampler-Flags + Contract),
+  CHANGELOG R11, docs/FORMAT-V2.md (SIMD-Status-Punkt).
+- **R11-F:** läuft — 5-Teil-Gate lokal, v1-Baseline
+  [471 386 385 386 385 386 385 386] muss byte-identical bleiben, dann
+  Commit → Push → PR (FACTS ONLY) → CI grün inkl. ARM-Leg.

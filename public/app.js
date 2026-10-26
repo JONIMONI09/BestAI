@@ -383,6 +383,25 @@
     $('input').setAttribute('aria-busy', busy ? 'true' : 'false');
   }
 
+  /* Sampler settings: a value is sent ONLY when it differs from the
+   * engine's greedy defaults (temp 0, min-p 0, penalty 1, window 64).
+   * A settings panel left untouched must therefore produce exactly the
+   * legacy request — no sampler flag reaches the CLI, and the run stays
+   * bit-identical. The server validates the same ranges as the Android
+   * bridge (hydra_sample_cfg.h, pinned by tools/sampler_contract_check.sh). */
+  function samplerSettings() {
+    const s = {};
+    const temp = Number($('opt-temp').value);
+    if (Number.isFinite(temp) && temp !== 0) s.temperature = temp;
+    const minP = Number($('opt-minp').value);
+    if (Number.isFinite(minP) && minP !== 0) s.minP = minP;
+    const repPenalty = Number($('opt-reppen').value);
+    if (Number.isFinite(repPenalty) && repPenalty !== 1) s.repetitionPenalty = repPenalty;
+    const repWindow = Number($('opt-repwin').value);
+    if (Number.isInteger(repWindow) && repWindow !== 64) s.repWindow = repWindow;
+    return s;
+  }
+
   async function send(text) {
     const startToken = Number($('opt-token').value) || 0;
     const steps = Number($('opt-steps').value) || 16;
@@ -414,7 +433,9 @@
       const t0 = performance.now();
       const res = await api('/api/infer', {
         method: 'POST',
-        body: JSON.stringify({ path: state.model, prompt, steps, request_id: callId }),
+        body: JSON.stringify(Object.assign(
+          { path: state.model, prompt, steps, request_id: callId },
+          samplerSettings())),
         signal: controller.signal,
       });
       const wall = performance.now() - t0;

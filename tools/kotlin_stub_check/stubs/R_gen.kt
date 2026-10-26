@@ -28,6 +28,7 @@ object R {
         const val err_too_small_human: Int = 0
         const val err_unreadable: Int = 0
         const val err_magic_gguf: Int = 0
+        const val err_magic_hydra2: Int = 0
         const val err_magic_zip: Int = 0
         const val err_magic_elf: Int = 0
         const val err_magic_png: Int = 0

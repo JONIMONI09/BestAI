@@ -940,6 +940,21 @@ static const int8_t HYDRA_T3[4] = {0, 1, -1, 0};
  * exact: |result| <= dim * 127. */
 static int32_t tf_row_dot(const uint8_t *row, const int8_t *x, uint32_t dim)
 {
+    /* SIMD dispatch (the M3 pattern): AVX2 at runtime through the same
+     * probe the load path uses, NEON at compile time (an NEON build
+     * always has it on its target). Both kernels are INTEGER EXACT -
+     * bit-for-bit this scalar loop, no float reassociation - which is
+     * what keeps the pinned v3/v4 token streams valid on vector
+     * machines; the parity suite in tests/test_engine.c proves it per
+     * build. On a non-NEON, non-AVX2 build (or an AVX2 build on a
+     * non-AVX2 CPU) the scalar loop below runs, unchanged. */
+#if defined(__AVX2__)
+    if (hydra_simd_has_avx2())
+        return hydra_avx2_tf_row_dot(row, x, dim);
+#endif
+#if defined(__ARM_NEON)
+    return hydra_neon_tf_row_dot(row, x, dim);
+#endif
     int32_t acc = 0;
     for (uint32_t b = 0; b < dim; b += 4) {
         const uint32_t by = row[b / 4]; /* uint32: the shifts below are

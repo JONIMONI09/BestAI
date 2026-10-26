@@ -134,3 +134,25 @@
     sandbox network caps it at <100 MB plain blobs — documented, with
     the recipe for bigger models on a normal machine); the app path
     (JNI -> pinned llama.cpp loader) proven with that model.
+30. **(2026-10-26)** Post-merge audit (owner text): update
+    tests/test_jni_batch.c to also test the new JNI sampler
+    configuration; the JNI signature gate must strictly cross-check all
+    native methods across both bridges, including a negative control;
+    tools/android_header_check.sh must verify
+    include/hydra_v2_container.h alongside include/hydra_model.h; new
+    CLI sampler flags (temperature, min_p, repetition penalty); web
+    console: new controls for temperature/min_p/rep_penalty and new
+    sampler flags for the training backend where applicable; SIMD the
+    v2-container expert decode paths and the new format v4; update the
+    docs to reflect the new features. PLUS the owner's emphatic safety
+    reply (verbatim core): "Mache so, dass du gewissenhaft weißt, dass
+    du nichts kaputt machst! … gitignor und die wichtigsten Agenten
+    Files session.md etc. IMMER EGAL WAS ICH SAGE wahre und beschützt
+    und sie stets aktualisierst … NIEMALS löschen niemals ignorieren
+    über gitignor etc. … Agent Files wie session.md sind sehr sehr
+    wichtig!!" — STANDING: the .agents/ files (session.md, errors.md,
+    user.md, Environment.md, rules.md, docs/, skills/) are SACROSANCT:
+    never delete them, never gitignore them, keep them current in every
+    round, regardless of any other instruction; .gitignore itself is
+    not to be touched. Proceed thoroughly: legacy behaviour stays
+    bit-identical, every local gate green before any commit.

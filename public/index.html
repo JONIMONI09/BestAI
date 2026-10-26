@@ -156,6 +156,28 @@
       <input id="opt-steps" type="number" min="1" max="256" value="16">
     </label>
 
+    <h3 class="mini-head">Sampler</h3>
+    <p class="explain">Optional stochastic sampling for the engine run. The defaults below are the
+      greedy path: a setting left at its default is not sent, so the run stays bit-identical
+      to the plain CLI. Temperature and min-p must both leave their defaults for sampling to
+      kick in (the engine's rule: sampling is on when temperature &gt; 0 and min-p &lt; 1).</p>
+    <label class="field" for="opt-temp">
+      <span>Temperature (default 0 = greedy; max 20)</span>
+      <input id="opt-temp" type="number" min="0" max="20" step="0.1" value="0">
+    </label>
+    <label class="field" for="opt-minp">
+      <span>Min-p filter (default 0 = off; 1 = greedy)</span>
+      <input id="opt-minp" type="number" min="0" max="1" step="0.05" value="0">
+    </label>
+    <label class="field" for="opt-reppen">
+      <span>Repetition penalty (default 1 = off)</span>
+      <input id="opt-reppen" type="number" min="1" step="0.05" value="1">
+    </label>
+    <label class="field" for="opt-repwin">
+      <span>Penalty window in tokens (default 64; max 4096)</span>
+      <input id="opt-repwin" type="number" min="0" max="4096" step="1" value="64">
+    </label>
+
     <h3 class="mini-head">Coexistence axiom</h3>
     <label class="field" for="opt-humanity">
       <span>Humanity factor H(s)</span>

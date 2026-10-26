@@ -156,6 +156,117 @@ test('/api/infer on a valid model returns a token stream', async () => {
   assert.ok(Array.isArray(body.state));
 });
 
+/* ---------------- sampler pass-through (/api/infer) ----------------
+ * The handler must (a) reject every value the Android bridge rejects
+ * (the SAME ranges as hydra_sample_cfg.h — pinned across surfaces by
+ * tools/sampler_contract_check.sh), (b) keep legacy and greedy-equivalent
+ * requests bit-identical, and (c) actually pass a chosen sampling config
+ * to the engine: with a fixed model, seed and config the stream is
+ * deterministic, so "a sampled run differs from the greedy one" is a
+ * stable negative control against a no-op pass-through. */
+
+async function firstModel() {
+  const { body: list } = await json('/api/models');
+  return list.models.find((m) => m.valid) || list.models[0];
+}
+
+test('/api/infer sampler: legacy request and explicit temperature 0 are bit-identical', async () => {
+  const model = await firstModel();
+  const legacy = await postJSON('/api/infer', { path: model.path, token: 11, steps: 12 });
+  const greedy = await postJSON('/api/infer', { path: model.path, token: 11, steps: 12, temperature: 0 });
+  assert.strictEqual(legacy.status, 200);
+  assert.strictEqual(greedy.status, 200);
+  assert.deepStrictEqual(
+    greedy.body.tokens,
+    legacy.body.tokens,
+    'temperature 0 must stay the plain greedy stream (no flag or --temp 0 - same run)');
+});
+
+test('/api/infer sampler: a sampling config changes the stream (no-op pass-through would fail)', async () => {
+  const model = await firstModel();
+  const greedy = await postJSON('/api/infer', { path: model.path, token: 11, steps: 16 });
+  const sampled = await postJSON('/api/infer', {
+    path: model.path, token: 11, steps: 16,
+    temperature: 1.5, minP: 0.5,
+  });
+  assert.strictEqual(greedy.status, 200);
+  assert.strictEqual(sampled.status, 200);
+  assert.strictEqual(sampled.body.tokens.length, 16);
+  assert.notDeepStrictEqual(
+    sampled.body.tokens,
+    greedy.body.tokens,
+    'temperature 1.5 + min-p 0.5 must change the deterministic stream - '
+      + 'identical output would mean the flags never reached the engine');
+});
+
+test('/api/infer sampler: the same config is reproducible (seed default 0)', async () => {
+  const model = await firstModel();
+  const a = await postJSON('/api/infer', {
+    path: model.path, token: 11, steps: 16,
+    temperature: 1.5, minP: 0.5,
+  });
+  const b = await postJSON('/api/infer', {
+    path: model.path, token: 11, steps: 16,
+    temperature: 1.5, minP: 0.5,
+  });
+  assert.deepStrictEqual(b.body.tokens, a.body.tokens,
+    'same model + seed + config must give the same stream');
+});
+
+test('/api/infer sampler: the full config (all four flags) is accepted', async () => {
+  const model = await firstModel();
+  const { status, body } = await postJSON('/api/infer', {
+    path: model.path, token: 11, steps: 16,
+    temperature: 1.0, minP: 0.2, repetitionPenalty: 1.3, repWindow: 32,
+  });
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.tokens.length, 16);
+});
+
+test('/api/infer sampler: the range boundaries (20, 1, 1, 0, 4096) are accepted', async () => {
+  const model = await firstModel();
+  const { status, body } = await postJSON('/api/infer', {
+    path: model.path, token: 11, steps: 8,
+    temperature: 20, minP: 1, repetitionPenalty: 1, repWindow: 4096,
+  });
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.tokens.length, 8);
+});
+
+test('/api/infer sampler: every value outside the contract ranges is a 400', async () => {
+  const model = await firstModel();
+  /* JSON has no NaN: JSON.stringify({temperature: NaN}) sends null - and
+   * Number(null) === 0 would silently turn it into a VALID config. null
+   * and true are therefore the serialisable stand-ins for "non-number",
+   * pinned here on every field. */
+  const bad = [
+    { temperature: -0.5 },
+    { temperature: 21 },
+    { temperature: 'abc' },
+    { temperature: null },
+    { temperature: true },
+    { minP: -0.1 },
+    { minP: 1.5 },
+    { minP: 'abc' },
+    { minP: null },
+    { repetitionPenalty: 0.5 },
+    { repetitionPenalty: 'abc' },
+    { repetitionPenalty: null },
+    { repWindow: -1 },
+    { repWindow: 5000 },
+    { repWindow: 1.5 },
+    { repWindow: 'abc' },
+    { repWindow: null },
+  ];
+  for (const field of bad) {
+    const { status, body } = await postJSON('/api/infer', {
+      path: model.path, token: 11, steps: 4, ...field,
+    });
+    assert.strictEqual(status, 400, `expected 400 for ${JSON.stringify(field)}, got ${status}`);
+    assert.ok(body.error && String(body.error).length > 0, `an error must name the problem for ${JSON.stringify(field)}`);
+  }
+});
+
 test('/api/infer forwards the whole prompt, not just its first token', async () => {
   const { body: list } = await json('/api/models');
   const model = list.models.find((m) => m.valid) || list.models[0];

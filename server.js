@@ -17,7 +17,9 @@
  *  POST /api/models/upload?name=   -> store an uploaded .hydra (raw body).
  *                                     Over the cap: 413 with a body, never a
  *                                     dropped connection.
- *  POST /api/infer {token,prompt,steps} -> inference via hydra-run --json
+ *  POST /api/infer {token,prompt,steps,temperature?,minP?,
+ *                   repetitionPenalty?,repWindow?} -> inference via
+ *                   hydra-run --json (sampler flags only when sent)
  *  POST /api/train {...}           -> train a model from a corpus
  *  GET  /api/vocab?model=...       -> token<->string map for a model
  *  PUT  /api/vocab                 -> store/replace that map
@@ -70,6 +72,19 @@ const MAX_BODY = 2 * 1024 * 1024; /* training corpora are text; 2 MiB is ample *
 const MAX_UPLOAD = parseByteSize(process.env.HYDRA_MAX_UPLOAD, 64 * 1024 * 1024);
 const MAX_PROMPT = 256; /* must match MAX_PROMPT in src/main.c */
 const ENGINE_TIMEOUT_MS = 20000;
+
+/* Sampler pass-through for /api/infer. The ranges are the SAME rules the
+ * Android bridge applies (android/app/src/main/cpp/hydra_sample_cfg.h,
+ * used by hydra_jni.c runInferenceSampled) and are pinned by
+ * tools/sampler_contract_check.sh: temperature in [0, 20] (0 = greedy),
+ * min-p in [0, 1] (1 = greedy), repetition penalty >= 1 (1 = off),
+ * penalty window an integer in [0, 4096]. A request without any of the
+ * fields emits NO sampler flag, so a legacy client keeps the bit-
+ * identical greedy run. */
+const SAMPLER_TEMP_MAX = 20;
+const SAMPLER_MINP_MAX = 1;
+const SAMPLER_REP_MIN = 1;
+const SAMPLER_REP_WINDOW_MAX = 4096;
 
 /* The console talks to a local engine and can run arbitrary uploaded code
  * paths, so binding it to every interface must be an explicit decision.
@@ -524,9 +539,17 @@ function engineJson(args, requestId) {
 
 /* prompt: optional token sequence fed through the engine before generation.
  * An empty prompt keeps the old single-seed behaviour (token). */
-function runInference(modelPath, token, steps, prompt, requestId) {
+function runInference(modelPath, token, steps, prompt, requestId, sampler) {
   const args = [modelPath, String(token), String(steps), '--json'];
   if (Array.isArray(prompt) && prompt.length > 0) args.push('--prompt', prompt.join(','));
+  /* Sampler flags are appended only for values the client sent (validated
+   * in the /api/infer handler against the hydra_sample_cfg.h ranges).
+   * execFile passes the array verbatim — no shell, the same invariant as
+   * every other engine call in this file. */
+  if (sampler && sampler.temperature !== undefined) args.push('--temp', String(sampler.temperature));
+  if (sampler && sampler.minP !== undefined) args.push('--min-p', String(sampler.minP));
+  if (sampler && sampler.repetitionPenalty !== undefined) args.push('--rep-penalty', String(sampler.repetitionPenalty));
+  if (sampler && sampler.repWindow !== undefined) args.push('--rep-window', String(sampler.repWindow));
   return engineJson(args, requestId);
 }
 
@@ -1160,6 +1183,48 @@ const server = http.createServer(async (req, res) => {
         if (prompt.length === 0) prompt = null;
       }
 
+      /* Sampler: optional fields, validated with the SAME ranges as the
+       * Android bridge (hydra_sample_cfg.h — tools/sampler_contract_check.sh
+       * fails when the two drift apart). Absent fields mean "no flag" (the
+       * CLI's greedy defaults), never "send the default": only a value the
+       * client actually chose changes the run, so a legacy request stays
+       * bit-identical. */
+      const sampler = {};
+      /* Strict typeof on purpose: JSON has no NaN, but it DOES have null,
+       * true and "5" - and Number(null) === 0, Number(true) === 1, so a
+       * Number() coercion would silently turn a garbage value into a
+       * valid sampling config (the same trap the token/steps shape check
+       * above guards against for a different reason). Only a real JSON
+       * number is a value the Android bridge (a jfloat) could carry. */
+      if (body.temperature !== undefined) {
+        const v = body.temperature;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > SAMPLER_TEMP_MAX) {
+          return sendJSON(res, 400, { error: `temperature must be a finite number in [0, ${SAMPLER_TEMP_MAX}]` });
+        }
+        sampler.temperature = v;
+      }
+      if (body.minP !== undefined) {
+        const v = body.minP;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > SAMPLER_MINP_MAX) {
+          return sendJSON(res, 400, { error: `minP must be a finite number in [0, ${SAMPLER_MINP_MAX}]` });
+        }
+        sampler.minP = v;
+      }
+      if (body.repetitionPenalty !== undefined) {
+        const v = body.repetitionPenalty;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < SAMPLER_REP_MIN) {
+          return sendJSON(res, 400, { error: `repetitionPenalty must be a finite number >= ${SAMPLER_REP_MIN}` });
+        }
+        sampler.repetitionPenalty = v;
+      }
+      if (body.repWindow !== undefined) {
+        const v = body.repWindow;
+        if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > SAMPLER_REP_WINDOW_MAX) {
+          return sendJSON(res, 400, { error: `repWindow must be an integer in [0, ${SAMPLER_REP_WINDOW_MAX}]` });
+        }
+        sampler.repWindow = v;
+      }
+
       /* An explicitly requested but forbidden path must not silently fall
        * back to the default model. */
       let p = DEFAULT_MODEL;
@@ -1191,7 +1256,7 @@ const server = http.createServer(async (req, res) => {
       });
 
       try {
-        const result = await runInference(p, token, steps, prompt, requestId);
+        const result = await runInference(p, token, steps, prompt, requestId, sampler);
         return sendJSON(res, 200, result);
       } catch (e) {
         if (e && e.cancelled) {

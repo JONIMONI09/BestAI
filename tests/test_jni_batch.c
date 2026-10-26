@@ -18,6 +18,7 @@
  * Build: make jni-batch-test | Run: ./jni-batch-test
  */
 #include "../android/app/src/main/cpp/hydra_batch.h"
+#include "../android/app/src/main/cpp/hydra_sample_cfg.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -270,6 +271,94 @@ static void test_negative_control_short_tail_is_lost(void)
     CHECK(dropped == 1, "the un-flushed policy silently drops the 17th token");
 }
 
+/* ====================================================================
+ * Sampler-configuration validation (hydra_sample_cfg.h).
+ *
+ * The SAME header the APK compiles into libhydra.so (hydra_jni.c
+ * runInferenceSampled): the rules that decide whether a sampling run is
+ * accepted at all - which parameter is out of range, which one is
+ * reported first, and what "greedy default" means - are executable on
+ * the host here, which makes them a test instead of a claim about a
+ * device:
+ *   - the boundaries (temp 0 and 20, min-p 0 and 1, penalty 1.0) are
+ *     ACCEPTED: 0 and 1.0 are valid greedy values, not errors (the
+ *     engine's M2 greedy guard, src/hydra_engine.c),
+ *   - the FIRST invalid parameter in the order temperature, min-p,
+ *     repetition penalty wins (the contract order the pre-extraction
+ *     inline code used - the error message a given request receives is
+ *     pinned),
+ *   - non-finite values are rejected per parameter, including +inf for
+ *     the penalty (isfinite, not merely ">= 1"),
+ *   - the greedy defaults are pinned to (0, 0, 1.0) and pass
+ *     validation; the range constants are pinned so a "harmless"
+ *     re-tuning turns red here before it can change what a run means.
+ * ==================================================================== */
+static void test_sampler_cfg_boundaries(void)
+{
+    CHECK(hydra_sample_cfg_validate(0.0f, 0.0f, 1.0f) == HYDRA_SAMPLE_OK,
+          "the greedy default (0, 0, 1.0) is valid");
+    CHECK(hydra_sample_cfg_validate(0.5f, 0.25f, 1.5f) == HYDRA_SAMPLE_OK,
+          "a typical sampling configuration is valid");
+    CHECK(hydra_sample_cfg_validate(20.0f, 1.0f, 2.0f) == HYDRA_SAMPLE_OK,
+          "the upper bounds (temp 20, min-p 1, penalty 2) are included");
+    CHECK(hydra_sample_cfg_validate(0.0f, 1.0f, 1.2f) == HYDRA_SAMPLE_OK,
+          "min-p = 1 is a valid greedy value, not an error");
+}
+
+static void test_sampler_cfg_rejections(void)
+{
+    CHECK(hydra_sample_cfg_validate(-0.1f, 0.0f, 1.0f) == HYDRA_SAMPLE_BAD_TEMP,
+          "a negative temperature is rejected as BAD_TEMP");
+    CHECK(hydra_sample_cfg_validate(20.0001f, 0.0f, 1.0f) == HYDRA_SAMPLE_BAD_TEMP,
+          "a temperature above 20 is rejected as BAD_TEMP");
+    CHECK(hydra_sample_cfg_validate(-1.0f, 2.0f, 1.0f) == HYDRA_SAMPLE_BAD_TEMP,
+          "the temperature error wins when later fields are invalid too");
+    CHECK(hydra_sample_cfg_validate(0.5f, -0.1f, 1.0f) == HYDRA_SAMPLE_BAD_MINP,
+          "a negative min-p is rejected as BAD_MINP");
+    CHECK(hydra_sample_cfg_validate(0.5f, 1.0001f, 1.0f) == HYDRA_SAMPLE_BAD_MINP,
+          "a min-p above 1 is rejected as BAD_MINP");
+    CHECK(hydra_sample_cfg_validate(0.5f, 0.5f, 1.0f) == HYDRA_SAMPLE_OK,
+          "penalty 1.0 is the valid 'off' value");
+    CHECK(hydra_sample_cfg_validate(0.5f, 0.5f, 0.9999f) == HYDRA_SAMPLE_BAD_REP,
+          "a penalty below 1.0 is rejected as BAD_REP");
+
+    const float nan = NAN;
+    const float inf = INFINITY;
+    CHECK(hydra_sample_cfg_validate(nan, 0.0f, 1.0f) == HYDRA_SAMPLE_BAD_TEMP,
+          "a NaN temperature is rejected");
+    CHECK(hydra_sample_cfg_validate(inf, 0.0f, 1.0f) == HYDRA_SAMPLE_BAD_TEMP,
+          "an infinite temperature is rejected");
+    CHECK(hydra_sample_cfg_validate(-inf, 0.0f, 1.0f) == HYDRA_SAMPLE_BAD_TEMP,
+          "a -infinite temperature is rejected");
+    CHECK(hydra_sample_cfg_validate(0.0f, nan, 1.0f) == HYDRA_SAMPLE_BAD_MINP,
+          "a NaN min-p is rejected");
+    CHECK(hydra_sample_cfg_validate(0.0f, inf, 1.0f) == HYDRA_SAMPLE_BAD_MINP,
+          "an infinite min-p is rejected");
+    CHECK(hydra_sample_cfg_validate(0.0f, 0.0f, nan) == HYDRA_SAMPLE_BAD_REP,
+          "a NaN penalty is rejected");
+    CHECK(hydra_sample_cfg_validate(0.0f, 0.0f, inf) == HYDRA_SAMPLE_BAD_REP,
+          "an infinite penalty is rejected (isfinite, not merely >= 1)");
+}
+
+static void test_sampler_cfg_defaults_are_pinned(void)
+{
+    CHECK(HYDRA_SAMPLE_DEFAULT_TEMP == 0.0f &&
+              HYDRA_SAMPLE_DEFAULT_MINP == 0.0f &&
+              HYDRA_SAMPLE_DEFAULT_REP == 1.0f,
+          "the greedy defaults are pinned to (0, 0, 1.0)");
+    CHECK(hydra_sample_cfg_validate(HYDRA_SAMPLE_DEFAULT_TEMP,
+                                    HYDRA_SAMPLE_DEFAULT_MINP,
+                                    HYDRA_SAMPLE_DEFAULT_REP) == HYDRA_SAMPLE_OK,
+          "the pinned defaults pass validation");
+    CHECK(HYDRA_SAMPLE_TEMP_MIN == 0.0f &&
+              HYDRA_SAMPLE_TEMP_MAX - HYDRA_SAMPLE_TEMP_MIN == 20.0f,
+          "the temperature range is pinned to [0, 20]");
+    CHECK(HYDRA_SAMPLE_MINP_MIN == 0.0f && HYDRA_SAMPLE_MINP_MAX == 1.0f,
+          "the min-p range is pinned to [0, 1]");
+    CHECK(HYDRA_SAMPLE_REP_MIN == 1.0f,
+          "the penalty lower bound is pinned to 1.0");
+}
+
 int main(void)
 {
     printf("== JNI batching policy (HYDRA_JNI_BATCH=%d) ==\n", HYDRA_JNI_BATCH);
@@ -278,6 +367,10 @@ int main(void)
     test_non_positive_steps_are_rejected();
     test_failures_propagate();
     test_negative_control_short_tail_is_lost();
+    printf("== sampler configuration (hydra_sample_cfg.h) ==\n");
+    test_sampler_cfg_boundaries();
+    test_sampler_cfg_rejections();
+    test_sampler_cfg_defaults_are_pinned();
     printf("\n%d checks, %d failed\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;
 }

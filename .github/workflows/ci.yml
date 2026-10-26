@@ -565,6 +565,19 @@ jobs:
             android/app/src/main/java/dev/hydrastone/LlamaBridge.kt \
             android/app/src/main/cpp/llama_jni.cpp
 
+      # R25: the gate above must be PROVED capable of failing (phantom
+      # native method + drifted parameter list, both directions). SKIPs
+      # without javac like the gate itself.
+      - name: JNI signature gate negative control
+        run: bash tools/jni_signature_negative_test.sh
+
+      # The sampler accept/reject ranges must be the same on every
+      # surface that exposes them (CLI, Android, web) - the gate pins
+      # the constants, the check order and the pass-through, and computes
+      # the numeric agreement between the C header and server.js.
+      - name: Sampler contract (CLI / Android / web agree)
+        run: bash tools/sampler_contract_check.sh
+
       # The crash-reporting contract cannot be executed without a device,
       # but the properties that were the bugs can be: the handler writes
       # the file BEFORE delegating, never starts an Activity, the report is

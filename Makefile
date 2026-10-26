@@ -28,10 +28,12 @@ test: hydra-test jni-batch-test large-model-test hydra2-test
 hydra-test: src/hydra_engine.c tests/test_engine.c include/hydra_model.h src/hydra_simd.h src/hydra_neon.h
 	$(CC) $(CFLAGS) -o hydra-test src/hydra_engine.c tests/test_engine.c $(LDFLAGS)
 
-# The JNI batching policy (android/app/src/main/cpp/hydra_batch.h) is shared
-# between the APK and this test, so the partial-final-batch rule is verified
-# on the host. No device or emulator is needed or available for it.
-jni-batch-test: tests/test_jni_batch.c android/app/src/main/cpp/hydra_batch.h
+# The JNI batching policy (android/app/src/main/cpp/hydra_batch.h) and the
+# sampler-configuration validation (android/app/src/main/cpp/hydra_sample_cfg.h)
+# are shared between the APK and this test, so the partial-final-batch rule and
+# the accept/reject ranges are verified on the host. No device or emulator is
+# needed or available for them.
+jni-batch-test: tests/test_jni_batch.c android/app/src/main/cpp/hydra_batch.h android/app/src/main/cpp/hydra_sample_cfg.h
 	$(CC) $(CFLAGS) -Iinclude -o jni-batch-test tests/test_jni_batch.c $(LDFLAGS)
 
 # Multi-GiB models and 32-bit offset arithmetic. The big file is sparse, so
