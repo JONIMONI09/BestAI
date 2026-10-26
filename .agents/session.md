@@ -419,3 +419,67 @@ annotations are the source of truth for any remaining findings.
     said out loud per R23). Full results in the commit message of 75b2649 and in the
     PR #67 description. Committed as 75b2649 (40 files, +5022/−212), pushed, PR #67
     opened (facts only). Merge: owner.
+
+## Round 2026-10-26 (round 9: GGUF verification — spec conformance, the ggml_type bug, the pinned llama.cpp smoke, the behavior gate, the .hydra2 GGUF boundary, all-.md pass)
+
+**Owner directive (verbatim intent):** "super, habe schon gemerged, dann prüfe nochmal, ob man dann GGUF dings modelle dort nutzen kann etc, also dass diese wirklich richtig schreiben, mit ihrer ganzen Intelligenz etc!!! mache tests, schaue im Web, und mache dann Doku etc!!!! alles an .md dateien aktualisieren!" — PR #67 merged by the owner as `0522d68` before this round started.
+
+**Question answered (honestly):** the app is dual-engine. The **llama.cpp
+engine** (submodule pinned at v0.5.0, `7fe450e19305b828c199d602c23a8337aaa1f03b`,
+`LlamaEngine.kt` + `llama_jni.cpp`, `isExperimental = false` per
+LlamaEngine.kt) is the main engine and runs GGUF with full transformer
+inference — that is the "ganze Intelligenz" path. The `GGUF → .hydra`
+converter is a documented 64-dim projection (seed model, not the source
+network); its output now has a behavior gate that states exactly what it
+can and cannot prove.
+
+**Plan + status (all local-gated before commit):**
+- [x] R9-A: web verification against official sources — ggml_type enum
+      (ggml-org/ggml `include/ggml.h`) and the GGUF spec (ggml-org/ggml
+      `docs/gguf.md`; the ggml-org/gguf repo does not exist).
+- [x] R9-B: bug found by the enum audit — `tools/gguf_reader.py`
+      quantised-name table wrong (31=TQ1_0/32=TQ2_0/34=MXFP4 vs official
+      34=TQ1_0/35=TQ2_0/39=MXFP4, +40/41/42 missing, 31–33/36–38 reserved).
+      Fixed; converter refusal now names tensor + layout
+      (`token_embd.weight (TQ1_0)`); regression gate `run_type_names` in
+      `tools/gguf_test.py` (6 current names + 6 reserved slots + message).
+- [x] R9-C: spec conformance checked (header order, 13 KV types, tensor
+      info, offsets relative to data section, alignment; version 2–3).
+      LE-only = spec-conformant (spec: assume LE, not detectable);
+      64-byte name cap not enforced (harmless) — both documented.
+- [x] R9-D: behavior gate `run_behavior` (converted model: two identical
+      `./hydra-run` runs + ≥2 distinct tokens, not the input repeated,
+      for (0,24)/(3,40)/(11,16)); measured streams before choosing the
+      threshold (token 0 → 3 distinct, tokens 3/11 → 2 distinct; ≥3 would
+      have failed on the real 4-token fixture — 16-token scratch fixture
+      gave 8–9 and does not count).
+- [x] R9-E: pinned llama.cpp smoke — built the pin (codeload tarball,
+      `cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF`,
+      `--target llama-cli llama-server`); `tools/gguf_minimal_llama.py`
+      (NEW, stdlib, fixed-seed LCG, 2 layers / dim 64 / heads 4 / ffn 192,
+      99-token BPE charmap, empty merges, 21 tensors) → `llama-cli -m
+      /tmp/smoke.gguf -p "a" -c 64 -n 4 -t 1 --temp 0` on the pin:
+      **prompt 36 894.7 t/s, generation 6 237.0 t/s, empty text by
+      construction** (random weights). Generator fixes from the run:
+      `tokenizer.ggml.model`="gpt2" (not "BPE" — "unknown tokenizer"),
+      `token_type` INT32, `output_norm.weight`, `llama.feed_forward_length`,
+      ffn layout `{n_embd,n_ff}` / `{n_ff,n_embd}` in this build. F16
+      variant reaches a ggml type mismatch in the pin (f32 act × f16 norm
+      in `ggml_mul`) → `--dtype f32` default. `run_minimal_llama` keeps
+      the generator alive in CI. llama-cli in this build is always-REPL:
+      closed stdin → `> ` prompt busy-loop (sandbox artifact, documented).
+- [x] R9-F: `.hydra2` boundary — `src/hydra_v2_container.c` refuses the
+      GGUF magic BY NAME (0x47475546, points at LlamaEngine + converter +
+      docs); +2 checks in `tests/test_hydra2_container.c` (suite 120→122;
+      `tools/test_count_baseline.txt` M-G note updated in this commit).
+- [x] R9-G: ALL .md updated — GGUF-IMPORT.md §11 + §4/§9, README
+      (dual-engine, import bullet, tools tree, 122), FORMAT-V2.md
+      (GGUF not a v2 container), CHANGELOG (round-9 entry + 122),
+      errors.md (round-9 mistakes), Environment.md (round-9: /tmp reset,
+      venv /tmp/lintenv2, llama.cpp build recipe), this section.
+- [x] R9-H: gate sweep + commit + push + PR (facts only; owner merges).
+      Local results: gguf_test green incl. the three new gates;
+      hydra2-test 122/0; flawfinder 0; cppcheck 0; make 0 warnings;
+      bandit medium+ 0 (20 Low = triaged asserts/subprocess, lint.yml
+      comment); pyflakes clean; v1 baseline `471 386 385 386 385 386
+      385 386` unchanged; llama.cpp build + smoke as above.

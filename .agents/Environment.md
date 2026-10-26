@@ -411,3 +411,26 @@
      wipe): the block in item 1 (one venv, five packages); the gcc
      gates stay system (`gcc -fanalyzer` is built into Debian 12's
      gcc 12.2). Zig frontend from round 6/7: same recipe, new venv.
+  5. **Round 9 (2026-10-26) — /tmp was wiped again; the llama.cpp pin
+     was built from source for the first time.**
+     - **Recreate (after a /tmp wipe):** the same single venv as round
+       8 now lives at **`/tmp/lintenv2`** (pyflakes, bandit, flawfinder,
+       cppcheck, cmake, ninja, clang-tidy via pip wheels — the flawfinder
+       PyPI package exists and works; the pip `gguf` package is NOT
+       usable in CI, so all test code under `tools/` stays stdlib-only):
+       `python3 -m venv /tmp/lintenv2 && /tmp/lintenv2/bin/pip install
+       pyflakes bandit flawfinder cppcheck cmake ninja clang-tidy`.
+     - **llama.cpp pin (v0.5.0, `7fe450e19305b828c199d602c23a8337aaa1f03b`):**
+       source at `/tmp/lc/llama.cpp-7fe450e…/` (codeload tarball, no
+       clone needed); build: `cmake -B build
+       -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF && cmake --build
+       build --parallel 2 --target llama-cli llama-server` (≈15–20 min
+       on this 2-core box; `libllama.so.0.5.0` confirms the pin).
+       Smoke: `python3 tools/gguf_minimal_llama.py --out /tmp/smoke.gguf
+       --seed 7` then `llama-cli -m /tmp/smoke.gguf -p "a" -c 64 -n 4
+       -t 1 --temp 0` — **give it an open stdin or it busy-spins on `> `
+       prompts** (this build's always-REPL; documented in
+       docs/GGUF-IMPORT.md §11.4 and errors.md round 9).
+     - Fetched spec sources (also wiped by the reset; re-fetch from
+       github raw if needed): ggml `include/ggml.h` (the ggml_type
+       enum) and `docs/gguf.md` (the GGUF spec) from ggml-org/ggml.

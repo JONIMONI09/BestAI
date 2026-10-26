@@ -478,6 +478,19 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                         "(0x48594452) - this is a v1 .hydra file, not a "
                         ".hydra2 container; the v2 reader is not a v1 "
                         "reader (FORMAT-V2.md 7.2)");
+        else if (memcmp(hdr, "GGUF", 4) == 0)
+            /* A GGUF is llama.cpp's transformer format: the supported
+             * path for it is the app's llama.cpp engine (full fidelity)
+             * or the offline tools/gguf_to_hydra.py projection - never
+             * this container reader. Naming it here keeps the mistake
+             * (dropping a .gguf into a .hydra2 slot) explainable from
+             * the error alone (docs/GGUF-IMPORT.md). */
+            rc = refuse(HYDRA2_E_MAGIC,
+                        "magic: file starts with the GGUF magic "
+                        "(0x47475546) - this is a llama.cpp GGUF model, "
+                        "not a .hydra2 container; GGUF support is the "
+                        "llama.cpp engine or the offline import "
+                        "tools/gguf_to_hydra.py (docs/GGUF-IMPORT.md)");
         else
             rc = refuse(HYDRA2_E_MAGIC, "magic: first 8 bytes are "
                         "0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X "

@@ -6,6 +6,102 @@
 
 ---
 
+## 2026-10-26 (round 9) — the quantised-type name table silently disagreed with the official ggml_type enum (user-facing mislabel, found by audit)
+
+- **Symptom:** `tools/gguf_reader.py` labelled `ggml_type` 31 as
+  `TQ1_0`, 32 as `TQ2_0`, 34 as `MXFP4`; 35/39/40/41/42 had no entry.
+  A file whose tensors are TQ1_0 (official value 34) would have been
+  refused under the label `MXFP4` — a wrong diagnostic in the message a
+  user reads to fix their import.
+- **Cause:** the table was written from memory of an older enum and
+  never checked against the source of truth. Official enum
+  (ggml-org/ggml `include/ggml.h`, fetched 2026-10-26): `TQ1_0 = 34`,
+  `TQ2_0 = 35`, `MXFP4 = 39`, `NVFP4 = 40`, `Q1_0 = 41`, `Q2_0 = 42`;
+  slots 31–33 and 36–38 are REMOVED (reserved).
+- **Fix:** `tools/gguf_reader.py` table corrected (reserved slots get
+  `ggml_type#N`, no invented names); the converter refusal now names
+  tensor **and** layout (`token_embd.weight (TQ1_0)`); regression gate
+  `run_type_names` in `tools/gguf_test.py` pins all six current names,
+  all six reserved slots, and the message content (CI-gated via
+  `make gguf-test` in `test-run`).
+- **Prevention:** any table that maps external IDs to user-visible
+  names is a living contract — it gets a gate that names each entry,
+  and the source (repo + date) is recorded next to it. See
+  docs/GGUF-IMPORT.md §11.1.
+
+## 2026-10-26 (round 9) — own GGUF writer: string lengths written as u32 instead of the spec's u64 (reader desync, 30-minute debug)
+
+- **Symptom:** `tools/gguf_minimal_llama.py` produced a file our own
+  reader rejected with `GgufError: string length 7308890738324930580`
+  (garbage) — the first KV pair parsed, everything after desynced.
+- **Cause:** GGUF `gguf_string_t` is a **u64** length + bytes; the
+  writer packed u32 lengths for KV keys and tensor names. Every string
+  was 4 bytes too short, so the reader cursor drifted from the second
+  string on.
+- **Fix:** two `struct.pack('<Q', …)` in the writer; self-test green
+  (242 752 B, 21 tensors, arch `llama`, 99 tokens, F16/F32 decode OK).
+- **Prevention:** (1) the spec (ggml-org/ggml `docs/gguf.md`) says the
+  width — check the width in the spec, not in your head; (2) while
+  debugging, `gguf_reader.Reader` IS the oracle — print its cursor
+  (`r.pos`) and stop hand-walking hex with ad-hoc widths (two
+  hand-walk scripts with wrong assumptions prolonged the debug);
+  (3) a new binary-format writer ships with a parse-back test against
+  the repository's own reader — `run_minimal_llama` is that test here.
+
+## 2026-10-26 (round 9) — pinned llama.cpp smoke: five layout/vocab facts, a REPL stdin spin, and an F16 type mismatch (environment traps, all documented)
+
+- **Symptom:** the minimal-llama GGUF was refused/crashed through
+  five sequential errors before it ran: `unknown tokenizer: 'BPE'` →
+  `invalid gguf type for tokenizer.ggml.token_type` →
+  `tensor 'output_norm.weight' not found` → `ffn_gate.weight has wrong
+  shape; expected 64, 0` → then a F32 file "hung" (100% CPU, no
+  output).
+- **Cause (verified against the pin's source, v0.5.0
+  `7fe450e…`):** (1) llama.cpp's vocab loader accepts `llama`/`gpt2`/
+  `bert`/…, not the string `BPE` — a BPE charmap with (possibly empty)
+  merges is `gpt2` (the key must exist; an empty array is legal);
+  (2) `tokenizer.ggml.token_type` must be an **INT32** array
+  (llama-vocab.cpp:2491); (3) the llama arch requires
+  `output_norm.weight`; (4) `expected 64, 0` = missing
+  `llama.feed_forward_length` (n_ff read as 0) **and** in this build
+  ffn_gate/up are `{n_embd, n_ff}` with ffn_down `{n_ff, n_embd}`;
+  (5) the "hang" was not a hang: this build's `llama-cli` always runs
+  its internal REPL, and with **closed stdin** (a bare pipe) the
+  server loop busy-spins printing `> ` prompts — 8.8 M lines in 10 s.
+  With stdin open the same run prints `[ Prompt: 36894.7 t/s |
+  Generation: 6237.0 t/s ]` in under a second. Bonus: the F16 variant
+  of the fixture hits `ggml-cpu binary_op: unsupported types
+  (dst f32, src0 f32, src1 f16)` in the pin — the fixture therefore
+  defaults to `--dtype f32`.
+- **Fix:** all five facts baked into `tools/gguf_minimal_llama.py`
+  with comments citing the pin's source; docs/GGUF-IMPORT.md §11.4
+  records the verified result, the REPL stdin note and the F16
+  mismatch; `run_minimal_llama` + the generator self-test keep it
+  green.
+- **Prevention:** when a pinned binary rejects a generated file, read
+  the pin's source (it is in /tmp/lc) instead of guessing; and always
+  suspect the harness (stdin! pipes! TTY!) before a "hang" — the
+  symptom "100% CPU + prompt flooding" is a harness loop, not the
+  model.
+
+## 2026-10-26 (round 9) — CHANGELOG anchor missed a word ("and in"), then the replacement ate the intro (process error, caught before commit)
+
+- **Symptom:** the scripted round-9 CHANGELOG insertion failed an
+  assert; re-ran with the shorter anchor, which matched — and the
+  replacement then consumed the "All notable changes … Newest entries
+  first." intro, leaving `# Changelog` followed directly by the new
+  heading.
+- **Cause:** the real line 2 ends "…are recorded here and **in**" —
+  the first anchor was missing the word; the second (shorter) anchor
+  started inside the intro, so the intro was inside the matched span
+  and the replacement did not carry it. No check between edit and
+  commit (the usual blind-script trap, round-8 edition).
+- **Fix:** intro restored in a second edit; verified with `head`.
+- **Prevention:** for multi-line markdown anchors, copy the anchor
+  from the file (grep/sed), never retype it; and after ANY
+  replacement of a block that includes a file's leading lines,
+  `head -8` the result before moving on.
+
 ## 2026-10-26 (round 8) — two real bugs in the new v2 container reader, both found by `gcc -fanalyzer` before they could ship
 
 - **Symptom 1 (guaranteed NULL deref on a refusal path):** the

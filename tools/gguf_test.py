@@ -23,6 +23,11 @@ wrong:
    fails - that is the case where "recognise a GGUF" quietly becomes "accept
    any file with four letters in front".
 
+Plus: the converted model must write a deterministic, non-degenerate
+stream (run_behavior); the quant name table must match the official
+ggml_type enum (run_type_names); and the minimal-llama generator must
+still produce a file this reader parses (run_minimal_llama).
+
 Run with --engine to check a freshly built binary; without it the C check
 is skipped and said to be skipped, never silently passed.
 """
@@ -521,6 +526,9 @@ def run(engine, tmp):
     ok &= check('a different source produces a different model',
                 read_hydra(out2)['A'] != got['A'])
 
+    # 2b. what the converted model DOES: deterministic, alive, stable
+    ok &= run_behavior(engine, out)
+
     # 3. negative controls
     ok &= check('a non-GGUF is refused', _convert_fails(out, b'not a gguf file' * 8))
     truncated = os.path.join(tmp, 'truncated.gguf')
@@ -543,6 +551,11 @@ def run(engine, tmp):
     # the inspector
     ok &= check('the inspector identifies the fixture', _inspect(gguf, 'llama'))
     ok &= check('the inspector refuses a non-GGUF', _inspect_refuses(out))
+
+    # the quant name table and the minimal-llama generator (see
+    # docs/GGUF-IMPORT.md "Verification")
+    ok &= run_type_names(tmp)
+    ok &= run_minimal_llama(tmp)
 
     # v3: per-layer ternary blocks -> .hydra v3 (real tensor slices)
     ok &= run_v3(engine, tmp, gguf)
@@ -964,6 +977,123 @@ def _quantised_message(tmp):
         rc = gguf_to_hydra.main([path, '--out',
                                  os.path.join(os.path.dirname(path), 'q.hydra')])
     return rc != 0 and 'F16' in err.getvalue()
+
+
+def run_behavior(engine, out):
+    """The converted model must actually WRITE: a deterministic, non-
+    degenerate token stream.
+
+    Determinism: the same (model, token) run twice gives the identical
+    stream - the engine is a pure function of the file. Non-degeneracy:
+    the stream is not one repeated token and not the trivial repetition
+    of the input token. This is the honest ceiling of what a projection
+    can prove (docs/GGUF-IMPORT.md): it shows the import produced a
+    stable, alive recurrent model - it does NOT claim the stream
+    reproduces the source LLM's language.
+    """
+    if not engine:
+        print('SKIP: the behavior check needs a built ./hydra-run (--engine)')
+        return True
+    ok = True
+    for token, steps in ((0, 24), (3, 40), (11, 16)):
+        runs = []
+        for _ in range(2):
+            proc = subprocess.run(
+                [engine, out, str(token), str(steps), '--json'],
+                capture_output=True, text=True, shell=False)
+            if proc.returncode != 0:
+                ok &= check('behavior: the engine runs (token %d)' % token,
+                            False, proc.stderr[-300:])
+                break
+            runs.append(json.loads(proc.stdout)['tokens'])
+        else:
+            ok &= check('the converted model is deterministic (token %d)' % token,
+                        runs[0] == runs[1],
+                        '%s vs %s' % (runs[0][:8], runs[1][:8]))
+            distinct = set(runs[0])
+            trivial = [token] * steps
+            ok &= check('the converted model is not degenerate (token %d, %d distinct)'
+                        % (token, len(distinct)),
+                        len(distinct) >= 2 and runs[0] != trivial,
+                        'stream %s' % runs[0][:16])
+    return ok
+
+
+def run_type_names(tmp):
+    """The quantised-layout name table is a user-facing diagnostic. A
+    file whose tensors are TQ1_0 must be NAMED TQ1_0 - a stale label is
+    exactly the kind of quiet drift the docs lint exists to kill.
+
+    Numbers verified 2026-10-26 against the official ggml_type enum
+    (ggml-org/ggml, include/ggml.h): 34=TQ1_0, 35=TQ2_0, 39=MXFP4,
+    40=NVFP4, 41=Q1_0, 42=Q2_0; slots 31-33 and 36-38 are REMOVED
+    (reserved) and must not be given invented names. This gate is the
+    regression for the 2026-10-26 audit that found the old table said
+    31=TQ1_0/32=TQ2_0/34=MXFP4 - all three wrong.
+    """
+    ok = True
+    for gtype, name in ((34, 'TQ1_0'), (35, 'TQ2_0'), (39, 'MXFP4'),
+                        (40, 'NVFP4'), (41, 'Q1_0'), (42, 'Q2_0')):
+        path = os.path.join(tmp, 't%d.gguf' % gtype)
+        build_gguf(path, [('token_embd.weight', [4, 4], gtype, [0.0] * 16)])
+        g = gguf_reader.GgufFile(open(path, 'rb').read())
+        ok &= check('ggml_type %d is named %s' % (gtype, name),
+                    g.tensors[0].type_name == name,
+                    'named %s' % g.tensors[0].type_name)
+    for gtype in (31, 32, 33, 36, 37, 38):
+        path = os.path.join(tmp, 'r%d.gguf' % gtype)
+        build_gguf(path, [('token_embd.weight', [4, 4], gtype, [0.0] * 16)])
+        g = gguf_reader.GgufFile(open(path, 'rb').read())
+        ok &= check('removed ggml_type slot %d gets no invented name' % gtype,
+                    g.tensors[0].type_name == 'ggml_type#%d' % gtype,
+                    'named %s' % g.tensors[0].type_name)
+    # and the converter refusal must carry the same name
+    path = os.path.join(tmp, 'tq.gguf')
+    build_gguf(path, [('token_embd.weight', [4, 4], 34, [0.0] * 16)])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = gguf_to_hydra.main([path, '--out', os.path.join(tmp, 'tq.hydra')])
+    ok &= check('the converter refuses a TQ1_0 file and names it TQ1_0',
+                rc != 0 and 'TQ1_0' in err.getvalue(),
+                err.getvalue()[-200:])
+    return ok
+
+
+def run_minimal_llama(tmp):
+    """tools/gguf_minimal_llama.py writes a structurally real 2-layer,
+    64-dim llama GGUF (F16 weights, BPE tokenizer). Our reader must
+    parse it and decode a tensor - this keeps the generator alive
+    (it is the input of the manual llama.cpp smoke test) and proves the
+    reader handles a file no fixture in this gate built. The
+    generation step itself runs against the PINNED llama.cpp, not in
+    CI - see docs/GGUF-IMPORT.md "Verification".
+    """
+    import gguf_minimal_llama
+    path = os.path.join(tmp, 'minimal_llama.gguf')
+    with open(path, 'wb') as fh:
+        fh.write(gguf_minimal_llama.build(7))
+    g = gguf_reader.GgufFile(open(path, 'rb').read())
+    # 21 tensors: token_embd + output_norm + output + 2 layers x 9
+    # (attn_q/k/v/output + attn_norm + ffn_gate/up/down + ffn_norm)
+    ok = check('the minimal llama GGUF parses (v3, arch llama, 21 tensors)',
+               g.version == 3 and g.architecture() == 'llama'
+               and len(g.tensors) == 21)
+    ok &= check('it carries the full per-layer tensor set',
+                all(g.find('blk.%d.%s' % (l, t)) is not None
+                    for l in range(2) for t in (
+                        'attn_q.weight', 'attn_k.weight', 'attn_v.weight',
+                        'attn_output.weight', 'attn_norm.weight',
+                        'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight',
+                        'ffn_norm.weight')))
+    ok &= check('its BPE tokenizer parses (99 tokens, specials last)',
+                len(g.tokens()) == 99 and g.tokens()[-2:] == ['</s>', '<pad>'])
+    t = g.find('token_embd.weight')
+    # llama's embedding is [n_embd, n_vocab] (64 x 99 for the fixture)
+    rows, cols = t.shape()
+    ok &= check('its F16 embedding decodes (64 x %d)' % cols,
+                t.is_decodable and rows == 64
+                and len(g.decode_rows(t, 0, 2)) == 2 * cols)
+    return ok
 
 
 # --------------------------------------------------------------- Q8_0 cases

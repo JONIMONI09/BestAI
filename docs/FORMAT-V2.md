@@ -16,6 +16,13 @@
 > 8-byte v2 magic before the v1 magic check, because the first four bytes of
 > `HYDRA2\0\0` are the v1 magic `HYDR` (`[CODE]` src/hydra_engine.c).
 >
+> **GGUF is not a v2 container either** (2026-10-26): the v2 reader names the
+> GGUF magic (`GGUF`, u32 `0x47475546`) in its refusal and points at the two
+> supported GGUF destinations — the app's llama.cpp engine (full fidelity)
+> and `tools/gguf_to_hydra.py` (the projection, `docs/GGUF-IMPORT.md`). Two
+> regression checks in `tests/test_hydra2_container.c` gate the code and the
+> message.
+>
 > **Disambiguation, because the name "version 2" is used two ways here.**
 > This document's v2 is the `.hydra2` container: magic `HYDRA2\0\0`, a
 > 128-byte header, sparse-MoE. The v1 loader in `src/hydra_engine.c`

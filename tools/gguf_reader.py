@@ -91,13 +91,20 @@ DECODABLE_TYPES = frozenset(DENSE_FLOAT_TYPES) | frozenset(BLOCK_TYPES)
 #: The quantised layouts worth naming in an error message. A file full of
 #: these is the normal case for a 4-bit download, so saying so plainly is
 #: more useful than a table of forty numbers.
+#:
+#: Numbers verified 2026-10-26 against the official ggml_type enum
+#: (ggml-org/ggml, include/ggml.h): slots 31/32/33 (Q4_0_4_4/4_8/8_8) and
+#: 36/37/38 (IQ4_NL_4_4/4_8/8_8) are REMOVED and reserved - a file using
+#: them is malformed, and the generic 'ggml_type#N' name says exactly that
+#: instead of inventing a label. TQ1_0/TQ2_0/MXFP4/NVFP4/Q1_0/Q2_0 are the
+#: 2025-2026 additions.
 QUANTISED_TYPES = {
     2: 'Q4_0', 3: 'Q4_1', 6: 'Q5_0', 7: 'Q5_1', 8: 'Q8_0', 9: 'Q8_1',
     10: 'Q2_K', 11: 'Q3_K', 12: 'Q4_K', 13: 'Q5_K', 14: 'Q6_K', 15: 'Q8_K',
     16: 'IQ2_XXS', 17: 'IQ2_XS', 18: 'IQ3_XXS', 19: 'IQ1_S', 20: 'IQ4_NL',
     21: 'IQ3_S', 22: 'IQ2_S', 23: 'IQ4_XS', 24: 'I8', 25: 'I16', 26: 'I32',
-    27: 'I64', 28: 'F64', 29: 'IQ1_M', 31: 'TQ1_0', 32: 'TQ2_0',
-    34: 'MXFP4',
+    27: 'I64', 28: 'F64', 29: 'IQ1_M', 34: 'TQ1_0', 35: 'TQ2_0',
+    39: 'MXFP4', 40: 'NVFP4', 41: 'Q1_0', 42: 'Q2_0',
 }
 
 _LITTLE = sys.byteorder == 'little'
