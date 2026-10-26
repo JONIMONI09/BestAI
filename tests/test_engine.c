@@ -2245,8 +2245,10 @@ static void write_seeded_v1_pinned(const char *path, uint32_t seed,
                                    uint32_t pin_i, uint8_t pin_c2)
 {
     lcg_seed(seed);
-    FILE *f = fopen(path, "wb");
-    if (!f) { perror("fopen"); exit(1); }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
     wr_header(f, vocab, dim, layers, (uint32_t)sizeof(HydraModelHeader),
               (uint32_t)(dim * layers));
     for (uint32_t l = 0; l < layers; ++l)
