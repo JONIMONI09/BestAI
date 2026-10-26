@@ -1007,6 +1007,11 @@ def run_behavior(engine, out):
                 break
             runs.append(json.loads(proc.stdout)['tokens'])
         else:
+            # the CLI contract: exactly the requested number of tokens
+            ok &= check('the engine returns exactly %d tokens (token %d)'
+                        % (steps, token),
+                        len(runs[0]) == steps,
+                        'got %d' % len(runs[0]))
             ok &= check('the converted model is deterministic (token %d)' % token,
                         runs[0] == runs[1],
                         '%s vs %s' % (runs[0][:8], runs[1][:8]))
@@ -1071,7 +1076,10 @@ def run_minimal_llama(tmp):
     import gguf_minimal_llama
     path = os.path.join(tmp, 'minimal_llama.gguf')
     with open(path, 'wb') as fh:
-        fh.write(gguf_minimal_llama.build(7))
+        # f32 is the verified llama.cpp smoke configuration (and the
+        # writer default); the F16 variant reaches a type mismatch in
+        # the pinned build - see docs/GGUF-IMPORT.md 11.4
+        fh.write(gguf_minimal_llama.build(7, dtype='f32'))
     g = gguf_reader.GgufFile(open(path, 'rb').read())
     # 21 tensors: token_embd + output_norm + output + 2 layers x 9
     # (attn_q/k/v/output + attn_norm + ffn_gate/up/down + ffn_norm)
@@ -1087,10 +1095,27 @@ def run_minimal_llama(tmp):
                         'ffn_norm.weight')))
     ok &= check('its BPE tokenizer parses (99 tokens, specials last)',
                 len(g.tokens()) == 99 and g.tokens()[-2:] == ['</s>', '<pad>'])
+    # token types follow the pinned llama.cpp enum (llama.h): NORMAL=1,
+    # CONTROL=3. Chars must be NORMAL or the BPE detokenizer silently
+    # drops them and the smoke output can never print text; the four
+    # specials must be CONTROL. (2026-10-26 review: the original file
+    # had these reversed - UNKNOWN chars, NORMAL specials.)
+    ttypes = g.metadata.get('tokenizer.ggml.token_type', [])
+    ok &= check('its 95 char tokens are NORMAL (1) and its 4 specials CONTROL (3)',
+                len(ttypes) == 99
+                and all(t == 1 for t in ttypes[:95])
+                and all(t == 3 for t in ttypes[95:]),
+                'types %s ... %s' % (ttypes[:3], ttypes[-4:]))
+    # the keys the pinned loader actually reads (llama-arch.cpp):
+    # tokenizer.ggml.add_bos_token / tokenizer.ggml.padding_token_id -
+    # an architecture-prefixed name would be parsed but ignored
+    ok &= check('it sets add_bos and the padding token under tokenizer.ggml.*',
+                g.metadata.get('tokenizer.ggml.add_bos_token') is True
+                and g.metadata.get('tokenizer.ggml.padding_token_id') == 98)
     t = g.find('token_embd.weight')
     # llama's embedding is [n_embd, n_vocab] (64 x 99 for the fixture)
     rows, cols = t.shape()
-    ok &= check('its F16 embedding decodes (64 x %d)' % cols,
+    ok &= check('its F32 embedding decodes (64 x %d)' % cols,
                 t.is_decodable and rows == 64
                 and len(g.decode_rows(t, 0, 2)) == 2 * cols)
     return ok

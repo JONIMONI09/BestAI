@@ -423,19 +423,21 @@ Verified against the official GGUF spec on the same date:
 
 `run_behavior` in `tools/gguf_test.py` (CI-gated through `make
 gguf-test` inside `test-run`): the converted fixture model must
-produce a **deterministic** stream (two independent `./hydra-run`
-runs, byte-identical) and a **non-degenerate** stream (≥2 distinct
-tokens, not the input token repeated) for all three tested
-(token, steps) pairs. That is the honest ceiling of what a
+return **exactly the requested number of tokens** (the CLI
+contract), produce a **deterministic** stream (two independent
+`./hydra-run` runs, byte-identical) and a **non-degenerate** stream
+(≥2 distinct tokens, not the input token repeated) for all three
+tested (token, steps) pairs. That is the honest ceiling of what a
 projection can prove: the import produces a stable, alive model — it
 does not claim the stream reproduces the source LLM's language.
 
 ### 11.4 llama.cpp smoke test (the pin, not a newer build)
 
 `tools/gguf_minimal_llama.py` (standard library only, deterministic
-fixed-seed LCG weights, 2 layers, 64 dim, 99-token BPE vocabulary,
-F16) writes a structurally real `llama`-architecture GGUF — every
-field llama.cpp's llama loader reads is present. The `gguf-test`
+fixed-seed LCG weights with real signs, 2 layers, 64 dim, 99-token
+BPE vocabulary, **F32** weights by default) writes a structurally
+real `llama`-architecture GGUF — every field llama.cpp's llama
+loader reads is present. The `gguf-test`
 gate keeps the generator alive by requiring this repository's own
 reader to parse it (`run_minimal_llama`). The generation step runs
 against the **pinned** llama.cpp — v0.5.0, commit
@@ -443,60 +445,79 @@ against the **pinned** llama.cpp — v0.5.0, commit
 app's submodule pins and the CI `llama.cpp pin` check enforces:
 
 ```bash
+# from the repository root - the generator lives here, not in the
+# extracted llama.cpp tree:
+python3 tools/gguf_minimal_llama.py --out /tmp/smoke.gguf --seed 7
 # pinned source (the codeload tarball is the no-clone way):
 curl -sL -o /tmp/llama.tar.gz \
   https://codeload.github.com/ggml-org/llama.cpp/tar.gz/7fe450e19305b828c199d602c23a8337aaa1f03b
-tar xzf /tmp/llama.tar.gz && cd llama.cpp-7fe450e*
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
-cmake --build build --parallel 2 --target llama-cli
-python3 tools/gguf_minimal_llama.py --out /tmp/smoke.gguf --seed 7
-./build/bin/llama-cli -m /tmp/smoke.gguf -p "a" -c 64 -n 4 -t 1 --temp 0
+tar xzf /tmp/llama.tar.gz
+LLAMA=llama.cpp-7fe450e19305b828c199d602c23a8337aaa1f03b
+cmake -S $LLAMA -B $LLAMA/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+cmake --build $LLAMA/build --parallel 2 --target llama-cli
+# give the CLI an open stdin, or its REPL loop busy-spins (below):
+(sleep 10 | timeout 10 OMP_NUM_THREADS=1 \
+  $LLAMA/build/bin/llama-cli -m /tmp/smoke.gguf -p "a" -c 64 -n 8 -t 1 --temp 0)
 ```
 
 Result on this machine (2026-10-26, 2 cores, `OMP_NUM_THREADS=1`):
 
 ```
 > a
+1'aV+uE~
 
-[ Prompt: 36894.7 t/s | Generation: 6237.0 t/s ]
+[ Prompt: 36082.5 t/s | Generation: 5640.6 t/s ]
 ```
 
-The pin loads the file our generator wrote, tokenizes, decodes and
-samples — the full pipeline, on a file that needed no download. The
-generated text is empty by construction: random weights point at
-control/special tokens, and that is the ceiling of a fixture (the
-generator's docstring says so). Full-intelligence GGUF inference in
-the app is the llama.cpp engine's job with a real model file.
+The pin loads the file our generator wrote, tokenizes, decodes,
+samples **and prints** the generated tokens — the full pipeline
+including detokenization, on a file that needed no download. The
+text is random by construction (random weights), and that is the
+ceiling of a fixture (the generator's docstring says so); repeated
+runs are byte-identical (`-t 1 --temp 0`, fixed seed).
+Full-intelligence GGUF inference in the app is the llama.cpp
+engine's job with a real model file.
 
-Three build-specific facts came out of that run and are baked into
-the generator (all regression-covered by `run_minimal_llama` and the
-generator's own self-test):
+Build-specific facts from that run, baked into the generator (all
+regression-covered by `run_minimal_llama` and the generator's own
+self-test):
 
 - `tokenizer.ggml.model` must be a llama.cpp vocab type — `"gpt2"`
   for a BPE charmap, not `"BPE"` (the loader answers "unknown
   tokenizer").
-- `tokenizer.ggml.token_type` must be an **INT32** array.
+- `tokenizer.ggml.token_type` must be an **INT32** array using the
+  pinned enum (`NORMAL=1`, `CONTROL=3`, …): a char labeled
+  `UNKNOWN` is silently dropped by the BPE detokenizer, so a file
+  with the types mislabeled can never print text — this fixture
+  marks its 95 chars `NORMAL` and its four specials `CONTROL`, like
+  real llama.cpp conversions.
+- the add-bos and padding keys live in the `tokenizer.ggml.*`
+  namespace (`tokenizer.ggml.add_bos_token`,
+  `tokenizer.ggml.padding_token_id`); an architecture-prefixed name
+  is parsed but ignored.
 - the llama arch in this build wants `ffn_gate`/`ffn_up` as
   `{n_embd, n_ff}`, `ffn_down` as `{n_ff, n_embd}`, plus
   `output_norm.weight` and `llama.feed_forward_length`.
 
 Two operational notes: this build's `llama-cli` always starts its
 interactive REPL, and with a **closed** stdin (a bare pipe) its
-server loop busy-spins printing `> ` prompts — run it with stdin
-open (or timeboxed) to capture the one-shot output. And the F16
-variant of this fixture reaches a ggml type mismatch in the pinned
-build (f32 activations × f16 norm weights in `ggml_mul`); `--dtype
-f32` (the default) is the verified smoke configuration. Real
-llama.cpp conversions are usually quantised, so the fixture proves
-structure and the pipeline — not fidelity.
+server loop busy-spins printing `> ` prompts (8.8 M lines in 10 s
+on this box) — run it with stdin open (or timeboxed) to capture the
+one-shot output. And the F16 variant of this fixture (`--dtype
+f16`) reaches a ggml type mismatch in the pinned build (f32
+activations × f16 norm weights in `ggml_mul`); `--dtype f32` (the
+default) is the verified smoke configuration. Real llama.cpp
+conversions are usually quantised, so the fixture proves structure
+and the pipeline — not fidelity.
 
 ### 11.5 What this round added to the gates
 
-- `run_behavior` (determinism + non-degeneracy of the converted
-  model's stream) — `tools/gguf_test.py`.
+- `run_behavior` (exact length + determinism + non-degeneracy of the
+  converted model's stream) — `tools/gguf_test.py`.
 - `run_type_names` (ggml_type audit regression) — `tools/gguf_test.py`.
-- `run_minimal_llama` (the generator's file must still parse) —
-  `tools/gguf_test.py`.
+- `run_minimal_llama` (the generator's file must still parse —
+  including the F32 dtype, the NORMAL/CONTROL token types and the
+  `tokenizer.ggml.*` keys) — `tools/gguf_test.py`.
 - the `.hydra2` reader now names a GGUF magic in its refusal (2 new
   checks in `tests/test_hydra2_container.c`; the suite is 122
   checks).

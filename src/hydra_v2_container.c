@@ -486,11 +486,12 @@ int hydra2_open(hydra2_container_t *c, const char *path)
              * (dropping a .gguf into a .hydra2 slot) explainable from
              * the error alone (docs/GGUF-IMPORT.md). */
             rc = refuse(HYDRA2_E_MAGIC,
-                        "magic: file starts with the GGUF magic "
-                        "(0x47475546) - this is a llama.cpp GGUF model, "
-                        "not a .hydra2 container; GGUF support is the "
-                        "llama.cpp engine or the offline import "
-                        "tools/gguf_to_hydra.py (docs/GGUF-IMPORT.md)");
+                        "magic: file starts with the bytes 0x47 0x47 "
+                        "0x55 0x46 (LE u32 0x46554747) - this is a "
+                        "llama.cpp GGUF model, not a .hydra2 container; "
+                        "GGUF support is the llama.cpp engine or the "
+                        "offline import tools/gguf_to_hydra.py "
+                        "(docs/GGUF-IMPORT.md)");
         else
             rc = refuse(HYDRA2_E_MAGIC, "magic: first 8 bytes are "
                         "0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X "

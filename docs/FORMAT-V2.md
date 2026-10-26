@@ -17,8 +17,8 @@
 > `HYDRA2\0\0` are the v1 magic `HYDR` (`[CODE]` src/hydra_engine.c).
 >
 > **GGUF is not a v2 container either** (2026-10-26): the v2 reader names the
-> GGUF magic (`GGUF`, u32 `0x47475546`) in its refusal and points at the two
-> supported GGUF destinations — the app's llama.cpp engine (full fidelity)
+> GGUF magic (bytes `0x47 0x47 0x55 0x46`, LE u32 `0x46554747`) in its
+> refusal and points at the two supported GGUF destinations — the app's llama.cpp engine (full fidelity)
 > and `tools/gguf_to_hydra.py` (the projection, `docs/GGUF-IMPORT.md`). Two
 > regression checks in `tests/test_hydra2_container.c` gate the code and the
 > message.

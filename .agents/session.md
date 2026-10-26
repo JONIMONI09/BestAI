@@ -421,6 +421,8 @@ annotations are the source of truth for any remaining findings.
     opened (facts only). Merge: owner.
 
 ## Round 2026-10-26 (round 9: GGUF verification — spec conformance, the ggml_type bug, the pinned llama.cpp smoke, the behavior gate, the .hydra2 GGUF boundary, all-.md pass)
+**Session start (R33):** 2026-10-26 (branch `arena/75337031-bestai`, base `0522d68` = merged PR #67). Read before the first edit: AGENTS.md, .agents/session.md (rounds 7-8), .agents/errors.md (top entries), .agents/rules.md (R2/R14/R23/R25/R26/R32/R33), .agents/user.md, .agents/Environment.md (round-8 section), docs/GGUF-IMPORT.md (full), docs/FORMAT-V2.md (header + boundary), README.md (Features + Android + tools tree), CHANGELOG.md (round-8 entry), tools/gguf_test.py + gguf_reader.py + gguf_to_hydra.py (current state), Makefile (gguf-test target) + .github/workflows/ci.yml (test-run), and - for the smoke test - the pinned llama.cpp source in /tmp/lc (llama-arch.cpp, llama-vocab.cpp, llama-graph.cpp, models/llama.cpp, llama-model.cpp, ggml.h enum) plus the official sources fetched fresh (ggml-org/ggml include/ggml.h + docs/gguf.md).
+
 
 **Owner directive (verbatim intent):** "super, habe schon gemerged, dann prüfe nochmal, ob man dann GGUF dings modelle dort nutzen kann etc, also dass diese wirklich richtig schreiben, mit ihrer ganzen Intelligenz etc!!! mache tests, schaue im Web, und mache dann Doku etc!!!! alles an .md dateien aktualisieren!" — PR #67 merged by the owner as `0522d68` before this round started.
 
@@ -459,17 +461,27 @@ can and cannot prove.
       (NEW, stdlib, fixed-seed LCG, 2 layers / dim 64 / heads 4 / ffn 192,
       99-token BPE charmap, empty merges, 21 tensors) → `llama-cli -m
       /tmp/smoke.gguf -p "a" -c 64 -n 4 -t 1 --temp 0` on the pin:
-      **prompt 36 894.7 t/s, generation 6 237.0 t/s, empty text by
-      construction** (random weights). Generator fixes from the run:
+      **prompt 36 082.5 t/s, generation 5 640.6 t/s, generated text
+      `1'aV+uE~`** (random by construction, byte-identical across
+      runs, `llama-cli -p "a" -c 64 -n 8 -t 1 --temp 0`). Generator
+      fixes from the run + the Qodo review (R9-I):
       `tokenizer.ggml.model`="gpt2" (not "BPE" — "unknown tokenizer"),
-      `token_type` INT32, `output_norm.weight`, `llama.feed_forward_length`,
-      ffn layout `{n_embd,n_ff}` / `{n_ff,n_embd}` in this build. F16
-      variant reaches a ggml type mismatch in the pin (f32 act × f16 norm
-      in `ggml_mul`) → `--dtype f32` default. `run_minimal_llama` keeps
-      the generator alive in CI. llama-cli in this build is always-REPL:
-      closed stdin → `> ` prompt busy-loop (sandbox artifact, documented).
+      `token_type` INT32 with the pinned enum (chars NORMAL=1,
+      specials CONTROL=3 — the original file had them REVERSED, which
+      is why the first smoke printed nothing),
+      `tokenizer.ggml.add_bos_token` / `padding_token_id` (not the
+      `llama.*` names — those are parsed but ignored by the pin),
+      `output_norm.weight`, `llama.feed_forward_length`, LCG weights
+      with real signs, ffn layout `{n_embd,n_ff}` / `{n_ff,n_embd}` in
+      this build. F16 variant reaches a ggml type mismatch in the pin
+      (f32 act × f16 norm in `ggml_mul`) → `--dtype f32` default
+      (library + gate + docs aligned). `run_minimal_llama` keeps the
+      generator alive in CI (dtype, token types, keys). llama-cli in
+      this build is always-REPL: closed stdin → `> ` prompt
+      busy-loop (sandbox artifact, documented).
 - [x] R9-F: `.hydra2` boundary — `src/hydra_v2_container.c` refuses the
-      GGUF magic BY NAME (0x47475546, points at LlamaEngine + converter +
+      GGUF magic BY NAME (bytes 0x47 0x47 0x55 0x46, LE u32
+      0x46554747; points at LlamaEngine + converter +
       docs); +2 checks in `tests/test_hydra2_container.c` (suite 120→122;
       `tools/test_count_baseline.txt` M-G note updated in this commit).
 - [x] R9-G: ALL .md updated — GGUF-IMPORT.md §11 + §4/§9, README
@@ -477,9 +489,39 @@ can and cannot prove.
       (GGUF not a v2 container), CHANGELOG (round-9 entry + 122),
       errors.md (round-9 mistakes), Environment.md (round-9: /tmp reset,
       venv /tmp/lintenv2, llama.cpp build recipe), this section.
-- [x] R9-H: gate sweep + commit + push + PR (facts only; owner merges).
-      Local results: gguf_test green incl. the three new gates;
-      hydra2-test 122/0; flawfinder 0; cppcheck 0; make 0 warnings;
-      bandit medium+ 0 (20 Low = triaged asserts/subprocess, lint.yml
-      comment); pyflakes clean; v1 baseline `471 386 385 386 385 386
-      385 386` unchanged; llama.cpp build + smoke as above.
+- [x] R9-H: gate sweep + commit + push + PR #68 (facts only; owner
+      merges). Local results: gguf_test green incl. the three new
+      gates; hydra2-test 122/0; flawfinder 0; cppcheck 0; make 0
+      warnings; bandit medium+ 0 (20 Low = triaged asserts/subprocess,
+      lint.yml comment); pyflakes clean; v1 baseline `471 386 385 386
+      385 386 385 386` unchanged; llama.cpp build + smoke as above.
+- [x] R9-I: Qodo code-review fixes on PR #68 (all 11 findings; every
+      one verified against the sources before acting — all were
+      valid): (1) **HIGH**: the R33 session-start marker (top of this
+      section) was missing — `tools/session_start_check.sh` would
+      have been RED in CI; (2) the two tokenizer keys renamed to the
+      `tokenizer.ggml.*` namespace the pin actually reads
+      (llama-arch.cpp L394/397 — the `llama.*` names are parsed but
+      ignored); (3) README: llama.cpp availability per ABI (arm64
+      selectable / x86_64 packaged but not selectable / armeabi-v7a
+      absent — MainActivity.kt L84-94 + CMakeLists verified); (4)
+      `run_behavior` now asserts the exact requested token count;
+      (5) token types NORMAL(1)/CONTROL(3) — the original file had
+      them reversed (UNKNOWN chars are dropped by the BPE
+      detokenizer: the root cause of the first empty smoke output);
+      (6) dtype defaults aligned on f32 (library, gate, docs);
+      (7) §11.4 intro now describes the fixture as F32; (8) LCG
+      produces real (-1,1) weights (was [0, 2·scale)); (9) GGUF
+      magic written as bytes 0x47 0x47 0x55 0x46 / LE u32 0x46554747
+      (the C message had the BE value 0x47475546) — C, FORMAT-V2,
+      CHANGELOG; (10) generator docstring: stale numbers replaced by
+      a pointer to §11.4, fact count corrected; (11) the §11.4
+      recipe runs the generator from the repo root (it lived in a
+      post-`cd` directory that does not contain tools/). Smoke
+      re-run after the fixes: prompt 36 082.5 t/s, generation
+      5 640.6 t/s, text `1'aV+uE~` (deterministic). NOT implemented
+      (owner call, per the standing "CI speed up safely" directive):
+      a CI job that builds the pin and runs the smoke automatically —
+      Qodo's optional suggestion, 10–15 min per PR. The manual
+      recipe is documented in §11.4; re-run it whenever the pin
+      changes.

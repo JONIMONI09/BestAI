@@ -41,18 +41,23 @@ recorded everything in `docs/GGUF-IMPORT.md` §11.
    GGUF: full per-layer tensor set, 99-token BPE charmap, empty
    merges). Result (2026-10-26, this box, 2 cores): the pinned v0.5.0
    build loads the generated file and runs the full pipeline —
-   prompt 36 894.7 t/s, generation 6 237.0 t/s, empty output text by
-   construction (random weights). Generator fixes baked in from the
-   run: `tokenizer.ggml.model` = `"gpt2"` (not `"BPE"`),
-   `tokenizer.ggml.token_type` INT32, `output_norm.weight` present,
-   `llama.feed_forward_length` set, `ffn_gate/up` = `{n_embd, n_ff}`
-   with `ffn_down` = `{n_ff, n_embd}` in this build. `run_minimal_llama`
-   keeps the generator alive in CI (our own reader must parse the
-   file); the llama.cpp step itself is manual (CI does not build
-   llama.cpp) and documented in `docs/GGUF-IMPORT.md` §11.4.
+   prompt 36 082.5 t/s, generation 5 640.6 t/s, generated text
+   `1'aV+uE~` (random by construction, byte-identical across runs).
+   Generator fixes baked in from the run: `tokenizer.ggml.model` =
+   `"gpt2"` (not `"BPE"`), `tokenizer.ggml.token_type` INT32 with the
+   pinned enum (chars NORMAL=1, specials CONTROL=3), the add-bos and
+   padding keys under `tokenizer.ggml.*` (not `llama.*`),
+   `output_norm.weight` present, `llama.feed_forward_length` set,
+   `ffn_gate/up` = `{n_embd, n_ff}` with `ffn_down` =
+   `{n_ff, n_embd}` in this build. `run_minimal_llama` keeps the
+   generator alive in CI (our own reader must parse the file, with
+   the F32 dtype, token types and keys); the llama.cpp step itself is
+   manual (CI does not build llama.cpp) and documented in
+   `docs/GGUF-IMPORT.md` §11.4.
 5. **The `.hydra2` container boundary** (`src/hydra_v2_container.c`):
    a GGUF file dropped into the v2 reader is now refused with the
-   GGUF magic **named** (`GGUF`, u32 `0x47475546`) and a pointer to
+   GGUF magic **named** (bytes `0x47 0x47 0x55 0x46`, LE u32
+   `0x46554747`) and a pointer to
    the two supported GGUF destinations. `+2` checks in
    `tests/test_hydra2_container.c` (suite 120 -> 122;
    `tools/test_count_baseline.txt` updated in this commit).
@@ -63,6 +68,30 @@ recorded everything in `docs/GGUF-IMPORT.md` §11.
    v2 container); `.agents/session.md` + `.agents/errors.md` +
    `.agents/Environment.md` (round 9, the new mistakes, the
    llama.cpp build environment).
+7. **Qodo code-review fixes on PR #68** (all 11 findings, each
+   verified against the pinned sources before acting): the
+   `tools/session_start_check.sh` R33 marker for the round 9 section
+   was missing (would have failed in CI); the two tokenizer keys were
+   renamed to the `tokenizer.ggml.*` namespace the pin actually reads
+   (llama-arch.cpp — the `llama.*` names are parsed but ignored);
+   the README now states the llama.cpp engine's availability per ABI
+   (arm64-v8a selectable, x86_64 packaged but not selectable,
+   armeabi-v7a absent); `run_behavior` now asserts the exact
+   requested token count; the fixture's token types were reversed
+   (UNKNOWN chars are dropped by the BPE detokenizer — the root cause
+   of the first empty smoke output) and are now NORMAL/CONTROL;
+   the dtype defaults are aligned on f32 (library, gate, docs); the
+   §11.4 intro describes the fixture as F32; the LCG produces real
+   (-1,1) weights; the GGUF magic in the v2 refusal message (and
+   FORMAT-V2, this file) is written as the byte sequence 0x47 0x47
+   0x55 0x46 / LE u32 0x46554747 (the message had the big-endian
+   value); the generator docstring no longer carries stale numbers;
+   the §11.4 recipe runs the generator from the repository root.
+   Smoke re-run: prompt 36 082.5 t/s, generation 5 640.6 t/s,
+   `1'aV+uE~` (deterministic). Deliberately NOT added (owner call,
+   standing "CI speed up safely" directive): a CI job that builds the
+   pin and runs the smoke automatically — Qodo's optional suggestion,
+   10-15 min per PR.
 
 ## 2026-10-26 (round 8) — JNI sampler exposure (M-E), format version 4 full attention (M-F), the `.hydra2` sparse-MoE container implemented (M-G), baselines + checkboxes (M-H)
 

@@ -17,19 +17,24 @@ deterministic for a fixed seed, a binary, and a thread count, which is
 what makes it a regression smoke.
 
 Verified 2026-10-26 against the pinned llama.cpp (v0.5.0, commit
-7fe450e19305b828c199d602c23a8337aaa1f03b), which loads the file and
-generates (prompt 35 320 tok/s, generation 5 033 tok/s on a 2-core box;
-empty text is expected - random weights). Two build-specific layout
-facts from that run are baked in: `tokenizer.ggml.model` must be a
-llama.cpp vocab type ("gpt2", not "BPE"), `tokenizer.ggml.token_type`
-must be an INT32 array, `output_norm.weight` must exist,
-`llama.feed_forward_length` must be set, and the llama arch in this
-build wants ffn_gate/up as {n_embd, n_ff} with ffn_down as
-{n_ff, n_embd}. The F16 variant of this fixture reaches a ggml type
-mismatch in the pinned build (f32 activations x f16 norm weights);
-`--dtype f32` is the verified smoke configuration.
-Real GGUFs from llama.cpp conversions are usually quantised, so neither
-variant represents them - the fixture proves structure, not fidelity.
+7fe450e19305b828c199d602c23a8337aaa1f03b), which loads the file,
+runs the full pipeline and prints the generated tokens (measured
+numbers in docs/GGUF-IMPORT.md section 11.4 - the text is random by
+construction, the weights are random). The build-specific facts from
+that run are baked in: `tokenizer.ggml.model` must be a llama.cpp
+vocab type ("gpt2", not "BPE"); `tokenizer.ggml.token_type` must be an
+INT32 array with the pinned enum (NORMAL=1 / CONTROL=3 - a char
+labeled UNKNOWN is silently dropped by the detokenizer and the output
+can never print); `output_norm.weight` must exist;
+`llama.feed_forward_length` must be set; the add-bos and padding keys
+live in the `tokenizer.ggml.*` namespace, not under `llama.*`; and the
+llama arch in this build wants ffn_gate/up as {n_embd, n_ff} with
+ffn_down as {n_ff, n_embd}. The F16 variant of this fixture reaches a
+ggml type mismatch in the pinned build (f32 activations x f16 norm
+weights); `--dtype f32` is the verified smoke configuration and the
+default. Real GGUFs from llama.cpp conversions are usually quantised,
+so neither variant represents them - the fixture proves structure, not
+fidelity.
 
 What is real about the file
 ---------------------------
@@ -95,7 +100,7 @@ class Writer:
         self.kv.append((key, body))
 
     # -- tensors --------------------------------------------------------
-    def tensor(self, name, dims, values, dtype='f16'):
+    def tensor(self, name, dims, values, dtype='f32'):
         if dtype == 'f32':
             raw = struct.pack('<%df' % len(values), *values)
             self.tensors.append((name, dims, T_F32, raw))
@@ -139,14 +144,15 @@ class LCG:
     def __init__(self, seed):
         self.s = (seed * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
 
-    def f16(self, scale=0.05):
+    def sample(self, scale=0.05):
         self.s = (self.s * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
-        # Uniform in (-1, 1) * scale: well inside the F16 range and inside
-        # the magnitude a real, normalized weight matrix has.
-        return (self.s >> 11) / float(1 << 53) * 2.0 * scale
+        # Uniform in (-1, 1) * scale (the 53-bit fraction mapped to
+        # (-1, 1)): well inside both F16 and F32 range, with the signs
+        # and magnitudes a real normalized weight matrix has.
+        return ((self.s >> 11) / float(1 << 53) * 2.0 - 1.0) * scale
 
 
-def build(seed, dtype='f16'):
+def build(seed, dtype='f32'):
     w = Writer()
     rng = LCG(seed)
 
@@ -162,9 +168,13 @@ def build(seed, dtype='f16'):
     specials = ['<unk>', '<s>', '</s>', '<pad>']
     tokens = chars + specials
     scores = [float(-i) for i in range(len(tokens))]
-    # token_type: 1 = normal, 2 = byte-fallback. Single ASCII chars are
-    # legal byte tokens in llama.cpp's BPE; the specials are normal.
-    types = [2] * len(chars) + [1] * len(specials)
+    # token_type enum of the pinned build (llama.h): UNDEFINED=0,
+    # NORMAL=1, UNKNOWN=2, CONTROL=3, USER_DEFINED=4, UNUSED=5, BYTE=6.
+    # The printable chars are NORMAL (the BPE detokenizer emits NORMAL
+    # tokens - UNKNOWN ones are dropped, which is why a file that
+    # mislabels them can never print text); <unk>/<s>/</s>/<pad> are
+    # CONTROL, like in real llama.cpp conversions.
+    types = [1] * len(chars) + [3] * len(specials)
     unk, bos, eos, pad = len(chars), len(chars) + 1, len(chars) + 2, len(chars) + 3
 
     w.s('general.architecture', 'llama')
@@ -179,7 +189,10 @@ def build(seed, dtype='f16'):
     w.u32('llama.block_count', layers)
     w.u32('llama.feed_forward_length', ffn)
     w.f32('llama.attention.layer_norm_rms_epsilon', 1e-5)
-    w.b('llama.add_bos_token', True)
+    # the pinned loader reads these under the tokenizer.ggml.* namespace
+    # (llama-arch.cpp: LLM_KV_TOKENIZER_ADD_BOS, LLM_KV_TOKENIZER_PAD_ID);
+    # an architecture-prefixed name would be parsed but IGNORED
+    w.b('tokenizer.ggml.add_bos_token', True)
     # "gpt2" is the BPE vocab type llama.cpp's loader accepts for a
     # charmap-style vocabulary with (possibly empty) merges; "BPE" is
     # not a vocab type in llama.cpp's loader (2026-10-26, smoke test
@@ -198,13 +211,13 @@ def build(seed, dtype='f16'):
     w.u32('tokenizer.ggml.byte_fallback_token_id', unk)
     w.u32('tokenizer.ggml.bos_token_id', bos)
     w.u32('tokenizer.ggml.eos_token_id', eos)
-    w.u32('tokenizer.ggml.pad_token_id', pad)
+    w.u32('tokenizer.ggml.padding_token_id', pad)
     w.u32('general.quantization_version', 0)
 
     v = len(tokens)
 
     def mat(rows, cols):
-        return [rng.f16() for _ in range(rows * cols)]
+        return [rng.sample() for _ in range(rows * cols)]
 
     w.tensor('token_embd.weight', [dim, v], mat(v, dim), dtype)
     for l in range(layers):

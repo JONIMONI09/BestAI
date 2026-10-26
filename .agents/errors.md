@@ -83,6 +83,20 @@
   suspect the harness (stdin! pipes! TTY!) before a "hang" — the
   symptom "100% CPU + prompt flooding" is a harness loop, not the
   model.
+- **Postscript (2026-10-26, Qodo review of PR #68):** the "empty
+  output text" of the first successful run was explained here and in
+  the docs as "random weights point at special tokens" — that was
+  wrong. The file's token types were reversed (chars labeled
+  UNKNOWN=2, which the BPE detokenizer silently drops; specials
+  labeled NORMAL=1), and the add-bos/padding keys were under
+  `llama.*` instead of the `tokenizer.ggml.*` namespace the pin
+  reads (llama-arch.cpp L394/397 — parsed but ignored). A second
+  class of "silently wrong" defects: the file loaded, the pipeline
+  ran, nothing pointed at the bug — only the output was empty.
+  Lesson: a smoke test that checks "it ran" misses semantic
+  defects; the gate now asserts what the output contains (token
+  types, keys, and the pinned smoke prints real characters:
+  `1'aV+uE~`, prompt 36 082.5 t/s, generation 5 640.6 t/s).
 
 ## 2026-10-26 (round 9) — CHANGELOG anchor missed a word ("and in"), then the replacement ate the intro (process error, caught before commit)
 
