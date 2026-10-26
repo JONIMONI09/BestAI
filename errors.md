@@ -1709,3 +1709,33 @@
   resolved against the real heading, and the license string compared
   against the actual LICENSE file (one grep, one diff — cheaper than
   discovering the contradiction on the repo's landing page).
+
+## 2026-10-26 — duplicate `key:` in lint.yml's cache save: PyYAML says ok, GitHub kills the workflow
+- **Symptom:** PR #53 push (2026-10-26, 10:30Z): the `lint.yml` run was
+  created with **zero jobs** and completed with `conclusion: failure` in
+  the **same second** (created_at == updated_at, total_count: 0, no
+  check-runs, no job log to read). All other workflows of the same push
+  ran fine.
+- **Cause:** the "Save Gradle dependency cache" step of the
+  android-lint job carried the `key:` line **twice**. The edit that
+  was supposed to add the missing key ran against a file state where
+  the key already existed (the edit tool's fuzzy match inserted the
+  line again instead of the parser seeing the same state). The trap
+  that let it ship: **PyYAML's safe_load silently accepts duplicate
+  mapping keys** (last one wins) - the local YAML validation reported
+  "ok" for all five touched files. GitHub's workflow compiler is
+  strictly stricter than the YAML spec and rejects the duplicate at
+  load time, before any job exists.
+- **Fix:** removed the duplicate line; the file now parses AND passes
+  a duplicate-key scan. New gate `tools/workflow_yaml_check.sh` (CI
+  gate 1h): parses every `.github/**/*.yml` with a duplicate-key-
+  rejecting loader (PyYAML on the runners, stdlib indent-scan
+  fallback) and proves the detector with the negative-control fixture
+  `tools/fixtures/workflow_yaml_bad.yml` (R25). Both parser paths
+  verified green before shipping.
+- **Prevention:** (1) the gate above makes this failure class a local
+  red, not a zero-job mystery; (2) an edit to a YAML `with:`/mapping
+  block must be re-read after the edit, not just re-parsed - a parser
+  that is more permissive than the consumer (here: PyYAML vs the
+  GitHub compiler) will always accept what the consumer rejects; the
+  validator has to model the STRICTEST consumer, not the common one.

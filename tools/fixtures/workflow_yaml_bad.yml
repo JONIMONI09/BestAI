@@ -1,0 +1,24 @@
+# Negative-control fixture for tools/workflow_yaml_check.sh (R25).
+#
+# This file MUST fail the gate. It is valid YAML by the YAML spec -
+# PyYAML's safe_load parses it happily and keeps the last `key:` - but
+# GitHub's workflow compiler rejects duplicate mapping keys: the run is
+# created with zero jobs and fails in the same second, with no job log
+# to read. That is exactly the PR #53 red run of 2026-10-26 (the
+# actions/cache save in lint.yml gained a second `key:` line).
+name: fixture-bad
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save with a duplicate key
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-deps-fixture
+          key: gradle-deps-fixture

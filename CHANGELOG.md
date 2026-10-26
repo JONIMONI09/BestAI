@@ -3,6 +3,98 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 — Compose crash fix + regression guard, Android CI caches, issue auto-close, research memory in repo
+
+Owner round after the M1 close-out (crash report, "füge die Memory zum
+Repo hinzu", missing tools, README audit, CI speed-up, auto-close).
+
+1. **Chat-tab crash fixed (`HydraApp.kt`) — regression from PR #50.**
+   Every chat-tab composition on Android (reported 2026-10-26, Android 15
+   / arm64 / API 35) threw
+   `IllegalStateException: … measured with an infinite max height and
+   Compose doesn't support this` (foundation 1.7.3, Compose BOM
+   2024.09.03). Root cause, proven by mapping every crash frame 1:1 onto
+   the foundation v1.7.x source (identical across v1.7.0–v1.7.3): the
+   ChatTab header — itself `Modifier.verticalScroll` — sits inside the
+   list body's `Column { verticalScroll { LazyColumn { … } } }` across a
+   composable boundary, so the inner scrollable measures with an
+   unbounded max height and the framework's
+   `CheckScrollableContainerConstraints` throws. Fix: the header is
+   de-scrolled; `AdaptiveHeaderSplit` keeps the header in a bounded
+   `BoxWithConstraints` height cap and applies `verticalScroll` only when
+   the cap binds — exactly one vertical scrollable per column, an
+   invariant now documented in the KDoc.
+2. **Regression guard for the crash class (new, permanent).**
+   `tools/compose_scroll_guard.py` detects (a) nested same-axis
+   scrollables within one strict source region and (b) the boundary case:
+   a scrollable at a lambda call site whose composable body (same file)
+   contains another same-axis scrollable or lazy list. `tests/fixtures/
+   compose/` carries the negative/positive controls (2 bad files with the
+   exact expected finding counts incl. the real crash shape; 2 good files
+   with legal shapes, zero findings). `tools/compose_scroll_check.sh` is
+   the self-testing gate, wired into CI as lint job gate **1g**.
+   Verified before shipping: the pre-fix file (commit `d0c7679`) is
+   detected with exactly the real pair; all 13 shipped Compose sources are
+   clean; fixture counts match (R25).
+3. **Android CI jobs cached (measured first, changed second).** Measured
+   on the 2026-10-26 runs: the QEMU leg is 23 s — the actual CI cost was
+   the two uncached Android jobs (APK 7 m 23 s, lint 4 m 38 s), each
+   re-downloading the SDK and Gradle. `.github/actions/setup-android`
+   now roots everything under `$HOME` (cacheable), skips all downloads
+   when every pinned package is already present, and takes a `gradle`
+   input; both Android jobs restore/save `actions/cache` — one shared
+   SDK key (identical pins) plus a dependency-cache key hashed over the
+   Android build files. A cache miss reproduces today's path exactly
+   (zero risk); a red build never overwrites a good dependency cache.
+   Expected: every Android job after the first warm run skips the
+   downloads; QEMU left as is (not the bottleneck).
+4. **Issue auto-close with proof (new, stdlib only).** Research on 2026
+   patterns (gh-CLI close with `issues: write`; the amd/gaia
+   "close only when the check ran and passed" reference) led to:
+   `tools/issue_verify.py` + `.github/issue-verifications.yml` (issue →
+   gates mapping) + `.github/workflows/issue-verify.yml` (push → main and
+   manual dispatch). The workflow runs exactly the mapped gates and
+   closes the issue via `gh issue close --comment` **only when every
+   gate passes**, with an audit comment (summary, `main@<sha>`, run URL,
+   gate list, reopen note); `--dry-run` exists and was exercised
+   end-to-end. Convention (AGENTS.md §8): ordinary issues close
+   natively with `Closes #N` in the PR body — only issues a PR body
+   cannot close get a mapping entry. First entry: issue #52 (gates: the
+   new compose guard + `make clean && make -j2 test-run`).
+5. **Research memory now lives in the repository.**
+   `.agent_memory/RESEARCH.md` is the permanent in-repo record of
+   investigations (crash line map, CI cache architecture, auto-close
+   research, code-scanning access findings, sandbox tool inventory with
+   the exact install channels that work/fail here). The `.gitignore`
+   rule that kept it local was removed; AGENTS.md §5 states the path
+   must be kept current.
+6. **AGENTS.md extended.** §3 gains the compose guard; new §6
+   (missing tools → install them before claiming "blocked", with the
+   measured sandbox channels — incl. that Docker is not installable in
+   the Arena sandbox because the APT sources are off the egress
+   allowlist, and no gate needs a container runtime), §7 (crash
+   protocol: no crash is done without a regression test that fails on
+   the pre-fix source, wired into CI), §8 (issue closing conventions).
+7. **README roadmap audited against the code.** All 7 roadmap claims
+   verified true (unwired forward pass, min-P sampling, stdlib-only
+   safetensors import, AVX2 + "AVX-512 not implemented", v2 4-per-byte
+   packing with the three decode paths and parity gates, `.hydra2`
+   unimplemented, sink KV cache); one precision note added: the NEON v2
+   unpack kernel is AArch64-only (32-bit ARM uses the bit-identical
+   scalar decode).
+8. **Workflow-YAML duplicate-key gate (CI gate 1h).** The first push of
+   this PR turned `lint.yml` into a zero-job red run: its dependency-
+   cache save carried a duplicate `key:` line. PyYAML (and most YAML
+   tooling) silently accepts duplicate mapping keys — last one wins —
+   so a plain parse check reports ok, but GitHub's workflow compiler
+   rejects them at load time: the run is created with zero jobs and
+   fails in the same second, with no job log to read. `tools/
+   workflow_yaml_check.sh` parses every `.github/**/*.yml` with a
+   duplicate-key-rejecting loader (PyYAML on the runners, a stdlib
+   indent-scan fallback) and proves the detector with the
+   negative-control fixture `tools/fixtures/workflow_yaml_bad.yml`
+   (R25). Both parser paths verified green.
+
 ## 2026-10-26 — NEON v2 test heap overflow fix + 32-bit ARM gate (third CI red run)
 
 The new in-step `::error::` diagnostics did their job and named both

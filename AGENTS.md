@@ -175,6 +175,8 @@ bash tools/llama_pin_check.sh              # llama.cpp pin + MIT licence
 bash tools/llama_pin_negative_test.sh
 bash tools/docs_claim_check.sh             # banned unqualified claims in docs
 bash tools/ci_release_version_test.sh      # release versioning discipline (needs pyyaml)
+bash tools/compose_scroll_check.sh         # crash guard: nested same-axis vertical scrollables in Compose (self-testing, R25)
+bash tools/workflow_yaml_check.sh          # every .github YAML: syntax + duplicate keys (GitHub rejects what PyYAML accepts; self-testing, R25)
 
 # 5. Web console (if UI touched)
 npm ci && npm run lint                     # ESLint (dev-only dependency)
@@ -226,6 +228,71 @@ same tokens). Cross-platform claims require running both platforms.
 | Android audit trail | `docs/ANDROID-AUDIT.md` |
 | Every error ever hit | `errors.md` |
 | Session-by-session history | `session.md` |
+| Crash root causes, CI decisions, research with follow-ups (permanent record) | `.agent_memory/RESEARCH.md` |
+| Issue→gate auto-close mapping (owner promise: gates are the proof) | `.github/issue-verifications.yml` |
 
-Local agent working memory (`RESEARCH.md`, `.agent_memory/`) is git-ignored
-by design: it is research scratch, not documentation.
+`.agent_memory/RESEARCH.md` is **in the repository on purpose** (owner
+decision 2026-10-26; the old gitignore rule that kept it local was removed).
+It is the permanent evidence trail for crash root causes, CI architecture
+decisions and research whose obligations outlive the session. **Keep it
+current:** every non-trivial investigation appends one section (date,
+question, method, finding, resolution, pointer to the shipped artifact)
+before the session ends. Do not treat it as scratch and do not delete it.
+
+## 6. Missing tools — install them, do not give up
+
+If a gate needs a tool that is absent, **try to install it** before reporting
+"blocked" (R32 — a "blocked" claim must say what was attempted and why it
+failed). In the Arena sandbox the reachable package channels are
+`registry.npmjs.org` and `pypi.org` (both verified working 2026-10-26); the
+APT sources (`deb.debian.org`) are **not** reachable there, so
+`apt-get install` and therefore **Docker cannot be installed in that
+environment** — a container runtime is not required for any gate in this
+repository, and nothing here should start needing one. The proven local
+ARM toolchain substitute is zig: `python3 -m venv /tmp/zvenv &&
+/tmp/zvenv/bin/pip install ziglang`, then `zig cc -target aarch64-linux-gnu`
+(see RESEARCH.md §5 for the full inventory and the exact failures). A
+"blocked, not measured" verdict is acceptable only after a real attempt was
+recorded in `.agent_memory/RESEARCH.md` — never as a default.
+
+## 7. Every crash gets a regression test (crash protocol)
+
+A crash — user report, CI failure, emulator logcat — is not done when the
+symptom disappears. It is done when it **cannot return unnoticed**:
+
+1. **Reproduce or reconstruct** the crash on the pre-fix source (git history
+   is available even in shallow clones; `git show <sha>:<path>`).
+2. **Find the invariant that was violated**, not the line that threw — and
+   prove the root cause against the framework/library source when the
+   library is open source (fetch the pinned version; line-mapping is
+   cheap and ends guessing).
+3. **Ship a detector or test that fails on the pre-fix source and passes on
+   the fix** — fixture-based for structural classes (see
+   `tools/compose_scroll_check.sh` + `tests/fixtures/compose/` as the
+   reference: 4 bad + 2 good fixtures, negative control R25, CI gate),
+   unit test for behavioral ones.
+4. **Wire the detector into CI as a gate** so the class of bug is blocked
+   for every future commit, and write the root cause + line map + shipped
+   artifacts into `.agent_memory/RESEARCH.md`.
+
+No crash section in RESEARCH.md without its regression test, and no
+regression test without a pre-fix red run recorded in the section.
+
+## 8. Issues: how they get closed
+
+- **Feature/fix issues:** GitHub-native — `Closes #N` (or `Fixes #N`) in the
+  PR body. This is the default and needs no workflow.
+- **Issues that a PR body cannot close** (bot-style alerts, open-ended "check
+  for problems" requests like #52): add one entry to
+  `.github/issue-verifications.yml` mapping the issue number to the gates
+  that prove it. `.github/workflows/issue-verify.yml` (push → main +
+  `workflow_dispatch`) then runs exactly those gates and closes the issue
+  with an audit comment **only when every gate passes** — the mapping entry
+  is an owner promise that the gates are the actual proof. Never map an
+  issue to a gate that does not verify the issue's claim; a false close is
+  worse than an open issue.
+- Closing policy for bot-authored alerts (edit the one open alert on repeat
+  failure, close only when the failing check ran and passed in the
+  resolving run) follows the 2026 reference pattern documented in
+  RESEARCH.md §3 (amd/gaia PR #5408) and is the convention to extend from
+  if a dedicated alert-bot ever replaces the shared workflow.
