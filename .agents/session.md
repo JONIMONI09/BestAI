@@ -2287,9 +2287,9 @@ weight), .agents/ (new folder: 5 moved files + 8 moved docs + user.md +
 README.md), .github/workflows/code-scanning.yml →
 code-scanning-alert.yml, 44 reference updates.
 
-**Open:** PR #59 open. After merge: confirm code-scanning-alert
-registers clean (no more zero-job push runs) and all four workflows green
-on main.
+**Open (superseded by follow-up 2 below):** PR #59 open. After merge:
+confirm no zero-job push runs and all four workflows green on main —
+see follow-up 2 for what the forensics actually showed.
 
 ### Round-6 follow-up (after the first PR #59 CI round, 2026-10-26)
 
@@ -2317,3 +2317,39 @@ the same day (commit after 303b5c8):
 Status after the second CI round: ci.yml `lint` PASS, all fast checks
 PASS; Android lint was re-running with the fixed gate — its
 annotations are the source of truth for any remaining findings.
+
+### Round-6 follow-up 2 (third CI round, 2026-10-26 evening)
+
+1. **The fixed gate worked — it published its first findings** (run
+   40339750614): exactly two, both fixed in **3354a9f**:
+   `AutoboxingStateCreation` at `HydraApp.kt:994` (`mutableStateOf`
+   with a Float → `mutableFloatStateOf`, stub gained the matching
+   top-level function) and `PluralsCandidate` at `strings.xml:143`
+   (`log_context_applied` "%d tokens" → `<plurals>` with one/other;
+   call site MainActivity.kt:658 → `R.plurals.…`; R stub
+   regenerated: 104 strings + 7 plurals). Stub check 0 errors,
+   string-format check ok.
+2. **Code-scanning forensics finished:** the rename did NOT clear the
+   old registration — BOTH (`code-scanning.yml` id 396960786,
+   `code-scanning-alert.yml` id 397125007) are still `active` and both
+   carry the file PATH as name (unique to these two; all other
+   workflows show their real `name:`). The new name produced the same
+   phantom zero-job runs, auto-retried by GitHub every ~13 min
+   (13:59/14:12/14:26 — not our pushes). The loop stopped by itself
+   after 14:26; nothing in the following 45+ min. `DELETE
+   .../actions/workflows/{id}` is 404 (token scope) — if it wakes up,
+   the owner must delete the stale workflow in the GitHub web UI.
+   **Not blocking the PR** (push-event runs never appear in `gh pr
+   checks`).
+3. **Sandbox reset incident:** the local branch pointer came back at
+   f79ff96 while all four commits lived only on the remote; worktree
+   intact. Recovered with `git fetch` + mixed `git reset
+   origin/arena/ed8432d1-bestai` (pointer + index only, worktree
+   untouched → clean). New rule (errors.md): after every push-ending
+   turn, verify `git log --oneline -1` == last pushed sha at the start
+   of the next turn. `/tmp` also wiped — kotlinc reinstalled from the
+   Environment.md recipe (~1 min).
+
+**Open:** PR #59 open, branch head 3354a9f. After the next CI round:
+expect all jobs green (Android lint was the only red). Then merge
+prep. If code-scanning phantoms reappear: web-UI deletion by owner.

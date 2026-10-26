@@ -11,6 +11,15 @@ on:
   push:
     branches: [ main, master ]
   pull_request:
+  # Code scanning alert handling (moved here from
+  # code-scanning-alert.yml 2026-10-26: the standalone file's GitHub
+  # workflow registration is corrupted server-side and fires phantom
+  # zero-job runs on every push - see .agents/errors.md round 6).
+  # The per-job `if:` gates keep the two event classes apart: the
+  # push/PR jobs never run on alert events, the alert job never runs
+  # on push/PR events.
+  code_scanning_alert:
+    types: [created]
 
 permissions:
   contents: read
@@ -18,11 +27,16 @@ permissions:
   # (the log-download and artifact hosts are unreachable by API-only
   # clients, so the comment is the only machine-readable copy).
   issues: write
+  # The code-scanning alert report job comments on the PR that owns the
+  # alert's commit (pull-requests: write; issues: write covers only
+  # regular issue comments - the two endpoints have separate scopes).
+  pull-requests: write
 
 jobs:
   # ---------- C: Compiler + Analyzer ----------
   c-lint:
     name: C lint & static analysis
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +137,7 @@ jobs:
   # ("2147483640 + 127 cannot be represented in type 'int'").
   sanitizers:
     name: ASan + UBSan (runtime)
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -155,6 +170,7 @@ jobs:
   # ---------- JNI: NDK clang hardening ----------
   jni-lint:
     name: JNI layer (CVE-2026-70638 class)
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -183,6 +199,7 @@ jobs:
   # ---------- Web-Console ----------
   web-lint:
     name: Web console (ESLint)
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -261,6 +278,7 @@ jobs:
   # ---------- Release-Konfiguration ----------
   release-config:
     name: Release config
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -284,6 +302,7 @@ jobs:
   # ---------- Dokumentation ----------
   docs-lint:
     name: Docs claim lint
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -299,6 +318,7 @@ jobs:
   # ---------- Android ----------
   android-lint:
     name: Android lint
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     # issues: write is only needed for this job: when lint has findings,
     # the check step publishes the report as a PR comment. The workflow
@@ -535,6 +555,7 @@ jobs:
   # Semgrep errors from blocking the run, real findings still block.
   semgrep:
     name: Semgrep security rules
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep
@@ -549,6 +570,7 @@ jobs:
   # further than the standard query suite.
   codeql:
     name: CodeQL (${{ matrix.language }})
+    if: github.event_name != 'code_scanning_alert'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -582,3 +604,90 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: '/language:javascript-typescript'
+  # ---------- Code scanning alert handling ----------
+  # Owner rule (2026-10-26): CI reacts to CODE SCANNING results - not to
+  # issues. This job therefore carries NO hardcoded results: no rule
+  # lists, no issue numbers, no gate mappings, no expected counts. Every
+  # fact it reports (rule id, file, line, message, commit, alert URL) is
+  # read at run time from the code_scanning_alert event payload that
+  # GitHub delivers with the run.
+  #
+  # Lifecycle:
+  #   1. A scanner (CodeQL, Semgrep, ...) reports a finding on some commit
+  #      -> GitHub creates a code-scanning alert -> this job runs.
+  #   2. The alert is reported where the author can act: as a PR comment
+  #      when the alert's commit belongs to an open PR of this repository,
+  #      otherwise into the job summary (a push to main has no PR).
+  #   3. The alert closes ITSELF: GitHub resolves a code-scanning alert as
+  #      "fixed" when the next analysis of the default branch no longer
+  #      reports it - i.e. the fix commit that makes the finding disappear
+  #      also closes the alert, autonomously, with no manual action and no
+  #      issue to track.
+  code-scanning-alert:
+    name: Code scanning alert report
+    if: github.event_name == 'code_scanning_alert'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deliver the alert report (PR comment or job summary)
+        env:
+          ALERT: ${{ toJSON(github.event.alert) }}
+          REPO: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # --- Read everything from the event payload (nothing hardcoded) ---
+          num=$(jq -r '.number' <<<"$ALERT")
+          rule=$(jq -r '.rule_id' <<<"$ALERT")
+          ref=$(jq -r '.ref' <<<"$ALERT")
+          sha=$(jq -r '.commit_sha' <<<"$ALERT")
+          alert_url=$(jq -r '.html_url' <<<"$ALERT")
+          path=$(jq -r '.most_recent_instance.location.path // "unknown"' <<<"$ALERT")
+          line=$(jq -r '.most_recent_instance.location.start_line // empty' <<<"$ALERT")
+          title=$(jq -r '.most_recent_instance.message.annotations[0].title // empty' <<<"$ALERT")
+          msg=$(jq -r '.most_recent_instance.message.annotations[0].message // empty' <<<"$ALERT")
+
+          body="## Code scanning alert ${num}: \`${rule}\`
+          <!-- code-scanning-alert-${num} -->
+
+          - **Location:** \`${path}${line:+:${line}}\` on \`${sha:0:7}\`
+          - **Alert:** [security/code-scanning/${num}](${alert_url})
+          ${title:+- **Title:** ${title}
+          }${msg:+- **Message:**
+            ${msg}
+          }
+
+          This comment was posted automatically by the
+          *Code scanning alert handling* job of the Lint & Security
+          workflow. The alert closes **itself** as *fixed* once the next
+          CodeQL/Semgrep analysis no longer reports it - a fix commit
+          that makes the finding disappear also closes the alert, no
+          manual action needed."
+
+          # --- Deliver: PR comment if the commit belongs to an open PR ---
+          branch="${ref#refs/heads/}"
+          pr_num=""
+          if [ "$branch" != "$ref" ]; then
+            pr_num=$(gh api "repos/${REPO}/pulls?head=${REPO_OWNER}:${branch}&state=open" \
+                       --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+
+          if [ -n "$pr_num" ]; then
+            # De-duplicate: a marker comment for this alert number
+            # already present means we reported it (e.g. the alert was
+            # re-created after a flaky re-analysis).
+            already=$(gh api "repos/${REPO}/issues/${pr_num}/comments?per_page=100" \
+                        --jq '.[].body' 2>/dev/null \
+                        | grep -cF "<!-- code-scanning-alert-${num} -->" || true)
+            if [ "${already:-0}" -gt 0 ]; then
+              echo "alert ${num} already reported on PR #${pr_num} - skipping"
+            else
+              gh pr comment "${pr_num}" --body "$body"
+              echo "alert ${num} reported on PR #${pr_num}"
+            fi
+          else
+            # No PR (push to main/master, merged branch): job summary.
+            printf '%s\n' "$body" >> "$GITHUB_STEP_SUMMARY"
+            echo "alert ${num} has no open PR - report written to the job summary"
+          fi

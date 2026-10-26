@@ -106,6 +106,22 @@
     from `code-scanning.yml` 2026-10-26 — see the corrupted-registration
     note in the round-6 block below) and resolves alerts natively when the
     next analysis no longer reports them.
+  - **Deleting a registered Actions workflow** — 2026-10-26: `gh api
+    -X DELETE /actions/workflows/{id}` → 404 for BOTH code-scanning
+    workflow ids (396960786, 397125007); listing them works, deleting
+    does not (same PAT-scoping class as `body: ''` in
+    `GET /actions/workflows/{id}`). Consequence: a stale/corrupted
+    registration can be observed but NOT removed from this sandbox —
+    only the repo owner's web UI (Settings → Actions → Workflows) can
+    delete it.
+  - **Between-turns state (measured 2026-10-26):** `/tmp` is wiped
+    every turn (recreate recipes above; kotlinc ≈ 1 min). ADDITIONALLY
+    the repo's LOCAL branch pointer was once reset to the merge base
+    (f79ff96) between turns while the worktree stayed intact — recover
+    with `git fetch origin <branch>` + mixed `git reset
+    origin/<branch>` after verifying the diff is only untracked-new
+    files; the remote branch is the commit source of truth (full
+    incident in `.agents/errors.md`, 2026-10-26 round 6).
 - **Tested local check paths (the ones to run — owner rule: no deferring
   C++/lint checks to CI, 2026-10-26):**
   1. **Linter venv (recreate if `/tmp/lintenv` is gone):**

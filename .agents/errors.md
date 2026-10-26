@@ -6,6 +6,73 @@
 
 ---
 
+## 2026-10-26 (round 6) — Android lint's first findings: `AutoboxingStateCreation` + `PluralsCandidate`
+
+- **Symptom:** run 40339750614 (after the gate fix, see entry below):
+  `Android lint` reported exactly two warnings: (1) `HydraApp.kt:994`
+  "Prefer `mutableFloatStateOf` instead of `mutableStateOf`" on
+  `var local by remember(value) { mutableStateOf(value) }` with
+  `value: Float` — boxing a primitive in the snapshot state; (2)
+  `strings.xml:143` `log_context_applied` "Context size applied: %1$d
+  tokens" — a count+word string that must be a `<plurals>`.
+- **Fix:** (1) `mutableFloatStateOf(value)` + import
+  `androidx.compose.runtime.mutableFloatStateOf`; the stub
+  `C_runtime.kt` gained the matching top-level function (real API is a
+  non-`@Composable` function returning `MutableState<Float>`).
+  (2) string converted to `<plurals>` with `one`/`other` items; the
+  call site (MainActivity.kt:658) now uses
+  `R.plurals.log_context_applied` — `Context.getString` resolves the
+  quantity for plurals res-ids. `R_gen.kt` stub regenerated from the
+  XML (string→plurals), stub check 0 errors, `string_format_check.py`
+  ok (it validates plurals too).
+- **Prevention:** new Compose state: pick the primitive overload
+  (`mutableFloatStateOf`/`mutableIntStateOf`) from the start — lint
+  treats the boxed generic as a finding, not a style nit. New
+  count-formatted strings: write them as `<plurals>` immediately
+  (the existing `gen_*` plurals in strings.xml are the pattern).
+
+## 2026-10-26 (round 6) — workspace reset between turns: branch pointer back at f79ff96, work lost from local refs
+
+- **Symptom:** after the 303b5c8/092c1e1 pushes, a new turn started
+  with local `arena/ed8432d1-bestai` pointing at **f79ff96** (main)
+  while all pushed work (4 commits, 954+561+149+115 lines) existed
+  ONLY on `origin/arena/ed8432d1-bestai`. `git log --all` showed no
+  local copy of the commits; the worktree, however, still contained
+  every file change (new files present but untracked).
+- **Cause:** the sandbox restore between turns rebuilt the worktree
+  from a stale snapshot and reset the branch pointer; the pushed
+  commits were gone from local refs (never fetched again) while the
+  remote kept them.
+- **Fix:** `git fetch origin arena/ed8432d1-bestai`, verify
+  `git diff origin/<branch>` is a pure artifact of untracked new files
+  (all 58 "deleted" files = exactly the untracked set), then
+  `git reset origin/arena/ed8432d1-bestai` (mixed reset — moves the
+  pointer, updates the index, leaves the worktree byte-for-byte).
+  Result: branch at 092c1e1, `git status` clean.
+- **Prevention:** after EVERY turn that ends in a push, re-verify the
+  pointer at the start of the next turn: `git log --oneline -1` must
+  equal the last pushed sha BEFORE doing new work; if not, fetch +
+  mixed-reset to `origin/<branch>` first. The remote branch is always
+  the source of truth for commits; the worktree only for pending
+  edits. Never `git checkout` another branch to "look" — the session
+  is tied to `arena/ed8432d1-bestai`.
+
+## 2026-10-26 (round 6) — `/tmp` wiped between turns: kotlinc (and every other /tmp tool) is gone
+
+- **Symptom:** `tools/kotlin_stub_check/kotlin_stub_check.sh` exited
+  with "kotlinc not found" although it had been green minutes earlier
+  in the previous turn. `/tmp/ktnpm` (npm kotlin-compiler 2.4.21 +
+  JRE) had been wiped — `/tmp` is outside the persisted workspace.
+- **Fix:** re-ran the setup from `.agents/Environment.md` (Arena,
+  item on the Kotlin stub check):
+  `mkdir -p /tmp/ktnpm && cd /tmp/ktnpm && npm install
+  kotlin-compiler@2.4.21 javajre-linux-64@17.0.8` (~1 min), then the
+  stub check ran normally (0 errors after the finding fixes).
+- **Prevention:** treat every `/tmp` install as per-turn: before a
+  tool that lives in `/tmp`, check it exists and reinstall from
+  Environment.md if not — do not assume the previous turn's venvs
+  (`/tmp/lintvenv`, `/tmp/zvenv`, `/tmp/ktnpm`) survived.
+
 ## 2026-10-26 (round 6) — CI red #3: corrupted GitHub registration of the code-scanning workflow
 
 - **Symptom:** the `code_scanning_alert` workflow ran on **every push**
@@ -19,10 +86,23 @@
   refreshed. Its trigger set did not match the file (push instead of
   code_scanning_alert) and its job graph was empty. No amount of local
   YAML validation can see this: it is server-side state, not file content.
-- **Fix:** moved the file to `.github/workflows/code-scanning-alert.yml`
-  (identical content) to force a fresh registration under a new path; the
-  orphaned `code-scanning.yml` registration clears with the file deletion
-  on merge. After merge: the next main push must show NO new zero-job run.
+- **Fix (partly — outcome corrected 2026-10-26 evening):** moved the file
+  to `.github/workflows/code-scanning-alert.yml` (identical content) to
+  force a fresh registration under a new path. **The original assumption
+  was WRONG:** the old `code-scanning.yml` registration (id 396960786)
+  did NOT clear on rename — both registrations stayed `state: active`,
+  and BOTH show `name` = the file PATH (all other workflows of the repo
+  show their real `name:` — so the corruption is specific to these two
+  server-side objects, not a token display artifact). The new
+  registration (id 397125007) produced the same phantom zero-job runs,
+  auto-retried by GitHub every ~13 minutes (13:59 → 14:12 → 14:26, NOT
+  triggered by our pushes). `DELETE .../actions/workflows/{id}` is
+  token-blocked (404) in this sandbox. The retry loop stopped by itself
+  after 14:26 and no new phantom run appeared in the following 45+ min.
+  **Current state: dormant, not blocking the PR** (the phantom runs are
+  push-event runs, they never appear in `gh pr checks`). If it wakes up:
+  the user must delete the stale workflow from the GitHub web UI
+  (Settings → Actions → Workflows), which this PAT cannot do.
 - **Prevention:** detection recipe recorded in `.agents/Environment.md`
   (Arena section, round 6, item 5): compare
   `gh api .../actions/workflows` registered names against the files'
@@ -71,6 +151,10 @@
   best-effort (`|| ::warning::`) so a future parse surprise can never
   again swallow the failure message. YAML + duplicate-key gate +
   PyYAML clean.
+- **Verified (2026-10-26 evening, run 40339750614):** the fixed gate
+  published its first-ever findings — exactly two: `AutoboxingState-
+  Creation` (HydraApp.kt:994) and `PluralsCandidate` (strings.xml:143),
+  both fixed in 3354a9f. Gate now behaves as designed.
 - **Prevention:** annotation/reporting code in a gate is part of the
   gate's contract — it must be exercised on the FAILURE path (here:
   "findings exist"), not only on the happy path. This gate had never
