@@ -2783,7 +2783,7 @@ static void test_tf_sampler_v3_deterministic(void)
         if (hydra_engine_load(&x, pa) != 0 || hydra_engine_load(&y, pa) != 0)
             { rep_ok = 0; second_ok = 0; break; }
         uint16_t sx[16], sy[16];
-        uint16_t hx[16], hy[16];
+        uint16_t hx[16] = {0}, hy[16] = {0};
         uint16_t tx = 3, ty = 3;
         for (int t = 0; t < 16; ++t) {
             uint16_t nx = 0, ny = 0;

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -863,7 +864,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
         SettingSlider(
             label = stringResource(R.string.setting_temperature),
             value = settings.temperature,
-            range = 0f..2f,
+            start = 0f, end = 2f,
             step = 0.05f,
             format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
             enabled = llamaActive,
@@ -872,7 +873,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
         SettingSlider(
             label = stringResource(R.string.setting_top_k),
             value = settings.topK.toFloat(),
-            range = 0f..100f,
+            start = 0f, end = 100f,
             step = 1f,
             format = { it.toInt().toString() },
             enabled = llamaActive,
@@ -881,7 +882,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
         SettingSlider(
             label = stringResource(R.string.setting_top_p),
             value = settings.topP,
-            range = 0.05f..1f,
+            start = 0.05f, end = 1f,
             step = 0.05f,
             format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
             enabled = llamaActive,
@@ -890,7 +891,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
         SettingSlider(
             label = stringResource(R.string.setting_min_p),
             value = settings.minP,
-            range = 0f..0.5f,
+            start = 0f, end = 0.5f,
             step = 0.01f,
             format = { String.format(java.util.Locale.ROOT, "%.2f", it) },
             enabled = llamaActive,
@@ -899,7 +900,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
         SettingSlider(
             label = stringResource(R.string.setting_max_tokens),
             value = settings.maxTokens.toFloat(),
-            range = 32f..1024f,
+            start = 32f, end = 1024f,
             step = 32f,
             format = { it.toInt().toString() },
             enabled = true,
@@ -908,7 +909,7 @@ private fun SettingsTab(state: MainUiState, actions: MainActions) {
         SettingSlider(
             label = stringResource(R.string.setting_context_size),
             value = settings.contextSize.toFloat(),
-            range = 512f..8192f,
+            start = 512f, end = 8192f,
             step = 256f,
             format = { it.toInt().toString() },
             enabled = llamaActive,
@@ -980,12 +981,17 @@ private fun SwitchRow(
 private fun SettingSlider(
     label: String,
     value: Float,
-    range: ClosedFloatingPointRange<Float>,
+    start: Float,
+    end: Float,
     step: Float,
     format: (Float) -> String,
     enabled: Boolean,
     onCommit: (Float) -> Unit
 ) {
+    // The endpoints come in as plain floats on purpose: Kotlin's
+    // ClosedFloatingPointRange exposes no .first/.last accessors (those
+    // belong to the integer ranges), so the step count is derived here
+    // from the values the caller already has.
     var local by remember(value) { mutableStateOf(value) }
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1007,8 +1013,8 @@ private fun SettingSlider(
             value = local,
             onValueChange = { local = it },
             onValueChangeFinished = { onCommit(local) },
-            valueRange = range,
-            steps = ((range.last - range.first) / step - 1).toInt().coerceAtLeast(0),
+            valueRange = start..end,
+            steps = (((end - start) / step).toInt() - 1).coerceAtLeast(0),
             enabled = enabled,
             modifier = Modifier.widthIn(min = 160.dp)
         )
