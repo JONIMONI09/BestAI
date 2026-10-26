@@ -20,7 +20,7 @@
 #     it catches the workflow-class duplicates this gate was born for,
 #     but it cannot detect general syntax errors, so it says so.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 python3 - <<'PY'
 import glob, os, sys

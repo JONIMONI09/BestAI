@@ -20,6 +20,8 @@
 | 2026-10-26 | Code-scanning API access from an Actions token | blocked; workaround channels documented |
 | 2026-10-26 | Sandbox tool inventory + install channels | measured; policy in AGENTS.md §6 |
 | 2026-10-26 | GitHub workflow compiler vs PyYAML (duplicate keys) | zero-job red run; gate 1h shipped |
+| 2026-10-26 | Auto-close target: issues → code-scanning alerts | issue-verify removed; event-driven workflow shipped |
+| 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in Environment.md |
 
 ---
 
@@ -176,3 +178,50 @@ parser. Shipped regression: `tools/workflow_yaml_check.sh` (CI gate 1h)
 PyYAML path (runners) and stdlib indent-scan path (no PyYAML) both
 verified green, including against the fixture. Full account: `errors.md`
 2026-10-26 (duplicate `key:` entry).
+
+## 7. Auto-close target changed: issues -> code-scanning alerts (2026-10-26)
+
+Owner decision (same day, after §3 shipped and closed issue #52
+successfully): CI must react to **code scanning results, not to issues**;
+alerts close themselves autonomously when a fix commit makes the next
+analysis clean; **no results may be hardcoded** in any workflow.
+
+Shipped:
+- **Removed:** `tools/issue_verify.py`, `.github/issue-verifications.yml`
+  (hardcoded issue→gates mapping), `.github/workflows/issue-verify.yml`.
+- **Added:** `.github/workflows/code-scanning.yml` — triggers on
+  `code_scanning_alert` (created); every reported fact (rule id, file,
+  line, message, commit, alert URL) is read at run time from the event
+  payload (zero hardcoded results); delivery = PR comment when the alert's
+  commit belongs to an open same-repo PR (de-duplicated by a
+  `<!-- code-scanning-alert-N -->` marker), otherwise the job summary.
+  Closure is **native GitHub behaviour**: the alert resolves as *fixed*
+  when the next CodeQL/Semgrep analysis no longer reports it — the fix
+  commit closes the alert, autonomously. Local verification: YAML +
+  duplicate-key gate, shellcheck on the run script, jq parsing of a
+  synthetic alert payload. Event delivery itself is verified by GitHub at
+  the first real alert.
+- **CI tier split (same owner rule):** `ci.yml` heavy jobs (neon-test
+  QEMU, build-test, gpu-bench, android-apk) run on **main pushes only**;
+  PRs and feature-branch pushes get the lint-only tier (ci.yml
+  `lint`/`jni-signatures`/`llama-pin` + the full `lint.yml`, which
+  already runs the whole unit suite under ASan+UBSan in its
+  `sanitizers` job). `release.yml` was already main/tag/dispatch only.
+
+## 8. Local lint stack from PyPI wheels (2026-10-26) — the "no deferral" path
+
+Owner rule: stop deferring C++ checks to CI; the sandbox has pip + gcc.
+Verified 2026-10-26 (full detail in `Environment.md`, Arena section):
+`python3 -m venv /tmp/lintenv && /tmp/lintenv/bin/pip install cpplint
+yamllint shellcheck-py cppcheck clang-tidy` installs **pre-built wheels**
+for Cppcheck 2.22.0, clang-tidy (LLVM 23.1.4), ShellCheck 0.11.0,
+yamllint 1.38.0, cpplint 2.0.2 — no apt, no APT egress needed. The strict
+pass (`gcc -std=c99 -Wall -Wextra -Wpedantic -fanalyzer` + `g++
+-fsyntax-only -fanalyzer` + cppcheck `--enable=all` + clang-tidy
+`bugprone/clang-analyzer/cert`) caught six real pre-merge defects that
+day (goto crossing an initializer, missing feature-test macros, uncast
+malloc, C++ `= {0}` warning, three missing final newlines, an unguarded
+cd, dead variables) — all fixed, all suites green. cpplint's remaining
+~180 findings are Google-C++-style noise on a C99 codebase (line length,
+brace style, include order) and were deliberately not "fixed" by
+reformatting the project.

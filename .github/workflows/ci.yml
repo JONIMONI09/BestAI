@@ -6,6 +6,12 @@ on:
   pull_request:
 
 jobs:
+  # Job matrix by event (owner rule 2026-10-26):
+  #   pull_request / push to a feature branch -> lint-only (fast):
+  #     lint, jni-signatures, llama-pin
+  #   push to main (or master) -> the full set:
+  #     + neon-test (QEMU), build-test (x86/macos), gpu-bench,
+  #       android-apk. Publishing lives in release.yml (main/tag only).
   # ---------- Stage 1: Lint / Syntax (fast, fails first) ----------
   lint:
     runs-on: ubuntu-latest
@@ -138,6 +144,11 @@ jobs:
   # commit, instead of depending on the macOS runner happening to be ARM64.
   neon-test:
     needs: lint
+    # PR / feature-branch runs are lint-only (owner rule 2026-10-26):
+    # the heavy build/QEMU/Android jobs run on main pushes only -
+    # pull requests get the fast lint set for review feedback,
+    # main gets the full build + publish path.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -238,6 +249,11 @@ jobs:
   # scalar (x86) and NEON (macOS ARM64 + the dedicated neon-test job).
   build-test:
     needs: lint
+    # PR / feature-branch runs are lint-only (owner rule 2026-10-26):
+    # the heavy build/QEMU/Android jobs run on main pushes only -
+    # pull requests get the fast lint set for review feedback,
+    # main gets the full build + publish path.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     strategy:
       # Both legs must report. With the default fail-fast: true a failure on
       # one leg CANCELS the other, which is how a macOS-only defect can go
@@ -420,6 +436,11 @@ jobs:
   gpu-bench:
     name: GPU bench (CPU reference)
     needs: lint
+    # PR / feature-branch runs are lint-only (owner rule 2026-10-26):
+    # the heavy build/QEMU/Android jobs run on main pushes only -
+    # pull requests get the fast lint set for review feedback,
+    # main gets the full build + publish path.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -560,6 +581,11 @@ jobs:
   android-apk:
     name: Android APK build
     needs: lint
+    # PR / feature-branch runs are lint-only (owner rule 2026-10-26):
+    # the heavy build/QEMU/Android jobs run on main pushes only -
+    # pull requests get the fast lint set for review feedback,
+    # main gets the full build + publish path.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     # issues: write is only needed for this job: when the gradle build
     # fails, the publish step posts the log tail as a PR comment (job

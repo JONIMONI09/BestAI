@@ -3,6 +3,70 @@
 All notable changes to this project, per change, are recorded here and in
 `session.md` (rules.md R2). Newest entries first.
 
+## 2026-10-26 — Local lint stack (no CI deferral), PR/main CI split, code-scanning alert handling, Environment.md
+
+Owner round: "stop deferring C++ checks to CI" (with a tested pip path),
+"PR runs = linters only, no full builds/publishing", "CI reacts to code
+scanning results — not to issues, nothing hardcoded", plus a shared
+environment record for all AI agents.
+
+1. **Local C/C++ verification now runs locally, with proof.** The pip
+   wheel path works in the Arena sandbox (no apt needed):
+   `/tmp/lintenv` venv with Cppcheck 2.22.0, clang-tidy (LLVM 23.1.4),
+   ShellCheck 0.11.0, yamllint 1.38.0, cpplint 2.0.2. The strict pass
+   (`gcc -std=c99 -Wall -Wextra -Wpedantic -fanalyzer`, `g++
+   -fsyntax-only -fanalyzer` C++ parse, cppcheck `--enable=all`,
+   clang-tidy bugprone/clang-analyzer/cert) caught and fixed **six real
+   pre-merge defects**: a `goto` crossing an initializer in
+   `hydra_engine_load` (ill-formed under a C++ parse), missing
+   feature-test macros under strict `-std=c99` in both `src/` files
+   (`O_CLOEXEC`/`O_NOFOLLOW`/`clock_gettime` now self-contained), an
+   uncast `malloc` + a `= {0}` aggregate in `main.c` (C++ parse),
+   missing final newlines in `src/hydra_engine.c`, `src/main.c` and
+   `.github/workflows/lint.yml`, an unguarded `cd` in
+   `tools/workflow_yaml_check.sh`, and dead variables in
+   `tools/string_format_negative_test.sh`. All suites re-run green after
+   the fixes (142/0, 86/0, 7/0, count vs baseline). Remaining linter
+   output is classified in Environment.md (intentional bit ops, C++-style
+   noise on a C99 codebase, by-design exported M4 primitives).
+2. **CI tier split: PR = lint-only, main = full build + publish.**
+   `ci.yml` heavy jobs (`neon-test` QEMU, `build-test` x86/macos,
+   `gpu-bench`, `android-apk`) now run on main pushes only; pull requests
+   and feature-branch pushes get the fast lint tier (C gates 1a–1h,
+   `jni-signatures`, `llama-pin`) plus the full `lint.yml` — whose
+   `sanitizers` job already runs the entire unit suite under ASan+UBSan,
+   so PR feedback keeps runtime test coverage without any artifact
+   build. `release.yml` was already main/tag/dispatch-only and is
+   untouched.
+3. **Code scanning alerts replace the issue-mapping workflow (nothing
+   hardcoded).** `tools/issue_verify.py`,
+   `.github/issue-verifications.yml` and
+   `.github/workflows/issue-verify.yml` are removed. New
+   `.github/workflows/code-scanning.yml` triggers on the
+   `code_scanning_alert` event; every reported fact (rule, file, line,
+   message, commit, alert URL) is read from the event payload at run
+   time — no rule lists, no issue numbers, no expected results. Delivery:
+   PR comment when the alert's commit belongs to an open same-repo PR
+   (de-duplicated by marker), job summary otherwise. Closure is native:
+   GitHub resolves the alert as *fixed* when the next analysis no longer
+   reports it — the fix commit closes it autonomously.
+4. **Environment.md (new, in-repo): the shared environment record for all
+   AI agents.** Describes each sandbox (what it is, egress allowlist,
+   present/blocked tools with date + exact error + workaround) and the
+   *tested* local check paths per environment. Contract (AGENTS.md §6):
+   each agent updates **its own section only**, reads other agents'
+   tested paths before claiming a tool missing, records every block with
+   evidence, and never silently defers a locally-runnable check to CI.
+   The first section (Arena AI, Debian 12) records the pip-wheel linter
+   path above and the measured blocks (apt/Docker/QEMU/Android SDK,
+   code-scanning API 403) with their workarounds.
+5. **AGENTS.md updated accordingly:** §3 adds the mandatory local
+   C/C++ static-analysis gate (1b) and the "read Environment.md first"
+   rule; §6 carries the Environment.md contract; §8 now documents the
+   code-scanning alert channel (and explicitly that CI reacts to
+   scanning results, not to issues, and that results are never
+   hardcoded); §5 table lists Environment.md and the new workflow.
+
 ## 2026-10-26 — Compose crash fix + regression guard, Android CI caches, issue auto-close, research memory in repo
 
 Owner round after the M1 close-out (crash report, "füge die Memory zum

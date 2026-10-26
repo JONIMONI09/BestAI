@@ -1698,3 +1698,50 @@ recorded in `docs/gpu-feasibility.md` so nobody repeats them.
       (CI gate 1h, negative-control fixture, both parser paths green) +
       errors.md entry. All other jobs green (APK 6 m 56 s incl. the
       Kotlin fix, cold cache).
+
+## Round 2026-10-26 (post-#53: local lint stack, PR/main CI split, code-scanning alerts, Environment.md)
+
+- [x] **Owner prompt executed (no CI deferral):** `/tmp/lintenv` venv via
+      pip = Cppcheck 2.22.0, clang-tidy (LLVM 23.1.4), ShellCheck 0.11.0,
+      yamllint 1.38.0, cpplint 2.0.2 (pre-built wheels, no apt).
+      Full output captured (Environment.md, Arena section).
+- [x] **Six real pre-merge defects found by the strict pass, all fixed:**
+      goto crossing an initializer (C++ ill-formed), missing feature-test
+      macros (strict -std=c99) in both src files, uncast malloc + `= {0}`
+      (C++ parse) in main.c, missing final newlines (hydra_engine.c,
+      main.c, lint.yml), unguarded cd (workflow_yaml_check.sh), dead
+      variables (string_format_negative_test.sh). C suite re-run green
+      (142/0, 86/0, 7/0, count vs baseline); g++/gcc -fanalyzer 100 %
+      clean; cppcheck --enable=all: 0 error/warning; clang-tidy: no
+      real-analyzer findings; shellcheck clean; yamllint: remaining =
+      cosmetic brackets + the (now-removed) 272-char mapping line.
+- [x] **CI tier split:** ci.yml heavy jobs (neon-test, build-test,
+      gpu-bench, android-apk) main-only via `if: github.ref == ...`;
+      PR/feature-branch = lint tier (lint 1a–1h, jni-signatures,
+      llama-pin) + full lint.yml (sanitizers job keeps the unit suite
+      under ASan+UBSan on PRs). release.yml already main/tag-only.
+- [x] **Code-scanning alerts replace issue-verify (owner: nothing
+      hardcoded, no issue checks):** issue_verify.py +
+      issue-verifications.yml + issue-verify.yml removed; new
+      code-scanning.yml on `code_scanning_alert` (created): event-payload
+      driven, PR comment (marker de-dup) or job summary, native
+      auto-resolution on the fixing analysis. Verified: YAML gate,
+      shellcheck, jq parsing of a synthetic alert payload.
+- [x] **Environment.md created (in-repo, root):** per-agent sections,
+      contract (own section only, evidence for every block, tested paths
+      first, no silent CI deferral); Arena AI section with measured
+      egress allowlist, present/blocked tools (date + error +
+      workaround), and the tested local check paths (lint venv, strict
+      compiler pass, zig ARM compile, 5-part gate).
+- [x] **AGENTS.md:** §3 gate 1b (mandatory local C/C++ static analysis)
+      + "read Environment.md first"; §6 Environment.md contract; §8 new
+      alert convention (scanning results, not issues, nothing
+      hardcoded); §5 table rows.
+- [x] **Linear checked (owner request):** workspace has 4 projects
+      (BetterCI/VibeCI, Jules OS, Ai_trainings_hub, StealthMod) — **no
+      Hydra-Stone/BestAI project and no Hydra issues** (title search
+      empty); all open issues belong to the other repos. Nothing to fix
+      there; no project created (not requested).
+- [x] RESEARCH.md §7 (replacement decision) + §8 (PyPI wheel path) +
+      index; CHANGELOG entry written.
+- [ ] Docs final check + local gate suite + commit + PR (R17).

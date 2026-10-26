@@ -1,3 +1,11 @@
+/* Feature-test macros: under a strict -std=c99 compile glibc hides
+ * struct timespec / clock_gettime (POSIX 1b) behind these. Defining
+ * them in the source file keeps the file self-contained instead of
+ * relying on every build adding -D_POSIX_C_SOURCE=200809L
+ * -D_DEFAULT_SOURCE (same finding as in hydra_engine.c, 2026-10-26). */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+
 #include "hydra_model.h"
 #include <errno.h>
 #include <limits.h>
@@ -243,7 +251,10 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
      * Zustand, und ein zweiter Lauf auf einem gesättigten Vektor ist ein
      * anderes Experiment als ein frischer Start. */
     uint16_t sink = 0;
-    HydraEngine full_stats = {0};   /* bench_run publishes the real values, or -1 */
+    /* Zeroed via memset (not `= {0}`) so the file stays warning-free
+     * under a C++ parse (g++ -Wmissing-field-initializers). */
+    HydraEngine full_stats;  /* bench_run publishes the real values, or -1 */
+    memset(&full_stats, 0, sizeof full_stats);
     const BenchRequest full_req = { start_token, steps, HYDRA_BENCH_FULL };
     double ns_full = bench_run(model_path, &full_req, &sink, &full_stats);
     if (ns_full < 0) { fprintf(stderr, "[Hydra] Bench: Modell konnte nicht geladen werden\n"); return 1; }
@@ -450,7 +461,10 @@ int main(int argc, char **argv)
         start_token %= engine.header.vocab_size;
     }
 
-    uint16_t *tokens = malloc(sizeof(uint16_t) * (size_t)steps);
+    /* The explicit cast keeps this file parseable as C++ (g++
+     * -fsyntax-only -fanalyzer), where implicit void* -> T* conversion
+     * is ill-formed; in C the cast is a no-op. */
+    uint16_t *tokens = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)steps);
     if (!tokens) {
         hydra_engine_unload(&engine);
         return 1;

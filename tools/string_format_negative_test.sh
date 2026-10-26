@@ -37,8 +37,6 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '   
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-RESOURCES="android/app/src/main/res/values/strings.xml"
-KT="android/app/src/main/java/dev/hydrastone"
 
 # A minimal but complete world: the gate reads exactly these three things.
 seed_fixture() {
