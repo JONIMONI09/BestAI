@@ -951,8 +951,11 @@ vergessen!!!" (2026-10-30).
         driven gates (gate 1h needed it but the lint job never built -
         would have failed in CI); converter gate added (gate 1i);
         numbering fixed (1h/1i -> 1j/1k for yaml/lint gates).
-- [ ] R12-E: remaining: .agents update (this entry), full local gate
-      pass, commit, push, PR (facts-only).
+- [x] R12-E: full local gate pass, commit e99fc30 (31 files,
+      +7141/-93), pushed, PR #73 opened (facts-only body). All gates
+      green at push time (state above); kotlin_stub ran with the
+      npm-installed kotlinc 2.4.21 (0 errors); the pinned llama.cpp
+      v0.5.0 submodule was checked out locally for the pin gate.
 
 Verification state at this entry (local, 2026-10-30):
 - make clean && make && make test: green. make test-run: hydra-test
