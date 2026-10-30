@@ -379,7 +379,15 @@ static void make_dirs(void)
 static int open_fixture(const char *path)
 {
     hydra2_container_t c;
-    return hydra2_open(&c, path);
+    int rc = hydra2_open(&c, path);
+    /* The rejection checks below pass through here too, but some
+     * mutations are the ACCEPTED side of a boundary (the vocab/merges
+     * type checks): a successful open must be closed or the container
+     * (directories, meta, mmap'd trunk) leaks - the CI sanitizer job
+     * runs this suite with detect_leaks=1. */
+    if (rc == HYDRA2_OK)
+        hydra2_close(&c);
+    return rc;
 }
 
 /* build + write the pristine fixture; returns 0 on success */

@@ -39,7 +39,6 @@ sys.path.insert(0, HERE)
 
 import gguf_minimal_llama  # noqa: E402
 import gguf_reader         # noqa: E402
-import gguf_to_hydra2      # noqa: E402
 
 MAGIC = b'HYDRA2\x00\x00'
 
@@ -59,7 +58,7 @@ def parse_v2(path):
         raw = fh.read()
     assert raw[:8] == MAGIC, 'magic'
     u64 = lambda i: struct.unpack_from('<Q', raw, i)[0]
-    meta_off, meta_len = u64(24), u64(32)
+    meta_off = u64(24)
     td_off, n_tensors = u64(40), u64(48)
     ed_off, n_experts = u64(64), u64(72)
     trunk_off, trunk_len = u64(88), u64(96)
