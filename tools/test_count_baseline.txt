@@ -122,5 +122,25 @@
 # guard __ARM_NEON, so armeabi-v7a is covered). ARM = 228 + 6 = 234
 # (re-measure on the ARM CI leg); x86 stays at 225.
 
-x86: 225
-arm: 234
+# 2026-10-27 (round 12, JNI contract): jni-batch-test grows 109 -> 128
+# (transformer v3/v4 section: deterministic v3/v4 writers, the exact
+# KV geometry of runInferenceSampled, batched-run == direct-run
+# stream equality for greedy AND fixed-seed sampling, the v4 stream
+# pin, the token-0 all-zero fixed point of the bias-free design, and
+# the 17-step partial block with a real step function). The main-suite
+# numbers below are unchanged (the engine was not touched).
+#
+# 2026-10-27 (round 12, block-scaled ternary M2.2): +9
+# architecture-independent checks (test_tf_row_dot_scaled: the
+# per-group integer-exact partials + f32 scale FMA of
+# hydra_tf_row_dot_scaled against the independent scalar reference
+# over 8 dim x 128 LCG cases with FULL int8 range in an exactly-dim x
+# buffer; the kernel-envelope split - group 64 through the SIMD
+# dispatch, group 128 through the scalar loop, both integer-exact;
+# hand-computed extremes 256*127 = 32512, the sign flip 16256, the
+# zero-scale group kill 24384, the one-weight asymmetric flip 254, and
+# the dim%group / foreign-group / NULL guards returning 0.0f).
+# x86 = 225 + 9 = 234 (re-measured on this AVX2 sandbox); ARM =
+# 234 + 9 = 243 (re-measure on the ARM CI leg).
+x86: 234
+arm: 243

@@ -938,23 +938,9 @@ static const int8_t HYDRA_T3[4] = {0, 1, -1, 0};
 /* One row (dim weights) of a 2-bit packed block dotted with the int8
  * state. Row i of a dim*dim block lives at base + i*(dim/4). Integer
  * exact: |result| <= dim * 127. */
-static int32_t tf_row_dot(const uint8_t *row, const int8_t *x, uint32_t dim)
+static int32_t tf_row_dot_scalar(const uint8_t *row, const int8_t *x,
+                                 uint32_t dim)
 {
-    /* SIMD dispatch (the M3 pattern): AVX2 at runtime through the same
-     * probe the load path uses, NEON at compile time (an NEON build
-     * always has it on its target). Both kernels are INTEGER EXACT -
-     * bit-for-bit this scalar loop, no float reassociation - which is
-     * what keeps the pinned v3/v4 token streams valid on vector
-     * machines; the parity suite in tests/test_engine.c proves it per
-     * build. On a non-NEON, non-AVX2 build (or an AVX2 build on a
-     * non-AVX2 CPU) the scalar loop below runs, unchanged. */
-#if defined(__AVX2__)
-    if (hydra_simd_has_avx2())
-        return hydra_avx2_tf_row_dot(row, x, dim);
-#endif
-#if defined(__ARM_NEON)
-    return hydra_neon_tf_row_dot(row, x, dim);
-#endif
     int32_t acc = 0;
     for (uint32_t b = 0; b < dim; b += 4) {
         const uint32_t by = row[b / 4]; /* uint32: the shifts below are
@@ -967,6 +953,68 @@ static int32_t tf_row_dot(const uint8_t *row, const int8_t *x, uint32_t dim)
         acc += (int32_t)HYDRA_T3[(by >> 6u) & 0x03u] * (int32_t)x[b + 3];
     }
     return acc;
+}
+
+static int32_t tf_row_dot(const uint8_t *row, const int8_t *x, uint32_t dim)
+{
+    /* SIMD dispatch (the M3 pattern): AVX2 at runtime through the same
+     * probe the load path uses, NEON at compile time (an NEON build
+     * always has it on its target). Both kernels are INTEGER EXACT -
+     * bit-for-bit the scalar loop, no float reassociation - which is
+     * what keeps the pinned v3/v4 token streams valid on vector
+     * machines; the parity suite in tests/test_engine.c proves it per
+     * build. On a non-NEON, non-AVX2 build (or an AVX2 build on a
+     * non-AVX2 CPU) the scalar loop runs, unchanged. The kernels'
+     * padded copies bound their inputs to dim <= 64 (the engine's
+     * HYDRA_EMBED_DIM envelope, documented in the kernel): the engine
+     * only ever passes 64, so the dispatch needs no size check here;
+     * callers with a WIDER envelope (the block-scaled dot below) guard
+     * themselves. */
+#if defined(__AVX2__)
+    if (hydra_simd_has_avx2())
+        return hydra_avx2_tf_row_dot(row, x, dim);
+#endif
+#if defined(__ARM_NEON)
+    return hydra_neon_tf_row_dot(row, x, dim);
+#endif
+    return tf_row_dot_scalar(row, x, dim);
+}
+
+/* Block-scaled ternary row dot (FORMAT-V2.md 3.2): per-group
+ * integer-exact partial dot through the SAME SIMD dispatch as
+ * tf_row_dot, then the documented f32 scale FMA, left to right.
+ * Row bytes for group g start at row + g/4 (4 codes/byte, group is
+ * a multiple of 4); the x chunk starts at x + g. The public wrapper
+ * is hydra_tf_row_dot_scaled (hydra_model.h); this is the engine
+ * copy the wrapper calls so the dispatch stays in one place. */
+static float tf_row_dot_scaled_impl(const uint8_t *row, const int8_t *x,
+                                    uint32_t dim, const float *scale,
+                                    uint32_t group)
+{
+    /* group <= 64: the chunk is inside the SIMD kernels' documented
+     * envelope (dim <= 64), so the same dispatch as tf_row_dot.
+     * group 128: the chunk is WIDER than the kernels' padded copies -
+     * the scalar loop is the correct (integer-exact) path there. Both
+     * are integer-exact; only the choice of loop differs. */
+    const int use_kernel = (group <= 64u);
+    float acc = 0.0f;
+    for (uint32_t g = 0; g < dim; g += group) {
+        const int32_t partial = use_kernel
+            ? tf_row_dot(row + (size_t)g / 4u, x + g, group)
+            : tf_row_dot_scalar(row + (size_t)g / 4u, x + g, group);
+        acc += scale[g / group] * (float)partial;
+    }
+    return acc;
+}
+
+float hydra_tf_row_dot_scaled(const uint8_t *row, const int8_t *x,
+                              uint32_t dim, const float *scale,
+                              uint32_t group)
+{
+    if (!row || !x || !scale || dim == 0 || group == 0) return 0.0f;
+    if (group != 64u && group != 128u) return 0.0f;
+    if (dim % group != 0) return 0.0f;
+    return tf_row_dot_scaled_impl(row, x, dim, scale, group);
 }
 
 /* Byte size of one per-layer non-linear block.

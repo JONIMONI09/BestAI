@@ -229,7 +229,8 @@ jobs:
       - name: Build linux-arm64 (static)
         run: |
           aarch64-linux-gnu-gcc-12 -O3 -static -Wall -Wextra \
-              -Iinclude src/hydra_engine.c src/main.c -lm -o dist/hydra-run-linux-arm64
+              -Iinclude src/hydra_engine.c src/main.c src/hydra_v2_container.c \
+              src/hydra_moe.c -lm -o dist/hydra-run-linux-arm64
 
       # Both binaries MUST produce the same results as the scalar host -
       # otherwise the NEON equality claim would be unproven again.
@@ -268,7 +269,8 @@ jobs:
         run: |
           mkdir -p dist
           clang -O3 -Wall -Wextra -Iinclude \
-              src/hydra_engine.c src/main.c -lm -o dist/hydra-run-macos-arm64
+              src/hydra_engine.c src/main.c src/hydra_v2_container.c \
+              src/hydra_moe.c -lm -o dist/hydra-run-macos-arm64
       - name: Smoke test on the release binary
         run: |
           python3 tools/make_model.py smoke.hydra

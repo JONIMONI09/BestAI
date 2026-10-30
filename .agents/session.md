@@ -719,3 +719,258 @@ can and cannot prove.
   (Rezepte Environment.md); pyyaml via pip --break-system-packages;
   llama.cpp-Submodule per `git submodule update --init` auf den Pin
   ausgecheckt (sonst pin-check "working tree"-Meldung).
+
+## Round 12 (2026-10-27) — audit of issue #72 ("post-fd1848ac transformer + .hydra2 expansion")
+
+**Owner directive (verbatim):** "ANALYSIEREN? … Bitte prüfen ob das Stimmt dann Doku machen und so etc !" with issue https://github.com/JONIMONI09/BestAI/issues/72 attached (6 milestones M1-M5 + a verification list). The issue is a post-merge audit drafted BEFORE PR #70 was merged — several of its claims are already obsolete. Task: verify every claim against the merged code (evidence-based, like the R11 audit), document the findings, then plan what is genuinely new.
+
+**Session start (R33):** 2026-10-27 (branch `arena/44edb923-bestai`, base `94f8e08` = merge of PR #70). Read before the first edit: AGENTS.md (full, incl. the new §2.1 v3/v4+SIMD paragraph and §3 counts), .agents/session.md (rounds 8-11, esp. R11 fact-finding + results), .agents/errors.md (R11 SIMD bug series + Number(null) entries), .agents/rules.md, .agents/user.md (directive 30 + standing rules), .agents/Environment.md (round-11 block: /tmp resets, pyyaml, submodule checkout, CI cppcheck 2.13 version gap, log-fetch block), android/app/src/main/cpp/CMakeLists.txt (full: HYDRA_ROOT = 5 levels up; libhydra.so = hydra_engine.c + hydra_jni.c ONLY; llama.cpp separate .so), android/app/src/main/cpp/hydra_jni.c (4 JNI exports: cancel/runInference/runInferenceSampled/benchmark; NO hydra_v2_container.h include; L319 comment: v3 dispatch = step_tf + caller KV), android/app/src/main/java/dev/hydrastone/HydraBridge.kt (runInference/runInferenceSampled/benchmark/cancel; runInference "still uses the v1/v2 step and refuses v3"), tests/test_jni_batch.c (109 checks; ZERO v3/v4 coverage - grep v3/transformer = empty), tools/jni_signature_check.sh (parameterised per bridge, name-based), include/hydra_v2_container.h (full: "it does not run MoE inference, it does not implement an expert cache, and it does not map the trunk"; tensor roles TRUNK/ROUTER/EMBEDDING/NORM/KV/SHARED_EXPERT; types incl. F16/BF16; archs hydra-recurrent-v1 + moe-transformer-v1), src/hydra_v2_container.c (metadata = routing K/V pairs: top_k etc.), include/hydra_model.h (v3 fixed design params L24-37; v4 pass L175-215: single full-dim causal attention, NO n_heads/n_kv_heads, NO MoE, w1 token injection, W_out; sampler = ONE acc[0] accumulator, no per-vocab logit vector), src/main.c (--prompt = token IDs only, NO --text-prompt, NO text decode), tools/gguf_to_hydra.py ("the vocabulary cannot be stored" L324), tools/gguf_minimal_llama.py (exists: minimal real llama GGUF + BPE-style tokenizer for the llama.cpp pipeline, --out required), server.js (NO .hydra2 handling), docs/FORMAT-V2.md (implementation status: container reader only, no inference path), tools/test_count_baseline.txt (x86 225 / arm 234 post-PR#70).
+
+### R12-A: evidence-based verdict per issue claim (measured 2026-10-27)
+
+DONE (merged in PR #70, 2026-10-26):
+- M1.3-part: sampler-config JNI tests (jni-batch 109 incl. boundaries/rejections/defaults);
+  jni_signature_negative_test.sh (both bridges in CI + negative control);
+  android_header_check .hydra2 validation (28 checks incl. computed
+  cross-surface pins). Measured post-merge: 109/109, 28/28, hydra-test
+  225/225.
+- M2.1-part: tf_row_dot (the v3/v4 projection hot path, 384 calls/token)
+  has AVX2 + NEON kernels with scalar fallback (PR #70); parity tests
+  225/234; integer-exact => bit-identical streams.
+- M5-part: web console sampler flags (server_test 43), AGENTS/README/
+  CHANGELOG/FORMAT-V2 docs, test_count_baseline same-commit update.
+- The issue's invariant is CORRECT and measured: starter model,
+  start_token=42, greedy, 8 steps -> [471 386 385 386 385 386 385 386].
+
+STALE/WRONG in the issue:
+- M1.1: "add ../../../../src/hydra_v2_container.c to CMakeLists" —
+  UNNECESSARY AND THE PATH IS WRONG. (a) CMake defines HYDRA_ROOT 5
+  levels up (`${CMAKE_CURRENT_SOURCE_DIR}/../../../../..`), so
+  `../../../../src/...` resolves to android/src/... (nonexistent).
+  (b) libhydra.so compiles hydra_engine.c + hydra_jni.c only, and
+  NEITHER references a single container symbol (grep: the only
+  hydra2 mention in hydra_engine.c is a refusal message L375) — adding
+  the .c would ship dead code in the phone .so. The container is
+  deliberately host-only (FORMAT-V2.md implementation status: "there is
+  no code path in hydra-run that consumes a .hydra2 file").
+- M1.3-rest: "test all new JNI entry points (.hydra2 loading)" — there
+  is NO .hydra2 JNI entry point (the bridge exports exactly
+  cancel/runInference/runInferenceSampled/benchmark; hydra_jni.c has no
+  container include). The audit asks for tests of a feature that does
+  not exist. PARTIALLY VALID: the v3/v4 transformer path IS reachable
+  via runInferenceSampled (documented at hydra_jni.c L319), but
+  tests/test_jni_batch.c covers it ZERO times (grep v3/transformer =
+  empty) — that gap is real and testable.
+- M2.2: per-group FP16/FP32 block scaling (group 64/128) — does not
+  exist. What DOES exist: one u16 absmean scale PER LAYER
+  (HYDRA_TF_SCALE_FP, hydra_model.h L33). Per-group scales = new
+  format work; retro-applying them would break the pinned streams, so
+  it must be additive (new version / new tensor type).
+- M3.1: GQA (n_heads/n_kv_heads), Sparse-MoE FFN, token-embedding
+  lookup, separate lm_head — NONE exist in v4. v4 is fixed-design:
+  single full-dimension causal attention (one Wq/Wk/Wv per layer, no
+  head split), dense ternary SwiGLU FFN, w1 token injection (NOT an
+  embedding table), W_out as the logit projection. The issue conflates
+  the container's STORED tensor roles (EMBEDDING/NORM/KV for the
+  future moe-transformer-v1 arch) with the executable v3/v4 engine —
+  the container explicitly does not run inference.
+- M3.2: mmap for .hydra2 — the container explicitly does NOT map the
+  trunk (documented scope, header L10-13); it uses pread-per-expert +
+  hydra2_read_tensor() for the trunk. New feature (would reverse a
+  documented design decision).
+- M4: no format stores token strings (v1 header = vocab_size only;
+  v2 roles have no VOCAB entry; gguf_to_hydra.py L324: "the
+  vocabulary cannot be stored"); no --text-prompt and no BPE in
+  main.c (token IDs only). NEW feature set (format + C + Python).
+- M5-rest: .hydra2 inspection in the web console — server.js has no
+  .hydra2 handling. NEW (small-medium).
+
+WRONG in the issue's verification list (measured):
+- `python3 tools/gguf_minimal_llama.py` (no args) -> usage error,
+  --out is required.
+- `bash tools/test_count_check.sh` (no args) -> "FAIL: usage:
+  test_count_check.sh <binary> <arch-label>".
+- `node tools/server_test.js` works but the repo convention is
+  `node --test tools/server_test.js`.
+- `tools/compose_scroll_guard.py` exists but the WIREd gate is
+  tools/compose_scroll_check.sh (AGENTS.md §3).
+- Existing + fine: apple_portability_check.sh,
+  kotlin_stub_check/kotlin_stub_check.sh, session_start_check.sh,
+  ci_syntax_mirror_test.sh, workflow_lint_check.sh, workflow_yaml_
+  check.sh, llama_pin_check.sh, docs_claim_check.sh,
+  android_header/autostart/crash_check.sh, jni_signature_check.sh.
+
+### R12 plan (owner approved 2026-10-27: "alles fixen was geht!!!!" = full scope)
+
+DESIGN (all additive; legacy bit-identical; new identifiers):
+- NEW tensor roles (reader updated, old readers refuse new files =
+  documented compat rule): 7=ATTN (attn_q/k/v.{l}), 8=VOCAB ('vocab'
+  type 0x0050 VOCAB_UTF8, 'merges' type 0x0051 U16_PAIRS), 9=LM_HEAD
+  (optional; default = tied embedding, llama-style).
+- NEW tensor type ids (FORMAT-V2.md 3.2 extension): 0x0040
+  TERNARY2_S64, 0x0041 TERNARY2_S128 (ternary2 payload + paired
+  F32 '<name>.scale' tensor, n = rows*ceil(cols/group); per-group
+  int32 partial dot (bound G*127) * f32 FMA); 0x0050/0x0051 above.
+- NEW inference metadata (enforced by the MoE layer, container stays
+  structural): v2.dim, v2.vocab_size, v2.n_heads, v2.n_kv_heads,
+  v2.head_dim, v2.inter, v2.expert_layout (0=F32 flat fixture,
+  1=ternary+scales [gate|up|down]), v2.rope_theta, v2.kv_sink,
+  v2.kv_ring, v2.tied_embedding, v2.bos_token.
+- NEW module src/hydra_moe.c + include/hydra_moe.h: open on container
+  (mmap trunk + pread fallback), full per-layer GQA pass (F32
+  attention, RoPE theta 10000, per-(layer,kv_head) sink+ring KV),
+  router -> top-k -> streamed expert FFN (F32 or ternary+scale),
+  final RMSNorm, logits via tied embed (or LM_HEAD), REAL per-vocab
+  logit vector -> new min-p/rep sampler (v1 sampler untouched, v1
+  streams stay bit-identical).
+- main.c: magic dispatch (.hydra2 -> MoE engine), --text-prompt for
+  .hydra2 (BPE encode from embedded merges; strict), UTF-8 decode of
+  output tokens, --inspect for both formats (JSON report).
+- server.js: /api/models/inspect + list handle .hydra2 (magic
+  dispatch), UI + server_test.
+- tools/make_model.py: --moe-full (complete-contract fixture incl.
+  attention/scales/vocab); legacy --v2 fixture UNCHANGED (122 checks).
+- NEW tools/gguf_to_hydra2.py: GGUF -> .hydra2 moe-transformer-v1
+  (real vocab+merges, F32 embed, ternarized attention, dense-FFN ->
+  E-expert slice surgery, documented approximation, NOT a bit-exact
+  GGUF port).
+- JNI gap: v3/v4 coverage in test_jni_batch.c via the same C logic the
+  bridge calls (repo pattern: shared header, cf. hydra_batch.h).
+- ANDROID decision (documented): .hydra2 inference stays host-only
+  this round (R23/R32: new kernels need the NEON port + ARM runtime
+  proof; no dead code into the .so -> M1.1 remains "no, wrong path").
+- Gates: every SIMD variant parity-tested scalar vs SIMD (x86+ARM
+  baselines, ASan, zig), deterministic stream pins, same-commit
+  test_count_baseline, cppcheck 2.13.2 replication before push.
+
+- [x] R12-A: evidence-based audit of issue #72 (above).
+- [x] R12-B: documentation — .agents/docs/ISSUE-72-AUDIT.md (the full
+      verdict table with file:line evidence), session.md (this
+      section).
+- [x] R12-C: scope decision — owner: "alles fixen was geht!!!!".
+- [ ] R12-D: implement — stage 1 (JNI v3/v4 batch gap + inspect),
+      stage 2 (mmap), stage 3 (scales + kernels), stage 4 (MoE
+      engine F32), stage 5 (ternary+scale experts), stage 6
+      (vocab+BPE+converter), stage 7 (docs/gates/PR).
+- [ ] R12-E: full local gate (incl. CI cppcheck 2.13.2 replication),
+      commit, push, PR facts-only.
+
+## Round 12 progress (2026-10-30, continuation) — stages 1-7 state
+
+**Session start (R33):** 2026-10-30 (branch `arena/44edb923-bestai`,
+base `94f8e08`, R12 audit committed at `c992cd6`). Continuation
+session resumed from the condensed session state; read before the
+first edit of this continuation: .agents/session.md (round 12
+section + this plan), .agents/errors.md (top entries),
+.agents/rules.md, docs/FORMAT-V2.md (3.2.1/3.2.3 + implementation
+status), tools/gguf_test.py + gguf_reader.py (reader API, decode_rows
+flat semantics, Tensor.shape 1-D = (1, n)), tools/gguf_minimal_llama.py
+(tensor names of the pinned build: token_embd.weight /
+attn_output.weight / output_norm.weight, GGUF linears stored
+[in, out]), tools/make_model.py (_assemble_v2 + build_moe_full meta),
+tests/test_hydra_moe.c (ref_forward engine conventions),
+Makefile (test-run), ci.yml (gate layout).
+
+All work on branch arena/44edb923-bestai. Owner: "alles fixen was
+geht!!!!" + "mache schneller bitte weiter, und doku am ende nicht
+vergessen!!!" (2026-10-30).
+
+- [x] R12-D stage 1: JNI v3/v4 batch gap closed. tests/test_jni_batch.c
+      +19 (109 -> 128): deterministic v3/v4 writers, batched-run ==
+      direct-run stream equality (greedy AND fixed-seed sampling), v4
+      stream pin, token-0 fixed point, 17-step partial block.
+- [x] R12-D stage 2: trunk mmap (src/hydra_v2_container.c): resident
+      trunk region mapped when possible (trunk_map + page-aligned base
+      offset), pread stays the portable fallback; tensor reads serve
+      from the mapping. test_hydra2_container.c now 152 (was 144
+      after the vocab work; the mmap section pins both backends).
+- [x] R12-D stage 3: block-scaled ternary M2.2. Types 0x0040/0x0041
+      (TERNARY2 + per-group F32 scales, '<name>.scale' pairing,
+      FORMAT-V2.md 3.2.1 with ceil(n/G)); hydra_tf_row_dot_scaled
+      (integer-exact group partials * f32 FMA); +9 main-suite checks
+      (234 x86 / 243 arm baseline updated in
+      tools/test_count_baseline.txt).
+- [x] R12-D stage 4: MoE inference engine M3.1 (src/hydra_moe.c +
+      include/hydra_moe.h, NEW): open on .hydra2, per-layer GQA pass
+      (F32 attention, partial RoPE from v2.rope_theta, per-layer
+      sink+ring KV, NON-CAUSAL over cached positions = documented
+      deviation), router -> deterministic top-k -> streamed expert
+      FFN, real per-vocab logits, min-p/rep sampler. main.c magic
+      dispatch. tests/test_hydra_moe.c NEW: 138 checks (parity vs
+      independent reference, KV pins, tamper refusals, ternary dequant
+      unit vs independent reference).
+- [x] R12-D stage 5: ternary + block-scale expert layouts (layout 1:
+      TERNARY2_S64/S128 experts [gate|up|down]); heap-overflow fix in
+      moe_get_tensor (alloc by destination width, not source);
+      attention-ternary trunk path (attn_q etc. block-scaled,
+      --moe-attn-ternary fixture, 8288 B); AT64 pinned streams
+      "10 5" x 12.
+- [x] R12-D stage 6: vocab + BPE + CLI + converter.
+      6a/6b/6c: role-8 tensors (VOCAB_UTF8 0x0050, U16_PAIRS 0x0051),
+      moe_* codec API in hydra_moe.c (strict BPE, byte-level tokens,
+      loud refusals: duplicate tokens, out-of-range rule ids, missing
+      concat target, missing trailing NUL), web console inspection of
+      .hydra2 (server.js /api/models/inspect, public/app.js,
+      server_test.js 47), make_model.py --moe-full vocab/merges.
+      6d: container hardening (vocab/merges n_bytes rules, tamper
+      fixtures in test_hydra2_container.c -> 152).
+      6e: hydra-run --text-prompt (main.c): BPE-encode user text with
+      the embedded vocab, parity with numeric --prompt pinned, JSON
+      "text" echo, [Text] line, mutual exclusion, refusals (v1,
+      vocab-less, bench combo); moe_find_quiet() for optional tensor
+      lookups. Gate: tools/text_prompt_check.sh (ci.yml gate 1h).
+      6f: tools/gguf_to_hydra2.py NEW (M2.2/M3.1/M4): llama GGUF
+      (official AND pinned-build tensor names, F32/F16/BF16/Q8_0) ->
+      complete-contract .hydra2 moe-transformer-v1: transposed
+      linears (GGUF [in,out] -> engine [out,in]), uniform router
+      (all-zero rows -> softmax 1/E), E full-width experts partitioning
+      the intermediate rows (gate/up masked + xE, down full) so the
+      engine result equals the dense FFN up to F32 order rounding;
+      E=1 default (verbatim dense FFN as one expert), --max-experts
+      bound (cost: E x FFN storage per layer, documented); embedded
+      vocab 1:1, merges optional (rules whose concat is not a token
+      are skipped, documented); rope_theta from llama.rope.freq_base;
+      loud refusals (non-GGUF, non-llama, undecodable tensor, missing
+      tokens, dim mismatch). Gate: tools/gguf_to_hydra2_test.py NEW
+      (26 checks: engine determinism, expert CRC tamper refusal,
+      F32-exact embed transpose, F32-exact masked-expert identity,
+      byte-exact vocab, metadata, router zeros, merges roundtrip,
+      5 refusal controls). Makefile gguf-conv-test in test-run.
+- [x] R12-D stage 7 (partial, this entry): docs + gates + sanitize.
+      * FORMAT-V2.md: 3.2.1 (ceil + trunk ternary materialization),
+        3.2.3 (vocab/merges codec + converter + documented
+        approximations), 7 type rows, implementation-status bullet
+        (round 12 stages 4-6, 138 checks, codec refusals, fixture
+        list), Q8_0 row, cross-ref fix.
+      * UBSan finding 2026-10-30: misaligned float load in the
+        ternary expert scale read (n % 4 == 2) - fixed with memcpy in
+        src/hydra_moe.c + test reference; NEW CI step "Sanitizers
+        (ASan+UBSan) over the whole test suite" (build-test job, both
+        matrix legs, UBSAN_OPTIONS=halt_on_error=1). errors.md entry.
+      * ci.yml: lint job now builds ./hydra-run before the binary-
+        driven gates (gate 1h needed it but the lint job never built -
+        would have failed in CI); converter gate added (gate 1i);
+        numbering fixed (1h/1i -> 1j/1k for yaml/lint gates).
+- [ ] R12-E: remaining: .agents update (this entry), full local gate
+      pass, commit, push, PR (facts-only).
+
+Verification state at this entry (local, 2026-10-30):
+- make clean && make && make test: green. make test-run: hydra-test
+  234/0 (baseline x86 234), jni-batch 128/0, large-model 7/0, gguf
+  101/0 (v1 gate UNTOUCHED, byte-identical fixtures), gguf-conv 26/0,
+  hydra2-test 152/0, hydra-moe-test 138/0.
+- node --test tools/server_test.js: 47/0 (a stale local `node
+  server.js` caused one port-conflict flake; killed, re-ran clean x3).
+- ASan+UBSan (halt_on_error=1): all five test binaries green, 0
+  runtime errors (after the misaligned-load fix).
+- gcc -fanalyzer (C99, -Wall -Wextra -Werror): clean on all 4 TUs.
+- cppcheck 2.13.2 exact CI command: NOT runnable in this sandbox
+  (2026-10-30: the repo-proxy whitelist no longer serves
+  cppcheck/cppcheck - codeload + git + api all 404 - and the sandbox
+  has no root for apt). The CI gate (lint job, apt cppcheck) covers
+  it; local static analysis was done via -fanalyzer + ASan/UBSan
+  instead. Re-run locally when the tool is reachable again.
+- .sh gates: run in the final pass (session_start, jni_signature,
+  kotlin_stub, compose_scroll, android_header/autostart/crash,
+  apple_portability, ci_syntax_mirror, workflow_yaml, workflow_lint,
+  llama_pin, docs_claim, test_count x86).

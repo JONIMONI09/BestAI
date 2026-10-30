@@ -19,6 +19,9 @@ python3 tools/gguf_to_hydra.py model.gguf --out models/converted.hydra
 # convert a safetensors file -> .hydra (version 2, 4 ternary weights per byte)
 python3 tools/safetensors_to_hydra.py model.safetensors --out models/converted.hydra
 
+# convert a GGUF -> .hydra2 (full-fidelity MoE container, section 12)
+python3 tools/gguf_to_hydra2.py model.gguf models/converted.hydra2
+
 # or through the web console
 POST /api/models/import?name=model.gguf
 ```
@@ -297,11 +300,12 @@ round-trip against itself; it would not survive the engine.
 - **`A`/`B` are column sums.** Column sums discard the per-row structure that
   attention depends on. That is inherent to what the format stores, not a
   limitation of the fold implementation.
-- **The `.hydra2` container is not a GGUF loader** (2026-10-26). GGUF has two
-  supported destinations only: the app's llama.cpp engine (full fidelity) and
-  this offline converter (projection). Dropping a GGUF into the v2 container
-  is refused with the GGUF magic named; the converter never writes `.hydra2`
-  (it emits v1, or `--v3` for the RoPE-capable variant). See §11.
+- **The v1 projection converter never writes `.hydra2`** (2026-10-26).
+  `tools/gguf_to_hydra.py` emits v1 (or `--v3` for the RoPE-capable
+  variant) only; dropping a GGUF directly into the container reader is
+  refused with the GGUF magic named. The full-fidelity path to the
+  container has its own dedicated converter since 2026-10-30 —
+  `tools/gguf_to_hydra2.py`, see §12.
 - **Little-endian only.** The GGUF spec allows big-endian files but provides
   no way to detect them; the spec says to assume little-endian, which is what
   the reader does (§11).
@@ -606,3 +610,63 @@ Not measured (R32, no device in the sandbox): `libllama_jni.so`
 inside the APK on a real phone or emulator — the Android CI tier
 compiles the exact JNI source, and the x86_64 emulator is the
 documented device-side verification path (`android/README.md`).
+
+---
+
+## 12. GGUF → `.hydra2` (full-fidelity MoE container, 2026-10-30)
+
+```bash
+python3 tools/gguf_to_hydra2.py model.gguf models/converted.hydra2
+# with real multi-expert structure (E x FFN storage per layer):
+python3 tools/gguf_to_hydra2.py model.gguf out.hydra2 --max-experts 4
+```
+
+This is a SECOND, independent converter — the v1 projection converter
+(§1–§9) is untouched. It reads a decoder-only **llama** GGUF (the
+official tensor names AND the pytorch-style names of this repository's
+pinned llama build; F32/F16/BF16/Q8_0 weights) and writes a
+complete-contract `.hydra2` file (`moe-transformer-v1`) that
+`hydra-run` executes directly: per-layer GQA attention, expert FFN,
+RMSNorm, real per-vocabulary logits, plus the embedded BPE vocabulary
+and merge rules (`docs/FORMAT-V2.md` §3.2.3) so the CLI's
+`--text-prompt` and the web console's inspection work on it.
+
+Mapping and exactness:
+
+- Every linear is transposed on the way in (GGUF llama stores
+  `[in, out]`, the engine wants `[out, in]`); the norms, the rope
+  theta (`llama.rope.freq_base`) and the bos id are carried into the
+  `v2.*` metadata.
+- The dense SwiGLU FFN becomes E full-width experts that PARTITION the
+  intermediate rows: expert *e* keeps rows `[e*c ... (e+1)*c)` of
+  gate/up (x E) and zeroes the rest, with the full dense down matrix.
+  The router rows are all zero (uniform: softmax weight 1/E, top_k =
+  E), so the engine's per-token FFN equals the dense FFN — row-wise
+  exact up to F32 summation order. E=1 (the default) is the dense FFN
+  verbatim as a single expert; `--max-experts N` raises E to the
+  largest divisor of the FFN width ≤ N, at E times the FFN storage per
+  layer.
+- The dense matrices are also kept in the trunk (`ffn_gate/up/down.L`)
+  as the source of record; the engine routes through the experts.
+
+Documented deviations from the original model (stated, not hidden —
+see the converter docstring): the engine's attention is NON-CAUSAL
+over the cached positions, RMSNorm epsilon is the engine's fixed
+1e-6, KV history is bounded by the sink+ring geometry (2+8), and BPE
+merge rules whose concatenated string is not a token are skipped. It
+is a faithful weight transfer, not a bit-exact transplant.
+
+Loud refusals (exit 2, the message names the problem): not a GGUF /
+bad version, a non-llama architecture, no `tokenizer.ggml.tokens`, a
+tensor in a layout the reader cannot decode (Q4_0 and friends —
+re-export with `--convert-f16`), a missing required tensor, or a
+dimension that does not divide.
+
+The gate `tools/gguf_to_hydra2_test.py` (Makefile target
+`gguf-conv-test`, CI gate 1i) converts the minimal llama GGUF and
+proves: the engine runs the result deterministically; a flipped expert
+byte is refused by the per-payload CRC32; the embedding is the exact
+transpose of `tok_emb` (F32-exact, independent re-read); every expert
+payload equals the masked/scaled dense FFN (F32-exact); the embedded
+vocabulary is byte-exact; the metadata matches the GGUF architecture;
+the merge rules survive the conversion; and each refusal class fires.

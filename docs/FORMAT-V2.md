@@ -84,11 +84,56 @@ Stated precisely, with the boundary between implemented and not:
   `tests/test_hydra2_container.c` (run as `make hydra2-test`, gated in CI)
   covers the happy path, every refusal class, routing determinism, the
   Python/C cross-check, and the mutual v1/v2 refusal (7.2/7.3).
-- **Not implemented:** MoE inference on top of the container (there is no
-  code path in `hydra-run` that consumes a `.hydra2` file), the expert cache
-  / slot leasing of section 6.2, prefetch of section 6.4, and every
-  `B_eff`/throughput number in section 6, which remain **NOT MEASURED**.
-  No `.hydra2` inference result may be quoted.
+- **Implemented `[CODE]` (2026-10-27):** the trunk is **memory-mapped**
+  when the kernel allows it — a page-aligned `mmap(MAP_PRIVATE, PROT_READ)`
+  range covering the whole trunk, tensor reads are `memcpy` out of the
+  mapping (`src/hydra_v2_container.c`, `trunk_backend` field: `"mmap"` or
+  `"pread"`). The explicit opt-out `HYDRA2_NO_MMAP=1` and a kernel refusal
+  both fall back to the original one-`pread`-per-tensor path, byte-for-byte
+  (parity CRC tested in `tests/test_hydra2_container.c`,
+  `test_trunk_mmap_backend`). Expert streaming is deliberately unchanged:
+  one `pread` per expert, CRC-32 verified at read time (5.1.5).
+- **Implemented `[CODE]` (2026-10-27):** `hydra-run --inspect <file>`
+  prints a JSON summary of a `.hydra2` file (version, header bytes, the
+  five regions, routing metadata, metadata key/value pairs, the tensor
+  directory, up to eight sample experts, and the reader backend) with the
+  same exit-code contract as the v1 inspection (0 ok / 2 reader refusal /
+  1 usage). The web server's `/api/models` and inspect route accept
+  `.hydra2` files (`server.js`, `execFileSync` dispatch on the binary's
+  exit status, covered by `tools/server_test.js`), and the `tools`
+  frontend lists and displays them.
+- **Implemented `[CODE]` (2026-10-30, round 12 stages 4–6):** MoE
+  inference on top of the container — `src/hydra_moe.c` /
+  `include/hydra_moe.h`, engine `moe-transformer-v1`: per-layer GQA
+  attention (RoPE, sink+ring KV caches), router → top-k → streamed expert
+  FFN (SwiGLU), final RMSNorm, real per-vocabulary logits, and a
+  min-p / repetition-penalty sampler over them. `hydra-run` dispatches on
+  the file magic: `.hydra2` files run the MoE engine (v1–v4 files run the
+  legacy engine, bit-identical, untouched). Expert layouts: **0** = flat
+  F32 and **1** = TERNARY2 + per-group F32 scales (section 3.2.2);
+  **trunk** tensors of the block-scaled ternary types are materialized
+  through their paired `<name>.scale` sibling at read time (section
+  3.2.1), and the optional **role-8 vocabulary** (`vocab` / `merges`,
+  section 3.2.3) carries the token strings: the module validates them at
+  open (UTF-8, uniqueness, merge targets) and exposes the BPE codec
+  (`hydra_moe_encode_text` / `hydra_moe_decode_token`), which
+  `hydra-run --text-prompt` uses (loud refusals: no vocab, v1 file,
+  unmapped byte, invalid UTF-8, overflow, flag combination). The v1
+  legacy engine and its pinned streams are not modified. Covered by
+  `tests/test_hydra_moe.c` (`make test-run`, 138 checks: independent-
+  reference forward parity, greedy stream pins for the F32 / S64 / S128 /
+  dim-256 multi-group / attention-ternary fixtures, KV eviction, sampler
+  extremes, the hand-crafted dequant round-trip, the vocab codec +
+  tamper refusals, and tampered-directory refusals), by
+  `tests/test_hydra2_container.c` (`test_vocab_types`) and by
+  `tools/text_prompt_check.sh` (CLI gate).
+  **Not implemented:** the expert cache / slot leasing of section 6.2,
+  prefetch of section 6.4, and every `B_eff`/throughput number in section
+  6, which remain **NOT MEASURED**. (The JNI bridge's batch sampling API
+  has, since 2026-10-27, transformer v3/v4 coverage in
+  `tests/test_jni_batch.c` — batched runs equal direct runs for greedy
+  and fixed-seed sampling; that is the v3/v4 engine, not a `.hydra2`
+  consumption path.)
 - **SIMD status (2026-10-26).** The transformer formats v3/v4 (the engine's
   per-layer ternary projections) compute their inner product through
   `tf_row_dot`, which is **integer-exact** and has AVX2 and NEON kernels
@@ -106,8 +151,10 @@ Stated precisely, with the boundary between implemented and not:
   `tools/gguf_to_hydra.py`). It is a Python reader for somebody else's file
   format that converts to a **v1** `.hydra`. The v2 container validates Q8_0
   *entries* (element-group and byte-size rules) but does not **decode** Q8_0
-  values; the same is true for F16/BF16. TERNARY2 and F32 are the types the
-  current test fixtures exercise.
+  values; the same is true for F16/BF16. The types the current test
+  fixtures exercise are F32, TERNARY2_S64/S128 (expert layout 1 and
+  attention trunk tensors) and the role-8 pair VOCAB_UTF8/U16_PAIRS
+  (section 3.2.3).
 - The **research** that motivates the sparse-MoE path is in
   [`.agents/docs/HYDRA2-RESEARCH.md`](../.agents/docs/HYDRA2-RESEARCH.md). Its benchmark plan is
   explicitly **not yet run**; nothing in it may be quoted as a result.
@@ -197,17 +244,181 @@ table is refused before a single tensor directory entry is read. **[SPEC]**
 | `0x0030` | `Q4_0` | 18/32 | reserved, **not implemented** |
 | `0x0031` | `Q4_K` | reserved, **not implemented** |
 | `0x0032` | `MXFP4` | reserved, **not implemented** |
+| `0x0040` | `TERNARY2_S64` | 0.5 | TERNARY2 packing + per-64-element block scales, sections 3.2.1 / 3.2.2 **[CODE]** |
+| `0x0041` | `TERNARY2_S128` | 0.5 | TERNARY2 packing + per-128-element block scales, sections 3.2.1 / 3.2.2 **[CODE]** |
+| `0x0050` | `VOCAB_UTF8` | var (>= 2) | NUL-terminated UTF-8 token strings, one per token id, section 3.2.3 **[CODE]** |
+| `0x0051` | `U16_PAIRS` | 4 | BPE merge rules `(left u16, right u16)` LE, section 3.2.3 **[CODE]** |
 
-The v2 reader **validates** all five implemented types structurally
+The v2 reader **validates** all seven implemented types structurally
 (`n_elements` multiple of the element group, `n_bytes == n_elements *
-bytes_per_element`) and **refuses** the last three **by name** rather than by
+bytes_per_element`; the variable-length pair follows its own rule,
+section 3.2.3: `VOCAB_UTF8` needs `n_bytes >= 2 * n_elements` — at least
+one data byte plus the NUL per token — and `U16_PAIRS` needs exactly
+`4 * n_elements`) and **refuses** the last four **by name** rather than by
 falling through to "unsupported" (`[CODE]` `src/hydra_v2_container.c`,
 tensor/expert entry validation). Value **decoders** exist in this repository
-for the first five only in the sense that `tools/gguf_reader.py` can read
-F32/F16/BF16/Q8_0 for the **GGUF import path**, which produces a **v1**
-`.hydra`; the v2 container does not decode expert values yet — it streams
-them into caller buffers (that is what the expert cache + inference path,
-section 6, will consume). **[SPEC]** + **[CODE]**
+in the sense that `tools/gguf_reader.py` can read F32/F16/BF16/Q8_0 for the
+**GGUF import path**, which produces a **v1** `.hydra`, and the MoE module
+(`src/hydra_moe.c`) decodes the expert payloads it streams: F32 (layout 0)
+and TERNARY2_S64/S128 (layout 1, section 3.2.2). The container itself
+still only streams expert bytes into caller buffers; the section 6.2 expert
+cache and the 6.4 prefetch remain open. **[SPEC]** + **[CODE]**
+
+#### 3.2.1 Block-scaled ternary (M2.2)
+
+`TERNARY2_S64` and `TERNARY2_S128` are the block-scaled ternary formats.
+Their **byte layout is the TERNARY2 layout itself** — two 2-bit codes per
+byte, `n_bytes == n_elements / 2`, `n_elements` even — so the container
+validates them with the TERNARY2 packing rule; the group size is *not* a
+property of the byte stream. **[CODE]**
+
+What the id adds is a **scale convention**: a tensor of one of these types
+is stored *paired* with a plain `F32` tensor named `"<name>.scale"`, whose
+`n_elements` is `ceil(n_elements / 64)` (S64) or `ceil(n_elements / 128)`
+(S128) — the **last group may be partial**, the same convention as the
+expert sub-matrices (section 3.2.2). The scale of group `g` is applied to
+elements `g*G .. min(n, (g+1)*G)-1` during inference, fused as one float
+multiply-add per group, left to right — the precision contract of
+`hydra_tf_row_dot_scaled()` (`include/hydra_model.h`, implemented in
+`src/hydra_engine.c`, parity-tested in `tests/test_engine.c`).
+**[CODE]**
+
+The **MoE module** (`src/hydra_moe.c`) materializes trunk tensors of these
+types through the same paired convention (FORMAT-V2.md section 4.2 role
+names `attn_q/k/v/o.{L}` and friends): on read it allocates the destination
+width (`n_elements * 4` bytes), copies the `n_elements / 2` payload bytes,
+locates the `"<name>.scale"` sibling (F32, exactly `ceil(n_elements / G)`
+elements) and writes `value = code * scale` into the destination — after
+which the engine runs the **identical F32 arithmetic**. A missing or
+mismatched sibling tensor is a loud refusal (section 5.2), and a retyped
+or mis-sized tensor is refused by the container's structural check.
+`tools/make_model.py --moe-full --moe-attn-ternary [64|128]` writes such
+files (flat group convention: a scale covers `G` consecutive elements in
+row-major order), and the greedy stream of one such fixture is pinned in
+`tests/test_hydra_moe.c`. **[CODE]**
+
+The paired-tensor form is the **tensor-directory** convention (a trunk
+tensor plus its `<name>.scale` sibling). The MoE expert stream uses the
+same two type ids with a **self-contained blob** convention instead,
+because expert directory entries have no sibling mechanism — see section
+3.2.2. Both conventions share the TERNARY2 code table and the F32 scale
+semantics. **[SPEC] + [CODE]**
+
+#### 3.2.2 Ternary MoE experts (`v2.expert_layout` 1, 2026-10-30)
+
+The MoE module (`src/hydra_moe.c`) understands two expert layouts,
+selected by the `v2.expert_layout` metadata key (section 4.4). The
+container stays structural: it validates the expert directory entries
+(length, type, CRC, ordering) and does not interpret the payload bytes.
+The layout rules below are enforced by the MoE module. **[SPEC] + [CODE]**
+
+* **Layout 0 (F32 flat).** Every expert is `3 * inter * dim` F32 values,
+  row-major: `gate (inter x dim) | up (inter x dim) | down (dim x inter)`.
+  Every expert directory entry carries type `F32` and the same length.
+* **Layout 1 (TERNARY2 + block scales).** Every expert is the
+  concatenation of three sub-matrix blocks, in the order
+  `gate | up | down`, and each block is
+
+  ```
+  [payload bytes][scale F32 array]
+  ```
+
+  for its `(rows x cols)` matrix (`gate`: `inter x dim`, `up`:
+  `inter x dim`, `down`: `dim x inter`; row-major element order):
+
+  * **payload** — the exact TERNARY2 packing, `n/2` bytes (`n = rows *
+    cols`, which must be even): element `2j` in the LOW two bits of byte
+    `j`, element `2j+1` in bits 2–3; code table `00 = 0`, `01 = +1`,
+    `10 = -1`, `11 = 0 (reserved)` — the same table as v1
+    (`hydra_decode_ternary_2bit`).
+  * **scales** — `rows * ceil(cols / group)` F32 values, row-major
+    `[row][group]`; one scale covers `group` consecutive columns of one
+    row and the **last group may be partial**. `group` is 64 for entry
+    type `TERNARY2_S64` (`0x0040`) and 128 for `TERNARY2_S128`
+    (`0x0041`); all entries of one file must use the same type.
+  * **dequantization** — `value = code * scale` (exact in F32: a multiply
+    by −1, +1 or 0). The engine materializes the selected expert into a
+    per-expert F32 buffer and then runs the **identical** layout-0 expert
+    arithmetic (same mat-vec, same SwiGLU, same summation order). There
+    is deliberately no separate ternary mat-vec kernel: at batch size 1
+    the materialization is cheap, and the downstream arithmetic is
+    provably the F32 path's, so the two layouts differ only in their
+    stored weights.
+  * **quantization recipe** (the fixture writer,
+    `tools/make_model.py --moe-full --moe-ternary [64|128]`): per row
+    group, `s = max |w|` of the group (F32, `0.0` for an all-zero group)
+    and code `+1` when `w >= 0.5*s`, `-1` when `w <= -0.5*s`, else `0`
+    (an all-zero group codes everything as `0`). The recipe is
+    deterministic (fixed LCG seed) and the dequantized value of element
+    `i` is exactly `code_i * s` in F32.
+  * **size** — per expert: `Σ over the three sub-matrices of
+    (n/2 + rows * ceil(cols/group) * 4)` bytes; the MoE module computes
+    this from `v2.inter`/`v2.dim` and the entry type and refuses any
+    entry whose `length` or `type_id` deviates. Example (dim 8, inter 4,
+    group 64): gate/up `4x8` → 16 + 16 B each, down `8x4` → 16 + 32 B,
+    total **112 B** versus 384 B for layout 0 (≈3.4×).
+  * **metadata** — `v2.expert_layout = 1` and `v2.expert_bytes_typ` set
+    to the layout-1 byte count.
+
+The test suite pins the greedy KV token streams of one S64, one S128 and
+one dim-256/inter-64 S64 (multi-group: four 64-element groups per
+gate/up row) fixture (`tests/test_hydra_moe.c`), and the S64/S128
+streams of the small fixture are identical by construction: there, every
+row has fewer columns than the smallest group, so both group sizes yield
+one full-row scale — the same quantized weights. **[CODE]**
+
+#### 3.2.3 Embedded vocabulary + BPE merges (role 8, M4)
+
+A `.hydra2` file may carry the token strings themselves, in the tensor
+directory (role 8, `HYDRA2_ROLE_VOCAB`), so that a text prompt can be
+encoded *without* an external tokenizer. Both tensors are **optional** —
+an inference-only file without them is valid; the `--text-prompt` CLI
+feature (`hydra-run --text-prompt`, see `--help` and the README) requires
+`vocab`, and `merges` is only legal together with `vocab`. **[SPEC]**
+
+* **`vocab`** — type `VOCAB_UTF8` (`0x0050`), `n_dims` 1,
+  `n_elements == v2.vocab_size`. The payload is the token strings in
+  token-id order, **each NUL-terminated** (so the blob ends in a NUL and
+  holds exactly `n_elements` NUL bytes, `n_bytes >= 2 * n_elements`).
+  Every string must be valid UTF-8 (RFC 3629: no overlong forms, no
+  surrogates, nothing above U+10FFFF), and **no two tokens may share a
+  string** — a duplicate would make the byte map and the merge targets
+  ambiguous. **[CODE]**
+* **`merges`** — type `U16_PAIRS` (`0x0051`), `n_dims` 1, exactly
+  `4 * n_elements` payload bytes: the rules `(left u16, right u16)` in
+  little-endian, in **priority order** (rule 0 is the highest-priority
+  rule). Every rule must name tokens that exist, and its **target token
+  must be the concatenation** `string(left) ++ string(right)` as a token
+  that actually exists in the vocabulary — a rule without a target is a
+  loud refusal at open time. `merges` without `vocab` is refused; `vocab`
+  without `merges` is legal (no BPE, byte-level encoding only).
+  `n_elements` may be 0 only by omitting the tensor (the directory
+  requires `n_elements >= 1`). **[CODE]**
+
+The **encoding** (`hydra_moe_encode_text`, `include/hydra_moe.h`) is
+byte-level BPE with the GPT-2-style priority rule:
+
+1. every input byte must map to exactly one single-byte token
+   (UTF-8 input, one-byte-per-token map built at open time); an unmapped
+   byte is refused (`-3`), invalid UTF-8 is refused (`-2`);
+2. the sequence is then merged **repeatedly until a fixed point**: scan
+   the rule list from rule 0; apply the first rule that matches, replacing
+   **all** its occurrences in one pass, then restart the scan at rule 0.
+   (Applying rule 0 may create a new match for rule 0 — the restart is
+   what makes `abcd` → `[ab] [cd]` → `[5, 6]` with rules
+   `(0,1)->5, (2,3)->6, (1,2)->7`.)
+3. the sequence **never grows**, so it fits in a buffer of the input
+   length; a request for fewer slots than input bytes is `-4`.
+
+`hydra_moe_decode_token` maps a token id back to its string (the inverse
+of step 1's table plus the merge strings). The fixture schema of
+`tools/make_model.py --moe-full` is tokens `a..e` (0–4), `ab` (5), `cd`
+(6), `bc` (7) and `tok%04d` (8+); the reference rules are
+`(0,1)->5, (2,3)->6, (1,2)->7`. The C codec, the container type rules and
+the CLI are parity/pin-tested in `tests/test_hydra_moe.c`
+(`test_moe_vocab_codec`, `test_moe_vocab_tamper`),
+`tests/test_hydra2_container.c` (`test_vocab_types`) and
+`tools/text_prompt_check.sh`. **[CODE]**
 
 ### 3.3 Out of scope
 
@@ -298,7 +509,7 @@ the end. **[SPEC]**
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 32 | `name[32]`, NUL-terminated ASCII |
-| 32 | 2 | `role` (`0` trunk tensor, `1` router, `2` embedding, `3` norm, `4` KV, `5` shared expert) |
+| 32 | 2 | `role` (`0` trunk tensor, `1` router, `2` embedding, `3` norm, `4` KV, `5` shared expert, `6` **reserved**, `7` attention (`attn_q/k/v/o.{L}`), `8` vocabulary (`vocab` UTF-8 `0x0050` / `merges` `0x0051`), `9` LM head) |
 | 34 | 2 | `type_id` (see §3.2) |
 | 36 | 2 | `n_dims` (`1..4`) |
 | 38 | 2 | `reserved` (`= 0`) |
@@ -344,6 +555,32 @@ search the directory for a layer, and one expert read is one contiguous
 `v2.top_k` is **required**, not defaulted. A reader that finds no `top_k` must
 refuse the file: guessing it would change which experts are read, and a
 silently different routing set is a wrong answer, not a slow one. **[SPEC]**
+
+**Inference metadata (round 12, 2026-10-30).** The MoE module
+(`src/hydra_moe.c`) consumes a `moe-transformer-v1` file and enforces these
+additional keys; the container reader stays structural and does not check
+them. Missing or malformed values are a refusal (code −4), never a default:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `v2.dim` | `uint32` | hidden size `> 0` |
+| `v2.vocab_size` | `uint32` | vocabulary size `> 0` |
+| `v2.n_heads` | `uint32` | query heads `> 0` |
+| `v2.n_kv_heads` | `uint32` | KV heads, `1..n_heads` (GQA) |
+| `v2.head_dim` | `uint32` | `> 0`, and `dim == n_heads * head_dim` |
+| `v2.inter` | `uint32` | FFN width `> 0` |
+| `v2.expert_layout` | `uint32` | `0` F32 flat, `1` ternary + block scales (§3.2.2) |
+| `v2.rope_theta` | `float32` | RoPE base, default `10000.0` |
+| `v2.kv_sink` | `uint32` | pinned KV entries, default `4`, `<= 0x10000` |
+| `v2.kv_ring` | `uint32` | ring KV entries, default `128`, `<= 0x10000` |
+| `v2.tied_embedding` | `uint32` | `1` logits use the embed matrix, `0` the `lm_head` tensor |
+| `v2.bos_token` | `uint32` | beginning-of-sequence token, default `0` |
+
+All ten are required for `moe-transformer-v1` files opened through the MoE
+module; the required trunk tensors are `embed`, per layer
+`attn_q/k/v/o.{L}`, `attn_norm.{L}`, `ffn_norm.{L}`, `router.{L}`,
+`ffn_gate/up/down.{L}` (roles per §4.2), and `final_norm`, plus `lm_head`
+when `v2.tied_embedding` is `0`. **[CODE]**
 
 **K/V block wire format `[CODE]` (implementation decision, 2026-10-26).** The
 specification names the keys but not the block layout; the reader and writer

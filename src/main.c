@@ -19,6 +19,8 @@
 #endif /* !__APPLE__ && !__MACH__ */
 
 #include "hydra_model.h"
+#include "hydra_v2_container.h"
+#include "hydra_moe.h"
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -59,8 +61,11 @@ static void usage(const char *argv0, FILE *out)
     fprintf(out, "  steps            Anzahl erzeugter Inferenzschritte, 1..256 (Standard: 16)\n");
     fprintf(out, "  --json           Maschinenlesbare Ausgabe auf stdout\n");
     fprintf(out, "  --prompt LIST    Komma-getrennte Token-IDs als Prefill vor der Generierung\n");
+    fprintf(out, "  --text-prompt TEXT  Text als BPE-Prompt (.hydra2 mit eingebettetem Vokabular, M4);\n"
+                 "                   wechselseitig ausschliesslich mit --prompt\n");
     fprintf(out, "  --bench [N]      Benchmark: N Schritte (Default 10000), JSON auf stdout\n");
     fprintf(out, "  --fast           Token-only Fast Path, nur Dimension 0\n");
+    fprintf(out, "  --inspect        Modell-Datei analysieren (JSON, .hydra UND .hydra2)\n");
     fprintf(out, "  --temp F         Sampler-Temperatur (Standard 0 = greedy); > 0 aktiviert Sampling\n");
     fprintf(out, "  --min-p F        Min-P-Filter in [0,1] (Standard 0); P(c) < min-p*p_max wird verworfen\n");
     fprintf(out, "  --rep-penalty F  Wiederholungs-Strafe, >= 1.0 (Standard 1.0 = aus)\n");
@@ -336,6 +341,471 @@ static int run_benchmark(const char *model_path, const HydraModelHeader *h,
     return sink == sink_fast ? 0 : 1;
 }
 
+/* --------------------------------------------------------------------
+ * --inspect: the model analysis report, for BOTH formats.
+ *
+ * This is the ONE place the .hydra2 container reader is consumed by
+ * hydra-run (FORMAT-V2.md "Implementation status" listed inspection as
+ * the missing consumer). The report is the reader's own verdict - the
+ * same validation the MoE engine will run - not a second, weaker
+ * implementation. Exit codes: 0 = the format's reader accepts the
+ * file (load_ok for .hydra), 2 = refused, 1 = usage/IO error.
+ * -------------------------------------------------------------------- */
+static void json_escape(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 6 < cap; ++i) {
+        unsigned char ch = (unsigned char)in[i];
+        if (ch == '"' || ch == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)ch;
+        } else if (ch < 0x20u) {
+            o += (size_t)snprintf(out + o, cap - o, "\\u%04x", ch);
+        } else {
+            out[o++] = (char)ch;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* A metadata value is raw bytes; render it by its evident type:
+ * 4/8 bytes -> unsigned number, printable ASCII -> string, else hex. */
+static void meta_value_json(const uint8_t *v, uint32_t n, char *out, size_t cap)
+{
+    if (n == 4) {
+        uint32_t x = (uint32_t)v[0] | ((uint32_t)v[1] << 8) |
+                     ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
+        snprintf(out, cap, "%u", (unsigned)x);
+        return;
+    }
+    if (n == 8) {
+        uint64_t x = 0;
+        for (int i = 7; i >= 0; --i) x = (x << 8) | v[i];
+        snprintf(out, cap, "%llu", (unsigned long long)x);
+        return;
+    }
+    int printable = 1;
+    for (uint32_t i = 0; i < n; ++i)
+        if (v[i] < 0x21u || v[i] > 0x7Eu) { printable = 0; break; }
+    if (printable) {
+        char esc[256];
+        if (n >= sizeof(esc)) n = (uint32_t)(sizeof(esc) - 1);
+        memcpy(esc, v, n);
+        esc[n] = '\0';
+        json_escape(esc, out, cap);
+        /* string values are wrapped in quotes at the call site */
+        return;
+    }
+    size_t o = 0;
+    out[0] = '"';
+    for (uint32_t i = 0; i < n && o + 3 < cap; ++i)
+        o += (size_t)snprintf(out + o, cap - o, "%02x", v[i]);
+    out[o++] = '"';
+    out[o] = '\0';
+}
+
+static int inspect_hydra_v1(const char *path, FILE *f, size_t file_bytes)
+{
+    HydraEngine engine;
+    int rc = hydra_engine_load(&engine, path);
+    if (rc != 0) {
+        /* The loader already named the exact rule on stderr. */
+        fprintf(f,
+            "{\"format\":\"hydra\",\"file_bytes\":%zu,"
+            "\"load\":{\"ok\":false,\"rc\":%d}}\n", file_bytes, rc);
+        return 2;
+    }
+    const HydraModelHeader *h = &engine.header;
+    fprintf(f,
+        "{\"format\":\"hydra\",\"file_bytes\":%zu,"
+        "\"magic_hex\":\"0x%08x\",\"version\":%u,\"vocab\":%u,"
+        "\"dim\":%u,\"layers\":%u,\"weights_offset\":%u,"
+        "\"weights_len\":%u,\"load\":{\"ok\":true}}\n",
+        file_bytes, (unsigned)h->magic, (unsigned)h->version,
+        (unsigned)h->vocab_size, (unsigned)h->dim, (unsigned)h->layers,
+        (unsigned)h->weights_offset, (unsigned)h->weights_len);
+    hydra_engine_unload(&engine);
+    return 0;
+}
+
+static int inspect_hydra_v2(const char *path, FILE *f, size_t file_bytes)
+{
+    hydra2_container_t c;
+    int rc = hydra2_open(&c, path);
+    if (rc != HYDRA2_OK) {
+        /* The reader already named field/value/bound on stderr. */
+        fprintf(f, "{\"format\":\"hydra2\",\"file_bytes\":%zu,"
+                   "\"reader\":\"refused\",\"error_code\":%d}\n",
+                file_bytes, rc);
+        return 2;
+    }
+    char name[64], val[512];
+    fprintf(f,
+        "{\"format\":\"hydra2\",\"file_bytes\":%zu,"
+        "\"version\":{\"major\":%u,\"minor\":%u},\"header_bytes\":%u,"
+        "\"reader\":\"ok\",\"trunk_backend\":\"%s\","
+        "\"regions\":{\"metadata\":{\"offset\":%llu,\"bytes\":%llu},"
+        "\"tensor_dir\":{\"offset\":%llu,\"bytes\":%llu},"
+        "\"expert_dir\":{\"offset\":%llu,\"bytes\":%llu},"
+        "\"trunk\":{\"offset\":%llu,\"bytes\":%llu},"
+        "\"experts\":{\"offset\":%llu,\"bytes\":%llu}},"
+        "\"routing\":{\"architecture\":\"%s\",\"layers\":%u,"
+        "\"moe_layers\":%u,\"top_k\":%u,\"experts_per_layer\":%u,"
+        "\"router_dtype\":\"%s\",\"expert_bytes_typ\":%llu,"
+        "\"router_runs_ahead\":%u},"
+        "\"metadata\":[",
+        file_bytes, (unsigned)c.version_major, (unsigned)c.version_minor,
+        (unsigned)c.header_bytes,
+        c.trunk_backend,
+        (unsigned long long)c.metadata_offset,
+        (unsigned long long)c.metadata_bytes,
+        (unsigned long long)c.tensor_dir_offset,
+        (unsigned long long)c.tensor_dir_bytes,
+        (unsigned long long)c.expert_dir_offset,
+        (unsigned long long)c.expert_dir_bytes,
+        (unsigned long long)c.trunk_offset,
+        (unsigned long long)c.trunk_bytes,
+        (unsigned long long)c.experts_offset,
+        (unsigned long long)c.experts_bytes,
+        c.architecture, (unsigned)c.layers, (unsigned)c.moe_layers,
+        (unsigned)c.top_k, (unsigned)c.experts_per_layer,
+        hydra2_type_name(c.router_dtype),
+        (unsigned long long)c.expert_bytes_typ,
+        (unsigned)c.router_runs_ahead);
+    for (uint32_t i = 0; i < c.meta_count; ++i) {
+        const hydra2_meta_kv_t *kv = &c.meta[i];
+        /* The blob is NOT NUL-terminated (key bytes are immediately
+         * followed by the value bytes): bound the copy by key_len. */
+        char keybuf[64];
+        uint32_t klen = kv->key_len;
+        if (klen >= sizeof(keybuf)) klen = (uint32_t)(sizeof(keybuf) - 1);
+        memcpy(keybuf, c.meta_blob + kv->key_off, klen);
+        keybuf[klen] = '\0';
+        json_escape(keybuf, name, sizeof name);
+        meta_value_json(c.meta_blob + kv->val_off, kv->val_len, val, sizeof val);
+        int is_string =
+            (kv->val_len != 4 && kv->val_len != 8) &&
+            (val[0] != '"' || val[1] != '0');
+        fprintf(f, "%s{\"key\":\"%s\",\"value\":%s%s%s}",
+                i ? "," : "", name,
+                is_string ? "\"" : "", val, is_string ? "\"" : "");
+    }
+    fprintf(f, "],\"tensors\":[");
+    for (uint64_t i = 0; i < c.tensor_dir_count; ++i) {
+        const hydra2_tensor_entry_t *t = &c.tensors[i];
+        json_escape(t->name, name, sizeof name);
+        fprintf(f, "%s{\"name\":\"%s\",\"role\":\"%s\",\"type\":\"%s\","
+                     "\"n_dims\":%u,\"n_elements\":%llu,\"n_bytes\":%llu,"
+                     "\"trunk_offset\":%llu}",
+                i ? "," : "", name, hydra2_role_name(t->role),
+                hydra2_type_name(t->type_id), (unsigned)t->n_dims,
+                (unsigned long long)t->n_elements,
+                (unsigned long long)t->n_bytes,
+                (unsigned long long)t->offset);
+    }
+    fprintf(f, "],\"experts\":{\"count\":%llu,\"sample\":[",
+            (unsigned long long)c.expert_dir_count);
+    uint64_t shown = 0;
+    for (uint64_t i = 0; i < c.expert_dir_count && shown < 8; ++i, ++shown) {
+        const hydra2_expert_entry_t *e = &c.experts[i];
+        fprintf(f, "%s{\"layer\":%u,\"expert_id\":%u,\"offset\":%llu,"
+                     "\"length\":%llu,\"type\":\"%s\",\"crc32\":\"0x%08x\"}",
+                shown ? "," : "", (unsigned)e->layer, (unsigned)e->expert_id,
+                (unsigned long long)e->offset, (unsigned long long)e->length,
+                hydra2_type_name((uint16_t)e->type_id), (unsigned)e->crc32);
+    }
+    fprintf(f, "]}}\n");
+    hydra2_close(&c);
+    return 0;
+}
+
+static int inspect_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[Hydra] --inspect: Datei nicht lesbar: %s\n", path);
+        return 1;
+    }
+    unsigned char head[8];
+    size_t got = fread(head, 1, 8, f);
+    long szl = 0;
+    if (fseek(f, 0, SEEK_END) == 0) szl = ftell(f);
+    fclose(f);
+    if (szl < 0) szl = 0;
+    const size_t file_bytes = (size_t)szl;
+
+    if (got < 8) {
+        printf("{\"format\":\"unknown\",\"file_bytes\":%zu,"
+               "\"error\":\"shorter than the 8-byte magic\"}\n", file_bytes);
+        return 2;
+    }
+    if (memcmp(head, HYDRA2_MAGIC_STR, HYDRA2_MAGIC_LEN) == 0)
+        return inspect_hydra_v2(path, stdout, file_bytes);
+    if (got >= 4 && *(uint32_t *)&head[0] == HYDRA_MAGIC)
+        return inspect_hydra_v1(path, stdout, file_bytes);
+    char hex[17];
+    for (int i = 0; i < 8; ++i)
+        snprintf(hex + 2 * i, 3, "%02x", head[i]);
+    printf("{\"format\":\"unknown\",\"file_bytes\":%zu,"
+           "\"magic_hex\":\"%s\",\"error\":\"not a .hydra or .hydra2 "
+           "file\"}\n", file_bytes, hex);
+    return 2;
+}
+
+/* ------------------------------------------------------------------ */
+/* .hydra2 execution: the F32 sparse-MoE engine (round 12)            */
+/* ------------------------------------------------------------------ */
+
+/* Minimal JSON string escaper for the --text-prompt echo (M4): quotes,
+ * backslashes and control characters. */
+static void json_print_string(const char *t)
+{
+    for (const uint8_t *p = (const uint8_t *)t; *p; ++p) {
+        if (*p == '"' || *p == '\\') {
+            putchar('\\');
+            putchar((int)*p);
+        } else if (*p == '\n') {
+            fputs("\\n", stdout);
+        } else if (*p == '\t') {
+            fputs("\\t", stdout);
+        } else if (*p == '\r') {
+            fputs("\\r", stdout);
+        } else if (*p < 0x20u) {
+            printf("\\u%04x", (unsigned)*p);
+        } else {
+            putchar((int)*p);
+        }
+    }
+}
+
+/* Magic sniff: is this a .hydra2 file? (the run path dispatches on it;
+ * the v1-v4 loader keeps its own validation). */
+static int file_is_hydra2(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char head[8];
+    size_t got = fread(head, 1, 8, f);
+    fclose(f);
+    return got == 8 && memcmp(head, HYDRA2_MAGIC_STR, HYDRA2_MAGIC_LEN) == 0;
+}
+
+/* Run a .hydra2 model through the MoE engine with the CLI's existing
+ * contract: prompt prefill (not printed), `steps` generated tokens,
+ * greedy by default, the v1-v4 sampler flags mapped onto the REAL
+ * per-vocabulary logit vector (which this engine produces). --fast has
+ * no meaning for the F32 path and is announced, not applied.
+ * text_prompt (M4): non-NULL when --text-prompt was given; the text is
+ * BPE-encoded with the model's embedded vocabulary and replaces the
+ * token prompt. */
+static int run_moe_file(const char *model_path, long start_token, long steps,
+                        int json_mode, int fast_mode,
+                        uint16_t *prompt, size_t prompt_n,
+                        const char *text_prompt,
+                        double temperature, double min_p,
+                        double rep_penalty, uint32_t penalty_window,
+                        uint64_t rng_seed, int sampler_set)
+{
+    hydra_moe_t m;
+    int rc = hydra_moe_open(model_path, &m);
+    if (rc != 0) {
+        fprintf(stderr, "[MoE] %s konnte nicht zum Inferieren geoeffnet werden (rc=%d)\n",
+                model_path, rc);
+        return 1;
+    }
+    hydra_moe_config_t cfg;
+    hydra_moe_config(&m, &cfg);
+
+    if (fast_mode) {
+        fprintf(stderr,
+                "[Hydra] Hinweis: --fast ist bei .hydra2-Modellen nicht anwendbar "
+                "(F32-Pfad ohne Aggregat-Legacy-Variante)\n");
+    }
+
+    /* prompt tokens are uint16 from the CLI; the MoE vocab can be
+     * smaller - validate loudly, do not wrap silently */
+    for (size_t p = 0; p < prompt_n; ++p) {
+        if (prompt[p] >= cfg.vocab_size) {
+            fprintf(stderr,
+                    "[MoE] Prompt-Token %zu (%u) liegt ausserhalb des Vokabulars "
+                    "(vocab_size=%u)\n", p, (unsigned)prompt[p], cfg.vocab_size);
+            hydra_moe_close(&m);
+            return 1;
+        }
+    }
+    if (start_token >= (long)cfg.vocab_size)
+        start_token %= (long)cfg.vocab_size;
+
+    if (text_prompt) {
+        if (!hydra_moe_has_vocab(&m)) {
+            fprintf(stderr,
+                    "[MoE] --text-prompt braucht ein eingebettetes Vokabular "
+                    "(Tensor 'vocab', M4); diese Datei hat keins\n");
+            hydra_moe_close(&m);
+            return 1;
+        }
+        if (cfg.vocab_size > 65535u) {
+            fprintf(stderr,
+                    "[MoE] --text-prompt: vocab_size %u uebersteigt den "
+                    "CLI-Promptbereich (uint16)\n", (unsigned)cfg.vocab_size);
+            hydra_moe_close(&m);
+            return 1;
+        }
+        uint32_t *tt = (uint32_t *)malloc((size_t)MAX_PROMPT * sizeof(uint32_t));
+        if (!tt) { hydra_moe_close(&m); return 1; }
+        int tn = hydra_moe_encode_text(&m, text_prompt, tt, MAX_PROMPT);
+        if (tn < 0) {
+            fprintf(stderr,
+                    "[MoE] --text-prompt konnte nicht kodiert werden (rc=%d)\n",
+                    tn);
+            free(tt);
+            hydra_moe_close(&m);
+            return 1;
+        }
+        for (int p = 0; p < tn; ++p)
+            prompt[p] = (uint16_t)tt[p];
+        prompt_n = (size_t)tn;
+        free(tt);
+    }
+
+    /* KV storage: one cache per layer, the model's own sink/ring
+     * geometry (the engine appends; the CLI owns the memory). */
+    const uint32_t n_layers = cfg.layers;
+    const uint32_t kvd = cfg.n_kv_heads * cfg.head_dim;
+    const uint32_t cap = cfg.kv_sink + cfg.kv_ring;
+    float *kv_k = NULL, *kv_v = NULL;
+    hydra_kv_cache_t *kvs = NULL;
+    if (n_layers > 0) {
+        const size_t per = (size_t)cap * (size_t)kvd * sizeof(float);
+        kv_k = (float *)malloc(per * n_layers);
+        kv_v = (float *)malloc(per * n_layers);
+        kvs = (hydra_kv_cache_t *)calloc(n_layers, sizeof(hydra_kv_cache_t));
+        if (!kv_k || !kv_v || !kvs) {
+            fprintf(stderr, "[MoE] KV-Initialisierung fehlgeschlagen\n");
+            free(kv_k); free(kv_v); free(kvs);
+            hydra_moe_close(&m);
+            return 1;
+        }
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            if (hydra_kv_cache_init(&kvs[l],
+                    kv_k + (size_t)l * cap * kvd,
+                    kv_v + (size_t)l * cap * kvd,
+                    kvd, cap, cfg.kv_sink) != 0) {
+                fprintf(stderr, "[MoE] KV-Initialisierung fehlgeschlagen\n");
+                free(kv_k); free(kv_v); free(kvs);
+                hydra_moe_close(&m);
+                return 1;
+            }
+        }
+    }
+
+    /* recent-token ring for the repetition penalty: prompt tokens
+     * count, then every generated token (chronological order) */
+    uint32_t *recent = (uint32_t *)malloc((size_t)penalty_window * sizeof(uint32_t));
+    if (!recent) {
+        free(kv_k); free(kv_v); free(kvs);
+        hydra_moe_close(&m);
+        return 1;
+    }
+    size_t recent_n = 0;
+    for (size_t p = 0; p < prompt_n; ++p) {
+        recent[recent_n++ % penalty_window] = prompt[p];
+        if (recent_n > penalty_window) recent_n = penalty_window;
+    }
+
+    uint32_t *tokens = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)steps);
+    if (!tokens) {
+        free(recent); free(kv_k); free(kv_v); free(kvs);
+        hydra_moe_close(&m);
+        return 1;
+    }
+    float *logits = (float *)malloc((size_t)cfg.vocab_size * sizeof(float));
+    if (!logits) {
+        free(tokens); free(recent); free(kv_k); free(kv_v); free(kvs);
+        hydra_moe_close(&m);
+        return 1;
+    }
+
+    const int sampling_enabled = temperature > 0.0 && min_p < 1.0;
+    uint64_t rng = rng_seed ? rng_seed : 0x9E3779B97F4A7C15ull;
+    uint32_t current = (uint32_t)start_token;
+    uint32_t pos = (uint32_t)prompt_n;
+
+    double t0 = now_ms();
+    int fail = 0;
+    for (long st = 0; st < steps; ++st) {
+        if (hydra_moe_forward(&m, current, pos, logits, kvs) != 0) { fail = 1; break; }
+        /* the greedy guard lives in hydra_moe_sample itself:
+         * temperature <= 0 or min_p >= 1 -> argmax, no RNG consumed */
+        if (hydra_moe_sample(logits, cfg.vocab_size, &current,
+                             temperature, min_p, rep_penalty,
+                             (uint32_t)recent_n,
+                             recent_n ? recent : NULL, &rng) != 0) { fail = 1; break; }
+        tokens[st] = current;
+        recent[recent_n++ % penalty_window] = current;
+        if (recent_n > penalty_window) recent_n = penalty_window;
+        ++pos;
+    }
+    double elapsed = now_ms() - t0;
+    if (fail) {
+        fprintf(stderr, "[MoE] Inferenz fehlgeschlagen\n");
+        free(logits); free(tokens); free(recent); free(kv_k); free(kv_v); free(kvs);
+        hydra_moe_close(&m);
+        return 1;
+    }
+
+    if (json_mode) {
+        printf("{\"format\":\"hydra2-moe\",\"tokens\":[");
+        for (long st = 0; st < steps; ++st)
+            printf("%s%u", st ? "," : "", (unsigned)tokens[st]);
+        printf("],\"dim\":%u,\"vocab\":%u,\"layers\":%u,\"top_k\":%u,"
+               "\"n_heads\":%u,\"n_kv_heads\":%u,\"head_dim\":%u,"
+               "\"inter\":%u,\n",
+               cfg.dim, cfg.vocab_size, cfg.layers, cfg.top_k,
+               cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.inter);
+        printf("\"start_token\":%u,\"steps\":%ld,\"elapsed_ms\":%.3f,"
+               "\"prompt\":[",
+               (unsigned)start_token, steps, elapsed);
+        for (size_t p = 0; p < prompt_n; ++p)
+            printf("%s%u", p ? "," : "", (unsigned)prompt[p]);
+        printf("]");
+        if (text_prompt) {
+            printf(",\"text\":\"");
+            json_print_string(text_prompt);
+            printf("\"");
+        }
+        printf(",\"sampler\":{\"temperature\":%.4g,\"min_p\":%.4g,"
+               "\"repetition_penalty\":%.4g,\"penalty_window\":%u,"
+               "\"seed\":%llu}}\n",
+               temperature, min_p, rep_penalty, (unsigned)penalty_window,
+               (unsigned long long)rng_seed);
+    } else {
+        printf("[Hydra] .hydra2 MoE-Inferenz. Eingangs-Token: %ld, Steps: %ld\n",
+               start_token, steps);
+        if (text_prompt)
+            printf("[Text]: %s\n", text_prompt);
+        if (prompt_n > 0) {
+            printf("[Prompt]: ");
+            for (size_t p = 0; p < prompt_n; ++p) printf("%u ", (unsigned)prompt[p]);
+            printf("\n");
+        }
+        if (sampler_set || sampling_enabled) {
+            printf("[Sampler]: temp=%.4g min-p=%.4g rep-penalty=%.4g rep-window=%u seed=%llu%s\n",
+                   temperature, min_p, rep_penalty, (unsigned)penalty_window,
+                   (unsigned long long)rng_seed,
+                   sampling_enabled ? "" : " (greedy guard aktiv)");
+        }
+        printf("[Tokens]: ");
+        for (long st = 0; st < steps; ++st) printf("%u ", (unsigned)tokens[st]);
+        printf("\n[Timing]: %.3f ms gesamt, %.3f ms/Token\n",
+               elapsed, steps ? elapsed / (double)steps : 0.0);
+    }
+
+    free(logits); free(tokens); free(recent); free(kv_k); free(kv_v); free(kvs);
+    hydra_moe_close(&m);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *model_path = NULL;
@@ -343,10 +813,12 @@ int main(int argc, char **argv)
     long steps = -1;
     int json_mode = 0;
     int fast_mode = 0;
+    int inspect_mode = 0;
     int bench_mode = 0;
     long bench_steps = 10000;
     uint16_t prompt[MAX_PROMPT];
     size_t prompt_n = 0;
+    const char *text_prompt = NULL;
 
     /* Sampler: defaults are the greedy guard (temperature 0, min_p 0),
      * so a plain invocation is bit-identical to the pre-sampling CLI.
@@ -364,6 +836,8 @@ int main(int argc, char **argv)
             json_mode = 1;
         } else if (strcmp(argv[i], "--fast") == 0) {
             fast_mode = 1;
+        } else if (strcmp(argv[i], "--inspect") == 0) {
+            inspect_mode = 1;
         } else if (strcmp(argv[i], "--temp") == 0) {
             double v;
             if (i + 1 >= argc || parse_float_arg(argv[i + 1], &v) != 0) {
@@ -428,12 +902,32 @@ int main(int argc, char **argv)
                 }
                 ++i;
             }
+        } else if (strcmp(argv[i], "--text-prompt") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "[Hydra] --text-prompt braucht einen Text\n");
+                usage(argv[0], stderr);
+                return 1;
+            }
+            if (prompt_n > 0) {
+                fprintf(stderr,
+                        "[Hydra] --text-prompt und --prompt sind wechselseitig "
+                        "ausschliesslich\n");
+                return 1;
+            }
+            text_prompt = argv[i + 1];
+            ++i;
         } else if (strcmp(argv[i], "--prompt") == 0) {
             /* Fehlendes Argument explizit abweisen: argv[i+1] == NULL ist
              * ein Benutzerfehler, kein leeres Prompt. */
             if (i + 1 >= argc || argv[i + 1][0] == '-') {
                 fprintf(stderr, "[Hydra] --prompt braucht eine kommagetrennte Token-Liste\n");
                 usage(argv[0], stderr);
+                return 1;
+            }
+            if (text_prompt) {
+                fprintf(stderr,
+                        "[Hydra] --text-prompt und --prompt sind wechselseitig "
+                        "ausschliesslich\n");
                 return 1;
             }
             if (parse_prompt(argv[i + 1], prompt, MAX_PROMPT, &prompt_n) != 0) {
@@ -475,6 +969,38 @@ int main(int argc, char **argv)
         fprintf(stderr, "[Hydra] Fehlende Modelldatei.\n");
         usage(argv[0], stderr);
         return 1;
+    }
+
+    if (inspect_mode) {
+        return inspect_file(model_path);
+    }
+
+    /* M4: --text-prompt exists only for .hydra2 files with an embedded
+     * vocabulary - the v1 .hydra format stores no token strings. */
+    if (text_prompt && !file_is_hydra2(model_path)) {
+        fprintf(stderr,
+                "[Hydra] --text-prompt braucht ein .hydra2-Modell mit "
+                "eingebettetem Vokabular; die v1 .hydra-Formate speichern "
+                "keine Token-Strings\n");
+        return 1;
+    }
+    if (text_prompt && bench_mode) {
+        fprintf(stderr,
+                "[Hydra] --text-prompt und --bench sind nicht kombinierbar\n");
+        return 1;
+    }
+
+    /* Magic dispatch (round 12): a .hydra2 file runs on the F32
+     * sparse-MoE engine (src/hydra_moe.c), NOT on the v1-v4 loader -
+     * the two formats share nothing at runtime. The v1-v4 path below
+     * is byte-for-byte the pre-round-12 code, untouched. */
+    if (file_is_hydra2(model_path)) {
+        return run_moe_file(model_path, start_token, steps, json_mode,
+                            fast_mode, prompt, prompt_n, text_prompt,
+                            sampler.temperature, sampler.min_p,
+                            sampler.repetition_penalty,
+                            sampler.penalty_window,
+                            (uint64_t)sampler.rng_seed, sampler_set);
     }
 
     /* Defaults fuer optionale Positional-Argumente; ausserhalb liegender

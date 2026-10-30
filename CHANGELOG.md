@@ -2,6 +2,88 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-27..30 (round 12, issue #72) — the `.hydra2` MoE inference engine, block-scaled ternary, the BPE vocabulary path, and the GGUF -> `.hydra2` converter (M1-M5 full scope)
+
+Owner directive 2026-10-27: "alles fixen was geht!!!!" — every
+actionable item of issue #72 in one branch/PR (audit with per-claim
+file:line evidence: `.agents/docs/ISSUE-72-AUDIT.md`).
+
+1. **JNI v3/v4 batch gap (M1).** `tests/test_jni_batch.c` 109 -> **128**:
+   deterministic v3/v4 writers, batched-run == direct-run stream
+   equality for greedy AND fixed-seed sampling through the same C
+   logic the bridge calls, the v4 stream pin, the token-0 fixed point
+   of the bias-free design, the 17-step partial block with a real step
+   function.
+2. **Trunk mmap (M3.2).** `src/hydra_v2_container.c` maps the resident
+   trunk region when possible (page-aligned extent + base offset);
+   tensor reads serve from the mapping, `pread` stays the documented
+   portable fallback; `trunk_backend` names the live path. The
+   hydra2 suite grew to **152** checks (both backends pinned).
+3. **Block-scaled ternary (M2.2).** New types `0x0040` TERNARY2_S64 /
+   `0x0041` TERNARY2_S128 (2-bit codes + per-group F32 scales, paired
+   `<name>.scale` tensor, `ceil(n/G)` scale count — FORMAT-V2.md 3.2.1);
+   `hydra_tf_row_dot_scaled` (integer-exact group partials * F32 FMA,
+   group-64 SIMD / group-128 scalar split); +9 main-suite checks
+   (x86 baseline 234 / arm 243 in `tools/test_count_baseline.txt`).
+4. **MoE inference engine (M3.1).** NEW `src/hydra_moe.c` +
+   `include/hydra_moe.h`: `.hydra2` `moe-transformer-v1` models run in
+   `hydra-run` — per-layer GQA (F32 attention, partial RoPE from
+   `v2.rope_theta`, per-layer sink+ring KV), deterministic top-k
+   routing, one-pread-per-expert FFN (F32 or ternary+scales layout),
+   real per-vocabulary logits, min-p/rep sampler. Documented
+   deviations: non-causal attention over cached positions, fixed 1e-6
+   RMSNorm epsilon, bounded KV (2+8). NEW `tests/test_hydra_moe.c`:
+   **138 checks** (parity vs independent reference, greedy stream pins
+   per layout — incl. the attention-ternary fixture — KV pins, ternary
+   dequant unit vs independent reference, tamper + metadata refusals).
+   `main.c` magic-dispatches `.hydra2` to the engine; the v1 path is
+   bit-identical (pinned streams re-verified).
+5. **Vocabulary + BPE + web inspection (M4).** Role-8 tensors
+   (`vocab` 0x0050 VOCAB_UTF8 / `merges` 0x0051 U16_PAIRS, FORMAT-V2.md
+   3.2.3), strict codec in the engine (byte-level tokens, loud
+   refusals: duplicates, out-of-range ids, missing concat target,
+   missing trailing NUL), `hydra-run --text-prompt` (BPE-encodes user
+   text with the embedded vocab; parity with numeric `--prompt`
+   pinned; JSON "text" echo; mutual exclusion; refusals), web console
+   `.hydra2` inspection (`/api/models/inspect`, `public/app.js`;
+   `server_test.js` 47 checks), `make_model.py --moe-full`
+   vocab/merges fixtures. Gate: `tools/text_prompt_check.sh` (CI gate
+   1h).
+6. **GGUF -> .hydra2 converter (M2.2/M3.1/M4).** NEW
+   `tools/gguf_to_hydra2.py`: a decoder-only llama GGUF (official AND
+   pinned-build tensor names; F32/F16/BF16/Q8_0) becomes a
+   complete-contract `.hydra2` MoE model — linears transposed, dense
+   FFN decomposed into E full-width masked experts (gate/up rows
+   partitioned and x E, down full, all-zero uniform router -> exact up
+   to F32 order), embedded vocab 1:1, merges filtered to expressible
+   rules (skips documented), rope_theta/bos carried; loud refusals for
+   non-GGUF / non-llama / undecodable tensors / missing tokens / dim
+   mismatch. NEW gate `tools/gguf_to_hydra2_test.py` (26 checks:
+   engine determinism, expert-CRC tamper refusal, F32-exact embed
+   transpose + masked-expert identity + byte-exact vocab + metadata,
+   merges roundtrip, five refusal controls); Makefile
+   `gguf-conv-test` in `test-run`; CI gate 1i. Docs: GGUF-IMPORT.md
+   12, FORMAT-V2.md 3.2.1/3.2.3 + implementation status.
+7. **Sanitizers in CI (found a real UB).** An ASan+UBSan rebuild
+   (same sources) flagged a misaligned float load in the ternary
+   expert scale read (rows*cols % 4 == 2): fixed with a memcpy read in
+   `src/hydra_moe.c` + the test reference (bit-identical values); NEW
+   CI step "Sanitizers (ASan+UBSan) over the whole test suite" runs
+   all five test binaries with `UBSAN_OPTIONS=halt_on_error=1`.
+   `errors.md` entry. Also fixed: the lint job never built `./hydra-run`
+   although gate 1h drives it — a build step now precedes the
+   binary-driven gates.
+
+Verification (local, 2026-10-30): `make clean && make && make test`
+green; `make test-run`: hydra-test 234/0 (x86 baseline), jni-batch
+128/0, large-model 7/0, gguf 101/0 (v1 gate untouched), gguf-conv
+26/0, hydra2-test 152/0, hydra-moe-test 138/0;
+`node --test tools/server_test.js` 47/0; ASan+UBSan all five binaries
+0 runtime errors; gcc -fanalyzer clean on all translation units;
+cppcheck 2.13.2 exact CI command NOT runnable in this sandbox (the
+repo-proxy whitelist stopped serving cppcheck/cppcheck and the sandbox
+has no root) — covered by the CI lint gate; all shell gates green.
+
 ## 2026-10-26 (round 11) — post-merge audit: sampler contract across all surfaces, .hydra2 Android validation, and the tf_row_dot SIMD completion (M1–M5)
 
 1. **One sampler validation contract across C, JNI and the web

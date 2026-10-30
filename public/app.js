@@ -120,10 +120,48 @@
     if (model.trained) box.appendChild(el('span', 'chip', 'trained'));
     if (model.uploaded) box.appendChild(el('span', 'chip', 'uploaded'));
     if (model.converted) box.appendChild(el('span', 'chip', 'from .gguf'));
+    if (model.format === 'hydra2') box.appendChild(el('span', 'chip', '.hydra2 container'));
     if (model.valid === false) box.appendChild(el('span', 'chip', 'invalid header'));
 
     const detail = $('model-detail');
     detail.textContent = '';
+    if (model.format === 'hydra2') {
+      /* The container entry carries no v1 header fields; the shape that
+       * decides anything (architecture, routing, sizes) comes from the
+       * reader's own report, same source as the API. */
+      for (const [k, v] of [['path', model.path], ['format', 'HYDRA2']]) {
+        detail.appendChild(el('span', null, k));
+        detail.appendChild(el('b', null, String(v)));
+      }
+      detail.appendChild(el('span', null, 'checking…'));
+      try {
+        const res = await fetch(`/api/models/inspect?path=${encodeURIComponent(model.path)}`);
+        const report = await res.json();
+        detail.querySelector('span:last-child')?.remove();
+        if (res.ok && report.reader === 'ok') {
+          const r = report.routing;
+          for (const [k, v] of [
+            ['architecture', r.architecture],
+            ['layers', `${r.moe_layers} MoE / ${r.layers} total`],
+            ['top-k', r.top_k],
+            ['experts/layer', r.experts_per_layer],
+            ['trunk tensors', report.tensors.length],
+            ['experts', report.experts.count],
+            ['trunk', (report.regions.trunk.bytes / 1024).toFixed(1) + ' kB'],
+          ]) {
+            detail.appendChild(el('span', null, k));
+            detail.appendChild(el('b', null, String(v)));
+          }
+        } else {
+          detail.appendChild(el('span', null, 'reader'));
+          detail.appendChild(el('b', null, report.reader_message || `refused (${report.error_code})`));
+        }
+      } catch (e) {
+        const hint = detail.querySelector('span:last-child');
+        if (hint) hint.textContent = `inspect failed: ${e.message}`;
+      }
+      return;
+    }
     for (const [k, v] of [['path', model.path], ['magic', model.magic === 1213809746 ? 'HYDR' : model.magic]]) {
       detail.appendChild(el('span', null, k));
       detail.appendChild(el('b', null, String(v)));
@@ -227,6 +265,7 @@
        * it would load at all. */
       const origin = m.trained ? 'trained' : (m.uploaded ? 'uploaded' : (m.converted ? 'converted' : 'models'));
       opt.textContent = `${m.path} · ${(m.bytes / 1024).toFixed(1)} kB · ${origin}`
+        + (m.format === 'hydra2' ? ' · .hydra2' : '')
         + (m.valid ? '' : ' · invalid header');
       select.appendChild(opt);
     }

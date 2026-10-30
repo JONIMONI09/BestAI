@@ -109,7 +109,35 @@ jobs:
       - name: Compose crash guard (nested scrollables)
         run: bash tools/compose_scroll_check.sh
 
-      # Gate 1h: workflow YAML validation, including duplicate mapping
+      # Build the engine ONCE for the binary-driven gates below (the
+      # text-prompt and the GGUF-converter gates run the real
+      # ./hydra-run; every other gate in this job is source-only).
+      - name: Build engine (for binary-driven gates)
+        run: make -s all
+
+      # Gate 1h: --text-prompt (M4, round 12). The CLI BPE-encodes the
+      # user text with the model's embedded vocabulary; the gate pins
+      # the parity with the equivalent numeric --prompt, the JSON
+      # "text" echo, and the loud refusals (vocab-less .hydra2, v1
+      # .hydra, flag combination).
+      - name: Text prompt gate (M4 CLI BPE)
+        run: bash tools/text_prompt_check.sh
+
+      # Gate 1i: the GGUF -> .hydra2 converter (M2.2/M3.1/M4, round
+      # 12). Converts a real llama GGUF into a complete-contract
+      # .hydra2 MoE model and proves, against independent re-reads of
+      # both files: the engine runs the result deterministically, a
+      # flipped expert byte is refused by the per-payload CRC, the
+      # embedding is the exact transpose of tok_emb, every expert is
+      # the exact masked/scaled dense FFN, the embedded vocabulary is
+      # byte-exact, the metadata matches the GGUF architecture, and
+      # the merge rules survive the conversion. Negative controls:
+      # non-GGUF input, Q4_0 weights, a non-llama architecture,
+      # missing tokens, mismatched dimensions.
+      - name: GGUF to .hydra2 converter gate (M4)
+        run: python3 tools/gguf_to_hydra2_test.py ./hydra-run
+
+      # Gate 1j: workflow YAML validation, including duplicate mapping
       # keys. Regression for the PR #53 red run (2026-10-26): a second
       # `key:` line in the actions/cache save of lint.yml. PyYAML - and
       # most YAML tooling - silently accepts duplicate keys (last one
@@ -120,7 +148,7 @@ jobs:
       - name: Workflow YAML (duplicate keys rejected by GitHub)
         run: bash tools/workflow_yaml_check.sh
 
-      # Gate 1i: actionlint over every workflow file. Regression for the
+      # Gate 1k: actionlint over every workflow file. Regression for the
       # 2026-10-26 phantom zero-job runs: `code_scanning_alert` is a
       # webhook event, NOT a workflow trigger event - GitHub's compiler
       # rejects a file that names it (zero-job run, same-second failure,
@@ -184,11 +212,12 @@ jobs:
       - name: Exact release-macos command, syntax-only
         run: |
           # Identical flags to release.yml build-macos (clang -O3
-          # -Wall -Wextra -Iinclude, both src TUs, no -D feature
-          # macros); -fsyntax-only replaces the -o/-lm link step
-          # so no binary or artifact is produced.
+          # -Wall -Wextra -Iinclude, all four hydra-run TUs, no -D
+          # feature macros); -fsyntax-only replaces the -o/-lm link
+          # step so no binary or artifact is produced.
           clang -O3 -fsyntax-only -Wall -Wextra -Iinclude \
-              src/hydra_engine.c src/main.c
+              src/hydra_engine.c src/main.c src/hydra_v2_container.c \
+              src/hydra_moe.c
 
       - name: Feature-test macro hygiene (Apple vs glibc)
         run: bash tools/apple_portability_check.sh
@@ -263,7 +292,8 @@ jobs:
           # sampler link against libm; a static aarch64 build does not
           # pull it in implicitly.
           aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
-              src/hydra_engine.c src/main.c -lm -o hydra-run-arm
+              src/hydra_engine.c src/main.c src/hydra_v2_container.c \
+              src/hydra_moe.c -lm -o hydra-run-arm
           qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
               2>/dev/null > /tmp/arm.json
           python3 - << 'EOF'
@@ -475,6 +505,44 @@ jobs:
             exit 1
           fi
           echo "ok: malformed prompts are rejected"
+
+      # ASan+UBSan over the ENTIRE native test suite. The regular build
+      # is -O3 without sanitizers, so memory errors and undefined
+      # behaviour are invisible there: x86 silently serves misaligned
+      # loads, the test passes, and only a strict platform sees it.
+      # Regression 2026-10-30: the ternary expert dequant read its
+      # per-group scales through a float pointer at a 2-byte-aligned
+      # offset (rows*cols % 4 == 2) - UBSan flagged it, the -O3 run
+      # was green. This step rebuilds the five test binaries from the
+      # SAME sources with -fsanitize=address,undefined and runs them
+      # with UBSAN_OPTIONS=halt_on_error=1, so any runtime error fails
+      # the build instead of continuing. LeakSanitizer is disabled
+      # (detect_leaks=0) because the engine's design keeps mmap'd model
+      # regions for the process lifetime; ASan's other checks and
+      # UBSan remain fully active.
+      - name: Sanitizers (ASan+UBSan) over the whole test suite
+        run: |
+          set -euo pipefail
+          CF="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude"
+          cc $CF -o /tmp/asan-hydra-test src/hydra_engine.c tests/test_engine.c -lm
+          cc $CF -o /tmp/asan-jni-batch-test -Iinclude tests/test_jni_batch.c src/hydra_engine.c -lm
+          cc $CF -o /tmp/asan-large-model-test src/hydra_engine.c tests/test_large_model.c -lm
+          cc $CF -o /tmp/asan-hydra2-test src/hydra_v2_container.c src/hydra_engine.c tests/test_hydra2_container.c -lm
+          cc $CF -o /tmp/asan-hydra-moe-test src/hydra_moe.c src/hydra_v2_container.c src/hydra_engine.c tests/test_hydra_moe.c -lm
+          export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1
+          /tmp/asan-hydra-test
+          /tmp/asan-jni-batch-test
+          /tmp/asan-large-model-test
+          python3 tools/make_model.py .asan-pyfix.hydra2 --v2
+          /tmp/asan-hydra2-test "$PWD/.asan-pyfix.hydra2"
+          python3 tools/make_model.py .asan-moefix1.hydra2 --moe-full --layers 2
+          python3 tools/make_model.py .asan-moefix2.hydra2 --moe-full --layers 2 --moe-ternary
+          python3 tools/make_model.py .asan-moefix3.hydra2 --moe-full --layers 2 --moe-ternary 128
+          python3 tools/make_model.py .asan-moefix4.hydra2 --moe-full --layers 1 --experts 4 --top-k 2 --dim 256 --n-heads 8 --head-dim 32 --inter 64 --moe-ternary 64
+          python3 tools/make_model.py .asan-moefix5.hydra2 --moe-full --layers 2 --moe-no-vocab
+          python3 tools/make_model.py .asan-moefix6.hydra2 --moe-full --layers 2 --moe-attn-ternary
+          /tmp/asan-hydra-moe-test .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2
+          rm -f .asan-pyfix.hydra2 .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2
 
       - name: Upload failure logs
         if: failure()

@@ -4,6 +4,40 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-10-30 (round 12) — the ternary expert dequant read its scales through a misaligned float pointer (UBSan-only: the -O3 suite was green)
+
+- **Symptom:** an ASan+UBSan rebuild of `hydra-moe-test` (same
+  sources, `-fsanitize=address,undefined`) reported
+  `runtime error: load of misaligned address … for type 'const float'`
+  at `src/hydra_moe.c:911` (and in the test's independent reference
+  dequant). The regular `-O3` build ran all 138 checks green, so
+  nothing in the existing gates could have seen it.
+- **Cause:** in the block-scaled ternary expert layout the per-group
+  F32 scales are stored directly AFTER the packed code bytes (`n/2`
+  bytes). When `rows*cols % 4 == 2` (e.g. the dequant unit test's
+  inter=2 x dim=3 blob, and any valid .hydra2 expert matrix of that
+  shape) the scale section starts at a 2-byte-aligned, not
+  4-byte-aligned, offset. `const float *scales = (const float
+  *)(p + n/2)` and then `scales[i]` is a misaligned load: silently
+  "works" on x86-64, a trap/perf hazard on ARM. The format's
+  code|scales concatenation makes the misalignment unavoidable, so
+  the READ side must be portable, not the layout.
+- **Fix:** read each scale through `memcpy` (4-byte copy, identical
+  value, portable) in both `src/hydra_moe.c` (`moe_dequant_block`)
+  and the independent reference in `tests/test_hydra_moe.c`
+  (`ref_dequant_expert`). No numeric change - the dequant values are
+  bit-identical, the pinned greedy streams re-verified.
+- **Prevention:** CI now has a "Sanitizers (ASan+UBSan) over the
+  whole test suite" step (build-test job, both matrix legs): all
+  five test binaries are rebuilt with
+  `-fsanitize=address,undefined` and run with
+  `UBSAN_OPTIONS=halt_on_error=1`, so any runtime error - including
+  misaligned accesses the -O3 build serves silently - fails the
+  build. Rule: a cast from `uint8_t *` to `float *` (or any wider
+  type) is only legal when the alignment is PROVEN by construction
+  (malloc/aligned array/16-byte-aligned section); byte-stream offsets
+  get a memcpy.
+
 ## 2026-10-26 (round 10) — the documented smoke recipe never ran llama-cli: `timeout` treated `OMP_NUM_THREADS=1` as the executable (Qodo issue, confirmed)
 
 - **Symptom:** docs/GGUF-IMPORT.md 11.4 said

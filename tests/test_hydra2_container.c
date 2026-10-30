@@ -600,8 +600,72 @@ static void mut_t_name_full(fx *f) {
     p16(f, f->tentry[0] + 34, HYDRA2_F32);
     p16(f, f->tentry[0] + 36, 1);
 }
-static void mut_t_role_high(fx *f)   { p16(f, f->tentry[0] + 32, 9); }
+static void mut_t_role_high(fx *f)   { p16(f, f->tentry[0] + 32, 10); }
+static void mut_t_role_six(fx *f)    { p16(f, f->tentry[0] + 32, 6); }
 static void mut_t_type_q40(fx *f)    { p16(f, f->tentry[0] + 34, HYDRA2_Q4_0); }
+
+/* Block-scaled ternary (FORMAT-V2.md 3.2, M2.2): the packing is the
+ * TERNARY2 rule (two 2-bit codes per byte), so n_bytes = n_elements / 2;
+ * the per-group scale travels in a paired F32 tensor "<name>.scale".
+ * The mutations swap the "embed" tensor (offset 32, 32 elements,
+ * 128 bytes) for the new type ids and check the grouped byte rule -
+ * including the two refusals a raw type swap would trigger. */
+static void mut_t_type_s64(fx *f)
+{
+    p16(f, f->tentry[2] + 34, HYDRA2_TERNARY2_S64);
+    p64(f, f->tentry[2] + 48, 32);      /* n_elements */
+    p64(f, f->tentry[2] + 56, 16);      /* 32 / 2 (Ternary2 packing) */
+}
+static void mut_t_type_s128(fx *f)
+{
+    p16(f, f->tentry[2] + 34, HYDRA2_TERNARY2_S128);
+    p64(f, f->tentry[2] + 48, 128);     /* one S128 group */
+    p64(f, f->tentry[2] + 56, 64);      /* 128 / 2 */
+}
+static void mut_t_type_s64_nbytes(fx *f)
+{
+    p16(f, f->tentry[2] + 34, HYDRA2_TERNARY2_S64);
+    p64(f, f->tentry[2] + 48, 32);
+    p64(f, f->tentry[2] + 56, 32);      /* F32 sizing -> mismatch */
+}
+static void mut_t_type_s128_odd(fx *f)
+{
+    p16(f, f->tentry[2] + 34, HYDRA2_TERNARY2_S128);
+    p64(f, f->tentry[2] + 48, 33);      /* odd: no whole code pair */
+    p64(f, f->tentry[2] + 56, 16);
+}
+/* Vocab + merge strings (FORMAT-V2.md 3.2.3): VOCAB_UTF8 needs
+ * n_bytes >= 2*n_elements (one byte + one NUL per token); U16_PAIRS
+ * needs exactly 4 bytes per pair. Both ride role 8 (VOCAB). */
+static void mut_t_vocab_ok(fx *f)
+{
+    p16(f, f->tentry[2] + 32, HYDRA2_ROLE_VOCAB);
+    p16(f, f->tentry[2] + 34, HYDRA2_VOCAB_UTF8);
+    p64(f, f->tentry[2] + 48, 16);
+    p64(f, f->tentry[2] + 56, 34);            /* >= 2 * 16 */
+}
+static void mut_t_vocab_small(fx *f)
+{
+    p16(f, f->tentry[2] + 32, HYDRA2_ROLE_VOCAB);
+    p16(f, f->tentry[2] + 34, HYDRA2_VOCAB_UTF8);
+    p64(f, f->tentry[2] + 48, 16);
+    p64(f, f->tentry[2] + 56, 10);            /* < 2 * 16 */
+}
+static void mut_t_pairs_ok(fx *f)
+{
+    p16(f, f->tentry[2] + 32, HYDRA2_ROLE_VOCAB);
+    p16(f, f->tentry[2] + 34, HYDRA2_U16_PAIRS);
+    p64(f, f->tentry[2] + 48, 8);
+    p64(f, f->tentry[2] + 56, 32);            /* 4 * 8 */
+}
+static void mut_t_pairs_bad(fx *f)
+{
+    p16(f, f->tentry[2] + 32, HYDRA2_ROLE_VOCAB);
+    p16(f, f->tentry[2] + 34, HYDRA2_U16_PAIRS);
+    p64(f, f->tentry[2] + 48, 8);
+    p64(f, f->tentry[2] + 56, 33);            /* != 4 * 8 */
+}
+
 static void mut_t_type_unknown(fx *f){ p16(f, f->tentry[0] + 34, 0x99); }
 static void mut_t_ndims_zero(fx *f)  { p16(f, f->tentry[0] + 36, 0); }
 static void mut_t_ndims_five(fx *f)  { p16(f, f->tentry[0] + 36, 5); }
@@ -641,6 +705,75 @@ static void mut_exp_bytes_small(fx *f) {
     p32(f, f->h_hcrc, hydra2_crc32(f->buf, 120));
 }
 static void mut_corrupt_expert0_byte(fx *f) { f->buf[f->exp_payload[0] + 3] ^= 0xFF; }
+
+/* ------------------------------------------------------------------ */
+/* trunk mapping (FORMAT-V2.md 9.4): mmap + portable fallback         */
+/* ------------------------------------------------------------------ */
+
+/* Read EVERY trunk tensor into one buffer: the read-path fingerprint
+ * is the CRC over the concatenated payloads (hydra2_crc32, the
+ * container's own primitive). Returns HYDRA2_OK on success. */
+#define TENSOR_DIGEST_CAP 16384
+static int read_all_tensors(const hydra2_container_t *c, uint8_t *out,
+                            uint64_t *total)
+{
+    uint64_t off = 0;
+    for (uint64_t i = 0; i < c->tensor_dir_count; ++i) {
+        const hydra2_tensor_entry_t *t = &c->tensors[i];
+        if (off + t->n_bytes > TENSOR_DIGEST_CAP) return HYDRA2_E_CAP;
+        if (hydra2_read_tensor((hydra2_container_t *)c, t,
+                               out + off, TENSOR_DIGEST_CAP - off)
+            != HYDRA2_OK)
+            return HYDRA2_E_READ;
+        off += t->n_bytes;
+    }
+    *total = off;
+    return HYDRA2_OK;
+}
+
+static void test_trunk_mmap_backend(void)
+{
+    section("trunk mapping: mmap active, fallback on demand, same bytes");
+    CHECK(fresh_fixture() == 0, "fresh fixture");
+
+    /* Default: the resident trunk is mapped (POSIX host, file inside
+     * the sandbox). */
+    uint8_t da[TENSOR_DIGEST_CAP], db[TENSOR_DIGEST_CAP];
+    uint64_t ta = 0, tb = 0;
+    hydra2_container_t a;
+    CHECK(hydra2_open(&a, FIXPATH) == HYDRA2_OK, "open with mapping");
+    CHECK(strcmp(a.trunk_backend, "mmap") == 0,
+          "the default backend is the trunk mapping");
+    const int rca = read_all_tensors(&a, da, &ta);
+    CHECK(rca == HYDRA2_OK, "every trunk tensor reads through the map");
+    hydra2_close(&a);
+
+    /* Opt-out: HYDRA2_NO_MMAP=1 takes the portable pread path. */
+    setenv("HYDRA2_NO_MMAP", "1", 1);
+    hydra2_container_t b;
+    CHECK(hydra2_open(&b, FIXPATH) == HYDRA2_OK, "open without mapping");
+    CHECK(strcmp(b.trunk_backend, "pread") == 0,
+          "the opt-out selects the pread fallback");
+    const int rcb = read_all_tensors(&b, db, &tb);
+    unsetenv("HYDRA2_NO_MMAP");
+    CHECK(rcb == HYDRA2_OK, "every trunk tensor reads through pread");
+    CHECK(ta == tb, "both backends deliver the same byte count");
+    CHECK(hydra2_crc32(da, ta) == hydra2_crc32(db, tb),
+          "the mapping and the fallback serve identical bytes");
+    hydra2_close(&b);
+
+    /* Expert streaming is UNCHANGED by the mapping: one pread per
+     * expert, CRC verified at read time (FORMAT-V2.md 5.1.5). */
+    hydra2_container_t d;
+    CHECK(hydra2_open(&d, FIXPATH) == HYDRA2_OK, "open for the expert read");
+    CHECK(strcmp(d.trunk_backend, "mmap") == 0, "trunk mapped");
+    const hydra2_expert_entry_t *e;
+    CHECK(hydra2_find_expert(&d, 0, 0, &e) == HYDRA2_OK, "find expert (0,0)");
+    uint8_t exp[512];
+    CHECK(hydra2_read_expert(&d, e, exp, sizeof(exp)) == HYDRA2_OK,
+          "the expert read still works with the trunk mapped");
+    hydra2_close(&d);
+}
 
 static void test_header_refusals(void)
 {
@@ -710,7 +843,8 @@ static void test_tensor_refusals(void)
 {
     section("tensor directory entry refusals");
     CHECK(open_mutated(mut_t_name_full) == HYDRA2_E_TENSOR_BAD, "name not NUL-terminated");
-    CHECK(open_mutated(mut_t_role_high) == HYDRA2_E_TENSOR_BAD, "role 9");
+    CHECK(open_mutated(mut_t_role_high) == HYDRA2_E_TENSOR_BAD, "role 10");
+    CHECK(open_mutated(mut_t_role_six) == HYDRA2_E_TENSOR_BAD, "role 6 (reserved)");
     CHECK(open_mutated(mut_t_type_q40) == HYDRA2_E_TENSOR_BAD, "type Q4_0");
     CHECK(open_mutated(mut_t_type_unknown) == HYDRA2_E_TENSOR_BAD, "type 0x99");
     CHECK(open_mutated(mut_t_ndims_zero) == HYDRA2_E_TENSOR_BAD, "n_dims 0");
@@ -721,6 +855,71 @@ static void test_tensor_refusals(void)
     CHECK(open_mutated(mut_t_nbytes_mismatch) == HYDRA2_E_TENSOR_BAD, "n_bytes mismatch");
     CHECK(open_mutated(mut_t_offset_unaligned) == HYDRA2_E_TENSOR_BAD, "t offset unaligned");
     CHECK(open_mutated(mut_t_offset_overrun) == HYDRA2_E_TENSOR_BAD, "t offset overrun");
+}
+
+static void test_block_scaled_types(void)
+{
+    section("block-scaled ternary types (FORMAT-V2.md 3.2, M2.2)");
+    CHECK(strcmp(hydra2_type_name(HYDRA2_TERNARY2_S64), "TERNARY2_S64") == 0,
+          "S64 type name");
+    CHECK(strcmp(hydra2_type_name(HYDRA2_TERNARY2_S128), "TERNARY2_S128") == 0,
+          "S128 type name");
+    CHECK(open_mutated(mut_t_type_s64) == HYDRA2_OK,
+          "S64 accepted: n_bytes 16 == 32/2 (Ternary2 packing)");
+    CHECK(open_mutated(mut_t_type_s128) == HYDRA2_OK,
+          "S128 accepted: n_bytes 64 == 128/2");
+    CHECK(open_mutated(mut_t_type_s64_nbytes) == HYDRA2_E_TENSOR_BAD,
+          "S64 with F32 n_bytes refused (packing byte rule)");
+    CHECK(open_mutated(mut_t_type_s128_odd) == HYDRA2_E_TENSOR_BAD,
+          "S128 with odd n_elements refused (no whole code pair)");
+
+    /* The accepted tensor is READABLE through the mapped trunk: its 8
+     * bytes are the trunk pattern at offset 32. */
+    {
+        fx f;
+        if (build_fx(&f) == 0) {
+            mut_t_type_s64(&f);
+            if (write_file(FIXPATH, f.buf, f.len) == 0) {
+                hydra2_container_t c;
+                if (hydra2_open(&c, FIXPATH) == HYDRA2_OK) {
+                    const hydra2_tensor_entry_t *t;
+                    CHECK(hydra2_find_tensor(&c, "embed", &t) == HYDRA2_OK,
+                          "find the S64 tensor");
+                    CHECK(t && t->type_id == HYDRA2_TERNARY2_S64,
+                          "type id round-trips");
+                    uint8_t tbuf[32];
+                    CHECK(hydra2_read_tensor(&c, t, tbuf, sizeof(tbuf)) == HYDRA2_OK,
+                          "S64 tensor readable via the trunk");
+                    int bytes_ok = 1;
+                    for (uint32_t b = 0; b < 16; b++)
+                        if (tbuf[b] != (uint8_t)((32 + b) * 31u + 7u))
+                            bytes_ok = 0;
+                    CHECK(bytes_ok, "S64 payload == trunk bytes at offset 32");
+                    hydra2_close(&c);
+                } else {
+                    CHECK(0, "open for the S64 read");
+                }
+            }
+            free_fx(&f);
+        }
+    }
+}
+
+static void test_vocab_types(void)
+{
+    section("vocab + merge string types (FORMAT-V2.md 3.2.3, M4)");
+    CHECK(strcmp(hydra2_type_name(HYDRA2_VOCAB_UTF8), "VOCAB_UTF8") == 0,
+          "VOCAB_UTF8 type name");
+    CHECK(strcmp(hydra2_type_name(HYDRA2_U16_PAIRS), "U16_PAIRS") == 0,
+          "U16_PAIRS type name");
+    CHECK(open_mutated(mut_t_vocab_ok) == HYDRA2_OK,
+          "VOCAB_UTF8 (role 8) accepted: n_bytes 34 >= 2 * 16");
+    CHECK(open_mutated(mut_t_vocab_small) == HYDRA2_E_TENSOR_BAD,
+          "VOCAB_UTF8 below the 2*n minimum is refused");
+    CHECK(open_mutated(mut_t_pairs_ok) == HYDRA2_OK,
+          "U16_PAIRS (role 8) accepted: n_bytes 32 == 4 * 8");
+    CHECK(open_mutated(mut_t_pairs_bad) == HYDRA2_E_TENSOR_BAD,
+          "U16_PAIRS with n_bytes != 4 * n is refused");
 }
 
 static void test_expert_refusals(void)
@@ -1003,11 +1202,14 @@ int main(int argc, char **argv)
     test_metadata_refusals();
     test_control_region_cap();
     test_tensor_refusals();
+    test_block_scaled_types();
+    test_vocab_types();
     test_expert_refusals();
     test_expert_read_crc();
     test_python_fixture_cross_check();
     test_mutual_v1_v2_refusal();
     test_missing_and_symlink();
+    test_trunk_mmap_backend();
 
     (void)unlink(FIXPATH);
     (void)unlink(CAPPATH);

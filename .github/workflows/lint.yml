@@ -43,10 +43,12 @@ jobs:
               -Wall -Wextra -Iinclude -c src/main.c -o /dev/null
           gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -Wall -Wextra -Iinclude -c src/hydra_v2_container.c -o /dev/null
+          gcc -fanalyzer -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+              -Wall -Wextra -Iinclude -c src/hydra_moe.c -o /dev/null
 
       - name: Clang Static Analyzer
         run: |
-          for f in src/hydra_engine.c src/main.c src/hydra_v2_container.c tests/test_engine.c tests/test_hydra2_container.c; do
+          for f in src/hydra_engine.c src/main.c src/hydra_v2_container.c src/hydra_moe.c tests/test_engine.c tests/test_hydra2_container.c tests/test_hydra_moe.c; do
             clang --analyze -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
                 -Iinclude -Xanalyzer -analyzer-output=text "$f" -o /dev/null
           done
@@ -59,7 +61,8 @@ jobs:
       - name: clang-tidy (bugprone / analyzer / cert / concurrency)
         run: |
           clang-tidy src/hydra_engine.c src/main.c src/hydra_v2_container.c \
-            tests/test_engine.c tests/test_hydra2_container.c \
+            src/hydra_moe.c tests/test_engine.c tests/test_hydra2_container.c \
+            tests/test_hydra_moe.c \
             --checks='-*,clang-analyzer-*,bugprone-*,cert-*,-cert-err33-c,concurrency-*,-concurrency-mt-unsafe' \
             -- -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude \
             || exit 1
@@ -163,7 +166,8 @@ jobs:
         run: |
           gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
               -fsanitize=address,undefined -fno-sanitize-recover=all -Iinclude \
-              src/hydra_engine.c src/main.c -lm -o hydra-run-san
+              src/hydra_engine.c src/main.c src/hydra_v2_container.c \
+              src/hydra_moe.c -lm -o hydra-run-san
           python3 tools/make_model.py san.hydra
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
             ./hydra-run-san san.hydra 42 32 --json
