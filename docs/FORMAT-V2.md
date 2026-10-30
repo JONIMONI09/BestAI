@@ -93,15 +93,25 @@ Stated precisely, with the boundary between implemented and not:
   (parity CRC tested in `tests/test_hydra2_container.c`,
   `test_trunk_mmap_backend`). Expert streaming is deliberately unchanged:
   one `pread` per expert, CRC-32 verified at read time (5.1.5).
+  The mapped extent is remembered in `trunk_map_len` so `hydra2_close()`
+  munmaps the exact range; round 13 (Qodo #5) fixed the pre-fix zero
+  length that made the munmap a no-op and leaked the mapping until
+  process exit (the CI sanitizer gate now runs LeakSanitizer enabled).
 - **Implemented `[CODE]` (2026-10-27):** `hydra-run --inspect <file>`
   prints a JSON summary of a `.hydra2` file (version, header bytes, the
   five regions, routing metadata, metadata key/value pairs, the tensor
   directory, up to eight sample experts, and the reader backend) with the
   same exit-code contract as the v1 inspection (0 ok / 2 reader refusal /
   1 usage). The web server's `/api/models` and inspect route accept
-  `.hydra2` files (`server.js`, `execFileSync` dispatch on the binary's
-  exit status, covered by `tools/server_test.js`), and the `tools`
-  frontend lists and displays them.
+  `.hydra2` files (`server.js`, async `execFile` on the binary's exit
+  status — the pre-fix sync spawn blocked the whole event loop for up to
+  the 10 s timeout, round 13 Qodo #27 — covered by
+  `tools/server_test.js`), and the `tools` frontend lists and displays
+  them. The inspect JSON emits every metadata value as a COMPLETE JSON
+  value (numbers bare, strings and hex blobs quoted by the encoder;
+  round 13, Qodo #18 fixed the pre-fix first-character heuristic that
+  double-quoted binary values starting with a non-`0` hex digit), and a
+  failed read refuses WITHOUT echoing the path (round 13, Qodo #25).
 - **Implemented `[CODE]` (2026-10-30, round 12 stages 4–6):** MoE
   inference on top of the container — `src/hydra_moe.c` /
   `include/hydra_moe.h`, engine `moe-transformer-v1`: per-layer GQA
@@ -119,12 +129,21 @@ Stated precisely, with the boundary between implemented and not:
   (`hydra_moe_encode_text` / `hydra_moe_decode_token`), which
   `hydra-run --text-prompt` uses (loud refusals: no vocab, v1 file,
   unmapped byte, invalid UTF-8, overflow, flag combination). The v1
-  legacy engine and its pinned streams are not modified. Covered by
-  `tests/test_hydra_moe.c` (`make test-run`, 138 checks: independent-
+  legacy engine and its pinned streams are not modified. The CLI prompt
+  CONDITIONS the model since round 13 (Qodo #30): every prompt token
+  except the last is run through the engine to build the KV history and
+  generation continues from the LAST prompt token (pre-fix the prompt
+  only seeded the repetition ring and the display). The generated stream
+  is reported as decoded text as well as token ids (`[Text-out]:` line
+  and the JSON `generated_text` field, round 13 Qodo #7). Covered by
+  `tests/test_hydra_moe.c` (`make test-run`, 180 checks: independent-
   reference forward parity, greedy stream pins for the F32 / S64 / S128 /
-  dim-256 multi-group / attention-ternary fixtures, KV eviction, sampler
-  extremes, the hand-crafted dequant round-trip, the vocab codec +
-  tamper refusals, and tampered-directory refusals), by
+  dim-256 multi-group / attention-ternary / GQA fixtures, KV eviction,
+  sampler extremes incl. the temperature-scaling pin, the hand-crafted
+  dequant round-trips (the in-place aliasing regression of round 13
+  Qodo #3 included), the vocab codec + tamper refusals, the
+  32-bit-wrap / non-divisible-GQA shape-tamper refusals, and the
+  mismatched-KV-dim refusal), by
   `tests/test_hydra2_container.c` (`test_vocab_types`) and by
   `tools/text_prompt_check.sh` (CLI gate).
   **Not implemented:** the expert cache / slot leasing of section 6.2,
@@ -134,6 +153,24 @@ Stated precisely, with the boundary between implemented and not:
   `tests/test_jni_batch.c` — batched runs equal direct runs for greedy
   and fixed-seed sampling; that is the v3/v4 engine, not a `.hydra2`
   consumption path.)
+- **Implemented `[CODE]` (2026-10-30, round 13):** engine hardening from
+  the Qodo audit of PR #73 — the MoE sampler's temperature now scales
+  the EXPONENT, `exp((v-mx)/T)`; the pre-fix `exp(v-mx)/T` + renorm
+  cancelled T entirely, so every temperature sampled the same
+  distribution (Qodo #8, pinned by a three-temperature CDF test). The
+  repetition penalty walks the WHOLE window (pre-fix it was capped at
+  the vocabulary size, Qodo #21); the stochastic path requires a
+  non-NULL RNG state (greedy may pass NULL, Qodo #19). The UTF-8
+  validator returns a distinct "invalid" code with the error offset —
+  the pre-fix `0` conflated "valid" with "invalid at offset 0" (Qodo
+  #20). The CLI repetition ring is a true circular buffer: the pre-fix
+  write position was clamped at the window, so after the first
+  wraparound every write hit slot 0 and `--rep-window 0` divided by
+  zero (Qodo #16/#22, pinned by `tools/text_prompt_check.sh`). The
+  positional-argument defaults/clamp (start 42, steps 1..256) now
+  precede the magic dispatch so `.hydra2` files get them too (Qodo
+  #23). All regression tests are in `tests/test_hydra_moe.c` and
+  `tools/text_prompt_check.sh`; the suite grew 138 -> 180 checks.
 - **SIMD status (2026-10-26).** The transformer formats v3/v4 (the engine's
   per-layer ternary projections) compute their inner product through
   `tf_row_dot`, which is **integer-exact** and has AVX2 and NEON kernels
@@ -566,8 +603,8 @@ them. Missing or malformed values are a refusal (code −4), never a default:
 | `v2.dim` | `uint32` | hidden size `> 0` |
 | `v2.vocab_size` | `uint32` | vocabulary size `> 0` |
 | `v2.n_heads` | `uint32` | query heads `> 0` |
-| `v2.n_kv_heads` | `uint32` | KV heads, `1..n_heads` (GQA) |
-| `v2.head_dim` | `uint32` | `> 0`, and `dim == n_heads * head_dim` |
+| `v2.n_kv_heads` | `uint32` | KV heads, `1..n_heads` AND `n_heads % n_kv_heads == 0` (GQA block mapping, round 13) |
+| `v2.head_dim` | `uint32` | `> 0`, and `dim == n_heads * head_dim` (checked in 64-bit arithmetic, round 13) |
 | `v2.inter` | `uint32` | FFN width `> 0` |
 | `v2.expert_layout` | `uint32` | `0` F32 flat, `1` ternary + block scales (§3.2.2) |
 | `v2.rope_theta` | `float32` | RoPE base, default `10000.0` |
@@ -580,7 +617,17 @@ All ten are required for `moe-transformer-v1` files opened through the MoE
 module; the required trunk tensors are `embed`, per layer
 `attn_q/k/v/o.{L}`, `attn_norm.{L}`, `ffn_norm.{L}`, `router.{L}`,
 `ffn_gate/up/down.{L}` (roles per §4.2), and `final_norm`, plus `lm_head`
-when `v2.tied_embedding` is `0`. **[CODE]**
+when `v2.tied_embedding` is `0`. The shape relations are enforced at open
+(refusal code −7) with 64-bit products — a 32-bit `n_heads * head_dim`
+could wrap around and accidentally "equal" `dim` (round 13, Qodo #17).
+Attention uses the llama.cpp GQA BLOCK mapping: query head `i` reads KV
+head `i / (n_heads / n_kv_heads)` (contiguous groups share one KV head);
+the pre-fix interleave `i % n_kv_heads` is wrong for any
+`n_kv_heads > 1` (round 13, Qodo #26). A KV cache passed to
+`hydra_moe_forward` whose vector length differs from
+`n_kv_heads * head_dim` is refused (−1) — the head-strided reads would
+otherwise wander outside the allocated slots (round 13, Qodo #28).
+**[CODE]**
 
 **K/V block wire format `[CODE]` (implementation decision, 2026-10-26).** The
 specification names the keys but not the block layout; the reader and writer

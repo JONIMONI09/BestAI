@@ -188,6 +188,22 @@ int hydra_moe_config(const hydra_moe_t *m, hydra_moe_config_t *out);
 int hydra_moe_dequant_expert(const uint8_t *blob, float *out,
                              uint32_t inter, uint32_t dim, uint32_t group);
 
+/* Dequantize a flat TERNARY2 trunk tensor payload (the paired
+ * '<name>.scale' convention, FORMAT-V2.md 3.2.1) into n F32 values.
+ * TERNARY2_S64 = group 64, TERNARY2_S128 = group 128; the last group
+ * may be partial. element k holds code(k) * scales[k / group] (0, +1
+ * or -1 times the scale). TERNARY2 packing: 2 elements per byte (the
+ * even element in the low 2 bits, the odd one in bits 2-3), so n
+ * elements occupy n/2 payload bytes. payload must NOT alias out: the
+ * packed bytes are read at byte k/2 while the result is written at
+ * byte 4k, so an aliased in-place call corrupts the payload from the
+ * second element on (round-13, Qodo #3 - moe_get_tensor keeps the
+ * packed bytes in a separate temporary buffer for this reason).
+ * Exported for the test parity suite, same pattern as
+ * hydra_moe_dequant_expert. */
+int hydra_moe_dequant_flat(const uint8_t *payload, const float *scales,
+                           uint64_t n, uint32_t group, float *out);
+
 /* ------------------------------------------------------------------ */
 /* vocabulary + BPE text codec (role 8 tensors, FORMAT-V2.md 3.2.3)   */
 /* ------------------------------------------------------------------ */
@@ -244,21 +260,30 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
 /* Sampler over a REAL logit vector (min-p + repetition penalty),
  * independent of the v1 sampler:
  *
- *   a) repetition penalty over the last `window` recent tokens
- *      (chronological order): positive logits divided, negative
- *      multiplied (sign-preserving, repeats compound);
- *   b) numerically stable softmax with scale 1/temperature (max
- *      subtracted before exp);
+ *   a) repetition penalty over the last `window` recent tokens:
+ *      positive logits divided, negative multiplied (sign-preserving,
+ *      repeats compound); the penalty walks the WHOLE window (round
+ *      13, Qodo #21 - the old cap at `vocab` dropped history beyond
+ *      one vocabulary span);
+ *   b) numerically stable softmax with scale 1/temperature: the
+ *      temperature scales the EXPONENT, exp((v-mx)/T) (round 13,
+ *      Qodo #8 - the old exp(v-mx)/T renormalized the factor away,
+ *      so every temperature sampled identically);
  *   c) min-p filter: drop P(c) < min_p * p_max, renormalize (p_max
  *      always survives);
  *   d) seeded xorshift64* CDF walk.
  *
- * temperature <= 0 or min_p >= 1: GREEDY - argmax, no RNG consumed.
- * rng_state is in/out (the caller persists it for reproducibility,
- * the same pattern as the v1 sampler's engine-embedded seed).
+ * recent_tokens must hold at least `window` entries (any order - the
+ * penalty counts occurrences); pass NULL for window 0.
+ * temperature <= 0 or min_p >= 1: GREEDY - argmax, no RNG consumed
+ * (rng_state may be NULL on the greedy path; the stochastic path
+ * REQUIRES a non-NULL rng_state, round 13, Qodo #19). rng_state is
+ * in/out (the caller persists it for reproducibility, the same
+ * pattern as the v1 sampler's engine-embedded seed).
  *
  * Returns 0 on success, -1 on bad arguments (logits NULL, vocab 0,
- * temperature < -1, min_p outside [0,1], penalty outside [0.5, 2.0]).
+ * temperature < -1, min_p outside [0,1], penalty outside [0.5, 2.0],
+ * or a NULL rng_state on the stochastic path).
  */
 int hydra_moe_sample(const float *logits, uint32_t vocab,
                      uint32_t *token_out,

@@ -96,8 +96,9 @@ test-run: hydra-test jni-batch-test large-model-test gguf-test gguf-conv-test hy
 	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-t64-lg.hydra2 --moe-full --layers 1 --experts 4 --top-k 2 --dim 256 --n-heads 8 --head-dim 32 --inter 64 --moe-ternary 64
 	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-nv.hydra2 --moe-full --layers 2 --moe-no-vocab
 	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-at64.hydra2 --moe-full --layers 2 --moe-attn-ternary
-	./hydra-moe-test "$(CURDIR)/.hydra2-moefix.hydra2" "$(CURDIR)/.hydra2-moefix-t64.hydra2" "$(CURDIR)/.hydra2-moefix-t128.hydra2" "$(CURDIR)/.hydra2-moefix-t64-lg.hydra2" "$(CURDIR)/.hydra2-moefix-nv.hydra2" "$(CURDIR)/.hydra2-moefix-at64.hydra2"
-	rm -f $(CURDIR)/.hydra2-moefix.hydra2 $(CURDIR)/.hydra2-moefix-t64.hydra2 $(CURDIR)/.hydra2-moefix-t128.hydra2 $(CURDIR)/.hydra2-moefix-t64-lg.hydra2 $(CURDIR)/.hydra2-moefix-nv.hydra2 $(CURDIR)/.hydra2-moefix-at64.hydra2
+	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-gqa.hydra2 --moe-full --layers 2 --n-heads 4 --head-dim 4 --n-kv-heads 2
+	./hydra-moe-test "$(CURDIR)/.hydra2-moefix.hydra2" "$(CURDIR)/.hydra2-moefix-t64.hydra2" "$(CURDIR)/.hydra2-moefix-t128.hydra2" "$(CURDIR)/.hydra2-moefix-t64-lg.hydra2" "$(CURDIR)/.hydra2-moefix-nv.hydra2" "$(CURDIR)/.hydra2-moefix-at64.hydra2" "$(CURDIR)/.hydra2-moefix-gqa.hydra2"
+	rm -f $(CURDIR)/.hydra2-moefix.hydra2 $(CURDIR)/.hydra2-moefix-t64.hydra2 $(CURDIR)/.hydra2-moefix-t128.hydra2 $(CURDIR)/.hydra2-moefix-t64-lg.hydra2 $(CURDIR)/.hydra2-moefix-nv.hydra2 $(CURDIR)/.hydra2-moefix-at64.hydra2 $(CURDIR)/.hydra2-moefix-gqa.hydra2
 
 # GPU feasibility benchmark, CPU reference only. The device build adds
 # -DHYDRA_WITH_GLES and links -lEGL -lGLESv2; see tools/gpu_bench/README.md.

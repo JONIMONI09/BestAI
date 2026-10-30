@@ -14,39 +14,62 @@ MAPPING (llama -> moe-transformer-v1)
   dim / n_heads / n_kv_heads / head_dim / inter / layers
       from llama.embedding_length / attention.head_count /
       attention.head_count_kv / feed_forward_length / block_count
-  tok_emb [dim, vocab]            -> embed [vocab, dim]   (transposed)
-  blk.L.attn_q/k/v/o [in, out]    -> attn_q/k/v/o.L [out, in] (transposed)
-  blk.L.attn_norm / ffn_norm      -> attn_norm.L / ffn_norm.L
-  blk.L.ffn_gate / ffn_up         -> ffn_gate/up.L [inter, dim] (transposed)
-  blk.L.ffn_down [inter, dim]     -> ffn_down.L [dim, inter] (transposed)
-  output norm                     -> final_norm
-  output [dim, vocab] (optional)  -> lm_head [vocab, dim] (transposed);
+  tok_emb (GGUF dims [dim, vocab])      -> embed [vocab, dim]
+  blk.L.attn_q/k/v/o (dims [in, out])   -> attn_q/k/v/o.L [out, in]
+  blk.L.attn_norm / ffn_norm            -> attn_norm.L / ffn_norm.L
+  blk.L.ffn_gate / ffn_up ([dim, inter])-> ffn_gate/up.L [inter, dim]
+  blk.L.ffn_down ([inter, dim])         -> ffn_down.L [dim, inter]
+  output norm                           -> final_norm
+  output (dims [dim, vocab], optional)  -> lm_head [vocab, dim];
                                      absent => tied embedding
-  tokenizer.ggml.tokens           -> 'vocab' tensor (VOCAB_UTF8, role 8)
-  tokenizer.ggml.merges           -> 'merges' tensor (U16_PAIRS, role 8)
-  llama.rope.freq_base            -> v2.rope_theta (default 10000.0)
+  tokenizer.ggml.tokens                 -> 'vocab' tensor (VOCAB_UTF8, 8)
+  tokenizer.ggml.merges                 -> 'merges' tensor (U16_PAIRS, 8)
+  llama.rope.freq_base                  -> v2.rope_theta (default 10000.0)
+
+LAYOUT (why there is NO transpose step)
+---------------------------------------
+GGUF dims are ggml order: ne[0] is the CONTIGUOUS (fastest-varying)
+dimension, the reverse of numpy shape order. A linear stored with dims
+[in, out] therefore holds its bytes as [out] rows of [in] contiguous
+values - already the engine's [out, in] row-major layout - and an
+embedding with dims [dim, vocab] holds [vocab] rows of [dim] values,
+already the engine's [vocab, dim] embed layout (token t's vector is the
+contiguous run at offset t*dim, which is exactly how the engine reads
+it: embed + token_in * dim). Every tensor is therefore copied in FILE
+ORDER; applying a transpose here would scramble every non-square tensor
+(round-13 fix: the original converter treated dims[0] as the row count
+and transposed, which is the numpy reading of a ggml tensor). The pinned
+llama.cpp source proves the convention (ggml_get_rows reads wte rows as
+contiguous ne[0] blocks; ggml_can_mul_mat requires w->ne[0] == in).
 
 DENSE FFN -> EXPERTS (the masked decomposition, EXACT by construction)
 -----------------------------------------------------------------------
 The engine's expert geometry is FIXED to the model's `inter` (every
 expert is a full-width [inter x dim] gate/up and [dim x inter] down),
-so a dense SwiGLU layer `down @ (up@x * sigmoid(gate@x))` is converted
-to E full-width experts that PARTITION the intermediate rows: expert e
-keeps only the rows [e*c .. (e+1)*c) of gate/up (c = inter/E), scaled
-by E, and zeroes the rest; its down matrix is the full dense down
-unmodified. Because every intermediate row r contributes only through
-its own gate/up rows, the partition is exact: with a UNIFORM router
+so a dense SwiGLU layer `down @ (SiLU(gate@x) * up@x)` is converted to
+E full-width experts that PARTITION the intermediate rows: expert e
+keeps only the rows [e*c .. (e+1)*c) of gate (c = inter/E) and up and
+zeroes the rest; its down matrix is the full dense down unmodified.
+The scaling must respect the nonlinearity: the engine computes the
+expert output as SiLU(G_e b) * (U_e b), and SiLU(E*g) * u is NOT
+E * (SiLU(g) * u). Therefore
+    G_e = gate block e          (unscaled)
+    U_e = E * (up block e)      (scaled by E)
+which makes the per-row contribution exact: with a UNIFORM router
 (all-zero router rows -> every logit 0 -> softmax weight 1/E) and
 top_k = E the engine computes
-  sum_e (1/E) * E * (rows G_e of the dense intermediate) = the dense
-  result,
+  sum_e (1/E) * (SiLU(g_e) * (E * u_e)) = sum_e SiLU(g_e) * u_e
+  = the dense result,
 up to F32 rounding of the per-expert summation order (a few ulp) - the
-only approximation in the weight path. E = 1 (the default: --max-
-experts 1) is a verbatim copy of the dense FFN (one expert, no
-masking). Note the storage cost: E experts of FULL width, i.e. E times
-the dense FFN bytes per layer; --max-experts N keeps E = the largest
-divisor of `inter` in [1, N]. The dense matrices are additionally kept
-verbatim in the trunk tensors `ffn_gate/up/down.L` (source of record).
+only approximation in the weight path. (Round-13 fix: the original
+converter scaled BOTH the gate and the up rows by E; because SiLU is
+nonlinear, every E > 1 model then computed a different function than
+the source FFN. The E = 1 default was unaffected and is a verbatim
+copy of the dense FFN.) Note the storage cost: E experts of FULL
+width, i.e. E times the dense FFN bytes per layer; --max-experts N
+keeps E = the largest divisor of `inter` in [1, N]. The dense
+matrices are additionally kept verbatim in the trunk tensors
+`ffn_gate/up/down.L` (source of record).
 
 DOCUMENTED APPROXIMATIONS (stated, not hidden)
 ----------------------------------------------
@@ -135,30 +158,27 @@ def pick_experts(inter, max_experts):
     return 1
 
 
-def rows_to_f32(gguf, tensor, rows, cols):
-    """Decode a tensor (decode_rows returns a FLAT list, row-major) and
-    return it as one flat byte string, [rows][cols] F32."""
+def flat_f32(gguf, tensor):
+    """Decode every element of a 1-D or 2-D tensor, IN FILE (ggml)
+    ORDER, as F32 bytes.
+
+    The file bytes of every tensor ARE the engine layout (linears as
+    [out][in], embeddings as [vocab][dim]; see the LAYOUT section of the
+    module docstring), so this decodes the whole tensor in file order.
+    decode_rows() indexes rows as dims[0] chunks of dims[1] values; for
+    a 1-D tensor it is a single row of dims[0] values - either way the
+    concatenation is the complete file, in order.
+    """
+    shape = tensor.shape()
+    if shape is None:
+        die('tensor %s has %d dimensions; only 1-D and 2-D are supported'
+            % (tensor.name, tensor.n_dims))
+    rows, cols = shape
     out = bytearray(rows * cols * 4)
     for r0 in range(0, rows, 256):
         nr = min(256, rows - r0)
         block = gguf.decode_rows(tensor, r0, nr)
         struct.pack_into('<%df' % len(block), out, r0 * cols * 4, *block)
-    return bytes(out)
-
-
-def transpose_f32(gguf, tensor, rows, cols):
-    """GGUF [rows][cols] -> flat F32 [cols][rows] (the tok_emb/output
-    transpose: [dim][vocab] -> [vocab][dim])."""
-    out = bytearray(rows * cols * 4)
-    for r0 in range(0, rows, 256):
-        nr = min(256, rows - r0)
-        block = gguf.decode_rows(tensor, r0, nr)
-        for i in range(nr):
-            d = r0 + i  # source row index == destination column
-            base = i * cols
-            for c in range(cols):
-                struct.pack_into('<f', out, c * rows * 4 + d * 4,
-                                 block[base + c])
     return bytes(out)
 
 
@@ -271,9 +291,8 @@ def main(argv=None):
         expert_dir = []
         expert_payloads = []
 
-        # ---- embed (transposed) ---------------------------------------
-        trunk.add('embed', 2, transpose_f32(gguf, tok_emb, dim, vocab),
-                  elems=vocab * dim)
+        # ---- embed (file order: already [vocab][dim]) -----------------
+        trunk.add('embed', 2, flat_f32(gguf, tok_emb), elems=vocab * dim)
 
         # ---- per-layer blocks -----------------------------------------
         for l in range(layers):
@@ -295,8 +314,10 @@ def main(argv=None):
                           'blk.%d.ffn_up.weight' % l)
             down = find_any('blk.%d.ffn_down' % l,
                             'blk.%d.ffn_down.weight' % l)
-            # GGUF llama stores every linear as [in, out]; the engine
-            # wants [out, in] - all of them are transposed.
+            # GGUF llama stores linears with ggml dims [in, out]; the
+            # FILE ORDER of such a tensor is already [out][in] row-major
+            # (the engine layout) - validate the dims, copy in file
+            # order, no transpose.
             for t, exp in ((q, [dim, dim]), (k, [dim, kvdim]),
                            (v, [dim, kvdim]), (o, [dim, dim]),
                            (an, [dim]), (fn, [dim]),
@@ -306,17 +327,17 @@ def main(argv=None):
                     die('tensor %s is %s, expected %s'
                         % (t.name, t.dims, exp))
             trunk.add('attn_q.%d' % l, 7,
-                      transpose_f32(gguf, q, dim, dim), elems=dim * dim)
+                      flat_f32(gguf, q), elems=dim * dim)
             trunk.add('attn_k.%d' % l, 7,
-                      transpose_f32(gguf, k, dim, kvdim), elems=kvdim * dim)
+                      flat_f32(gguf, k), elems=kvdim * dim)
             trunk.add('attn_v.%d' % l, 7,
-                      transpose_f32(gguf, v, dim, kvdim), elems=kvdim * dim)
+                      flat_f32(gguf, v), elems=kvdim * dim)
             trunk.add('attn_o.%d' % l, 7,
-                      transpose_f32(gguf, o, dim, dim), elems=dim * dim)
+                      flat_f32(gguf, o), elems=dim * dim)
             trunk.add('attn_norm.%d' % l, 3,
-                      rows_to_f32(gguf, an, 1, dim), elems=dim, ndims=1)
+                      flat_f32(gguf, an), elems=dim, ndims=1)
             trunk.add('ffn_norm.%d' % l, 3,
-                      rows_to_f32(gguf, fn, 1, dim), elems=dim, ndims=1)
+                      flat_f32(gguf, fn), elems=dim, ndims=1)
 
             # uniform router: every logit is 0 -> softmax 1/E (exact)
             trunk.add('router.%d' % l, 1,
@@ -324,30 +345,32 @@ def main(argv=None):
 
             # dense FFN kept verbatim in the trunk (source of record;
             # the engine routes through the experts)
-            gate_f = transpose_f32(gguf, gate, dim, inter)
-            up_f = transpose_f32(gguf, up, dim, inter)
-            down_f = transpose_f32(gguf, down, inter, dim)
+            gate_f = flat_f32(gguf, gate)
+            up_f = flat_f32(gguf, up)
+            down_f = flat_f32(gguf, down)
             trunk.add('ffn_gate.%d' % l, 0, gate_f, elems=inter * dim)
             trunk.add('ffn_up.%d' % l, 0, up_f, elems=inter * dim)
             trunk.add('ffn_down.%d' % l, 0, down_f, elems=dim * inter)
 
             # the masked decomposition: E full-width experts that
             # partition the intermediate rows (chunk = inter/E rows
-            # each; E == 1 -> the dense FFN verbatim)
-            def masked_scaled(buf, i0):
+            # each; E == 1 -> the dense FFN verbatim). SiLU is nonlinear,
+            # so only the UP rows carry the E factor (see the module
+            # docstring): G_e = block, U_e = E * block.
+            def masked_block(buf, i0, scale):
                 """Full [inter][dim] matrix: rows i0..i0+chunk kept and
-                multiplied by E, every other row zeroed."""
+                multiplied by `scale`, every other row zeroed."""
                 out = bytearray(inter * dim * 4)
                 for i in range(chunk * dim):
                     x = struct.unpack_from('<f', buf,
                                            (i0 + i) * 4)[0]
-                    struct.pack_into('<f', out, (i0 + i) * 4, x * E)
+                    struct.pack_into('<f', out, (i0 + i) * 4, x * scale)
                 return bytes(out)
 
             for e in range(E):
                 i0 = e * chunk * dim
-                payload = masked_scaled(gate_f, i0) + masked_scaled(
-                    up_f, i0) + down_f
+                payload = masked_block(gate_f, i0, 1.0) + masked_block(
+                    up_f, i0, float(E)) + down_f
                 off = sum(len(p) for p in expert_payloads)
                 expert_payloads.append(payload)
                 expert_dir.append((l, e, off, len(payload), fe,
@@ -355,15 +378,92 @@ def main(argv=None):
                 fe += 1
 
         # ---- final norm + lm_head -------------------------------------
+        # the engine reads final_norm as a 1-D vector of length dim - a
+        # tensor that merely EXISTS with other shape would open and
+        # compute garbage, so validate it (round-13, Qodo #24).
+        if (norm_t.n_dims != 1 or list(norm_t.dims) != [dim]):
+            die('output norm %s is %s, expected 1-D [dim=%d]'
+                % (norm_t.name, list(norm_t.dims), dim))
         trunk.add('final_norm', 3,
-                  rows_to_f32(gguf, norm_t, 1, dim),
+                  flat_f32(gguf, norm_t),
                   elems=dim, ndims=1)
         if output is not None:
             trunk.add('lm_head', 9,
-                      transpose_f32(gguf, output, dim, vocab),
+                      flat_f32(gguf, output),
                       elems=vocab * dim)
 
         # ---- vocabulary + merges (role 8, FORMAT-V2.md 3.2.3) ----------
+        # Token normalisation (round-13, Qodo #15): tokenizer models
+        # write the leading space as a GLYPH (llama/SPM: '\u2581...',
+        # T5: '\u0120...') or as an escaped byte (GPT-2: '<0xNN>'). The
+        # engine's byte->token map is BYTE-OPTIMAL single-char tokens,
+        # so a glyph-stored space has no token at all and --text-prompt
+        # refuses on every such model. Store the byte-equivalent string
+        # instead (each glyph/escape names exactly one byte, at any
+        # position in the token), which makes decoded output and text
+        # prompts work for both families. Normalisation happens before
+        # every id lookup, so merges (raw "left right" strings) are
+        # normalised the same way.
+        def normalize_token(t):
+            # The space GLYPH (SPM/llama '\u2581', T5 '\u0120') and the
+            # escaped byte '<0xNN>' (GPT-2) each stand for exactly one
+            # byte - a space or the named byte - at ANY position in the
+            # token string (a merge target can carry the glyph in the
+            # middle: 'a' + '\u2581b' -> the token 'a\u2581b' means
+            # 'a b'). Map every occurrence to the byte it names.
+            if '\u2581' in t or '\u0120' in t or '<0x' in t:
+                out = []
+                i = 0
+                while i < len(t):
+                    if t.startswith('<0x', i) and i + 5 <= len(t) \
+                            and t[i + 4] == '>':
+                        try:
+                            out.append(chr(int(t[i + 3:i + 4], 16)))
+                            i += 5
+                            continue
+                        except ValueError:
+                            pass
+                    ch = t[i]
+                    out.append(' ' if ch in ('\u2581', '\u0120') else ch)
+                    i += 1
+                return ''.join(out)
+            return t
+
+        tokens = [normalize_token(t) for t in tokens]
+        # The engine's vocab loader (moe_load_vocab) REQUIRES: no empty
+        # token, no embedded NUL, no duplicates. A GGUF that violates
+        # any of these is rejected here at conversion time with a loud
+        # message instead of producing a .hydra2 the engine refuses to
+        # open (round-13, Qodo #2).
+        seen = {}
+        for i, t in enumerate(tokens):
+            b = t.encode('utf-8')
+            if b == b'':
+                die('token %d is empty - the engine vocab loader cannot '
+                    'store it' % i)
+            if b'\x00' in b:
+                die('token %d contains an embedded NUL byte - the '
+                    'NUL-terminated vocab format cannot store it' % i)
+            if t in seen:
+                die('token %d (%r) duplicates token %d'
+                    % (i, t, seen[t]))
+            seen[t] = i
+        # Byte-coverage report (not a refusal): bytes without a
+        # single-byte token cannot be mapped by --text-prompt; the
+        # engine still refuses them per-byte with a named message.
+        covered = set()
+        for t in tokens:
+            b = t.encode('utf-8')
+            if len(b) == 1:
+                covered.add(b[0])
+        if len(covered) < 256:
+            missing = [b for b in range(256) if b not in covered]
+            print('[gguf_to_hydra2] WARNING: %d of 256 bytes have no '
+                  'single-byte token (first: %s); --text-prompt is '
+                  'limited to the covered bytes; decoded output keeps '
+                  'the stored (normalised) token strings'
+                  % (256 - len(covered),
+                     ', '.join('0x%02x' % b for b in missing[:8])))
         vocab_blob = b''.join(t.encode('utf-8') + b'\x00' for t in tokens)
         trunk.add('vocab', 8, vocab_blob, tid=0x0050, ndims=1,
                   elems=vocab)
@@ -377,14 +477,26 @@ def main(argv=None):
                     skipped += 1
                     continue
                 left, _, right = m.partition(' ')
-                li = id_of.get(left)
-                ri = id_of.get(right)
-                ti = id_of.get(left + right)
+                li = id_of.get(normalize_token(left))
+                ri = id_of.get(normalize_token(right))
+                ti = id_of.get(normalize_token(left + right))
                 if li is None or ri is None or ti is None:
                     skipped += 1  # not expressible as a token triple
                     continue
                 rules.append((li, ri))
         if rules:
+            # The merge rule format is 16-bit (left, right) token pairs
+            # (FORMAT-V2.md 3.2.3). struct.pack('<HH') would RAISE for
+            # an operand above 65535 (an uncaught traceback in the
+            # middle of the conversion, after the expensive decoding) -
+            # refuse before that point, loudly (round-13, Qodo #9).
+            big = [id for pair in rules for id in pair if id > 0xFFFF]
+            if big:
+                die('merge operands exceed the 16-bit pair format: '
+                    'token ids %s are above 65535 (vocab %d tokens); '
+                    'this converter supports up to 65535 tokens per '
+                    'merge rule' % (', '.join(str(i) for i in big[:5]),
+                                    vocab))
             trunk.add('merges', 8,
                       b''.join(struct.pack('<HH', a, b)
                                for a, b in rules),

@@ -1068,6 +1068,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
      * inside the file. */
     c->trunk_map = NULL;
     c->trunk_map_base_off = 0;
+    c->trunk_map_len = 0;
     c->trunk_backend = "pread";
     if (c->trunk_bytes > 0 &&
         getenv("HYDRA2_NO_MMAP") == NULL) {
@@ -1089,6 +1090,12 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                 if (p != MAP_FAILED) {
                     c->trunk_map = (const uint8_t *)p;
                     c->trunk_map_base_off = map_off;
+                    /* round 13 (Qodo #5): the mapped extent MUST be
+                     * remembered - hydra2_close() munmaps with
+                     * trunk_map_len, and the pre-fix zero length made
+                     * the munmap a no-op (EINVAL), leaking the whole
+                     * mapping until process exit. */
+                    c->trunk_map_len = map_len;
                     c->trunk_backend = "mmap";
                 }
             }

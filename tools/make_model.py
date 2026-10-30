@@ -320,6 +320,11 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
         raise ValueError('top_k must be 1..experts')
     if not 1 <= n_kv_heads <= n_heads:
         raise ValueError('n_kv_heads must be 1..n_heads')
+    if n_heads % n_kv_heads != 0:
+        # GQA block mapping (head i -> kv head i / (n_heads /
+        # n_kv_heads)) only exists for divisible counts; the engine
+        # refuses such files at open (round 13, Qodo #26).
+        raise ValueError('n_heads must be divisible by n_kv_heads (GQA)')
     if n_heads * head_dim != dim:
         raise ValueError('n_heads * head_dim must equal dim')
     if not 2 <= vocab <= 256:

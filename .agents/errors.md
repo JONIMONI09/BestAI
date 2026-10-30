@@ -1,8 +1,59 @@
 # Error Log — Hydra-Stone
-
 > Protocol: see `.agents/skills/session-workflow/SKILL.md`.
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
+
+## 2026-10-30 (round 13) — self-inflicted test/pin mistakes during the Qodo-fix round (five distinct traps, all caught before commit)
+
+- **Symptom:** after the engine fixes, the moe suite and the CLI gate
+  failed in ways the fixes could not have caused: six dequant unit
+  anchors wrong, a "divergence" between text and numeric prompt
+  streams, a meta-tamper test that refused the wrong file, a GQA pin
+  that could not distinguish old from new mapping, and one server
+  test receiving 500 instead of 200.
+- **Cause (each one real, each one mine):**
+  (1) The `test_moe_dequant_flat_unit` anchors were computed by hand
+  against a WRONG code pattern (0,0,3,3,2,1,1,2 instead of the
+  generator's 0,0,3,0,2,1,1,2) and a WRONG payload size (n/4 bytes
+  instead of the n/2 the engine reads, `payload[k/2]`) — a 64-byte
+  payload for 256 elements let groups 2/3 read OOB stack garbage,
+  which is exactly why only their anchors failed while 0/1 passed.
+  The compiler warnings ("iteration 64 invokes UB", "writing 32 bytes
+  into region of size 0") pointed at the first overflow variant.
+  (2) The #23 dispatch move made `--prompt` win over the positional
+  start token on .hydra2 too, so the R12 text/numeric parity check
+  compared different START tokens (the header line differs); the
+  streams only become equal with the #30 prefill. The gate's byte
+  comparison then needed to exclude the metadata header line — and
+  my first regex excluded `^\[Hydra\]:` (with a colon) while the
+  line is `[Hydra] .hydra2 ...` (no colon), so the exclusion
+  silently did nothing until the second fix.
+  (3) The meta-tamper helper computed FILE offsets from the
+  container's `meta_blob` offsets — but the blob is a COMPACT
+  re-serialization (key bytes, value bytes, no headers), not the
+  on-disk region; the tamper wrote the wrong 4 bytes, the file still
+  opened, and the refusal check failed. The on-disk wire format
+  (u32 count, then klen/vlen-prefixed pairs) has to be walked from
+  `metadata_offset`.
+  (4) The first GQA pin (`12 12 12 12 12 12 5 5 5 5 13 5`) was
+  captured from a binary that had NOT been rebuilt after the
+  mapping fix — it is the OLD interleave stream; a scripted
+  A/B (build-swap-build-run per mapping) showed every tested
+  geometry actually differs, and the corrected pin is
+  `15 9 12 12 9 13 13 13 13 13 10 13`.
+  (5) Node's ASYNC execFile error object carries the exit code in
+  `.code` (the SYNC throw uses `.status`), so the refusal branch
+  (`rc === 2`) after the #27 async conversion never matched and the
+  inspect endpoint returned 500 for broken .hydra2 files.
+- **Fix/lesson (one rule each):** anchors and pins are ALWAYS
+  verified by an independent implementation (byte-level Python replay
+  for the packing; a scripted build/swap/run A/B for any stream pin,
+  which must prove old != new before the pin is meaningful); offsets
+  across an API boundary are re-derived from the on-disk format, not
+  from the in-memory view; a rebuilt binary is verified (mtime or a
+  canary behavior) before it pins anything; sync/async subprocess
+  error shapes differ in every runtime — read the docs, don't assume.
+
 
 ## 2026-10-30 (round 12) — cppcheck found two warnings the local gates could not (one a real latent OOB), and the CI logs were unreadable from this sandbox
 

@@ -519,7 +519,8 @@ jobs:
       # the build instead of continuing. LeakSanitizer is disabled
       # (detect_leaks=0) because the engine's design keeps mmap'd model
       # regions for the process lifetime; ASan's other checks and
-      # UBSan remain fully active.
+      # UBSan (and LeakSanitizer - see the export below) remain fully
+      # active.
       - name: Sanitizers (ASan+UBSan) over the whole test suite
         run: |
           set -euo pipefail
@@ -529,7 +530,12 @@ jobs:
           cc $CF -o /tmp/asan-large-model-test src/hydra_engine.c tests/test_large_model.c -lm
           cc $CF -o /tmp/asan-hydra2-test src/hydra_v2_container.c src/hydra_engine.c tests/test_hydra2_container.c -lm
           cc $CF -o /tmp/asan-hydra-moe-test src/hydra_moe.c src/hydra_v2_container.c src/hydra_engine.c tests/test_hydra_moe.c -lm
-          export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1
+          # detect_leaks=1 (round 13, Qodo #6): the suite is LSan-clean
+          # since the container munmaps its trunk mapping with the
+          # REMEMBERED length (trunk_map_len was never set, so
+          # munmap(ptr, 0) was a no-op leak). Verified 2026-10-30 on
+          # all five binaries below.
+          export ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1
           /tmp/asan-hydra-test
           /tmp/asan-jni-batch-test
           /tmp/asan-large-model-test
@@ -541,8 +547,9 @@ jobs:
           python3 tools/make_model.py .asan-moefix4.hydra2 --moe-full --layers 1 --experts 4 --top-k 2 --dim 256 --n-heads 8 --head-dim 32 --inter 64 --moe-ternary 64
           python3 tools/make_model.py .asan-moefix5.hydra2 --moe-full --layers 2 --moe-no-vocab
           python3 tools/make_model.py .asan-moefix6.hydra2 --moe-full --layers 2 --moe-attn-ternary
-          /tmp/asan-hydra-moe-test .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2
-          rm -f .asan-pyfix.hydra2 .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2
+          python3 tools/make_model.py .asan-moefix7.hydra2 --moe-full --layers 2 --n-heads 4 --head-dim 4 --n-kv-heads 2
+          /tmp/asan-hydra-moe-test .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2 .asan-moefix7.hydra2
+          rm -f .asan-pyfix.hydra2 .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2 .asan-moefix7.hydra2
 
       - name: Upload failure logs
         if: failure()

@@ -56,6 +56,7 @@ static const char *g_nvpath;      /* argv[5]: moe-full --moe-no-vocab   */
 static const char *g_at64path;    /* argv[6]: moe-full --moe-attn-ternary 64
                                      (ternary attention trunk tensors +
                                       paired F32 .scale tensors)          */
+static const char *g_gqapath;     /* argv[7]: GQA fixture (n_heads 4, n_kv_heads 2, dim 16) */
 
 static void make_dirs(void)
 {
@@ -680,6 +681,52 @@ static void test_moe_sampler(void)
     hydra_moe_sample(lg7, 8, &t2, 1.0, 0.1, 1.0, 0, NULL, &r2);
     CHECK(t1 == t2, "same seed -> same token");
 
+    /* temperature must actually SCALE the distribution (round 13,
+     * Qodo #8: the old code divided exp(v-mx) by T and renormalized,
+     * which cancels T - every temperature sampled identically).
+     * logits [3,2,1,0], seed 3 -> r = 0.8425... in the CDF:
+     *   T=0.5: P ~ [0.865, 0.117, 0.016, 0.002] -> token 0
+     *   T=1.0: P ~ [0.644, 0.237, 0.087, 0.032] -> token 1
+     *   T=2.0: P ~ [0.455, 0.276, 0.167, 0.102] -> token 2
+     * Pre-fix all three calls returned token 1. */
+    float lt[4] = { 3.0f, 2.0f, 1.0f, 0.0f };
+    uint32_t ta = 99, tb = 99, tc = 99;
+    uint64_t rs_a = 3, rs_b = 3, rs_c = 3;
+    CHECK(hydra_moe_sample(lt, 4, &ta, 0.5, 0.0, 1.0, 0, NULL, &rs_a) == 0,
+          "temp 0.5 ok");
+    CHECK(hydra_moe_sample(lt, 4, &tb, 1.0, 0.0, 1.0, 0, NULL, &rs_b) == 0,
+          "temp 1.0 ok");
+    CHECK(hydra_moe_sample(lt, 4, &tc, 2.0, 0.0, 1.0, 0, NULL, &rs_c) == 0,
+          "temp 2.0 ok");
+    CHECK(ta == 0, "temp 0.5 -> token 0 (sharper distribution)");
+    CHECK(tb == 1, "temp 1.0 -> token 1");
+    CHECK(tc == 2, "temp 2.0 -> token 2 (flatter distribution)");
+    CHECK(ta != tb && tb != tc, "three temperatures -> three different "
+          "tokens (T cannot cancel out)");
+
+    /* the penalty walk covers the WHOLE window, not min(window,
+     * vocab) (round 13, Qodo #21): vocab 4, window 6, token 0 occurs
+     * 4 times - two of them at window indexes 4 and 5, BEYOND the
+     * old vocab cap of 4. New: 2.0/2/2/2/2 = 0.125, so the un-recent
+     * token 3 (0.5) wins. Pre-fix (cap = 4) only the first two
+     * occurrences counted: 2.0/2/2 = 0.5, TIE with token 3 -> the
+     * lower id 0 won. */
+    float lw[4] = { 2.0f, 0.5f, 0.5f, 0.5f };
+    uint32_t rw[6] = { 0, 0, 1, 2, 0, 0 };
+    uint64_t rr = 7;
+    CHECK(hydra_moe_sample(lw, 4, &tok, 0.0, 1.0, 2.0, 6, rw, &rr) == 0,
+          "window > vocab ok");
+    CHECK(tok == 3, "repeats beyond the vocab cap are penalized (token 3)");
+
+    /* a NULL rng_state is refused on the STOCHASTIC path (round 13,
+     * Qodo #19 - was an unchecked dereference) but stays legal for
+     * pure greedy callers (no RNG is consumed there). */
+    CHECK(hydra_moe_sample(lg, 5, &tok, 1.0, 0.5, 1.0, 0, NULL, NULL) == -1,
+          "stochastic path with NULL rng -> -1");
+    CHECK(hydra_moe_sample(lg, 5, &tok, 0.0, 1.0, 1.0, 0, NULL, NULL) == 0,
+          "greedy path with NULL rng ok");
+    CHECK(tok == 1, "greedy with NULL rng still picks argmax 1");
+
     /* guards */
     CHECK(hydra_moe_sample(NULL, 5, &tok, 1.0, 0.5, 1.0, 0, NULL, &rng) == -1,
           "NULL logits -> -1");
@@ -868,6 +915,95 @@ static void test_moe_dequant_unit(void)
           "odd rows*cols refused (1x3)");
 }
 
+static void test_moe_dequant_flat_unit(void)
+{
+    section("flat ternary dequant: payload vs independent reference "
+            "(round 13, Qodo #3)");
+    /* 256 elements, group 64 -> 4 full groups; codes cycle 0,1,2,3
+     * (zero, +1, -1, reserved) so every code path runs in every
+     * group; scales cover sign flips and sub-1 magnitudes. */
+    enum { N = 256, GROUP = 64, NBYTES = 128 };
+    /* TERNARY2 packing: 2 elements per byte (even element in the low
+     * 2 bits, the odd one in bits 2-3) -> n/2 bytes per n elements. */
+    uint8_t payload[NBYTES];
+    for (int i = 0; i < NBYTES; i++)
+        payload[i] = (uint8_t)((i % 4u) * 0x33u); /* 00,33,66,99,... */
+    static const float scales[4] = { 1.0f, -2.5f, 0.125f, 4.0f };
+    static const float expect_code[4] = { 0.0f, 1.0f, -1.0f, 0.0f };
+
+    float out[N], ref[N];
+    CHECK(hydra_moe_dequant_flat(payload, scales, N, GROUP, out) == 0,
+          "flat dequant ok");
+    /* independent reference: stride the groups first (the engine
+     * strides the elements first) and take the code from the byte
+     * table a different way. */
+    for (int g = 0; g < N / GROUP; g++) {
+        for (int k = 0; k < GROUP; k++) {
+            const uint64_t i = (uint64_t)g * GROUP + k;
+            const uint8_t byte = payload[i / 2u];
+            const uint8_t code = (k & 1u)
+                ? (uint8_t)(byte >> 2) & 0x3u : (uint8_t)byte & 0x3u;
+            ref[i] = expect_code[code] * scales[g];
+        }
+    }
+    int allmatch = 1;
+    for (int i = 0; i < N; i++)
+        if (!(out[i] == ref[i])) allmatch = 0;
+    CHECK(allmatch, "flat dequant == independent reference (bit-strict)");
+    /* hand-verified anchors (2026-10-30, replayed byte by byte): the
+     * bytes 00,33,66,99 give the code pattern 0,0,3,0,2,1,1,2 every
+     * 8 elements (code table 00=0, 01=+1, 10=-1, 11=reserved). */
+    CHECK(out[0] == 0.0f, "e0: code 00 -> 0 * 1.0");
+    CHECK(out[2] == 0.0f, "e2: code 11 -> reserved -> 0");
+    CHECK(out[4] == -1.0f, "e4: code 10 -> -1 * 1.0 (group 0)");
+    CHECK(out[5] == 1.0f, "e5: code 01 -> +1 * 1.0 (group 0)");
+    CHECK(out[66] == 0.0f, "e66: code 11 -> reserved -> 0 (group 1)");
+    CHECK(out[68] == 2.5f, "e68: code 10 -> -1 * -2.5 (group 1)");
+    CHECK(out[77] == -2.5f, "e77: code 01 -> +1 * -2.5 (group 1)");
+    CHECK(out[79] == 2.5f, "e79: code 10 -> -1 * -2.5 (group 1)");
+    CHECK(out[132] == -0.125f, "e132: code 10 -> -1 * 0.125 (group 2)");
+    CHECK(out[196] == -4.0f, "e196: code 10 -> -1 * 4.0 (group 3)");
+    CHECK(out[197] == 4.0f, "e197: code 01 -> +1 * 4.0 (group 3)");
+    CHECK(out[255] == -4.0f, "e255: code 10 -> -1 * 4.0 (last element)");
+
+    /* The aliasing guard must be MEANINGFUL: replay the pre-round-13
+     * in-place call pattern (read the code at byte k/2, write the F32
+     * result at byte 4k, one buffer) and show it corrupts the value
+     * already at element 4 - the write of e0 (bytes 0..3) destroys
+     * the codes e1..e7 are still about to read. This is the same
+     * divergence the model-level AT64 stream pin exhibits. If a
+     * future payload made the simulation match, this test would say
+     * so loudly instead of pinning silently. */
+    uint8_t inplace[N * 4u];
+    memcpy(inplace, payload, sizeof payload);
+    for (int k = 0; k < N; k++) {
+        const uint8_t code = (k & 1u)
+            ? (uint8_t)((inplace[k / 2u] >> 2) & 0x3u)
+            : (uint8_t)(inplace[k / 2u] & 0x3u);
+        const int t = (code == 1) ? 1 : (code == 2) ? -1 : 0;
+        float v = (t == 0) ? 0.0f : (t < 0) ? -scales[k / GROUP]
+                                            : scales[k / GROUP];
+        memcpy(inplace + (size_t)k * 4u, &v, sizeof v);
+    }
+    int corrupted = 0;
+    for (int k = 1; k < N; k++) {
+        float old;
+        memcpy(&old, inplace + (size_t)k * 4u, sizeof old);
+        if (!(old == ref[k])) corrupted = 1;
+    }
+    CHECK(corrupted, "in-place replay corrupts element 4+ (the bug the "
+          "separate-buffer path fixes)");
+    /* guard rails */
+    CHECK(hydra_moe_dequant_flat(NULL, scales, N, GROUP, out) == -1,
+          "NULL payload");
+    CHECK(hydra_moe_dequant_flat(payload, NULL, N, GROUP, out) == -1,
+          "NULL scales");
+    CHECK(hydra_moe_dequant_flat(payload, scales, N, 0, out) == -1,
+          "group 0");
+    CHECK(hydra_moe_dequant_flat(payload, scales, N + 1, GROUP, out) == -1,
+          "odd element count");
+}
+
 static void test_moe_ternary_open(void)
 {
     section("ternary fixtures: open + geometry (S64/S128)");
@@ -945,8 +1081,15 @@ static int copy_file(const char *src, const char *dst)
 {
     FILE *in = fopen(src, "rb");
     if (!in) return -1;
-    FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); return -1; }
+    /* CodeQL C1 (2026-10-30): the destination is created 0600 (owner
+     * only) via open() - the tamper fixtures live in /tmp and must
+     * not be world-readable; fopen "wb" would yield 0666 & ~umask.
+     * O_NOFOLLOW: a planted symlink in /tmp must not redirect the
+     * test's writes elsewhere. */
+    int fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) { fclose(in); return -1; }
+    FILE *out = fdopen(fd, "wb");
+    if (!out) { close(fd); fclose(in); return -1; }
     uint8_t buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, in)) > 0)
@@ -1078,6 +1221,12 @@ static void test_moe_vocab_codec(void)
           "BPE: unmapped byte is refused (-3)");
     CHECK(hydra_moe_encode_text(&m, "a\xC3" "\x28" "b", out, 32) == -2,
           "BPE: invalid UTF-8 is refused (-2)");
+    /* invalid LEADING byte: the old validator returned 0 for BOTH
+     * "valid" and "invalid at offset 0", so this slipped past the
+     * check and died as 'unmapped byte 0xFF' (-3) - round 13, Qodo
+     * #20. It must be a UTF-8 refusal (-2) now. */
+    CHECK(hydra_moe_encode_text(&m, "\xFF", out, 32) == -2,
+          "BPE: invalid UTF-8 at offset 0 is refused (-2, not -3)");
     CHECK(hydra_moe_encode_text(&m, "abcde", out, 2) == -4,
           "BPE: overflow is refused (-4)");
     CHECK(hydra_moe_encode_text(&m, NULL, out, 32) == -5,
@@ -1276,10 +1425,17 @@ static void test_moe_attn_ternary(void)
     /* greedy pin of the --moe-attn-ternary 64 fixture (2 layers,
      * dim 8): attention matrices are TERNARY2_S64 trunk tensors with
      * paired F32 '<name>.scale' tensors; the engine materializes
-     * code*scale into F32 and runs the identical F32 math. */
+     * code*scale into F32 and runs the identical F32 math.
+     * RE-PINNED 2026-10-30 (round 13, Qodo #3): the old pin was taken
+     * while moe_get_tensor dequantized IN PLACE (the F32 write at
+     * byte 4k corrupted the packed bytes still to be read from byte
+     * k/2), so the old stream ran on scrambled attention weights.
+     * The pin below is the first pin of the CORRECTLY dequantized
+     * fixture - any regression of the separate-buffer path (or of the
+     * ternary packing) changes this stream. */
     uint32_t got[TPIN_STEPS];
     static const uint32_t AT64[TPIN_STEPS] = {
-        10, 5, 10, 5, 10, 5, 10, 5, 10, 5, 10, 5,
+        12, 10, 10, 10, 5, 10, 10, 5, 10, 5, 10, 5,
         10, 5, 10, 5, 10, 5, 10, 5, 10, 5, 10, 5
     };
     CHECK(run_greedy_stream(g_at64path, 7, 0x9E3779B97F4A7C15ull,
@@ -1352,6 +1508,138 @@ static void test_moe_attn_ternary(void)
     unlink(tmp);
 }
 
+
+/* helper: FILE offset of a 4-byte metadata value (UINT64_MAX if
+ * absent). The container's meta_blob is a COMPACT re-serialization
+ * (key bytes, value bytes, no headers) - blob offsets are NOT file
+ * offsets. So walk the on-disk region in wire format (hydra_v2_
+ * container.c 4.4: u32 count, then per pair u32 key_len, u32
+ * val_len, key bytes, val bytes). */
+static uint64_t meta_value_file_off(const char *path, const char *key)
+{
+    uint64_t meta_off = 0, meta_bytes = 0;
+    hydra_moe_t probe;
+    if (hydra_moe_open(path, &probe) != 0) return UINT64_MAX;
+    meta_off = probe.container.metadata_offset;
+    meta_bytes = probe.container.metadata_bytes;
+    hydra_moe_close(&probe);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return UINT64_MAX;
+    uint8_t *reg = (uint8_t *)malloc(meta_bytes);
+    if (reg) {
+        if (fseek(f, (long)meta_off, SEEK_SET) == 0 &&
+            fread(reg, 1, meta_bytes, f) == meta_bytes) {
+            uint32_t count = (uint32_t)reg[0] | ((uint32_t)reg[1] << 8) |
+                             ((uint32_t)reg[2] << 16) |
+                             ((uint32_t)reg[3] << 24);
+            uint64_t off = 4;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t klen = (uint32_t)reg[off] |
+                                ((uint32_t)reg[off + 1] << 8) |
+                                ((uint32_t)reg[off + 2] << 16) |
+                                ((uint32_t)reg[off + 3] << 24);
+                uint32_t vlen = (uint32_t)reg[off + 4] |
+                                ((uint32_t)reg[off + 5] << 8) |
+                                ((uint32_t)reg[off + 6] << 16) |
+                                ((uint32_t)reg[off + 7] << 24);
+                if (vlen == 4 && klen == strlen(key) &&
+                    memcmp(reg + off + 8, key, klen) == 0) {
+                        free(reg);
+                        fclose(f);
+                        return meta_off + off + 8 + klen;
+                }
+                off += 8 + klen + vlen;
+                if (off + 8 > meta_bytes) break;
+            }
+        }
+        free(reg);
+    }
+    fclose(f);
+    return UINT64_MAX;
+}
+
+static void test_moe_shape_gqa(void)
+{
+    section("shape validation + GQA (round 13, Qodo #17/#26/#28)");
+    hydra_moe_t m;
+    static const char *const tmp = "/tmp/hydra_moe_shape.hydra2";
+
+    /* #28: a kv cache whose dim does NOT match n_kv_heads * head_dim
+     * must be refused by forward (pre-fix: the head-strided reads
+     * wandered outside the intended slots). */
+    if (hydra_moe_open(g_fixpath, &m) == 0) {
+        float *kb = (float *)malloc(4 * 8 * sizeof(float));
+        float *vb = (float *)malloc(4 * 8 * sizeof(float));
+        hydra_kv_cache_t wrong[1];
+        if (kb && vb && hydra_kv_cache_init(wrong, kb, vb, 9, 4, 1) == 0) {
+            float lg[16];
+            CHECK(hydra_moe_forward(&m, 0, 0, lg, wrong) == -1,
+                  "kv cache with mismatched dim -> -1 (#28)");
+        } else CHECK(0, "set up mismatched kv cache");
+        free(kb); free(vb);
+        hydra_moe_close(&m);
+    } else CHECK(0, "open fixture for kv-dim check");
+
+    /* #17: n_heads * head_dim that WRAPS AROUND in 32-bit arithmetic:
+     * (2 + 2^30) * 4 == 8 (mod 2^32) 'equals' dim 8 after the wrap.
+     * Pre-fix the shape check passed and open succeeded; now -7. */
+    const uint64_t off_nh = meta_value_file_off(g_fixpath, "v2.n_heads");
+        CHECK(off_nh != UINT64_MAX, "v2.n_heads meta locatable");
+        unlink(tmp);
+        CHECK(copy_file(g_fixpath, tmp) == 0, "copy for n_heads tamper");
+        {
+            FILE *f = fopen(tmp, "r+b");
+            if (f) {
+                uint32_t wrapped = 1073741826u; /* 2 + 2^30 */
+                fseek(f, (long)off_nh, SEEK_SET);
+                fwrite(&wrapped, sizeof wrapped, 1, f);
+                fclose(f);
+            }
+        }
+    CHECK(hydra_moe_open(tmp, &m) == -7,
+          "32-bit-wrap n_heads*head_dim == dim is refused (#17)");
+    hydra_moe_close(&m);
+
+    /* #26a: n_kv_heads that does not divide n_heads (8 % 3 != 0) must
+     * be refused at open - pre-fix it opened fine and the block
+     * mapping then computed kv heads beyond n_kv_heads (OOB). */
+    const uint64_t off_nkv = meta_value_file_off(g_t64lgpath, "v2.n_kv_heads");
+        CHECK(off_nkv != UINT64_MAX, "v2.n_kv_heads meta locatable");
+        CHECK(copy_file(g_t64lgpath, tmp) == 0, "copy for n_kv_heads tamper");
+        {
+            FILE *f = fopen(tmp, "r+b");
+            if (f) {
+                uint32_t nkv3 = 3u;
+                fseek(f, (long)off_nkv, SEEK_SET);
+                fwrite(&nkv3, sizeof nkv3, 1, f);
+                fclose(f);
+            }
+        }
+    CHECK(hydra_moe_open(tmp, &m) == -7,
+          "n_heads %% n_kv_heads != 0 is refused (#26)");
+    hydra_moe_close(&m);
+    unlink(tmp);
+
+    /* #26b: a real GQA model (n_heads 4, n_kv_heads 2) opens and the
+     * stream pin encodes the BLOCK mapping (head i reads kv head
+     * i / (nh/nkv)). The old interleave (i % nkv) produced
+     * `12 12 12 12 12 12 5 5 5 5 13 5` on this fixture; the pinned
+     * stream below is the fixed one. */
+    static const uint32_t TPIN_GQA[12] = {
+        15, 9, 12, 12, 9, 13, 13, 13, 13, 13, 10, 13
+    };
+    CHECK(hydra_moe_open(g_gqapath, &m) == 0, "GQA fixture (nkv 2) opens");
+    uint32_t got[12];
+    CHECK(run_greedy_stream(g_gqapath, 7, 0x9E3779B97F4A7C15ull, 12, got)
+          == 0, "GQA run ok");
+    int mgqa = 1;
+    for (uint32_t i = 0; i < 12; i++)
+        if (got[i] != TPIN_GQA[i]) mgqa = 0;
+    CHECK(mgqa, "GQA block-mapping stream matches the pinned tokens (#26)");
+    hydra_moe_close(&m);
+}
+
 int main(int argc, char **argv)
 {
     make_dirs();
@@ -1361,12 +1649,14 @@ int main(int argc, char **argv)
     if (argc > 4) g_t64lgpath = argv[4];
     if (argc > 5) g_nvpath = argv[5];
     if (argc > 6) g_at64path = argv[6];
+    if (argc > 7) g_gqapath = argv[7];
     if (!g_fixpath || !g_t64path || !g_t128path || !g_t64lgpath ||
-        !g_nvpath || !g_at64path) {
+        !g_nvpath || !g_at64path || !g_gqapath) {
         printf("  FAIL: fixture paths missing - run make test-run (the "
                "Makefile passes F32 as argv[1], ternary S64 as argv[2], "
                "ternary S128 as argv[3], ternary S64 large as argv[4], "
-               "no-vocab F32 as argv[5], attention-ternary S64 as argv[6])"
+               "no-vocab F32 as argv[5], attention-ternary S64 as argv[6], "
+               "GQA (n_heads 4, n_kv_heads 2) as argv[7])"
                "\n");
         g_fail = 1;
         g_tests = 1;
@@ -1382,12 +1672,14 @@ int main(int argc, char **argv)
     test_moe_sampler();
     test_moe_refusals();
     test_moe_dequant_unit();
+    test_moe_dequant_flat_unit();
     test_moe_ternary_open();
     test_moe_ternary_pin();
     test_moe_ternary_tamper();
     test_moe_vocab_codec();
     test_moe_vocab_tamper();
     test_moe_attn_ternary();
+    test_moe_shape_gqa();
     printf("\n=== %d Tests, %d failures ===\n", g_tests, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

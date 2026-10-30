@@ -118,8 +118,8 @@ static int moe_meta_f32(const char *path, const hydra_moe_t *m,
  * layout 0, so this is HYDRA2_F32 for everything in this round). */
 /* Flat tensor dequant (paired '<name>.scale' convention); the full
  * implementation is with the other dequant helpers below. */
-static int moe_dequant_flat(const uint8_t *payload, const float *scales,
-                            uint64_t n, uint32_t group, float *out);
+int hydra_moe_dequant_flat(const uint8_t *payload, const float *scales,
+                           uint64_t n, uint32_t group, float *out);
 
 static int moe_get_tensor(const char *path, hydra_moe_t *m, const char *name,
                           uint64_t want_nelem, moe_tensor_t *t)
@@ -201,12 +201,27 @@ static int moe_get_tensor(const char *path, hydra_moe_t *m, const char *name,
                      "trunk", sname);
             return moe_refuse(path, "trunk read", d, -2);
         }
-        if (moe_dequant_flat((const uint8_t *)t->data, scales,
-                             e->n_elements, group, t->data) != 0) {
+        /* Dequantize through a SEPARATE packed buffer. The payload
+         * (2 elements/byte) is read at byte k/2 while the F32 result
+         * is written at byte 4k: with src == dst the write at 4k
+         * corrupts the packed bytes still to be read, so in-place
+         * dequant silently scrambles the tensor (round-13, Qodo #3;
+         * the unit test replays the in-place pattern and shows the
+         * first corrupted element). The temporary is exactly the disk
+         * payload. */
+        uint8_t *packed = (uint8_t *)malloc(e->n_bytes ? e->n_bytes : 1u);
+        if (!packed) {
             free(scales); free(t->data); t->data = NULL;
+            return moe_refuse(path, "memory", "out of memory", -9);
+        }
+        memcpy(packed, t->data, e->n_bytes);
+        if (hydra_moe_dequant_flat(packed, scales, e->n_elements, group,
+                                   t->data) != 0) {
+            free(packed); free(scales); free(t->data); t->data = NULL;
             return moe_refuse(path, "tensor",
                               "ternary dequantization failed", -6);
         }
+        free(packed);
         free(scales);
     }
     return 0;
@@ -227,10 +242,14 @@ static void moe_free_tensor(moe_tensor_t *t)
 /* vocabulary + BPE (role 8, FORMAT-V2.md 3.2.3)                      */
 /* ------------------------------------------------------------------ */
 
-/* UTF-8 validation (RFC 3629): returns 0 when the whole buffer is
- * valid, otherwise the offset of the first invalid byte. No
- * overlongs, no surrogates, no > U+10FFFF. */
-static uint32_t moe_utf8_first_error(const uint8_t *p, uint32_t len)
+/* UTF-8 validation (RFC 3629): 0 when the whole buffer is valid,
+ * -1 when not (and *err_off set to the offset of the first invalid
+ * byte; pass NULL when the offset is not needed). No overlongs, no
+ * surrogates, no > U+10FFFF. Round-13 (Qodo #20): the old single
+ * return value used 0 for BOTH "valid" and "invalid at offset 0",
+ * so an invalid leading byte slipped past every caller. */
+static int moe_utf8_first_error(const uint8_t *p, uint32_t len,
+                                uint32_t *err_off)
 {
     uint32_t i = 0;
     while (i < len) {
@@ -238,24 +257,27 @@ static uint32_t moe_utf8_first_error(const uint8_t *p, uint32_t len)
         uint32_t need;
         uint32_t cp;
         if (b < 0x80u) { i += 1; continue; }
-        if (b < 0xC2u) return i;                 /* 0x80-0xC1 overlong */
+        if (b < 0xC2u) goto invalid;               /* 0x80-0xC1 overlong */
         if (b < 0xE0u) { need = 1; cp = b & 0x1Fu; }
         else if (b < 0xF0u) { need = 2; cp = b & 0x0Fu; }
         else if (b < 0xF5u) { need = 3; cp = b & 0x07u; }
-        else return i;                           /* > U+10FFFF */
-        if (i + need >= len + 1 - 0 && i + need > len) return i;
+        else goto invalid;                         /* > U+10FFFF */
+        if (i + need > len) goto invalid;
         for (uint32_t k = 1; k <= need; k++) {
-            if (p[i + k] < 0x80u || p[i + k] >= 0xC0u) return i;
+            if (p[i + k] < 0x80u || p[i + k] >= 0xC0u) goto invalid;
             cp = (cp << 6) | (p[i + k] & 0x3Fu);
         }
-        if (need == 1 && cp < 0x20u) return i;           /* overlong */
-        if (need == 2 && cp < 0x800u) return i;          /* overlong */
+        if (need == 1 && cp < 0x20u) goto invalid; /* overlong */
+        if (need == 2 && cp < 0x800u) goto invalid;/* overlong */
         if (need == 3 && (cp < 0x10000u ||
                           (cp >= 0xD800u && cp <= 0xDFFFu) ||
-                          cp > 0x10FFFFu)) return i;
+                          cp > 0x10FFFFu)) goto invalid;
         i += 1 + need;
     }
     return 0;
+invalid:
+    if (err_off) *err_off = i;
+    return -1;
 }
 
 /* FNV-1a over the token strings; open-addressing map (empty slot =
@@ -372,7 +394,7 @@ static int moe_load_vocab(const char *path, hydra_moe_t *m,
         uint32_t len = 0;
         while (b[off + len] != 0u) len++;
         /* UTF-8 per string (the whole-blob check is implied) */
-        if (moe_utf8_first_error(b + off, len) != 0) {
+        if (moe_utf8_first_error(b + off, len, NULL) != 0) {
             char d[150];
             snprintf(d, sizeof d, "vocab token %u is not valid UTF-8", i);
             free(tab);
@@ -550,13 +572,21 @@ int hydra_moe_open(const char *path, hydra_moe_t *m)
     m->cfg.experts_per_layer = epl;
     m->cfg.top_k = topk;
 
-    /* --- shape relations (7) -------------------------------------- */
+    /* --- shape relations (7) --------------------------------------
+     * Round 13 (Qodo #17/#26): every product is 64-bit - in 32-bit
+     * arithmetic n_heads * head_dim could WRAP AROUND and accidentally
+     * 'equal' dim (e.g. 65536 * 65536 % 2^32 == 0) - and GQA requires
+     * n_heads % n_kv_heads == 0 (the block mapping head i -> kv head
+     * i / (n_heads / n_kv_heads) is only defined then; llama.cpp
+     * convention). */
     if (m->cfg.dim == 0 || m->cfg.vocab_size == 0 || m->cfg.n_heads == 0 ||
         m->cfg.head_dim == 0 || m->cfg.inter == 0 || m->cfg.layers == 0 ||
         m->cfg.experts_per_layer == 0 || m->cfg.top_k == 0 ||
         m->cfg.top_k > m->cfg.experts_per_layer ||
         m->cfg.n_kv_heads < 1 || m->cfg.n_kv_heads > m->cfg.n_heads ||
-        m->cfg.n_heads * m->cfg.head_dim != m->cfg.dim ||
+        m->cfg.n_heads % m->cfg.n_kv_heads != 0 ||
+        (uint64_t)m->cfg.n_heads * (uint64_t)m->cfg.head_dim !=
+            m->cfg.dim ||
         m->cfg.expert_layout > 1 ||
         m->cfg.kv_sink > 0x10000u || m->cfg.kv_ring > 0x10000u) {
         char d[240];
@@ -864,8 +894,12 @@ int hydra_moe_config(const hydra_moe_t *m, hydra_moe_config_t *out)
  * element-group order. Materialized value = code * scale (exact F32);
  * the engine then runs the identical F32 path (the same materialize-
  * and-reuse decision as the layout-1 experts). */
-static int moe_dequant_flat(const uint8_t *payload, const float *scales,
-                            uint64_t n, uint32_t group, float *out)
+/* Public (test-visible): the flat tensor dequant that moe_get_tensor
+ * runs for TERNARY2 trunk tensors. payload must NOT alias out - the
+ * caller materializes the packed bytes in a separate buffer first
+ * (round-13, Qodo #3; see moe_get_tensor). */
+int hydra_moe_dequant_flat(const uint8_t *payload, const float *scales,
+                           uint64_t n, uint32_t group, float *out)
 {
     if (!payload || !scales || !out || !group) return -1;
     if (n % 2u) return -1;
@@ -992,15 +1026,19 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
     if (!m || !m->container_open || !logits_out) return -1;
     const hydra_moe_config_t *c = &m->cfg;
     if (token_in >= c->vocab_size) return -1;
-    if (kv_per_layer && c->layers > 0) {
-        for (uint32_t l = 0; l < c->layers; l++) {
-            if (!kv_per_layer[l].k || !kv_per_layer[l].v) return -1;
-        }
-    }
-
     const uint32_t dim = c->dim, hd = c->head_dim;
     const uint32_t nh = c->n_heads, nkv = c->n_kv_heads;
     const uint32_t inter = c->inter;
+    if (kv_per_layer && c->layers > 0) {
+        for (uint32_t l = 0; l < c->layers; l++) {
+            if (!kv_per_layer[l].k || !kv_per_layer[l].v) return -1;
+            /* Round 13 (Qodo #28): the cache geometry must match the
+             * model's KV heads - with a mismatched cache dim the
+             * head-strided reads (kbuf + kh * hd) wander outside the
+             * slots the caller actually allocated. */
+            if (kv_per_layer[l].dim != nkv * hd) return -1;
+        }
+    }
 
     /* buffers (dim <= 4096 is the rmsnorm bound; inter <= 65536 here is
      * not checked against that bound - the swiglu call uses inter, so
@@ -1059,8 +1097,16 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
         /* attention over resident entries + current token */
         const float scale = 1.0f / sqrtf((float)hd);
         uint32_t n_res = kv_per_layer ? hydra_kv_cache_size(&kv_per_layer[l]) : 0u;
+        const uint32_t gqa = nh / nkv; /* kv heads per group */
         for (uint32_t i = 0; i < nh; i++) {
-            const uint32_t kh = i % nkv;
+            /* BLOCK mapping (llama.cpp convention): contiguous query
+             * heads share one kv head - head i reads kv head
+             * i / (nh/nkv). The old i % nkv INTERLEAVED the heads,
+             * which no reference implementation does and which gives
+             * wrong attention for any n_kv_heads > 1 (round 13,
+             * Qodo #26; identical for n_kv_heads == 1, so all pinned
+             * fixtures are unaffected). */
+            const uint32_t kh = i / gqa;
             const float *qh = q + i * hd;
             const float *kh_base = k + kh * hd;
             uint32_t n = n_res + 1;
@@ -1251,16 +1297,19 @@ int hydra_moe_sample(const float *logits, uint32_t vocab,
         rep_penalty < 0.5 || rep_penalty > 2.0)
         return -1;
 
-    /* penalize repeats of the last `window` tokens (sign-preserving) */
+    /* penalize repeats of the last `window` tokens (sign-preserving).
+     * recent_tokens must hold at least `window` entries; each
+     * occurrence in the window compounds the penalty (round 13,
+     * Qodo #21: the old code capped the walk at `vocab`, silently
+     * dropping tokens from a window longer than the vocabulary). */
     float *adj = (float *)malloc((size_t)vocab * sizeof(float));
     if (!adj) return -1;
     for (uint32_t t = 0; t < vocab; t++) {
         float v = logits[t];
         if (MOE_NAN_CHECK(v)) { free(adj); return -1; }
         if (recent_tokens) {
-            uint32_t start = window > vocab ? vocab : window;
-            for (uint32_t w = 1; w <= start; w++) {
-                if (recent_tokens[w - 1] == t) {
+            for (uint32_t w = 0; w < window; w++) {
+                if (recent_tokens[w] == t) {
                     v = (v > 0.0f) ? (float)(v / rep_penalty)
                                    : (float)(v * rep_penalty);
                 }
@@ -1280,14 +1329,17 @@ int hydra_moe_sample(const float *logits, uint32_t vocab,
         return 0;
     }
 
-    /* stable softmax with scale 1/temperature */
+    /* stable softmax with scale 1/temperature: the temperature must
+     * scale the EXPONENT, not the exp result - dividing exp(v-mx) by
+     * T and then renormalizing cancels T entirely (round-13, Qodo #8:
+     * every temperature sampled the identical distribution). */
     const float T = (float)temperature;
     float mx = -INFINITY;
     for (uint32_t t = 0; t < vocab; t++)
         if (adj[t] > mx) mx = adj[t];
     float sum = 0.0f;
     for (uint32_t t = 0; t < vocab; t++) {
-        adj[t] = expf(adj[t] - mx) / T;
+        adj[t] = expf((adj[t] - mx) / T);
         sum += adj[t];
     }
     for (uint32_t t = 0; t < vocab; t++) adj[t] /= sum;
@@ -1312,7 +1364,11 @@ int hydra_moe_sample(const float *logits, uint32_t vocab,
     }
     for (uint32_t t = 0; t < vocab; t++) adj[t] /= keep_sum;
 
-    /* CDF walk with the shared xorshift64* RNG */
+    /* CDF walk with the shared xorshift64* RNG. The stochastic path
+     * REQUIRES an RNG state (round-13, Qodo #19: a NULL state here
+     * was an unchecked dereference; greedy never reaches this point,
+     * so NULL stays legal for pure argmax callers). */
+    if (!rng_state) { free(adj); return -1; }
     double r = (double)(moe_xorshift64s(rng_state) >> 11) *
                (1.0 / 9007199254740992.0); /* [0,1) 53-bit */
     float acc = 0.0f;
@@ -1360,11 +1416,14 @@ int hydra_moe_encode_text(const hydra_moe_t *m, const char *text,
     if (!m->container_open || !m->has_vocab) return -1;
     const uint8_t *t = (const uint8_t *)text;
     const uint32_t len = (uint32_t)strlen(text);
-    if (moe_utf8_first_error(t, len) != 0) {
-        fprintf(stderr,
-                "[MoE] text prompt: invalid UTF-8 at byte offset %u\n",
-                moe_utf8_first_error(t, len));
-        return -2;
+    {
+        uint32_t uerr = 0;
+        if (moe_utf8_first_error(t, len, &uerr) != 0) {
+            fprintf(stderr,
+                    "[MoE] text prompt: invalid UTF-8 at byte offset %u\n",
+                    uerr);
+            return -2;
+        }
     }
     if (len > max_tokens) return -4;
     /* The working sequence never grows (merging only shrinks), so it

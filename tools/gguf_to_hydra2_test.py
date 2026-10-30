@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end tests for tools/gguf_to_hydra2.py (round 12, M2.2/M3.1/M4).
+"""End-to-end tests for tools/gguf_to_hydra2.py (round 12, M2.2/M3.1/M4;
+round 13, Qodo #1/#2/#4/#9/#15/#24).
 
     python3 tools/gguf_to_hydra2_test.py [path/to/hydra-run]
 
@@ -11,17 +12,30 @@ verifies:
      the identical token stream (determinism);
   2. a single flipped byte in the expert section changes the outcome
      (refusal or different stream) - the weights actually flow;
-  3. embed is exactly the transposed tok_emb (independent re-read of
-     both files, F32-exact);
-  4. every expert payload is exactly the masked/scaled dense FFN
-     (independent re-computation from the dense trunk matrices);
+  3. embed is exactly the tok_emb bytes in GGUF FILE order (independent
+     re-read of both files, F32-exact) - the round-13 layout fix: the
+     engine layout IS the file order, so any rearrangement (the old
+     transpose) scrambles every non-square tensor;
+  4. every expert payload is exactly the masked dense FFN with the
+     correct scaling - gate x1, up xE (independent re-computation from
+     the dense trunk matrices; the round-13 fix: SiLU is nonlinear, so
+     the gate rows must stay unscaled);
   5. the embedded vocabulary is byte-exact (NUL-terminated tokens);
   6. the v2 metadata agrees with the GGUF architecture;
   7. the router rows are all-zero (the documented uniform router);
   8. merges: a GGUF WITH merge rules produces exactly the expected
      u16 pair rules; unresolvable rules are skipped;
+  8b. E=1 vs E=2 equivalence: the same source GGUF converted with
+      --max-experts 1 and 2 yields IDENTICAL greedy streams (the masked
+      decomposition is behaviourally the dense FFN);
+  8c. token normalisation: SPM U+2581-glyph tokens are stored
+      byte-equivalent (' b' not '\u2581b') and merges resolve through
+      the normalised ids (Qodo #15 - real llama vocabs have no
+      single-byte space token);
   9. loud refusals: non-GGUF input, Q4_0 tensors, non-llama
-     architecture, missing tokens, mismatched dimensions.
+     architecture, missing tokens, mismatched dimensions, empty/NUL/
+     duplicate tokens, a wrongly shaped output norm, and a merge
+     operand above the 16-bit pair format.
 
 Every check exits non-zero on failure (the CI gate contract).
 """
@@ -159,32 +173,48 @@ def main():
         check('flipped expert byte is refused (CRC32 mismatch)',
               rc3 != 0, 'engine accepted a tampered expert payload')
 
-        # ============================ 3. embed transpose ===============
+        # ============================ 3. embed file order ==============
+        # The embedding's GGUF dims are ggml [dim, vocab] (ne[0] = the
+        # contiguous dim); its FILE bytes are already the engine's
+        # [vocab][dim] embed layout (token t's vector is the contiguous
+        # run at offset t*dim). The converter must copy in file order -
+        # any rearrangement (the pre-round-13 transpose) scrambles every
+        # non-square tensor, and this non-square fixture (64 x 99) makes
+        # the difference visible. Independent re-read, F32-exact.
         g = gguf_reader.GgufFile.open(gguf)
         dim = struct.unpack('<I', meta['v2.dim'])[0]
         vocab = struct.unpack('<I', meta['v2.vocab_size'])[0]
         tok_emb = g.find('token_embd.weight') or g.find('tok_emb')
+        eshape = tok_emb.shape()
         ok = True
         detail = ''
-        for r0 in range(0, dim, 64):
-            rows = g.decode_rows(tok_emb, r0, min(64, dim - r0))
-            n_cols = len(rows) // min(64, dim - r0)
-            for i in range(min(64, dim - r0)):
+        for r0 in range(0, eshape[0], 64):
+            n = min(64, eshape[0] - r0)
+            rows = g.decode_rows(tok_emb, r0, n)
+            for i in range(n):
                 d = r0 + i
-                row = rows[i * n_cols:(i + 1) * n_cols]
+                row = rows[i * eshape[1]:(i + 1) * eshape[1]]
                 for v, val in enumerate(row):
                     if (f32_at_off(trunk, tensors['embed'][4]
-                                   + (v * dim + d) * 4) != val):
+                                   + (d * eshape[1] + v) * 4) != val):
                         ok = False
-                        detail = 'd=%d v=%d' % (d, v)
+                        detail = 'i=%d' % (d * eshape[1] + v)
                         break
                 if not ok:
                     break
             if not ok:
                 break
-        check('embed == transposed tok_emb (F32-exact)', ok, detail)
+        check('embed == tok_emb in GGUF file order (F32-exact)', ok, detail)
 
         # ============================ 4. expert == masked dense ========
+        # The scaling must respect SiLU's nonlinearity: the engine
+        # computes SiLU(G_e b) * (U_e b), so the GATE block stays
+        # unscaled and only the UP block carries the factor E (with the
+        # uniform router's 1/E weight the sum over the experts
+        # reproduces the dense FFN). The pre-round-13 converter scaled
+        # BOTH by E, which made every E > 1 model compute a different
+        # function than the source FFN - this F32-exact re-computation
+        # pins the corrected convention.
         inter = struct.unpack('<I', meta['v2.inter'])[0]
         E = struct.unpack('<I', meta['v2.experts_per_layer'])[0]
         topk = struct.unpack('<I', meta['v2.top_k'])[0]
@@ -207,7 +237,7 @@ def main():
                 p = experts[ent[2]:ent[2] + ent[3]]
                 ng = inter * dim
                 ok_g = all(
-                    f32_at(p, i) == (E * gate[e * chunk * dim + i]
+                    f32_at(p, i) == (gate[e * chunk * dim + i]
                                      if (i // dim) >= e * chunk and
                                      (i // dim) < (e + 1) * chunk else 0.0)
                     for i in range(ng))
@@ -226,7 +256,8 @@ def main():
                     break
             if not ok:
                 break
-        check('experts == E x masked dense FFN (F32-exact)', ok, detail)
+        check('experts == masked dense FFN, gate x1 / up xE (F32-exact)',
+              ok, detail)
 
         # ============================ 5. vocab bytes ===================
         tv = tensors['vocab']
@@ -288,6 +319,59 @@ def main():
               rules == expected, '%r vs %r' % (rules, expected))
         rc4, t4 = run_engine(binary, merges_model, 3, 12)
         check('merges model runs in the engine', rc4 == 0 and t4)
+
+        # ==================== 8b. E=1 vs E=2 equivalence ===============
+        # Qodo #4 end-to-end proof: the same source GGUF converted with
+        # --max-experts 1 (dense FFN verbatim) and with --max-experts 2
+        # (two experts, up rows scaled by 2) must produce the IDENTICAL
+        # greedy token stream in the engine. The pre-round-13 scaling
+        # (both gate and up x E) broke this for every E > 1 because
+        # SiLU(E*g) * u != E * (SiLU(g) * u).
+        model_e2 = os.path.join(tmp, 'minilama-e2.hydra2')
+        rce = subprocess.run([sys.executable,
+                              os.path.join(HERE, 'gguf_to_hydra2.py'),
+                              gguf, model_e2, '--max-experts', '2'],
+                             capture_output=True, text=True)
+        check('converter --max-experts 2 exits 0', rce.returncode == 0,
+              rce.stderr)
+        rc_e2, t_e2 = run_engine(binary, model_e2, 7, 24)
+        check('E=2 greedy stream == E=1 dense stream (equivalence)',
+              rc_e2 == 0 and t_e2 == t1, '%r vs %r' % (t_e2, t1))
+        m_e2, _, _, _, _, _ = parse_v2(model_e2)
+        check('E=2 model reports 2 experts/layer and top_k 2',
+              struct.unpack('<I', m_e2['v2.experts_per_layer'])[0] == 2
+              and struct.unpack('<I', m_e2['v2.top_k'])[0] == 2)
+
+        # ==================== 8c. token normalisation ==================
+        # Qodo #15: SPM/llama vocabularies store the leading space as
+        # the U+2581 glyph, which has no byte-identity - the engine's
+        # byte->token map cannot map 0x20 and --text-prompt refused on
+        # EVERY real llama model. The converter now stores the
+        # byte-equivalent string (' b' instead of '\u2581b') and merges
+        # resolve against the normalised ids.
+        build_with_glyphs(os.path.join(tmp, 'glyphs.gguf'))
+        glyph_model = os.path.join(tmp, 'glyphs.hydra2')
+        rcg = subprocess.run([sys.executable,
+                              os.path.join(HERE, 'gguf_to_hydra2.py'),
+                              os.path.join(tmp, 'glyphs.gguf'), glyph_model],
+                             capture_output=True, text=True)
+        check('converter normalises glyph tokens and exits 0',
+              rcg.returncode == 0, rcg.stderr)
+        m4, t4m, _, trunk4, _, _ = parse_v2(glyph_model)
+        tv4 = t4m['vocab']
+        vb4 = trunk4[tv4[4]:tv4[4] + tv4[5]]
+        toks4 = vb4.split(b'\x00')[:-1]
+        check('SPM "\u2581x" tokens stored byte-equivalent (" x")',
+              toks4 == [b'a', b' b', b'a b'], repr(toks4))
+        tm4 = t4m.get('merges')
+        rules4 = (list(struct.unpack('<%dH' % (len(trunk4[
+            tm4[4]:tm4[4] + tm4[5]]) // 2),
+            trunk4[tm4[4]:tm4[4] + tm4[5]])) if tm4 else None)
+        check('glyph merge rule resolved to normalised ids [0, 1]',
+              rules4 == [0, 1], repr(rules4))
+        rc5, t5 = run_engine(binary, glyph_model, 1, 12)
+        check('normalised-glyph model runs in the engine',
+              rc5 == 0 and t5)
 
         # ============================ 9. refusals ======================
         def must_fail(name, in_path, expect_substr):
@@ -384,6 +468,42 @@ def main():
             fh.write(data)
         must_fail('dim-mismatch', baddim, 'not divisible')
 
+        # ---- token-level refusals (Qodo #2) ---------------------------
+        # The engine's vocab loader REQUIRES no empty token, no embedded
+        # NUL, no duplicates. The converter must refuse a GGUF that
+        # violates any of these at conversion time (loudly, exit 2)
+        # instead of emitting a .hydra2 the engine would refuse to open.
+        etok = os.path.join(tmp, 'emptytok.gguf')
+        build_tiny_with_tokens(etok, ['a', '', 'b'])
+        must_fail('empty-token', etok, 'is empty')
+
+        ntok = os.path.join(tmp, 'nultok.gguf')
+        build_tiny_with_tokens(ntok, ['a', 'x\x00y', 'b'])
+        must_fail('nul-token', ntok, 'embedded NUL')
+
+        dtok = os.path.join(tmp, 'duptok.gguf')
+        build_tiny_with_tokens(dtok, ['a', 'b', 'a'])
+        must_fail('duplicate-token', dtok, 'duplicates')
+
+        # ---- norm shape refusal (Qodo #24) ----------------------------
+        # a norm tensor that exists but is the wrong shape would open
+        # and compute garbage in the engine - refuse at conversion time
+        bnorm = os.path.join(tmp, 'badnorm.gguf')
+        build_tiny_with_tokens(bnorm, ['a', 'b', 'c'], norm_len=7)
+        must_fail('norm-shape', bnorm, 'expected 1-D [dim')
+
+        # ---- merge U16 overflow refusal (Qodo #9) ---------------------
+        # a merge operand above 65535 cannot fit the 16-bit pair format;
+        # struct.pack('<HH') would raise mid-conversion (uncaught
+        # traceback after the expensive decode) - refuse before that
+        bigtok = os.path.join(tmp, 'bigtok.gguf')
+        # '%06d' so that id 65536 reads 't065536' (the merge operand
+        # that must overflow the 16-bit pair format)
+        build_tiny_with_tokens(bigtok, ['t%06d' % i for i in range(70000)]
+                               + ['t000000t065536'],
+                               merges=['t000000 t065536'])
+        must_fail('merge-u16-overflow', bigtok, '16-bit')
+
         print('\nAll gguf_to_hydra2 checks passed.')
         return 0
     finally:
@@ -414,12 +534,87 @@ def build_with_merges(path):
     w.tensor('blk.0.attn_v', [dim, dim], vals(dim * dim), 'f32')
     w.tensor('blk.0.attn_o', [dim, dim], vals(dim * dim), 'f32')
     w.tensor('blk.0.attn_norm', [dim], [1.0] * dim, 'f32')
-    w.tensor('blk.0.ffn_gate', [dim, ffn], vals(dim * ffn), 'f32')
-    w.tensor('blk.0.ffn_up', [dim, ffn], vals(dim * ffn), 'f32')
-    w.tensor('blk.0.ffn_down', [ffn, dim], vals(ffn * dim), 'f32')
+    # ggml value order: a linear with dims [in, out] stores [out] rows
+    # of [in] values (see tools/gguf_minimal_llama.py)
+    w.tensor('blk.0.ffn_gate', [dim, ffn], vals(ffn * dim), 'f32')
+    w.tensor('blk.0.ffn_up', [dim, ffn], vals(ffn * dim), 'f32')
+    w.tensor('blk.0.ffn_down', [ffn, dim], vals(dim * ffn), 'f32')
     w.tensor('blk.0.ffn_norm', [dim], [1.0] * dim, 'f32')
     w.tensor('norm', [dim], [1.0] * dim, 'f32')
     w.tensor('output', [dim, 3], vals(dim * 3), 'f32')
+    with open(path, 'wb') as fh:
+        fh.write(w.serialize())
+
+
+def build_with_glyphs(path):
+    """A tiny llama GGUF whose vocabulary uses the SPM leading-space
+    glyph U+2581 (like real llama.cpp conversions) plus one merge that
+    only resolves through the normalised ids."""
+    w = gguf_minimal_llama.Writer()
+    w.s('general.architecture', 'llama')
+    w.s('tokenizer.ggml.model', 'gpt2')
+    w.u32('llama.embedding_length', 8)
+    w.u32('llama.attention.head_count', 2)
+    w.u32('llama.attention.head_count_kv', 2)
+    w.u32('llama.block_count', 1)
+    w.u32('llama.feed_forward_length', 16)
+    w.u32('tokenizer.ggml.bos_token_id', 0)
+    w.arr('tokenizer.ggml.tokens', gguf_minimal_llama.KV_STRING, None,
+          ['a', '\u2581b', 'a\u2581b'])
+    w.arr('tokenizer.ggml.merges', gguf_minimal_llama.KV_STRING, None,
+          ['a \u2581b'])
+    dim, ffn = 8, 16
+    vals = lambda n: [((i * 7919) % 1000) / 1000.0 - 0.5 for i in range(n)]
+    w.tensor('tok_emb', [dim, 3], vals(dim * 3), 'f32')
+    w.tensor('blk.0.attn_q', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_k', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_v', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_o', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_norm', [dim], [1.0] * dim, 'f32')
+    w.tensor('blk.0.ffn_gate', [dim, ffn], vals(ffn * dim), 'f32')
+    w.tensor('blk.0.ffn_up', [dim, ffn], vals(ffn * dim), 'f32')
+    w.tensor('blk.0.ffn_down', [ffn, dim], vals(dim * ffn), 'f32')
+    w.tensor('blk.0.ffn_norm', [dim], [1.0] * dim, 'f32')
+    w.tensor('norm', [dim], [1.0] * dim, 'f32')
+    w.tensor('output', [dim, 3], vals(dim * 3), 'f32')
+    with open(path, 'wb') as fh:
+        fh.write(w.serialize())
+
+
+def build_tiny_with_tokens(path, tokens, merges=None, norm_len=None):
+    """A structurally complete 1-layer llama GGUF (all tensors F32,
+    dim 8, ffn 16) with a caller-chosen token list - used by the
+    refusal tests. norm_len replaces the norm shape (the Qodo #24
+    refusal)."""
+    w = gguf_minimal_llama.Writer()
+    w.s('general.architecture', 'llama')
+    w.s('tokenizer.ggml.model', 'gpt2')
+    w.u32('llama.embedding_length', 8)
+    w.u32('llama.attention.head_count', 2)
+    w.u32('llama.attention.head_count_kv', 2)
+    w.u32('llama.block_count', 1)
+    w.u32('llama.feed_forward_length', 16)
+    w.u32('tokenizer.ggml.bos_token_id', 0)
+    w.arr('tokenizer.ggml.tokens', gguf_minimal_llama.KV_STRING, None,
+          tokens)
+    if merges:
+        w.arr('tokenizer.ggml.merges', gguf_minimal_llama.KV_STRING, None,
+              merges)
+    dim, ffn = 8, 16
+    vals = lambda n: [((i * 7919) % 1000) / 1000.0 - 0.5 for i in range(n)]
+    w.tensor('tok_emb', [dim, len(tokens)], vals(dim * len(tokens)), 'f32')
+    w.tensor('blk.0.attn_q', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_k', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_v', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_o', [dim, dim], vals(dim * dim), 'f32')
+    w.tensor('blk.0.attn_norm', [dim], [1.0] * dim, 'f32')
+    w.tensor('blk.0.ffn_gate', [dim, ffn], vals(ffn * dim), 'f32')
+    w.tensor('blk.0.ffn_up', [dim, ffn], vals(ffn * dim), 'f32')
+    w.tensor('blk.0.ffn_down', [ffn, dim], vals(dim * ffn), 'f32')
+    w.tensor('blk.0.ffn_norm', [dim], [1.0] * dim, 'f32')
+    nlen = norm_len if norm_len is not None else dim
+    w.tensor('norm', [nlen], vals(nlen), 'f32')
+    w.tensor('output', [dim, len(tokens)], vals(dim * len(tokens)), 'f32')
     with open(path, 'wb') as fh:
         fh.write(w.serialize())
 

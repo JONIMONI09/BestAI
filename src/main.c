@@ -387,21 +387,30 @@ static void meta_value_json(const uint8_t *v, uint32_t n, char *out, size_t cap)
     int printable = 1;
     for (uint32_t i = 0; i < n; ++i)
         if (v[i] < 0x21u || v[i] > 0x7Eu) { printable = 0; break; }
+    /* Round-13 (Qodo #18): every branch returns a COMPLETE JSON
+     * value - numbers bare, strings and hex blobs already quoted.
+     * The pre-fix split contract (strings unquoted, blobs quoted)
+     * was re-guessed at the call site with a first-character test
+     * that double-quoted any binary value starting with a hex digit
+     * other than '0' (e.g. "ab..." -> ""ab...""). */
     if (printable) {
         char esc[256];
         if (n >= sizeof(esc)) n = (uint32_t)(sizeof(esc) - 1);
         memcpy(esc, v, n);
         esc[n] = '\0';
-        json_escape(esc, out, cap);
-        /* string values are wrapped in quotes at the call site */
+        char tmp[sizeof(esc)];
+        json_escape(esc, tmp, sizeof tmp);
+        snprintf(out, cap, "\"%s\"", tmp);
         return;
     }
+    char tmp[2 * 256 + 8];
     size_t o = 0;
-    out[0] = '"';
-    for (uint32_t i = 0; i < n && o + 3 < cap; ++i)
-        o += (size_t)snprintf(out + o, cap - o, "%02x", v[i]);
-    out[o++] = '"';
-    out[o] = '\0';
+    tmp[o++] = '"';
+    for (uint32_t i = 0; i < n && o + 3 < sizeof tmp; ++i)
+        o += (size_t)snprintf(tmp + o, sizeof tmp - o, "%02x", v[i]);
+    tmp[o++] = '"';
+    tmp[o] = '\0';
+    snprintf(out, cap, "%s", tmp);
 }
 
 static int inspect_hydra_v1(const char *path, FILE *f, size_t file_bytes)
@@ -483,12 +492,8 @@ static int inspect_hydra_v2(const char *path, FILE *f, size_t file_bytes)
         keybuf[klen] = '\0';
         json_escape(keybuf, name, sizeof name);
         meta_value_json(c.meta_blob + kv->val_off, kv->val_len, val, sizeof val);
-        int is_string =
-            (kv->val_len != 4 && kv->val_len != 8) &&
-            (val[0] != '"' || val[1] != '0');
-        fprintf(f, "%s{\"key\":\"%s\",\"value\":%s%s%s}",
-                i ? "," : "", name,
-                is_string ? "\"" : "", val, is_string ? "\"" : "");
+        /* val is a complete JSON value (meta_value_json contract) */
+        fprintf(f, "%s{\"key\":\"%s\",\"value\":%s}", i ? "," : "", name, val);
     }
     fprintf(f, "],\"tensors\":[");
     for (uint64_t i = 0; i < c.tensor_dir_count; ++i) {
@@ -523,7 +528,12 @@ static int inspect_file(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "[Hydra] --inspect: Datei nicht lesbar: %s\n", path);
+        /* Round 13 (Qodo #25): the error must NOT echo the path -
+         * inspect output is what tools display to users, and a failed
+         * read must not leak the local filesystem layout. */
+        fprintf(stderr,
+                "[Hydra] --inspect: Datei nicht lesbar (fehlende Datei, "
+                "Zugriffsrechte oder kein reguläres Dateisystem-Objekt)\n");
         return 1;
     }
     unsigned char head[8];
@@ -700,17 +710,27 @@ static int run_moe_file(const char *model_path, long start_token, long steps,
     }
 
     /* recent-token ring for the repetition penalty: prompt tokens
-     * count, then every generated token (chronological order) */
-    uint32_t *recent = (uint32_t *)malloc((size_t)penalty_window * sizeof(uint32_t));
-    if (!recent) {
-        free(kv_k); free(kv_v); free(kvs);
-        hydra_moe_close(&m);
-        return 1;
-    }
-    size_t recent_n = 0;
-    for (size_t p = 0; p < prompt_n; ++p) {
-        recent[recent_n++ % penalty_window] = prompt[p];
-        if (recent_n > penalty_window) recent_n = penalty_window;
+     * count, then every generated token. Round-13 fixes (Qodo #16/#22):
+     * the write position is a MONOTONIC counter modulo the window -
+     * the old code indexed by recent_n clamped at the window, so after
+     * the first wraparound every write hit slot 0 (the "last" window
+     * of tokens was wrong), and a window of 0 hit `x % 0` (SIGFPE).
+     * A full ring is passed to the sampler rotated; the sampler only
+     * counts occurrences per token, so the rotation is immaterial. */
+    uint32_t *recent = NULL;
+    uint32_t recent_n = 0, recent_pos = 0;
+    if (penalty_window > 0) {
+        recent = (uint32_t *)malloc((size_t)penalty_window * sizeof(uint32_t));
+        if (!recent) {
+            free(kv_k); free(kv_v); free(kvs);
+            hydra_moe_close(&m);
+            return 1;
+        }
+        for (size_t p = 0; p < prompt_n; ++p) {
+            recent[recent_pos] = prompt[p];
+            recent_pos = (recent_pos + 1) % penalty_window;
+            if (recent_n < penalty_window) recent_n++;
+        }
     }
 
     uint32_t *tokens = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)steps);
@@ -728,11 +748,29 @@ static int run_moe_file(const char *model_path, long start_token, long steps,
 
     const int sampling_enabled = temperature > 0.0 && min_p < 1.0;
     uint64_t rng = rng_seed ? rng_seed : 0x9E3779B97F4A7C15ull;
-    uint32_t current = (uint32_t)start_token;
-    uint32_t pos = (uint32_t)prompt_n;
+
+    /* Round-13 fix (Qodo #30): the prompt now CONDITIONS the model -
+     * every prompt token except the last is run through the engine to
+     * build the KV history, and generation continues from the LAST
+     * prompt token. Pre-fix the prompt only seeded the repetition ring
+     * and the display; the generated stream ignored it entirely (the
+     * forward loop started at pos = prompt_n with current = the CLI
+     * start token, so the KV cache was empty and "conditioned on the
+     * prompt" was a lie). With an empty prompt this reduces to exactly
+     * the pre-fix behaviour (current = start_token, pos = 0). */
+    int fail = 0;
+    uint32_t pos = 0;
+    for (size_t p = 0; p + 1u < prompt_n; ++p) {
+        if (hydra_moe_forward(&m, prompt[p], pos, logits, kvs) != 0) {
+            fail = 1;
+            break;
+        }
+        ++pos;
+    }
+    uint32_t current = (prompt_n > 0) ? (uint32_t)prompt[prompt_n - 1]
+                                      : (uint32_t)start_token;
 
     double t0 = now_ms();
-    int fail = 0;
     for (long st = 0; st < steps; ++st) {
         if (hydra_moe_forward(&m, current, pos, logits, kvs) != 0) { fail = 1; break; }
         /* the greedy guard lives in hydra_moe_sample itself:
@@ -742,8 +780,11 @@ static int run_moe_file(const char *model_path, long start_token, long steps,
                              (uint32_t)recent_n,
                              recent_n ? recent : NULL, &rng) != 0) { fail = 1; break; }
         tokens[st] = current;
-        recent[recent_n++ % penalty_window] = current;
-        if (recent_n > penalty_window) recent_n = penalty_window;
+        if (penalty_window > 0) {
+            recent[recent_pos] = current;
+            recent_pos = (recent_pos + 1) % penalty_window;
+            if (recent_n < penalty_window) recent_n++;
+        }
         ++pos;
     }
     double elapsed = now_ms() - t0;
@@ -752,6 +793,35 @@ static int run_moe_file(const char *model_path, long start_token, long steps,
         free(logits); free(tokens); free(recent); free(kv_k); free(kv_v); free(kvs);
         hydra_moe_close(&m);
         return 1;
+    }
+
+    /* Round-13 fix (Qodo #7): the generated stream is reported as
+     * DECODED text, not only token ids - the decoder exists
+     * (hydra_moe_decode_token) but the CLI never called it, so users
+     * saw "10 5 10 5 ..." and had to guess the vocabulary. Only when
+     * the model carries an embedded vocabulary; a token without a
+     * string (should not happen) is skipped, not fatal. */
+    char *out_text = (char *)malloc(256);
+    size_t out_cap = out_text ? 256u : 0u, out_len = 0;
+    if (hydra_moe_has_vocab(&m)) {
+        char tbuf[1024];
+        for (long st = 0; st < steps; ++st) {
+            const int tl = hydra_moe_decode_token(&m, tokens[st], tbuf,
+                                                  (uint32_t)sizeof tbuf);
+            if (tl < 0) continue;
+            while (out_len + (size_t)tl + 1u > out_cap) {
+                const size_t nc = out_cap ? out_cap * 2u : 256u;
+                char *nb = (char *)realloc(out_text, nc);
+                if (!nb) break;
+                out_text = nb;
+                out_cap = nc;
+            }
+            if (out_len + (size_t)tl + 1u > out_cap) break;
+            memcpy(out_text + out_len, tbuf, (size_t)tl);
+            out_len += (size_t)tl;
+            out_text[out_len++] = 0;
+        }
+        if (out_len > 0) out_text[out_len - 1] = 0;
     }
 
     if (json_mode) {
@@ -772,6 +842,11 @@ static int run_moe_file(const char *model_path, long start_token, long steps,
         if (text_prompt) {
             printf(",\"text\":\"");
             json_print_string(text_prompt);
+            printf("\"");
+        }
+        if (hydra_moe_has_vocab(&m)) {
+            printf(",\"generated_text\":\"");
+            json_print_string(out_len ? out_text : "");
             printf("\"");
         }
         printf(",\"sampler\":{\"temperature\":%.4g,\"min_p\":%.4g,"
@@ -797,10 +872,14 @@ static int run_moe_file(const char *model_path, long start_token, long steps,
         }
         printf("[Tokens]: ");
         for (long st = 0; st < steps; ++st) printf("%u ", (unsigned)tokens[st]);
-        printf("\n[Timing]: %.3f ms gesamt, %.3f ms/Token\n",
+        printf("\n");
+        if (hydra_moe_has_vocab(&m))
+            printf("[Text-out]: %s\n", out_len ? out_text : "");
+        printf("[Timing]: %.3f ms gesamt, %.3f ms/Token\n",
                elapsed, steps ? elapsed / (double)steps : 0.0);
     }
 
+    free(out_text);
     free(logits); free(tokens); free(recent); free(kv_k); free(kv_v); free(kvs);
     hydra_moe_close(&m);
     return 0;
@@ -990,22 +1069,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Magic dispatch (round 12): a .hydra2 file runs on the F32
-     * sparse-MoE engine (src/hydra_moe.c), NOT on the v1-v4 loader -
-     * the two formats share nothing at runtime. The v1-v4 path below
-     * is byte-for-byte the pre-round-12 code, untouched. */
-    if (file_is_hydra2(model_path)) {
-        return run_moe_file(model_path, start_token, steps, json_mode,
-                            fast_mode, prompt, prompt_n, text_prompt,
-                            sampler.temperature, sampler.min_p,
-                            sampler.repetition_penalty,
-                            sampler.penalty_window,
-                            (uint64_t)sampler.rng_seed, sampler_set);
-    }
-
     /* Defaults fuer optionale Positional-Argumente; ausserhalb liegender
      * Werte werden explizit geklemmt und nicht mehr stillschweigend
-     * akzeptiert. */
+     * akzeptiert. Round 13 (Qodo #23): this now precedes the magic
+     * dispatch so it applies to BOTH engine paths - the .hydra2
+     * dispatch used to run with start_token = -1 / steps = -1 when
+     * the positional arguments were omitted. */
     if (start_token == -1) start_token = 42;
     if (steps == -1) steps = 16;
     if (steps < 1)   steps = 1;
@@ -1014,6 +1083,19 @@ int main(int argc, char **argv)
     /* --prompt gewinnt ueber das positionelle start_token: der Seed ist
      * dann das LETZTE Prompt-Token. Das ist explizit, nicht still. */
     if (prompt_n > 0) start_token = prompt[prompt_n - 1];
+
+    /* Magic dispatch (round 12): a .hydra2 file runs on the F32
+     * sparse-MoE engine (src/hydra_moe.c), NOT on the v1-v4 loader -
+     * the two formats share nothing at runtime. The v1-v4 path below
+     * is the pre-round-12 code, untouched. */
+    if (file_is_hydra2(model_path)) {
+        return run_moe_file(model_path, start_token, steps, json_mode,
+                            fast_mode, prompt, prompt_n, text_prompt,
+                            sampler.temperature, sampler.min_p,
+                            sampler.repetition_penalty,
+                            sampler.penalty_window,
+                            (uint64_t)sampler.rng_seed, sampler_set);
+    }
 
     HydraEngine engine;
     if (hydra_engine_load(&engine, model_path) != 0) {

@@ -41,6 +41,10 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+/* execFile: async, used by the request handlers. execFileSync: ONLY
+ * at startup (ensureDefaultModel, before server.listen - there is no
+ * event-loop traffic yet); a sync spawn inside a request handler
+ * would stall every other request (round 13, Qodo #27). */
 const { execFile, execFileSync } = require('child_process');
 const { randomUUID } = require('node:crypto');
 const trainer = require('./tools/hydra_train');
@@ -1157,21 +1161,42 @@ const server = http.createServer(async (req, res) => {
       if (rel.endsWith('.hydra2')) {
         /* The .hydra2 report is the C container reader's OWN verdict
          * (hydra-run --inspect): one validator, the same one the
-         * engine runs. execFileSync = no shell, the same invariant as
-         * every other spawn in this file. */
+         * engine runs. Round 13 (Qodo #27): ASYNC execFile - the
+         * sync variant blocked the ENTIRE event loop for up to the
+         * 10 s timeout, stalling every other request (health checks,
+         * running inferences) behind one inspect call. No shell, the
+         * same invariant as every other spawn in this file. */
         try {
-          const out = execFileSync(HYDRA_RUN, ['--inspect', abs], {
-            timeout: 10000,
-            maxBuffer: 8 * 1024 * 1024,
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'pipe'],
+          const out = await new Promise((resolve, reject) => {
+            execFile(
+              HYDRA_RUN,
+              ['--inspect', abs],
+              {
+                timeout: 10000,
+                maxBuffer: 8 * 1024 * 1024,
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+              },
+              (err, stdout, stderr) => {
+                if (err) {
+                  err.stdout = stdout;
+                  err.stderr = stderr;
+                  reject(err);
+                } else {
+                  resolve(stdout);
+                }
+              }
+            );
           });
           report = JSON.parse(out);
         } catch (e) {
           /* rc 2 = the reader refused the file: that is still a
            * successful diagnosis. Anything else (binary missing,
-           * crash) is a server-side failure. */
-          if (e.status === 2) {
+           * crash) is a server-side failure. The ASYNC execFile error
+           * carries the exit code in .code (the sync throw used
+           * .status), so both are probed (round 13, Qodo #27). */
+          const rc = e.status !== undefined ? e.status : e.code;
+          if (rc === 2) {
             try { report = JSON.parse(e.stdout || '{}'); } catch { report = {}; }
             report.reader_message = (e.stderr || '').trim();
           } else {
