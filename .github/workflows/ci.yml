@@ -59,6 +59,23 @@ jobs:
               -Iinclude --error-exitcode=2 \
               src/ tests/
 
+      # TEMPORARY (R12 debug, remove after the round): re-runs the same
+      # analysis with error-exitcode=0 and re-emits every diagnostic as
+      # an annotation, because the sandbox that triages this run cannot
+      # download job logs. Without this step a red cppcheck gate only
+      # shows "exit code 2" and not WHICH check fired.
+      - name: Cppcheck diagnostics as annotations (temporary)
+        if: always()
+        run: |
+          cppcheck --enable=warning,portability \
+              --inline-suppr --std=c99 --platform=unix64 \
+              -Iinclude --error-exitcode=0 \
+              src/ tests/ 2>&1 | grep -v '^Checking\|^$' \
+            | while IFS= read -r line; do
+                echo "::error::[cppcheck] $line"
+              done
+          exit 0
+
       # Gate 1d: Python syntax + packing consistency of the format
       # reference writer
       - name: Python lint (py_compile + format reference check)
