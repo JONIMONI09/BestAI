@@ -1178,7 +1178,11 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
                 }
                 ef = m->expert_f32buf;
             } else {
-                ef = (const float *)m->expert_scratch;
+                /* F32 expert: the scratch buffer holds the expert's raw
+                 * float32 bytes (pread'd above). The buffer is a malloc
+                 * allocation (4-byte aligned) and the payload is F32 by
+                 * format contract, so the float view is well defined. */
+                ef = (const float *)m->expert_scratch; // cppcheck-suppress invalidPointerCast
             }
             const float *gate = ef;
             const float *up   = ef + (size_t)inter * dim;

@@ -296,11 +296,12 @@ static int ref_forward(const char *path, const hydra_moe_config_t *cfg,
         {
             uint32_t done = 0;
             while (done < topk) {
-                int32_t best = -1;
-                float bv = -INFINITY;
-                for (uint32_t j = 0; j < epl; j++)
-                    if (best < 0 || rk[j] > bv) { bv = rk[j]; best = (int32_t)j; }
-                sel[done++] = (uint32_t)best;
+                /* epl >= 1 is guaranteed by the model config (n_experts
+                 * >= 1, topk <= n_experts), so index 0 is always valid. */
+                uint32_t best = 0;
+                for (uint32_t j = 1; j < epl; j++)
+                    if (rk[j] > rk[best]) best = j; /* strict >: tie -> lower id */
+                sel[done++] = best;
                 rk[best] = -INFINITY; /* selection scratch, see engine */
             }
         }
