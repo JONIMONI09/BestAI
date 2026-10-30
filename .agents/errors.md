@@ -4,6 +4,46 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-10-30 (round 12) — cppcheck found two warnings the local gates could not (one a real latent OOB), and the CI logs were unreadable from this sandbox
+
+- **Symptom:** every CI run of the R12 branch failed in the `lint`
+  job with only "Process completed with exit code 2" visible. `gh run
+  view --log-failed` and `gh run download` hit the sandbox network
+  whitelist (results-receiver / blob storage -> EOF) and the jobs API
+  returned an empty step list, so the failing step was unknown.
+  Meanwhile all local gates (gcc/clang -Werror, -fanalyzer, ASan+UBSan,
+  full test suite) were green — only cppcheck could not be run locally
+  (the proxy whitelist no longer serves the cppcheck repo; no root for
+  apt).
+- **Cause (gate red):** two real findings, both in round-12 code:
+  (1) `tests/test_hydra_moe.c` reference top-k used a `best = -1`
+  sentinel; with zero experts the elimination write `rk[best]` would
+  index -1 — `[negativeIndex]` error. (2) `src/hydra_moe.c` casts the
+  raw expert scratch buffer `uint8_t *` -> `const float *` for the F32
+  path — `[invalidPointerCast]` (portability). Second subtlety:
+  cppcheck ABORTS at 82% when it hits the first error-severity
+  finding, so a second analysis pass after the fixes was required to
+  prove the remaining files were clean (they were: 9/9, 0 findings).
+- **Fix:** (1) restructured the reference scan to a `best = 0` start
+  with a strict `>` comparison (epl >= 1 is guaranteed by the model
+  config; identical winner, tie -> lower id; 138/0 re-verified).
+  (2) documented the cast inline (malloc-aligned buffer, F32 payload by
+  format contract) + `cppcheck-suppress invalidPointerCast` — the gate
+  is explicitly run with `--inline-suppr`. Triage method that worked:
+  check-run ANNOTATIONS API (`/check-runs/<id>/annotations`) exposes
+  the failing line + exit code, and a temporary workflow step that
+  re-ran cppcheck with `--error-exitcode=0` re-emitting every line as
+  a `::error::` annotation made the findings visible. The diagnostic
+  step was removed again in the final commit.
+- **Prevention:** (1) a `-1` sentinel that can reach an array index is
+  a defect even when the caller's invariants make it unreachable —
+  write index loops so the sentinel cannot be used (init from a
+  provably-valid element); (2) for any gate whose tool is unreachable
+  locally, keep the CI reproducible from the log AND keep the
+  annotation-API fallback (see the ci-triage skill); (3) after fixing
+  findings from an aborted static-analysis run, re-run it to 100% —
+  the first pass hides what comes after the abort point.
+
 ## 2026-10-30 (round 12) — the ternary expert dequant read its scales through a misaligned float pointer (UBSan-only: the -O3 suite was green)
 
 - **Symptom:** an ASan+UBSan rebuild of `hydra-moe-test` (same

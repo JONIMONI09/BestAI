@@ -977,3 +977,40 @@ Verification state at this entry (local, 2026-10-30):
   kotlin_stub, compose_scroll, android_header/autostart/crash,
   apple_portability, ci_syntax_mirror, workflow_yaml, workflow_lint,
   llama_pin, docs_claim, test_count x86).
+
+**CI triage (2026-10-30, after the R12 push) — both workflows GREEN
+at `c5fcd38`, PR #73 ready for merge:**
+- CI run at 22a67c5 failed in the lint job with ONLY "Process
+  completed with exit code 2" visible: `gh run view --log-failed` and
+  artifact download both hit the sandbox network whitelist (results-
+  receiver / blob storage EOF), and the jobs API returned an empty
+  step list. Triage path that worked: (1) the check-run ANNOTATIONS
+  API (`/check-runs/<id>/annotations`) revealed the failing line
+  (ci.yml:69) + exit code 2; (2) exit code 2 was the signature of the
+  cppcheck gate (`--error-exitcode=2` — Python failures exit 1);
+  (3) a temporary diagnostic step (same cppcheck command,
+  `--error-exitcode=0`, every line re-emitted as a `::error::`
+  annotation) made the actual findings visible through the same API.
+  Keep this recipe for any future red-gate-with-unreadable-logs.
+- Findings (cppcheck 2.13.2, `--enable=warning,portability`):
+  1. `tests/test_hydra_moe.c:304` `[negativeIndex]` — the reference
+     top-k used a `best = -1` sentinel; if the expert count were 0 the
+     `rk[best]` write would index -1. Fixed structurally: `best = 0`
+     start (epl >= 1 is guaranteed by the model config) + strict `>`
+     scan — identical winner selection (tie -> lower id), 138/0 after.
+  2. `src/hydra_moe.c:1181` `[invalidPointerCast]` (portability) —
+     the intentional `uint8_t* -> const float*` view of the F32 expert
+     scratch buffer. Documented + inline suppression (the gate is run
+     with `--inline-suppr`; buffer is malloc-aligned, payload F32 by
+     format contract).
+  cppcheck aborted at 82% on the first error-severity finding, so the
+  second round of annotations (after both fixes) ran to 100% with zero
+  findings — the remaining files were clean. The temporary diagnostic
+  step was removed in the final commit; the lint job is back to its
+  original shape.
+- Final state at `c5fcd38`: CI workflow SUCCESS (lint + JNI bridge +
+  llama pin + Portability; build-test/neon/GPU/Android skipped on PR
+  by design — they are `if: refs/heads/main`-only per the PR-vs-main
+  CI split) and Lint & Security 11/11 SUCCESS (incl. ASan+UBSan
+  runtime, CodeQL c-cpp, Semgrep). The heavy main-only jobs will run
+  the full suite when the owner merges to main.
