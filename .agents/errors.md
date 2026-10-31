@@ -3,6 +3,30 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-10-31 (round 14) — macOS CI leg crashed on detect_leaks=1: AppleClang has no LeakSanitizer
+
+- **Symptom:** after the PR #73 merge (`d1729ba`), the main-tier run failed
+  exactly one step: `build-test (macos-latest)` → "Sanitizers (ASan+UBSan)
+  over the whole test suite", **exit 134 (SIGABRT)**. Every other job and
+  step passed - including the ubuntu leg of the SAME step (identical
+  commands, green there).
+- **Cause:** round 13 (Qodo #6) changed the step to
+  `export ASAN_OPTIONS=detect_leaks=1`. AppleClang (macOS) ships NO
+  LeakSanitizer; when detect_leaks is requested, the ASan runtime aborts
+  at process startup on macOS. The option is platform-specific, and the
+  sandbox has no macOS toolchain, so the change could not be verified on
+  that leg locally. The green ubuntu leg was mistaken for proof.
+- **Fix:** platform-conditional option in `.github/workflows/ci.yml`
+  (commit `fe2edc6`, PR #75, merged `5ff3011`):
+  `case $(uname -s) in Darwin) ASAN_OPTIONS= ;; *) detect_leaks=1 ;; esac`;
+  ASan + UBSan stay fully active on both legs. Main run after the merge:
+  9/9 jobs success, main green.
+- **Prevention:** treat every `ASAN_OPTIONS`/sanitizer-runtime option as
+  platform-specific: either verify it on every matrix leg or guard it with
+  `uname -s`. Exit 134 = SIGABRT = the process died at startup (runtime
+  option / missing runtime), not a test failure - read the step name first,
+  don't assume the suite code regressed.
+
 ## 2026-10-30 (round 13) — self-inflicted test/pin mistakes during the Qodo-fix round (five distinct traps, all caught before commit)
 
 - **Symptom:** after the engine fixes, the moe suite and the CLI gate
