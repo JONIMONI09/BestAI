@@ -3,6 +3,32 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-10-31 (round 15) — making Q4_0 decodable broke two tests that ENCODED the old behaviour
+
+- **Symptom:** after adding the Q4_0/Q4_1 decoders to
+  `tools/gguf_reader.py`, `tools/gguf_test.py` failed twice: first an
+  `AssertionError: Q8_0 needs whole blocks` in the fixture builder (a
+  tensor built as "type 2 = undecodable" now went through the block-size
+  path with a non-multiple-of-32 element count), then
+  "a Q8_0 tensor is decodable, not on the refused list" failing (its
+  `quantised_names()` expectation listed the Q4_0 tensor as
+  not-decodable).
+- **Cause (both mine, both structural):** the v1 gate's negative controls
+  used **type 2 (Q4_0) as the standing "undecodable" example** - a control
+  that hard-codes the behaviour under test goes stale the moment that
+  behaviour legitimately changes. The comment even said so ("a negative
+  control that silently starts passing is worse than no control at all"),
+  but the fix for that warning was to *relabel*, not to *re-derive*:
+  when a layout graduates from refused to decodable, every control that
+  named it must move to a type that is still refused (Q4_K, 12).
+- **Fix:** both controls now use `ggml_type 12` (Q4_K); comments say
+  which types they used to use. 101/0 re-verified.
+- **Prevention:** a negative control must pick its example type from the
+  REFUSED set by construction (e.g. a constant `REFUSED_EXAMPLE = 12`
+  next to `BLOCK_TYPES`), and whenever `BLOCK_TYPES` grows, the gate run
+  itself is the detector - a stale control failing is a feature, not a
+  flake: re-derive the control's example, never revert the feature.
+
 ## 2026-10-31 (round 14) — macOS CI leg crashed on detect_leaks=1: AppleClang has no LeakSanitizer
 
 - **Symptom:** after the PR #73 merge (`d1729ba`), the main-tier run failed

@@ -18,12 +18,12 @@ Layout (little-endian throughout, see ggml/docs/gguf.md):
     [pad to general.alignment]
     tensor data
 
-Four layouts are decoded: the three dense float types F32, F16 and BF16, plus
-the Q8_0 block-quantised type. Every other ggml_type (Q4_0, Q4_K, MXFP4, ...)
-is block-quantised with a scale layout this reader does not implement, and
-there is no honest way to recover dense floats from it with arithmetic
-alone. Those tensors are reported by name and refused, not silently
-misread - see docs/GGUF-IMPORT.md.
+Six layouts are decoded: the three dense float types F32, F16 and BF16, plus
+the block-quantised types Q8_0, Q4_0 and Q4_1 (round 15). Every other
+ggml_type (Q4_K, Q5_0, MXFP4, ...) is block-quantised with a scale layout
+this reader does not implement, and there is no honest way to recover dense
+floats from it with arithmetic alone. Those tensors are reported by name
+and refused, not silently misread - see docs/GGUF-IMPORT.md.
 
 Why no numpy: the engine, the console and the CI all work on a bare Python
 3. A converter that needs a wheel the rest of the project does not have is
@@ -36,7 +36,7 @@ import struct
 import sys
 from array import array
 from itertools import repeat
-from operator import mul
+from operator import add, mul
 
 GGUF_MAGIC = 0x46554747  # b"GGUF"
 GGUF_VERSION_MIN = 2
@@ -60,8 +60,10 @@ _KV_SCALAR = {
     KV_FLOAT64: ('<d', 8),
 }
 
-# ggml_type. The first three are dense floats; Q8_0 is block-quantised.
+# ggml_type. The first three are dense floats; Q8_0, Q4_0 and Q4_1 are
+# block-quantised (one block per 32 values behind one or two F16 scales).
 T_F32, T_F16, T_BF16, T_Q8_0 = 0, 1, 30, 8
+T_Q4_0, T_Q4_1 = 2, 3
 
 #: Dense float types this reader can decode, mapped to their byte width.
 DENSE_FLOAT_TYPES = {T_F32: 4, T_F16: 2, T_BF16: 2}
@@ -79,10 +81,13 @@ DENSE_FLOAT_TYPES = {T_F32: 4, T_F16: 2, T_BF16: 2}
 #: that assumes "one width in bytes per element" keeps its meaning - it just
 #: never sees these types. Use decodable_types() / Tensor.is_decodable for
 #: "can this reader turn the bytes back into floats".
-BLOCK_TYPES = {T_Q8_0: (32, 34)}
+BLOCK_TYPES = {T_Q8_0: (32, 34), T_Q4_0: (32, 18), T_Q4_1: (32, 20)}
 
 QK8_0 = 32
+QK4 = 32
 Q8_0_BLOCK_BYTES = 34
+Q4_0_BLOCK_BYTES = 18   # half d (2) + 16 nibble bytes = 32 x 4-bit values
+Q4_1_BLOCK_BYTES = 20   # half d (2) + half m (2) + 16 nibble bytes
 
 #: Every layout this reader can decode: dense floats plus the block types it
 #: implements. Anything outside this set is refused by name.
@@ -463,8 +468,8 @@ class GgufFile:
         if not tensor.is_decodable:
             raise GgufError(
                 'tensor %r is %s - a block-quantised layout this reader does '
-                'not implement (it decodes F32, F16, BF16 and Q8_0). '
-                'Re-export the model in F16 or F32 (llama.cpp: '
+                'not implement (it decodes F32, F16, BF16, Q8_0, Q4_0 and '
+                'Q4_1). Re-export the model in F16 or F32 (llama.cpp: '
                 '--convert-f16) and import it again.'
                 % (tensor.name, tensor.type_name))
         shape = tensor.shape()
@@ -491,7 +496,7 @@ class GgufFile:
                     'offset %d, %d available'
                     % (tensor.name, tensor.type_name,
                        (b1 - b0) * block_bytes, start, len(raw)))
-            out = _decode_q8_0(raw)
+            out = _decode_block(tensor.ggml_type, raw)
             off = first_el - b0 * per_block
             return out[off:off + n]
 
@@ -508,6 +513,26 @@ class GgufFile:
             raise GgufError('tensor %r has %d dimensions; only 1-D and 2-D '
                             'tensors can be read' % (tensor.name, tensor.n_dims))
         return self.decode_rows(tensor, 0, shape[0])
+
+    def raw_bytes(self, tensor):
+        """The tensor's raw payload bytes, UNDECODED (round 16).
+
+        This is what `--t4` in tools/gguf_to_hydra2.py needs: a Q4_0
+        tensor is copied block-for-block into the .hydra2 file instead
+        of being decoded to F32 and re-quantized (a re-quantization is
+        a second, unnecessary rounding of already-rounded values). The
+        file order of a GGUF llama tensor IS the .hydra2 layout the
+        engine expects (the same convention flat_f32 relies on), and
+        the blocks are flat 32-value units, so the copy is bit-exact
+        as long as the engine's row width is a multiple of 32 (the
+        engine enforces that at open for Q4_0 files)."""
+        if not tensor.is_decodable:
+            raise GgufError(
+                'tensor %r is %s - a layout this reader cannot read at all; '
+                'no raw copy is possible'
+                % (tensor.name, tensor.type_name))
+        start = tensor.data_start
+        return self.data[start:start + tensor.size_bytes]
 
 
 def _decode_q8_0(raw):
@@ -555,6 +580,108 @@ def _decode_q8_0(raw):
     for d in scales:
         repeated.extend(repeat(d, QK8_0))
     return array('f', map(mul, repeated, qs))
+
+# Byte->byte translation tables for the 4-bit decoders (applied with
+# bytes.translate - C speed over the whole tensor, no Python value loop).
+_T4_LO = bytes((b & 0x0F) for b in range(256))
+_T4_HI = bytes((b >> 4) for b in range(256))
+_T4_SUB8 = bytes(((b - 8) & 0xFF) for b in range(256))
+
+
+def _q4_nibbles(raw, block_bytes, first):
+    """Element-ordered signed-4-bit byte string of every Q4 block.
+
+    Byte k of each block's nibble run carries element 2k in its LOW nibble
+    and element 2k+1 in its HIGH nibble (ggml-quants.c: dequantize_row_q4_0
+    reads (qs[i] >> 4) for i>=16 first - the values are stored low-first).
+    `first` is where the nibble run starts inside the block (2 for Q4_0,
+    4 for Q4_1). Everything is strided-slice + translate: the 4 billion
+    values of an 8B model must not pass through a Python loop.
+    """
+    n_blocks = len(raw) // block_bytes
+    nib = bytearray((QK4 // 2) * n_blocks)
+    for i in range(QK4 // 2):
+        nib[i::QK4 // 2] = raw[first + i:block_bytes * n_blocks:block_bytes]
+    nib = bytes(nib)
+    vals = bytearray(QK4 * n_blocks)
+    vals[0::2] = nib.translate(_T4_LO)
+    vals[1::2] = nib.translate(_T4_HI)
+    return bytes(vals).translate(_T4_SUB8)
+
+
+def _decode_q4_0(raw):
+    """Dequantise Q4_0 blocks: w[i] = d * (q[i] - 8), 18 bytes per 32 values.
+
+    struct block_q4_0 { half d; uint8_t qs[16]; } (ggml-common.h). d is
+    IEEE binary16 widened to float32 first, so the only rounding is the
+    float32 arithmetic the format itself mandates - the same exactness
+    contract the Q8_0 decoder states.
+    """
+    n_blocks, rem = divmod(len(raw), Q4_0_BLOCK_BYTES)
+    if rem:
+        raise GgufError(
+            'Q4_0 data is %d bytes, which is %d whole 18-byte blocks plus %d '
+            'trailing bytes' % (len(raw), n_blocks, rem))
+    if n_blocks == 0:
+        return array('f')
+    span = Q4_0_BLOCK_BYTES * n_blocks
+    scale_bytes = bytearray(2 * n_blocks)
+    scale_bytes[0::2] = raw[0:span:Q4_0_BLOCK_BYTES]
+    scale_bytes[1::2] = raw[1:span:Q4_0_BLOCK_BYTES]
+    scales = array('f', (t[0] for t in
+                          struct.iter_unpack('<e', bytes(scale_bytes))))
+    vals = array('b')
+    vals.frombytes(_q4_nibbles(raw, Q4_0_BLOCK_BYTES, 2))
+    repeated = array('f')
+    for d in scales:
+        repeated.extend(repeat(d, QK4))
+    return array('f', map(mul, repeated, vals))
+
+
+def _decode_q4_1(raw):
+    """Dequantise Q4_1 blocks: w[i] = d * (q[i] - 8) + m, 20 bytes per 32.
+
+    struct block_q4_1 { half d; half m; uint8_t qs[16]; }. ggml's
+    dequantize_row_q4_1 computes exactly d*(q-8)+m per element, so this
+    decoder performs that same F32 expression (d and m widened from
+    binary16 first) - bit-identical to the reference for valid inputs.
+    """
+    n_blocks, rem = divmod(len(raw), Q4_1_BLOCK_BYTES)
+    if rem:
+        raise GgufError(
+            'Q4_1 data is %d bytes, which is %d whole 20-byte blocks plus %d '
+            'trailing bytes' % (len(raw), n_blocks, rem))
+    if n_blocks == 0:
+        return array('f')
+    span = Q4_1_BLOCK_BYTES * n_blocks
+    d_bytes = bytearray(2 * n_blocks)
+    d_bytes[0::2] = raw[0:span:Q4_1_BLOCK_BYTES]
+    d_bytes[1::2] = raw[1:span:Q4_1_BLOCK_BYTES]
+    d = array('f', (t[0] for t in struct.iter_unpack('<e', bytes(d_bytes))))
+    m_bytes = bytearray(2 * n_blocks)
+    m_bytes[0::2] = raw[2:span:Q4_1_BLOCK_BYTES]
+    m_bytes[1::2] = raw[3:span:Q4_1_BLOCK_BYTES]
+    m = array('f', (t[0] for t in struct.iter_unpack('<e', bytes(m_bytes))))
+    vals = array('b')
+    vals.frombytes(_q4_nibbles(raw, Q4_1_BLOCK_BYTES, 4))
+    repeated_d = array('f')
+    for s in d:
+        repeated_d.extend(repeat(s, QK4))
+    repeated_m = array('f')
+    for s in m:
+        repeated_m.extend(repeat(s, QK4))
+    prod = array('f', map(mul, repeated_d, vals))
+    return array('f', map(add, prod, repeated_m))
+
+
+def _decode_block(gtype, raw):
+    if gtype == T_Q8_0:
+        return _decode_q8_0(raw)
+    if gtype == T_Q4_0:
+        return _decode_q4_0(raw)
+    if gtype == T_Q4_1:
+        return _decode_q4_1(raw)
+    raise GgufError('no decoder for block type %d' % gtype)
 
 
 def _decode_raw(gtype, raw, n):

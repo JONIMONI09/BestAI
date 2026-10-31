@@ -183,15 +183,19 @@ Stated precisely, with the boundary between implemented and not:
   data-parallel arithmetic (SIMD has no correct form there), and the float
   parts of v3/v4 (RMSNorm/RoPE/SwiGLU) stay scalar so the pinned token
   streams are not broken by reassociation.
-- The **Q8_0 decoder** that appears in §3.2 is real code, but it belongs to the
-  **GGUF import path** (`tools/gguf_reader.py`, feeding
-  `tools/gguf_to_hydra.py`). It is a Python reader for somebody else's file
-  format that converts to a **v1** `.hydra`. The v2 container validates Q8_0
-  *entries* (element-group and byte-size rules) but does not **decode** Q8_0
-  values; the same is true for F16/BF16. The types the current test
-  fixtures exercise are F32, TERNARY2_S64/S128 (expert layout 1 and
-  attention trunk tensors) and the role-8 pair VOCAB_UTF8/U16_PAIRS
-  (section 3.2.3).
+- The **Q8_0/Q4_0/Q4_1 decoders** that appear in §3.2 are real code, but they
+  belong to the **GGUF import path** (`tools/gguf_reader.py`, feeding both
+  converters). They are Python readers for somebody else's file format:
+  `gguf_to_hydra.py` projects to a **v1** `.hydra`, `gguf_to_hydra2.py`
+  writes a **v2** `.hydra2` (round 15: the Q4_0/Q4_1 GGUF inputs decode in
+  place to F32, so an 8B Q4 download converts without a re-export; the v2
+  container itself still stores F32 - its own `Q4_0` type id `0x0030`
+  remains reserved, which is the milestone for 4-bit *resident* weights).
+  The v2 container validates Q8_0 *entries* (element-group and byte-size
+  rules) but does not **decode** Q8_0 values; the same is true for F16/BF16.
+  The types the current test fixtures exercise are F32, TERNARY2_S64/S128
+  (expert layout 1 and attention trunk tensors) and the role-8 pair
+  VOCAB_UTF8/U16_PAIRS (section 3.2.3).
 - The **research** that motivates the sparse-MoE path is in
   [`.agents/docs/HYDRA2-RESEARCH.md`](../.agents/docs/HYDRA2-RESEARCH.md). Its benchmark plan is
   explicitly **not yet run**; nothing in it may be quoted as a result.
@@ -294,8 +298,9 @@ one data byte plus the NUL per token — and `U16_PAIRS` needs exactly
 `4 * n_elements`) and **refuses** the last four **by name** rather than by
 falling through to "unsupported" (`[CODE]` `src/hydra_v2_container.c`,
 tensor/expert entry validation). Value **decoders** exist in this repository
-in the sense that `tools/gguf_reader.py` can read F32/F16/BF16/Q8_0 for the
-**GGUF import path**, which produces a **v1** `.hydra`, and the MoE module
+in the sense that `tools/gguf_reader.py` can read F32/F16/BF16/Q8_0/Q4_0/Q4_1
+for the **GGUF import path** (v1 `.hydra` via `gguf_to_hydra.py`, v2
+`.hydra2` via `gguf_to_hydra2.py`), and the MoE module
 (`src/hydra_moe.c`) decodes the expert payloads it streams: F32 (layout 0)
 and TERNARY2_S64/S128 (layout 1, section 3.2.2). The container itself
 still only streams expert bytes into caller buffers; the section 6.2 expert

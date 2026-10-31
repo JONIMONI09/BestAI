@@ -41,6 +41,7 @@ Every check exits non-zero on failure (the CI gate contract).
 """
 
 import os
+import random
 import shutil
 import struct
 import subprocess
@@ -53,6 +54,7 @@ sys.path.insert(0, HERE)
 
 import gguf_minimal_llama  # noqa: E402
 import gguf_reader         # noqa: E402
+import gguf_to_hydra2      # noqa: E402
 
 MAGIC = b'HYDRA2\x00\x00'
 
@@ -389,9 +391,11 @@ def main():
             fh.write(b'this is not a gguf file')
         must_fail('non-gguf', txt, 'not a GGUF')
 
-        # a GGUF whose embedding is stored as Q4_0: metadata and tokens
-        # are complete, so the ONLY problem is the undecodable layout -
-        # that is what the converter must refuse loudly.
+        # a GGUF whose embedding is stored as IQ2_XXS (ggml_type 16):
+        # metadata and tokens are complete, so the ONLY problem is the
+        # undecodable layout - that is what the converter must refuse
+        # loudly. (Q4_0/Q4_1 itself is decodable since round 15 and is
+        # covered by the parity section below.)
         q4 = os.path.join(tmp, 'q40.gguf')
         q4_w = gguf_minimal_llama.Writer()
         q4_w.s('general.architecture', 'llama')
@@ -408,7 +412,7 @@ def main():
             ('tok_emb', [8, 4], 0x10, b'\x01\x00' * 17))
         with open(q4, 'wb') as fh:
             fh.write(q4_w.serialize())
-        must_fail('q4-0-weights', q4, 'does not implement')
+        must_fail('undecodable-weights', q4, 'does not implement')
 
         badarch = os.path.join(tmp, 'badarch.gguf')
         with open(gguf, 'rb') as fh:
@@ -503,6 +507,189 @@ def main():
                                + ['t000000t065536'],
                                merges=['t000000 t065536'])
         must_fail('merge-u16-overflow', bigtok, '16-bit')
+
+        # ---- Q4_0 / Q4_1 (round 15: the 8B-class quants) -------------
+        # 4-bit block-scaled GGUF (the format 8B downloads actually use)
+        # converts and runs; the stored F32 must be BIT-EXACT against an
+        # independent from-scratch decode of the ggml block format.
+        def f32(x):
+            return struct.unpack('<f', struct.pack('<f', x))[0]
+
+        def indep_q4_decode(g, t, kind):
+            bb = 18 if kind == 'q40' else 20
+            n = t.n_elements
+            if n % 32:
+                raise AssertionError('element count not a multiple of 32')
+            out = []
+            for b0 in range(0, n, 32):
+                off = t.data_start + (b0 // 32) * bb
+                d = f32(struct.unpack_from('<e', g.data, off)[0])
+                if kind == 'q41':
+                    m = f32(struct.unpack_from('<e', g.data, off + 2)[0])
+                    nbs = g.data[off + 4:off + 20]
+                else:
+                    m = 0.0
+                    nbs = g.data[off + 2:off + 18]
+                for k in range(16):
+                    lo = nbs[k] & 0x0F
+                    hi = nbs[k] >> 4
+                    out.append(f32(f32((lo - 8) * d) + m))
+                    out.append(f32(f32((hi - 8) * d) + m))
+            return out
+
+        for kind in ('q40', 'q41'):
+            src = os.path.join(tmp, 'minilama-%s.gguf' % kind)
+            with open(src, 'wb') as fh:
+                fh.write(gguf_minimal_llama.build(7, dtype=kind))
+            dst = os.path.join(tmp, 'minilama-%s.hydra2' % kind)
+            rcc = subprocess.run([sys.executable,
+                                  os.path.join(HERE, 'gguf_to_hydra2.py'),
+                                  src, dst],
+                                 capture_output=True, text=True)
+            check('converter exits 0 on the %s fixture' % kind,
+                  rcc.returncode == 0, rcc.stderr)
+            ra, sa = run_engine(binary, dst, 7, 24)
+            check('engine runs the %s-converted model' % kind,
+                  ra == 0 and sa, str((ra, sa)))
+            rb, sb = run_engine(binary, dst, 7, 24)
+            check('%s stream deterministic (two runs identical)' % kind,
+                  rb == 0 and sa == sb, '%r vs %r' % (sa, sb))
+            if kind == 'q40':
+                check('%s stream differs from the F32 stream '
+                      '(quantisation is visible)' % kind, sa != t1,
+                      'the 4-bit weights must change the tokens')
+            gq = gguf_reader.GgufFile.open(src)
+            tq = gq.find('token_embd.weight')
+            ref = indep_q4_decode(gq, tq, kind)
+            gq.close()
+            _, ttensors, _, ttrunk, _, _ = parse_v2(dst)
+            eoff = ttensors['embed'][4]
+            ok = True
+            detail = ''
+            for i, val in enumerate(ref):
+                if f32_at_off(ttrunk, eoff + i * 4) != val:
+                    ok = False
+                    detail = 'i=%d' % i
+                    break
+            check('%s embed == independent block decode (F32-exact)' % kind,
+                  ok, detail)
+
+        # ---- --t4 (round 16): Q4_0 resident, bit-exact raw copy ------
+        # The Q4_0 source fixture from above is converted in --t4 mode:
+        # the large tensors are stored as 18-byte Q4_0 blocks (the
+        # source blocks are copied bit-exact, no re-quantization), the
+        # experts are layout 2, and the engine dequantizes in-kernel.
+        src = os.path.join(tmp, 'minilama-q40.gguf')
+        dst4 = os.path.join(tmp, 'minilama-q40-t4.hydra2')
+        rc4 = subprocess.run([sys.executable,
+                              os.path.join(HERE, 'gguf_to_hydra2.py'),
+                              '--t4', src, dst4],
+                             capture_output=True, text=True)
+        check('converter exits 0 with --t4 on the Q4_0 fixture',
+              rc4.returncode == 0, rc4.stderr)
+        ra, sa = run_engine(binary, dst4, 7, 24)
+        check('engine runs the --t4 model', ra == 0 and sa,
+              str((ra, sa)))
+        rb, sb = run_engine(binary, dst4, 7, 24)
+        check('--t4 stream deterministic (two runs identical)',
+              rb == 0 and sa == sb, '%r vs %r' % (sa, sb))
+        check('--t4 stream differs from the F32 stream '
+              '(quantisation is visible)', sa != t1,
+              'the 4-bit resident weights must change the tokens')
+        # bit-exact raw copy: the stored embed payload must be the
+        # source blocks themselves (the default path decodes Q4_0 to
+        # F32; --t4 must not re-quantize).
+        gq = gguf_reader.GgufFile.open(src)
+        tq = gq.find('token_embd.weight')
+        raw_src = gq.raw_bytes(tq)
+        gq.close()
+        _, ttensors, _, ttrunk, _, _ = parse_v2(dst4)
+        eoff = ttensors['embed'][4]
+        check('--t4 embed is a bit-exact copy of the source blocks',
+              ttrunk[eoff:eoff + len(raw_src)] == raw_src,
+              '%d bytes' % len(raw_src))
+
+        # ---- quantizer parity (numpy optional, round 16) --------------
+        # The vectorized fast path must produce byte-identical payloads
+        # to the pure-Python reference. numpy is a CI-optional
+        # dependency, so the check is skipped (loudly) without it.
+        rng = random.Random(20261031)
+        vals = []
+        for _ in range(30016):  # 938 whole 32-value Q4_0 blocks
+            r = rng.random()
+            if r < 0.1:
+                vals.append(0.0)
+            else:
+                vals.append((rng.random() * 2 - 1)
+                            * 10 ** rng.randint(-8, 3))
+        qbuf = struct.pack('<%df' % len(vals), *vals)
+        if not gguf_to_hydra2._numpy_available():
+            print('  skip: quantizer numpy parity (numpy not installed)')
+        else:
+            check('quantize_q40: numpy fast path is bit-identical to '
+                  'the pure-Python reference',
+                  gguf_to_hydra2._quantize_q40_python(qbuf)
+                  == gguf_to_hydra2._quantize_q40_numpy(qbuf))
+
+        # ---- --t4 loud refusal: dim not a multiple of 32 --------------
+        bad = os.path.join(tmp, 'minilama-dim48.gguf')
+        with open(bad, 'wb') as fh:
+            # F32 source is fine: the refusal must fire on the dim,
+            # before any payload is read.
+            fh.write(gguf_minimal_llama.build(7, dtype='f32', dim=48))
+        rc4b = subprocess.run([sys.executable,
+                               os.path.join(HERE, 'gguf_to_hydra2.py'),
+                               '--t4', bad, os.path.join(tmp, 'x.hydra2')],
+                              capture_output=True, text=True)
+        check('--t4 refuses dim % 32 != 0 (loud)',
+              rc4b.returncode != 0 and 'divisible by 32' in rc4b.stderr,
+              rc4b.stderr)
+
+        # ---- 3B-geometry end-to-end (opt-in: HYDRA2_3B_E2E=1) --------
+        # Real Llama-3.2-3B shapes (28 layers, dim 3072, heads 8/4,
+        # inter 8192, vocab 128256, Q4_0 source ~1.7 GiB) through the
+        # full pipeline: synthetic GGUF -> --t4 conversion (streaming)
+        # -> engine inference. The real Llama weights are not
+        # downloadable from the sandbox egress allowlist, so the
+        # weights are synthetic (deterministic MT19937); the geometry
+        # and the Q4_0 payload path are the real thing. Takes a few
+        # minutes, so it is opt-in (the default suite stays fast).
+        if os.environ.get('HYDRA2_3B_E2E') and not \
+                gguf_to_hydra2._numpy_available():
+            print('  skip: 3B E2E (numpy not installed)')
+        elif os.environ.get('HYDRA2_3B_E2E'):
+                src3 = os.path.join(tmp, 'llama3b-synthetic.gguf')
+                out3 = os.path.join(tmp, 'llama3b.hydra2')
+                r3 = subprocess.run(
+                    [sys.executable, os.path.join(HERE, 'build_3b_synth_gguf.py'),
+                     src3], capture_output=True, text=True, timeout=1800)
+                check('3B: synthetic Q4_0 source builds (1.7 GiB)',
+                      r3.returncode == 0 and os.path.exists(src3)
+                      and os.path.getsize(src3) > 1 << 30,
+                      r3.stderr[-200:])
+                if r3.returncode == 0:
+                    r3c = subprocess.run(
+                        [sys.executable, os.path.join(HERE,
+                                                       'gguf_to_hydra2.py'),
+                         '--t4', src3, out3],
+                        capture_output=True, text=True, timeout=1800)
+                    check('3B: --t4 conversion succeeds (streaming)',
+                          r3c.returncode == 0
+                          and os.path.getsize(out3) > 2 << 30,
+                          r3c.stderr[-200:])
+                    if r3c.returncode == 0:
+                        # run_engine returns (returncode, token list)
+                        rc3a, t3a = run_engine(binary, out3, 128000, 6,
+                                               timeout=600)
+                        rc3b, t3b = run_engine(binary, out3, 128000, 6,
+                                               timeout=600)
+                        check('3B: engine runs and is deterministic',
+                              rc3a == 0 and rc3b == 0
+                              and t3a is not None and t3a == t3b,
+                              ('%r %r vs %r %r' % (rc3a, t3a, rc3b, t3b))[:200])
+                        check('3B: token stream has the requested count',
+                              t3a is not None and len(t3a) == 6,
+                              repr(t3a)[:100])
 
         print('\nAll gguf_to_hydra2 checks passed.')
         return 0

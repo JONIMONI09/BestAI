@@ -67,6 +67,77 @@ Until 2026-10-02 the NEON kernel decoded the ternary code `01` as **−1** inste
 
 It survived because *no test compared the two paths to each other* — every test compared the engine against fixed expectations, and each platform only ever ran its own path. The fix (`src/hydra_neon.h`, explicit `0x01`/`0xFF` mask normalisation) came together with `test_neon_matches_scalar`, which now runs a scalar reference **inside the same ARM build** and demands bit-identical tokens *and* state vectors. That test immediately caught a second latent defect in the SIMD store offsets, which would otherwise have shipped.
 
+## Architecture
+
+The whole system in one diagram (how a model gets in, what runs it, where the guarantees come from):
+
+```mermaid
+flowchart TB
+    subgraph SRC["Model sources"]
+        GGUF["llama GGUF<br/>F32 / F16 / BF16 / Q8_0 / Q4_0 / Q4_1"]
+        FIX["make_model.py / gguf_minimal_llama.py<br/>(synthetic fixtures + pins)"]
+    end
+
+    subgraph CONV["tools/gguf_to_hydra2.py - converter (stdlib-only)"]
+        RD["gguf_reader.py<br/>6 decoders, loud refusals by name"]
+        MAP["masked-expert decomposition<br/>gate x1 / up xE, file-order copy"]
+    end
+
+    subgraph V2[".hydra2 (FORMAT-V2.md)"]
+        META["metadata: dim, vocab, heads, GQA<br/>kv_sink 2 / kv_ring 8, rope_theta"]
+        TRUNK["trunk (mmap'd, CRC32 per payload)<br/>embed, attn, norms, dense FFN"]
+        EXP["expert section (streamed, one read/expert/step)<br/>F32 or TERNARY2_S64/S128: 2-bit codes + F32 group scales"]
+        VOC["vocab + BPE merges (role 8)"]
+    end
+
+    subgraph MOE["src/hydra_moe.c - MoE engine (C99)"]
+        ATT["per-layer GQA attention (F32)<br/>partial RoPE, sink+ring KV"]
+        RT["deterministic top-k routing"]
+        FFN["expert FFN (SwiGLU)<br/>no weight heap, page-cache-backed"]
+        SMP["sampler: temp / min-p / rep-penalty / seed<br/>greedy guard by default"]
+        ATT --> RT --> FFN --> SMP
+    end
+
+    subgraph V1["src/hydra_engine.c - v1 ternary engine"]
+        TERN["2*d integer adds per token<br/>mmap, zero heap, NEON/x86 parity-pinned"]
+    end
+
+    subgraph OUT["Surfaces"]
+        CLI["hydra-run CLI<br/>--text-prompt (BPE), --json, [Text-out]"]
+        WEB["server.js web console<br/>/api/models, /inspect, /import"]
+        APP["Android app<br/>JNI v3/v4 -> v1 engine; llama.cpp for GGUF"]
+    end
+
+    subgraph GATE["Quality gates (every push, all platforms)"]
+        SUITE["hydra 234 / jni 128 / large 7 / hydra2 152<br/>moe 180 / gguf 101 / converter 44 / server 47"]
+        SAN["ASan + UBSan (LSan on Linux)<br/>stream pins = behavior, not just return codes"]
+        SEC["cppcheck / clang / Semgrep / CodeQL<br/>pyflakes + bandit / ESLint / workflow lints"]
+    end
+
+    GGUF --> RD --> MAP --> V2
+    FIX --> V2
+    TRUNK --> ATT
+    EXP --> FFN
+    META --> ATT
+    VOC --> CLI
+    V2 --> CLI
+    V2 --> WEB
+    GGUF --> TERN
+    TERN --> CLI
+    TERN --> APP
+    SMP --> CLI
+    SMP --> WEB
+    V2 --> SUITE
+    MOE --> SAN
+    SUITE --> GATE
+    SAN --> GATE
+    SEC --> GATE
+```
+
+**The honest picture:** the v1 engine (`src/hydra_engine.c`) is the zero-heap ternary core the README title promises. The v2 `.hydra2` path (`src/hydra_moe.c`, round 12+) is the full-fidelity transformer: real F32 attention, real expert FFN, real logits - the price paid for fidelity is that it is a normal C program (heap for activations and KV, weights still mmap'd and streamed). The two coexist by design (the coexistence axiom in the architecture doc), and everything - both engines, both converters - is held by the same gate wall on the right.
+
+**Where each claim lives:** format contract in [`docs/FORMAT-V2.md`](docs/FORMAT-V2.md), engine math in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), the GGUF bridge in [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md), and the 8B/30B/700B feasibility analysis in [`docs/LARGE-MODELS.md`](docs/LARGE-MODELS.md).
+
 ## Quick Start
 
 ```bash
@@ -167,8 +238,9 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 | `/api/model` | GET | Header info of the model |
 | `/api/models` | GET | Every `.hydra` under `models/`, with a real header; drives the chat model selector |
 | `/api/models/inspect?path=` | GET | Full header **plus every rule the file violates**, each with a readable reason |
-| `/api/models/upload?name=` | POST | Store a `.hydra` (`HYDRA_MAX_UPLOAD`, 64 MiB default) |
-| `/api/models/import?name=` | POST | Convert a **`.gguf`** to `.hydra` and store both |
+| `/api/models/upload?name=` | POST | Store a `.hydra` or `.hydra2` (`HYDRA_MAX_UPLOAD`, 64 MiB default) |
+| `/api/models/import?name=` | POST | Convert a **`.gguf`**: `?mode=auto\|v1\|v2` (auto = the v1 projection, the existing behaviour; v2 = the full-fidelity `.hydra2` MoE container, t4 size-optimal by default with `&t4=auto\|force\|none` and `&max_experts=1..8` overrides) |
+| `/api/config` | GET | The whole configuration surface: every knob with its effective value, default, source (default/env) and override |
 | `/api/infer` | POST | `{token, steps}` → JSON with tokens, state, timing |
 | `/api/cancel` | POST | Abort the running inference (409 `cancelled`) |
 | `/api/axiom?h=0.5` | GET | Axiom gate simulation |
@@ -179,7 +251,7 @@ Architecture: `server.js` (Node, **zero npm dependencies**) → `hydra-run --jso
 - ✅ **Version-3 per-layer transformer path** — real non-linear depth over the ternary core: per-layer SwiGLU (ternary BitLinear gate/up, b1.58 absmean scale) → RMSNorm → RoPE → int8 state, KV sink+append per token, full-dimension logit mix (no column-0 bottleneck). Proven non-reducible to load-time plane sums, and every dim-`d>0` weight demonstrably affects the stream (`tests/test_engine.c`). Legacy v1/v2 recurrence stays available and is explicitly refused on v3 models (`-14`)
 - ✅ **Version-4 full per-layer attention pass** — the transformer on top of the v3 structure: per-layer ternary `Wq`/`Wk`/`Wv` projections → RoPE on q/k → causal scaled dot-product attention over each layer's own caller-owned KV cache (sinks + window) → residual → the v3 SwiGLU FFN → residual; final stage RMSNorm + `W_out` logits. `hydra_transformer_forward_step()` (`include/hydra_model.h`, `src/hydra_engine.c`); deterministic fixed-point throughout, zero-heap engine. v1/v2/v3 files and the v3 pass are untouched; cross-version steps refuse each other with `-14`. See [`docs/FORMAT.md`](docs/FORMAT.md) § *Version 4* and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § *Version 4 forward pass*
 - ✅ **Ternary linear math** — ternary weights, no FP multiplication in the inner loop. *Density note:* the v1 format stores **2 ternary weights per byte — 4 bits of file per weight** (`w1` in bits 0–1, `w2` in bits 2–3, upper 4 bits reserved). The v2 header variant packs 4 weights per byte — exactly the 2-bit code of each weight, no reserved bits — which **halves the file** — implemented, tested and documented in `docs/FORMAT.md` ("Version 2"); it is the same 24-byte header, not the `.hydra2` container.
-- ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. This is the **projection** path — the app's full-fidelity GGUF inference runs through the llama.cpp engine above (a converted `.hydra` is a seed model, not the source network). There is also a **full-fidelity converter to the `.hydra2` MoE engine** (round 12): `python3 tools/gguf_to_hydra2.py model.gguf out.hydra2` writes a complete-contract MoE model (real weights, transposed, dense FFN decomposed into masked uniform-router experts, embedded BPE vocabulary + merges) that `hydra-run` executes directly, with its documented deviations stated in the spec. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md) (§12: the converter + its exactness argument + refusal list; §11: 2026-10-26 verification round — spec conformance, the ggml_type audit, the pinned llama.cpp smoke test, the behavior gate, and §11.7: a real downloaded model — llama-68m-chat-v1 Q8_0, 73 MB — run through the pinned llama.cpp the app bundles, with the reproducible download + gate recipe).
+- ✅ **GGUF import** — a `.gguf` is detected and ternarised into a real `.hydra` with absmean scaling, streaming so a multi-GB file does not have to fit in RAM. Decodes **F32, F16, BF16 and Q8_0**; every other GGUF block layout is refused by name. One import at a time — a concurrent one gets HTTP 429. Python stdlib only: no numpy, no torch. This is the **projection** path — the app's full-fidelity GGUF inference runs through the llama.cpp engine above (a converted `.hydra` is a seed model, not the source network). There is also a **full-fidelity converter to the `.hydra2` MoE engine** (round 12, 4-bit quants since round 15): `python3 tools/gguf_to_hydra2.py model.gguf out.hydra2` decodes **F32, F16, BF16, Q8_0, Q4_0 and Q4_1** (the 4-bit block-scaled layouts the 8B-class downloads actually ship) and writes a complete-contract MoE model (real weights, dense FFN decomposed into masked uniform-router experts, embedded BPE vocabulary + merges) that `hydra-run` executes directly, with its documented deviations stated in the spec. Since round 16 the converter is **two-pass streaming** (O(chunk) memory — a 1.73 GiB 3B-geometry Q4_0 source converts in ~6 s at 2.6 GiB peak RSS), gains **`--t4`** (4-bit-resident output: Q4_0 source blocks are copied bit-exact, other layouts are re-quantised deterministically; the T4_0 engine dequantises in the GEMM hot loop, `docs/LARGE-MODELS.md` §8) and **`--probe`** (a header-only acceptance verdict the server uses to offer the right import mode). The web console imports through it: `POST /api/models/import?name=x.gguf&mode=v2` converts server-side into `models/converted/x.hydra2` (t4 size-optimal by default, `&t4=` and `&max_experts=` override, the probe's verdict comes back in the response), and `GET /api/config` exposes every server knob with its value, default, source and override — the round-16 "intelligent + configurable everywhere" decision, with all defaults unchanged for existing clients. See [`docs/GGUF-IMPORT.md`](docs/GGUF-IMPORT.md) (§12: the converter + its exactness argument + refusal list; §11: 2026-10-26 verification round — spec conformance, the ggml_type audit, the pinned llama.cpp smoke test, the behavior gate, and §11.7: a real downloaded model — llama-68m-chat-v1 Q8_0, 73 MB — run through the pinned llama.cpp the app bundles, with the reproducible download + gate recipe).
 - ✅ **Coexistence axiom** — `humanity ≤ 0 ∨ NaN ∨ ±∞ ⇒ Utility = −∞`, hard safety gate before any action
 - ✅ **NEON SIMD kernel** — 16 parallel ternary accumulations, **actively integrated** into `hydra_engine_step()` on ARM (`__ARM_NEON`); bit-identical scalar fallback on x86. On the load path, `hydra_neon_unpack_v2_plane()` (`src/hydra_neon.h`) decodes the 2-bit version-2 weight planes in-register (shift + mask + 16-entry LUT + sign-extended widening + two-round `vzipq` interleave) — the ARM counterpart of the AVX2 unpack — so the in-RAM weight memory on ARM is only the two aggregated int32 A/B vectors
   - *Honesty note:* the NEON path is active on ARM builds only, and the AVX2 path (`src/hydra_simd.h`) on x86-64 builds. Neither is merely covered indirectly — `tests/test_engine.c` runs a scalar reference implementation next to the SIMD kernel **in the same build** and requires bit-identical results (step *and* v2 unpack); a `-mavx2` build also keeps a runtime CPU check and a scalar fallback, so it still runs (and falls back) on a CPU without AVX2. The NEON v2 unpack is exercised by the CI `qemu-aarch64-static` leg, which has no runtime probe to skip.
@@ -338,7 +410,7 @@ that cannot fail is worthless.
 | Android | Android header-diagnostics gate (`tools/android_header_check.sh`) | the app and the server must apply the **same** header rules and quote the **same** reason |
 | Node | `node --test tools/server_test.js` | upload cap, diagnostics, GGUF import, cancel — each with a negative control |
 | Python | `python3 tools/gguf_test.py` | a synthetic GGUF goes in, a **real C engine run** comes out — the converter is checked against the engine, not against itself |
-| Python | `python3 tools/gguf_to_hydra2_test.py` | the GGUF→.hydra2 converter (38 checks): deterministic engine stream, CRC-protected expert tamper refusal, F32-exact weight/vocab/merge re-reads, the layout/scaling/normalization regression gates and the refusal controls |
+| Python | `python3 tools/gguf_to_hydra2_test.py` | the GGUF→.hydra2 converter (44 checks): deterministic engine stream, CRC-protected expert tamper refusal, F32-exact weight/vocab/merge re-reads, the layout/scaling/normalization regression gates, Q4_0/Q4_1 parity against an independent block decode, and the refusal controls |
 | Android | NDK clang build (stricter than host gcc) | JNI/Android header issues |
 | Security | CodeQL (`c-cpp`, `javascript-typescript`, `security-extended`) | taint flows from HTTP input into `open()`/`execFile` |
 | Security | Semgrep | pattern-based security rules |

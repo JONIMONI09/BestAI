@@ -1397,3 +1397,212 @@ test('the console binds to loopback unless HYDRA_ALLOW_REMOTE=1', async (t) => {
   assert.ok(publicBind.includes('0.0.0.0') || publicBind.includes('*'),
     `HYDRA_ALLOW_REMOTE=1 must bind every interface, got ${publicBind.join(',')}`);
 });
+/* ------------------------------------------------------------------ */
+/* Round 16: "intelligent + configurable everywhere"                  */
+/* ------------------------------------------------------------------ */
+
+test('/api/config reports every knob with value, default, source and override', async () => {
+  const { status, body } = await json('/api/config');
+  assert.strictEqual(status, 200);
+  assert.ok(Array.isArray(body.settings) && body.settings.length >= 10,
+    'the full configuration surface must be reported');
+  const byName = Object.fromEntries(body.settings.map((s) => [s.name, s]));
+  for (const name of ['port', 'defaultModel', 'inferTimeoutMs', 'maxPrompt',
+    'maxTrainBodyBytes', 'maxUploadBytes', 'convertTimeoutMs',
+    'defaultSteps', 'importMode']) {
+    assert.ok(byName[name], `setting ${name} must be reported`);
+    for (const k of ['value', 'default', 'source', 'env']) {
+      assert.ok(k in byName[name], `${name} must carry ${k}`);
+    }
+  }
+  assert.strictEqual(byName.importMode.allowed.join(','), 'auto,v1,v2');
+  assert.strictEqual(byName.maxPrompt.engineCap, 256,
+    'the engine cap must be visible next to the effective value');
+  assert.ok(body.engine.sampler, 'the sampler contract must be reported');
+});
+
+test('env overrides change the effective config and are marked as such', async () => {
+  const port = PORT + 3;
+  const c = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      HYDRA_DEFAULT_STEPS: '7',
+      HYDRA_MAX_PROMPT: '64',
+      HYDRA_IMPORT_MODE: 'v2',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    let up = false;
+    for (let i = 0; i < 150 && !up; i++) {
+      try {
+        const r = await fetch(`${base}/api/config`);
+        up = r.ok;
+      } catch {
+        /* not up yet */
+      }
+      if (!up) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(up, 'the override server did not start');
+    const body = await (await fetch(`${base}/api/config`)).json();
+    const byName = Object.fromEntries(body.settings.map((s) => [s.name, s]));
+    assert.strictEqual(byName.defaultSteps.value, 7);
+    assert.strictEqual(byName.defaultSteps.source, 'env');
+    assert.strictEqual(byName.maxPrompt.value, 64);
+    assert.strictEqual(byName.importMode.value, 'v2');
+    assert.strictEqual(byName.importMode.source, 'env');
+  } finally {
+    c.kill('SIGKILL');
+  }
+});
+
+test('an invalid HYDRA_IMPORT_MODE refuses to start and names the variable', async () => {
+  const { code, out } = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ['server.js'], {
+      cwd: ROOT,
+      env: { ...process.env, PORT: String(PORT + 4), HYDRA_IMPORT_MODE: 'bogus' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let err = '';
+    c.stderr.on('data', (d) => { err += d; });
+    const timer = setTimeout(() => { c.kill('SIGKILL'); resolve({ code: 'timeout', out: err }); }, 8000);
+    c.on('exit', (code) => { clearTimeout(timer); resolve({ code, out: err }); });
+  });
+  assert.notStrictEqual(code, 0, 'a server-level misconfiguration must not start silently');
+  assert.notStrictEqual(code, 'timeout');
+  assert.ok(String(out).includes('HYDRA_IMPORT_MODE'),
+    `the message must name the variable: ${out}`);
+});
+
+/** Builds a complete minimal-llama GGUF with the in-repo builder. */
+function writeFullLlamaGguf(name, dtype) {
+  const dir = path.join(ROOT, 'models', 'converted');
+  const src = path.join(dir, name);
+  execFileSync('python3', [
+    path.join(ROOT, 'tools', 'gguf_minimal_llama.py'),
+    '--out', src, '--dtype', dtype,
+  ], { cwd: ROOT });
+  createdFiles.push(src);
+  return src;
+}
+
+test('import mode=v2 of an F32 llama GGUF: .hydra2, t4 auto, engine runs it', async () => {
+  const src = writeFullLlamaGguf(`r16-v2-f32-${process.pid}.gguf`, 'f32');
+  const res = await fetch(
+    `${BASE}/api/models/import?name=r16-v2-f32-${process.pid}.gguf&mode=v2`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fs.readFileSync(src),
+    });
+  const j = await res.json();
+  assert.strictEqual(res.status, 200, JSON.stringify(j));
+  assert.strictEqual(j.ok, true);
+  assert.strictEqual(j.mode, 'v2');
+  assert.ok(j.model.path.endsWith('.hydra2'), j.model.path);
+  assert.strictEqual(j.model.format, 'hydra2');
+  assert.strictEqual(j.t4.effective, true,
+    'auto is size-optimal: a dim%32==0 source converts to t4');
+  assert.strictEqual(j.t4.all_q4_0, false,
+    'an F32 source is re-quantised, not a raw copy');
+  createdFiles.push(path.join(ROOT, j.model.path));
+
+  const list = await json('/api/models');
+  assert.ok(list.body.models.some((m) => m.path === j.model.path),
+    'the imported .hydra2 must be listed');
+
+  const run = await postJSON('/api/infer', { path: j.model.path, token: 0, steps: 4 });
+  assert.strictEqual(run.status, 200, JSON.stringify(run.body));
+  assert.strictEqual(run.body.tokens.length, 4);
+});
+
+test('import mode=v2 of a Q4_0 llama GGUF: bit-exact raw copy (t4.all_q4_0)', async () => {
+  const src = writeFullLlamaGguf(`r16-v2-q40-${process.pid}.gguf`, 'q40');
+  const res = await fetch(
+    `${BASE}/api/models/import?name=r16-v2-q40-${process.pid}.gguf&mode=v2`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fs.readFileSync(src),
+    });
+  const j = await res.json();
+  assert.strictEqual(res.status, 200, JSON.stringify(j));
+  assert.strictEqual(j.t4.all_q4_0, true,
+    'a Q4_0 source is recognised as the bit-exact path');
+  assert.strictEqual(j.t4.effective, true);
+  assert.ok(j.t4.note.includes('bit-exact'), j.t4.note);
+  createdFiles.push(path.join(ROOT, j.model.path));
+
+  const run = await postJSON('/api/infer', { path: j.model.path, token: 0, steps: 4 });
+  assert.strictEqual(run.status, 200, JSON.stringify(run.body));
+  assert.strictEqual(run.body.tokens.length, 4);
+});
+
+test('import t4=none keeps the v2 output F32-resident', async () => {
+  const src = writeFullLlamaGguf(`r16-v2-nt4-${process.pid}.gguf`, 'f32');
+  const res = await fetch(
+    `${BASE}/api/models/import?name=r16-v2-nt4-${process.pid}.gguf&mode=v2&t4=none`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fs.readFileSync(src),
+    });
+  const j = await res.json();
+  assert.strictEqual(res.status, 200, JSON.stringify(j));
+  assert.strictEqual(j.t4.effective, false, 'an explicit override wins over auto');
+  createdFiles.push(path.join(ROOT, j.model.path));
+});
+
+test('import auto (the default) keeps v1 and reports the v2 verdict', async () => {
+  const src = writeFullLlamaGguf(`r16-auto-${process.pid}.gguf`, 'f32');
+  const res = await fetch(`${BASE}/api/models/import?name=r16-auto-${process.pid}.gguf`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fs.readFileSync(src),
+    });
+  const j = await res.json();
+  assert.strictEqual(res.status, 200, JSON.stringify(j));
+  assert.strictEqual(j.mode, 'v1',
+    'auto must keep the existing behaviour for existing clients');
+  assert.ok(j.model.path.endsWith('.hydra'), j.model.path);
+  assert.strictEqual(j.v2.available, true,
+    'a full llama decoder is v2-able and the client must be told');
+  createdFiles.push(path.join(ROOT, j.model.path));
+});
+
+test('import rejects an invalid mode, t4 and max_experts before reading the body', async () => {
+  for (const q of ['mode=bogus', 't4=bogus', 'max_experts=9', 'max_experts=0']) {
+    const res = await fetch(
+      `${BASE}/api/models/import?name=r16-inv-${process.pid}.gguf&${q}`,
+      { method: 'POST', body: Buffer.alloc(16) });
+    assert.strictEqual(res.status, 400, `${q} must be refused: ${await res.text()}`);
+  }
+});
+
+test('a .hydra2 upload is accepted on the magic and listed', async () => {
+  const buf = Buffer.alloc(128);
+  buf.write('HYDRA2', 0, 'latin1');
+  const name = `r16-up-${process.pid}.hydra2`;
+  const res = await fetch(`${BASE}/api/models/upload?name=${name}`,
+    { method: 'POST', body: buf });
+  assert.strictEqual(res.status, 200, await res.text());
+  createdFiles.push(path.join(ROOT, 'models', 'uploaded', name));
+  const list = await json('/api/models');
+  assert.ok(list.body.models.some((m) => m.path.includes(name)),
+    'the uploaded .hydra2 must be listed');
+});
+
+test('a .hydra2 upload without the magic is refused and stored nothing', async () => {
+  const buf = Buffer.alloc(128);
+  buf.write('NOTGGUF', 0, 'latin1');
+  const name = `r16-bad-${process.pid}.hydra2`;
+  const res = await fetch(`${BASE}/api/models/upload?name=${name}`,
+    { method: 'POST', body: buf });
+  assert.strictEqual(res.status, 400, await res.text());
+  assert.ok(!fs.existsSync(path.join(ROOT, 'models', 'uploaded', name)),
+    'a refused upload must not be stored');
+});

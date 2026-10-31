@@ -133,10 +133,13 @@ static int moe_get_tensor(const char *path, hydra_moe_t *m, const char *name,
     }
     if (e->type_id != HYDRA2_F32 &&
         e->type_id != HYDRA2_TERNARY2_S64 &&
-        e->type_id != HYDRA2_TERNARY2_S128) {
-        char d[190];
-        snprintf(d, sizeof d, "tensor '%s' must be F32 or a block-scaled "
-                 "ternary (0x0040/0x0041), got type 0x%04X ('%s')",
+        e->type_id != HYDRA2_TERNARY2_S128 &&
+        e->type_id != HYDRA2_Q4_0) {
+        char d[230];
+        snprintf(d, sizeof d,
+                 "tensor '%s' must be F32, a block-scaled ternary "
+                 "(0x0040/0x0041) or Q4_0 (0x0030), got type 0x%04X "
+                 "('%s')",
                  name, e->type_id, hydra2_type_name(e->type_id));
         return moe_refuse(path, "tensor", d, -6);
     }
@@ -149,9 +152,14 @@ static int moe_get_tensor(const char *path, hydra_moe_t *m, const char *name,
     }
     t->name = name;
     t->n_elements = e->n_elements;
+    t->type_id = e->type_id;
     /* The ternary payload is n/2 bytes on disk but materializes to n
-     * F32 values: the buffer is sized for the DESTINATION width. */
-    const uint64_t alloc = (e->type_id == HYDRA2_F32) ? e->n_bytes
+     * F32 values: the buffer is sized for the DESTINATION width.
+     * Q4_0 (round 16) is the opposite: the buffer holds the RAW 18-byte
+     * blocks (n_bytes) and is never materialized - the mat-vec path
+     * dequantizes one row at a time, keeping the resident memory 4-bit. */
+    const uint64_t alloc = (e->type_id == HYDRA2_F32 ||
+                            e->type_id == HYDRA2_Q4_0) ? e->n_bytes
         : e->n_elements * 4u;
     t->data = (float *)malloc(alloc ? alloc : 1);
     if (!t->data) return moe_refuse(path, "memory", "out of memory", -9);
@@ -163,9 +171,12 @@ static int moe_get_tensor(const char *path, hydra_moe_t *m, const char *name,
         snprintf(d, sizeof d, "tensor '%s' could not be read from the trunk", name);
         return moe_refuse(path, "trunk read", d, -2);
     }
-    if (e->type_id != HYDRA2_F32) {
+    if (e->type_id == HYDRA2_TERNARY2_S64 ||
+        e->type_id == HYDRA2_TERNARY2_S128) {
         /* Block-scaled ternary: materialize through the PAIRED
-         * '<name>.scale' tensor (FORMAT-V2.md 3.2.1). */
+         * '<name>.scale' tensor (FORMAT-V2.md 3.2.1). Q4_0 (round 16)
+         * deliberately does NOT materialize - the raw blocks stay
+         * resident and the mat-vec dequantizes per row. */
         const uint32_t group = (e->type_id == HYDRA2_TERNARY2_S64)
             ? 64u : 128u;
         const uint64_t nscale = (e->n_elements + group - 1u) / group;
@@ -587,7 +598,7 @@ int hydra_moe_open(const char *path, hydra_moe_t *m)
         m->cfg.n_heads % m->cfg.n_kv_heads != 0 ||
         (uint64_t)m->cfg.n_heads * (uint64_t)m->cfg.head_dim !=
             m->cfg.dim ||
-        m->cfg.expert_layout > 1 ||
+        m->cfg.expert_layout > 2 ||
         m->cfg.kv_sink > 0x10000u || m->cfg.kv_ring > 0x10000u) {
         char d[240];
         snprintf(d, sizeof d,
@@ -694,6 +705,28 @@ int hydra_moe_open(const char *path, hydra_moe_t *m)
             rc = moe_refuse(path, "expert", "expert size overflows", -8);
             goto fail;
         }
+    } else if (m->cfg.expert_layout == 2) {
+        /* Q4_0 experts (round 16): each sub-matrix is a flat Q4_0
+         * payload (18 bytes per 32 values), so rows*cols must be a
+         * multiple of 32; the blob is [gate][up][down] of equal length
+         * 3 * inter * dim elements -> 3 * (inter*dim*18/32) bytes. */
+        const uint64_t nsub = (uint64_t)m->cfg.inter * m->cfg.dim;
+        if (nsub % 32u) {
+            char d[160];
+            snprintf(d, sizeof d,
+                     "Q4_0 expert sub-matrix has rows*cols %llu, not a "
+                     "multiple of 32 (the Q4_0 block holds 32 values)",
+                     (unsigned long long)nsub);
+            rc = moe_refuse(path, "expert", d, -8);
+            goto fail;
+        }
+        const uint64_t sub = nsub * 18u / 32u;
+        if (sub > SIZE_MAX / 3u) {
+            rc = moe_refuse(path, "expert", "Q4_0 expert size overflows",
+                            -8);
+            goto fail;
+        }
+        m->expert_bytes = (size_t)(3u * sub);
     } else {
         /* Ternary + scales (layout 1): the group comes from the
          * expert directory type (0x0040 -> 64, 0x0041 -> 128); every
@@ -754,7 +787,9 @@ int hydra_moe_open(const char *path, hydra_moe_t *m)
     for (uint64_t i = 0; i < m->container.expert_dir_count; i++) {
         const hydra2_expert_entry_t *e = &m->container.experts[i];
         const uint32_t want_type = (m->cfg.expert_layout == 0)
-            ? HYDRA2_F32 : m->container.experts[0].type_id;
+            ? HYDRA2_F32
+            : (m->cfg.expert_layout == 2) ? HYDRA2_Q4_0
+            : m->container.experts[0].type_id;
         if (e->length != m->expert_bytes || e->type_id != want_type) {
             char d[250];
             snprintf(d, sizeof d,
@@ -791,6 +826,52 @@ int hydra_moe_open(const char *path, hydra_moe_t *m)
         if (!m->expert_f32buf) {
             rc = moe_refuse(path, "memory", "out of memory", -9);
             goto fail;
+        }
+    }
+    /* Q4_0 (round 16): the row dequant scratch is sized for the WIDEST
+     * mat-vec column count (dim for q/k/v/o/gate/up/embed/lm_head,
+     * inter for ffn_down). It is needed when any trunk tensor is Q4_0
+     * or the experts use layout 2. Shape rule (loud, at open): a Q4_0
+     * row must hold a whole number of 32-value blocks, so dim AND
+     * inter must be multiples of 32 (over-strict on purpose - a mixed
+     * file with one odd row is a confusing file). */
+    {
+        int any_q4 = (m->cfg.expert_layout == 2);
+        if (m->embed.type_id == HYDRA2_Q4_0 ||
+            (m->has_lm_head && m->lm_head.type_id == HYDRA2_Q4_0))
+            any_q4 = 1;
+        for (uint32_t l = 0; l < m->cfg.layers && !any_q4; l++) {
+            const moe_layer_t *L = &m->layers[l];
+            if (L->attn_q.type_id == HYDRA2_Q4_0 ||
+                L->attn_k.type_id == HYDRA2_Q4_0 ||
+                L->attn_v.type_id == HYDRA2_Q4_0 ||
+                L->attn_o.type_id == HYDRA2_Q4_0 ||
+                L->ffn_gate.type_id == HYDRA2_Q4_0 ||
+                L->ffn_up.type_id == HYDRA2_Q4_0 ||
+                L->ffn_down.type_id == HYDRA2_Q4_0)
+                any_q4 = 1;
+        }
+        if (any_q4) {
+            if (m->cfg.dim % 32u || m->cfg.inter % 32u) {
+                char d[160];
+                snprintf(d, sizeof d,
+                         "file uses Q4_0 tensors but dim %u / inter %u "
+                         "are not multiples of 32 (a Q4_0 row must hold "
+                         "whole 32-value blocks)",
+                         m->cfg.dim, m->cfg.inter);
+                rc = moe_refuse(path, "shape", d, -7);
+                goto fail;
+            }
+            const uint32_t widest = (m->cfg.inter > m->cfg.dim)
+                ? m->cfg.inter : m->cfg.dim;
+            /* widest <= UINT32_MAX; * sizeof(float) cannot overflow
+             * size_t (4 * 2^32 < 2^64). */
+            m->q4_scratch = (float *)malloc((size_t)widest *
+                                            sizeof(float));
+            if (!m->q4_scratch) {
+                rc = moe_refuse(path, "memory", "out of memory", -9);
+                goto fail;
+            }
         }
     }
     /* --- vocabulary + merges (role 8, FORMAT-V2.md 3.2.3) -------- */
@@ -867,6 +948,8 @@ void hydra_moe_close(hydra_moe_t *m)
     m->expert_scratch = NULL;
     free(m->expert_f32buf);
     m->expert_f32buf = NULL;
+    free(m->q4_scratch);
+    m->q4_scratch = NULL;
     free(m->vocab_blob);
     m->vocab_blob = NULL;
     free(m->vocab_off);
@@ -999,6 +1082,102 @@ static void moe_matvec(const float *W, const float *x, float *y,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Q4_0 (round 16, FORMAT-V2.md 3.2): 18-byte blocks of 32 values,    */
+/* F16 scale d at block offset 0, then 16 bytes carrying two 4-bit    */
+/* codes each (value 2j in the LOW nibble of byte j, 2j+1 in the      */
+/* HIGH nibble), w[i] = d * (q[i] - 8) - the exact ggml block_q4_0    */
+/* layout (the GGUF reader's Q4_0 is gated bit-exact against an       */
+/* independent decode in tools/gguf_test.py; this C decode must stay  */
+/* value-identical to tools/gguf_reader.py's _decode_q4_0).           */
+/* ------------------------------------------------------------------ */
+
+/* IEEE binary16 -> binary32, exact (F16 is a subset of F32). */
+static float f16_to_f32(uint16_t h)
+{
+    uint32_t sign = ((uint32_t)(h >> 15) & 1u) << 31;
+    int e = (int)((h >> 10) & 0x1Fu);
+    uint32_t mant = (uint32_t)(h & 0x3FFu);
+    uint32_t bits;
+    if (e == 0) {
+        if (mant == 0u) {
+            bits = sign; /* +-0 */
+        } else {
+            /* subnormal: normalize to 1.mant form */
+            while (!(mant & 0x400u)) { mant <<= 1u; e--; }
+            mant &= 0x3FFu;
+            bits = sign | ((uint32_t)(e + 112) << 23) | (mant << 13);
+        }
+    } else if (e == 31) {
+        bits = sign | 0x7F800000u | (mant << 13); /* Inf / NaN */
+    } else {
+        bits = sign | ((uint32_t)(e + 112) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+/* One row of cols elements (cols % 32 == 0) from the block layout
+ * into out. The per-block F16 scale is decoded once per block; the
+ * product d*(q-8) is a single F32 multiply (q-8 exact in F32), so the
+ * value matches the Python reference decode bit-for-bit. */
+static void q40_row_dequant(const uint8_t *row, float *out, uint32_t cols)
+{
+    const uint32_t nblocks = cols / 32u;
+    for (uint32_t b = 0; b < nblocks; b++) {
+        const uint8_t *blk = row + (size_t)b * 18u;
+        uint16_t dh = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        const float d = f16_to_f32(dh);
+        const uint8_t *nb = blk + 2;
+        for (uint32_t j = 0; j < 16u; j++) {
+            uint8_t byte = nb[j];
+            out[b * 32u + 2u * j] = d * ((float)(byte & 0x0Fu) - 8.0f);
+            out[b * 32u + 2u * j + 1u] = d * ((float)(byte >> 4) - 8.0f);
+        }
+    }
+}
+
+/* Public (test-visible): flat Q4_0 dequant, see the header contract
+ * (n % 32 == 0, no aliasing between payload and out). */
+int hydra_moe_dequant_q40(const uint8_t *payload, uint64_t n, float *out)
+{
+    if (!payload || !out || (n % 32u) || n == 0) return -1;
+    for (uint64_t off = 0; off < n; off += 32u)
+        q40_row_dequant(payload + off * 18u / 32u, out + off, 32u);
+    return 0;
+}
+
+/* Q4_0 mat-vec with the SAME accumulation order as moe_matvec
+ * (y[i] = sum_j Wq[i,j] * x[j]): one row is dequantized into the
+ * caller's scratch (cols floats) and the row dot runs in F32 source
+ * order. The resident bytes stay 4-bit (18 per 32 values); the only
+ * extra state is the one-row scratch. */
+static void moe_matvec_q40(const uint8_t *Wq, const float *x, float *y,
+                           uint32_t rows, uint32_t cols, float *scratch)
+{
+    const size_t row_bytes = (size_t)cols * 18u / 32u;
+    for (uint32_t i = 0; i < rows; i++) {
+        float acc = 0.0f;
+        q40_row_dequant(Wq + (size_t)i * row_bytes, scratch, cols);
+        for (uint32_t j = 0; j < cols; j++)
+            acc += scratch[j] * x[j];
+        y[i] = acc;
+    }
+}
+
+/* Dispatch: F32 tensors take the plain kernel, Q4_0 tensors the
+ * in-kernel dequant path (the caller passes the shared row scratch). */
+static void moe_mv(const moe_tensor_t *t, const float *x, float *y,
+                   uint32_t rows, uint32_t cols, float *q4_scratch)
+{
+    if (t->type_id == HYDRA2_Q4_0)
+        moe_matvec_q40((const uint8_t *)t->data, x, y, rows, cols,
+                       q4_scratch);
+    else
+        moe_matvec(t->data, x, y, rows, cols);
+}
+
 /* Top-k selection with the container tie rule (tie -> lower id).
  * Writes the selected expert ids in DESCENDING logit order into sel. */
 static void moe_top_k(float *logits, uint32_t n, uint32_t k,
@@ -1071,7 +1250,14 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
     int rc = 0;
 
     /* h = embed[token] */
-    memcpy(h, m->embed.data + (size_t)token_in * dim, dim * sizeof(float));
+    if (m->embed.type_id == HYDRA2_Q4_0) {
+        /* one row of the block layout (dim % 32 == 0, checked at open) */
+        q40_row_dequant((const uint8_t *)m->embed.data +
+                        (size_t)token_in * dim * 18u / 32u, h, dim);
+    } else {
+        memcpy(h, m->embed.data + (size_t)token_in * dim,
+               dim * sizeof(float));
+    }
 
     for (uint32_t l = 0; l < c->layers; l++) {
         const moe_layer_t *L = &m->layers[l];
@@ -1080,9 +1266,9 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
         if (hydra_rmsnorm(h, L->attn_norm.data, dim, 1e-6f, a) != 0) {
             rc = -16; goto done;
         }
-        moe_matvec(L->attn_q.data, a, q, dim, dim);
-        moe_matvec(L->attn_k.data, a, k, nkv * hd, dim);
-        moe_matvec(L->attn_v.data, a, v, nkv * hd, dim);
+        moe_mv(&L->attn_q, a, q, dim, dim, m->q4_scratch);
+        moe_mv(&L->attn_k, a, k, nkv * hd, dim, m->q4_scratch);
+        moe_mv(&L->attn_v, a, v, nkv * hd, dim, m->q4_scratch);
 
         /* RoPE per head */
         for (uint32_t i = 0; i < nh; i++)
@@ -1160,7 +1346,7 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
         }
 
         /* residual: h += attn_o * co */
-        moe_matvec(L->attn_o.data, co, exp, dim, dim);
+        moe_mv(&L->attn_o, co, exp, dim, dim, m->q4_scratch);
         for (uint32_t i = 0; i < dim; i++) h[i] += exp[i];
 
         /* append the CURRENT token's k/v (after attention, so the
@@ -1175,7 +1361,7 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
         if (hydra_rmsnorm(h, L->ffn_norm.data, dim, 1e-6f, b) != 0) {
             rc = -16; goto done;
         }
-        moe_matvec(L->router.data, b, rlog, c->experts_per_layer, dim);
+        moe_mv(&L->router, b, rlog, c->experts_per_layer, dim, m->q4_scratch);
         for (uint32_t i = 0; i < c->experts_per_layer; i++) {
             if (MOE_NAN_CHECK(rlog[i])) { rc = -16; goto done; }
         }
@@ -1213,7 +1399,8 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
                                    m->expert_scratch, ee->length) != HYDRA2_OK) {
                 rc = -2; goto done;
             }
-            const float *ef;
+            const float *gate = NULL, *up = NULL, *down = NULL;
+            size_t sub = 0;
             if (m->cfg.ternary_group) {
                 /* dequantize, then run the IDENTICAL F32 expert path */
                 if (hydra_moe_dequant_expert(m->expert_scratch,
@@ -1222,19 +1409,34 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
                                              m->cfg.ternary_group) != 0) {
                     rc = -2; goto done;
                 }
-                ef = m->expert_f32buf;
+                gate = m->expert_f32buf;
+                up   = m->expert_f32buf + (size_t)inter * dim;
+                down = m->expert_f32buf + (size_t)2 * inter * dim;
+                moe_matvec(gate, b, gl, inter, dim);
+                moe_matvec(up, b, ul, inter, dim);
+            } else if (m->cfg.expert_layout == 2) {
+                /* Q4_0 expert (round 16): the blob is the raw
+                 * [gate][up][down] block payloads (inter*dim elements
+                 * each, 18 bytes per 32 values); the in-kernel dequant
+                 * keeps the resident bytes 4-bit. */
+                sub = (size_t)inter * dim * 18u / 32u;
+                moe_matvec_q40(m->expert_scratch, b, gl,
+                               inter, dim, m->q4_scratch);
+                moe_matvec_q40(m->expert_scratch + sub, b, ul,
+                               inter, dim, m->q4_scratch);
             } else {
                 /* F32 expert: the scratch buffer holds the expert's raw
                  * float32 bytes (pread'd above). The buffer is a malloc
                  * allocation (4-byte aligned) and the payload is F32 by
                  * format contract, so the float view is well defined. */
-                ef = (const float *)m->expert_scratch; // cppcheck-suppress invalidPointerCast
+                const float *ef =
+                    (const float *)m->expert_scratch; // cppcheck-suppress invalidPointerCast
+                gate = ef;
+                up   = ef + (size_t)inter * dim;
+                down = ef + (size_t)2 * inter * dim;
+                moe_matvec(gate, b, gl, inter, dim);
+                moe_matvec(up, b, ul, inter, dim);
             }
-            const float *gate = ef;
-            const float *up   = ef + (size_t)inter * dim;
-            const float *down = ef + (size_t)2 * inter * dim;
-            moe_matvec(gate, b, gl, inter, dim);
-            moe_matvec(up, b, ul, inter, dim);
             /* swiglu (local loop: no 4096 cap) */
             for (uint32_t j = 0; j < inter; j++) {
                 float g = gl[j];
@@ -1243,7 +1445,11 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
             }
             float *eout = (float *)malloc((size_t)dim * sizeof(float));
             if (!eout) { rc = -1; goto done; }
-            moe_matvec(down, hh, eout, dim, inter);
+            if (m->cfg.expert_layout == 2)
+                moe_matvec_q40(m->expert_scratch + 2 * sub, hh, eout,
+                               dim, inter, m->q4_scratch);
+            else
+                moe_matvec(down, hh, eout, dim, inter);
             float w = wts[i];
             for (uint32_t j = 0; j < dim; j++)
                 exp[j] += w * eout[j];
@@ -1256,8 +1462,8 @@ int hydra_moe_forward(hydra_moe_t *m, uint32_t token_in,
     if (hydra_rmsnorm(h, m->final_norm.data, dim, 1e-6f, outf) != 0) {
         rc = -16; goto done;
     }
-    const float *Wout = m->has_lm_head ? m->lm_head.data : m->embed.data;
-    moe_matvec(Wout, outf, logits_out, c->vocab_size, dim);
+    const moe_tensor_t *Wt = m->has_lm_head ? &m->lm_head : &m->embed;
+    moe_mv(Wt, outf, logits_out, c->vocab_size, dim, m->q4_scratch);
     for (uint32_t t = 0; t < c->vocab_size; t++) {
         if (MOE_NAN_CHECK(logits_out[t])) { rc = -16; goto done; }
     }

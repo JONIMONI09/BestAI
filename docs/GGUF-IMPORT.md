@@ -118,8 +118,8 @@ converted model in this repository stores.
 
 ## 4. Which GGUF files are accepted
 
-Four layouts are decoded — the three dense float types plus one
-block-quantised type:
+Six layouts are decoded — the three dense float types plus three
+block-quantised types (round 15 added the 4-bit pair):
 
 | `ggml_type` | Value | Bytes/element | Kind |
 |---|---|---|---|
@@ -127,18 +127,25 @@ block-quantised type:
 | `F16` | 1 | 2 | dense float |
 | `BF16` | 30 | 2 | dense float |
 | `Q8_0` | 8 | 34 per 32 values | **block-quantised, dequantised at read time** |
+| `Q4_0` | 2 | 18 per 32 values | **block-quantised, dequantised at read time** |
+| `Q4_1` | 3 | 20 per 32 values | **block-quantised, dequantised at read time** |
 
-`Q8_0` is the one block layout implemented, because it is also the one whose
-format is short enough to read without guessing. Each 34-byte block is an F16
-scale `d` followed by 32 signed int8 values, and dequantises as `w[i] = d *
-qs[i]` (`ggml-common.h`, `block_q8_0`). There is no second scale term and no
-interleaving to get wrong.
+`Q8_0` is the one whose format is short enough to read without guessing:
+each 34-byte block is an F16 scale `d` followed by 32 signed int8 values,
+dequantising as `w[i] = d * qs[i]` (`ggml-common.h`, `block_q8_0`). The
+4-bit pair is the 2026 addition (round 15): `block_q4_0` is an F16 scale `d`
+plus 16 bytes carrying two 4-bit codes each (value 2i in the low nibble,
+value 2i+1 in the high nibble), dequantising as `w[i] = d * (q[i] - 8)`;
+`block_q4_1` adds an F16 offset `m` (`w[i] = d * (q[i] - 8) + m`, exactly
+ggml's `dequantize_row_q4_1`). These are the layouts the 8B-class GGUF
+downloads actually ship, and both decoders are proven bit-exact against
+independent implementations (`tools/gguf_test.py`, `tools/gguf_to_hydra2_test.py`).
 
-Every other layout (`Q4_0`, `Q4_1`, `Q5_0`, `Q8_1`, `Q4_K`, `Q6_K`, `MXFP4`, …)
+Every other layout (`Q5_0`, `Q8_1`, `Q4_K`, `Q6_K`, `MXFP4`, …)
 is refused, by name:
 
 ```
-no F32/F16/BF16/Q8_0 1-D or 2-D tensor in this file.
+no F32/F16/BF16/Q8_0/Q4_0/Q4_1 1-D or 2-D tensor in this file.
 Unsupported quantised tensors: blk.0.ffn_gate.weight (Q4_K), …
 Re-export with llama.cpp --convert-f16 and import again.
 ```
@@ -150,9 +157,10 @@ official `ggml_type` enum (see §11), and a message that says only
 out which quantisation it has.
 
 Re-export from llama.cpp with `--convert-f16` if you need a file this tool can
-read. Decoding the remaining block formats would mean re-implementing a dozen
-quantisation kernels to throw the result away — the output is ternary either
-way.
+read. Decoding the *remaining* block formats (the K-quants, IQ-quants, the
+MXFP4/NVFP4 float blocks) would mean re-implementing a dozen super-block
+kernels; they are refused by name instead. (The v2 converter in §12 does not
+need the re-export for Q4_0/Q4_1 anymore — those decode in place.)
 
 `tools/gguf_test.py` proves the `Q8_0` path rather than asserting it: a
 hand-built file with four different per-block scales is compared against
@@ -227,12 +235,13 @@ can decode, and "decodable" is a precise list, not a guess
 (`tools/gguf_to_hydra.py`, `pick_tensors()`):
 
 - **F32, F16, BF16** — read directly, and
-- **Q8_0** — a *quantised* type, dequantised at read time (F16 scale `d` plus
-  32 int8 per block, `w = d*q`).
+- **Q8_0, Q4_0, Q4_1** — *quantised* types, dequantised at read time
+  (Q8_0: F16 scale `d` plus 32 int8 per block, `w = d*q`; Q4_0/Q4_1:
+  4-bit codes with an F16 scale (and offset for Q4_1), `w = d*(q-8)[+m]`).
 
-So "next dense tensor" was wrong twice over: it excluded Q8_0, which is the one
-quantised type the importer handles, and it implied a float tensor rather than a
-decoding path. Anything outside that list — Q4_0, Q4_K, MXFP4 and the rest — is
+So "next dense tensor" was wrong twice over: it excluded the block types the
+importer handles, and it implied a float tensor rather than a decoding path.
+Anything outside that list — Q4_K, Q5_0, MXFP4 and the rest — is
 **refused by name**, never silently skipped, so an import either uses a tensor
 it really understands or says which type stopped it.
 
@@ -260,8 +269,10 @@ tensor.
 
 | Route | Behaviour |
 |---|---|
-| `POST /api/models/import?name=x.gguf` | streams to a temp file, converts, validates with the **same** header analysis as every other path, deletes the source GGUF, returns `{ok, model, conversion}` |
+| `POST /api/models/import?name=x.gguf` | streams to a temp file, converts, validates with the **same** header analysis as every other path, deletes the source GGUF, returns `{ok, model, conversion}`. Round 16: `?mode=auto\|v1\|v2` (default `auto` = this v1 path, bit-identical output for existing clients) — `v2` runs the streaming full-fidelity converter (`tools/gguf_to_hydra2.py`) into `models/converted/x.hydra2` with `&t4=auto\|force\|none` (auto = size-optimal: Q4_0 storage whenever the geometry allows, bit-exact for an all-Q4_0 source) and `&max_experts=1..8`; the response carries the probe's verdict (`t4.all_q4_0`, the geometry) and the auto/v1 paths carry a `v2: {available, ...}` field so the client sees the full-fidelity option for the exact file it just imported. A header-only `--probe` run decides that before any conversion work |
 | `GET /api/models` | lists the result; models under `models/converted/` are flagged `converted: true` so the chat selector can mark them |
+| `GET /api/config` | the whole server configuration surface (round 16 "configurable everywhere"): every knob with its effective value, default, source (`default`/`env`) and the override that changes it — env: `PORT`, `HYDRA_ALLOW_REMOTE`, `HYDRA_DEFAULT_MODEL`, `HYDRA_INFER_TIMEOUT_MS`, `HYDRA_MAX_PROMPT` (may lower the engine's 256 cap, never raise it), `HYDRA_MAX_TRAIN_BODY`, `HYDRA_MAX_UPLOAD`, `HYDRA_CONVERT_TIMEOUT_MS`, `HYDRA_DEFAULT_STEPS`, `HYDRA_IMPORT_MODE` (`auto`/`v1`/`v2`) |
+| `POST /api/models/upload?name=x.hydra2` | round 16: `.hydra2` containers are uploadable too (8-byte magic + 128-byte minimum checked at the header layer; the deep verdict stays with inspect and the engine) |
 
 The converted file is validated against the engine's own header rules before it
 is offered. A converter that produced something the engine would refuse is a
@@ -293,8 +304,9 @@ round-trip against itself; it would not survive the engine.
 - **Not a Llama.** See §2. The dominant token behaviour of the original network
   is not preserved.
 - **Small.** 64 dimensions, ≤1024 vocabulary, ≤256 KiB of weights.
-- **Float types, plus `Q8_0`.** `F32`, `F16`, `BF16` and `Q8_0` are decoded;
-  every other block layout is refused by name, not guessed.
+- **Float types, plus the block types Q8_0/Q4_0/Q4_1.** `F32`, `F16`, `BF16`,
+  `Q8_0`, `Q4_0` and `Q4_1` are decoded; every other block layout is refused
+  by name, not guessed.
 - **Vocabulary is truncated** to the format ceiling; the count of dropped
   entries is reported.
 - **`A`/`B` are column sums.** Column sums discard the per-row structure that
@@ -624,7 +636,9 @@ python3 tools/gguf_to_hydra2.py model.gguf out.hydra2 --max-experts 4
 This is a SECOND, independent converter — the v1 projection converter
 (§1–§9) is untouched. It reads a decoder-only **llama** GGUF (the
 official tensor names AND the pytorch-style names of this repository's
-pinned llama build; F32/F16/BF16/Q8_0 weights) and writes a
+pinned llama build; F32/F16/BF16/Q8_0/Q4_0/Q4_1
+weights — the 4-bit pair since round 15, the format 8B downloads ship) and
+writes a
 complete-contract `.hydra2` file (`moe-transformer-v1`) that
 `hydra-run` executes directly: per-layer GQA attention, expert FFN,
 RMSNorm, real per-vocabulary logits, plus the embedded BPE vocabulary
@@ -658,15 +672,41 @@ is a faithful weight transfer, not a bit-exact transplant.
 
 Loud refusals (exit 2, the message names the problem): not a GGUF /
 bad version, a non-llama architecture, no `tokenizer.ggml.tokens`, a
-tensor in a layout the reader cannot decode (Q4_0 and friends —
+tensor in a layout the reader cannot decode (Q4_K and friends —
 re-export with `--convert-f16`), a missing required tensor, or a
 dimension that does not divide.
 
 The gate `tools/gguf_to_hydra2_test.py` (Makefile target
-`gguf-conv-test`, CI gate 1i) converts the minimal llama GGUF and
+`gguf-conv-test`, CI gate 1i; 44 checks) converts the minimal llama GGUF and
 proves: the engine runs the result deterministically; a flipped expert
 byte is refused by the per-payload CRC32; the embedding is the exact
 transpose of `tok_emb` (F32-exact, independent re-read); every expert
 payload equals the masked/scaled dense FFN (F32-exact); the embedded
 vocabulary is byte-exact; the metadata matches the GGUF architecture;
-the merge rules survive the conversion; and each refusal class fires.
+the merge rules survive the conversion; the Q4_0 and Q4_1 fixtures
+convert, run, and their embedded F32 is bit-exact against an
+independent from-scratch decode of the ggml block format; and each
+refusal class fires.
+Round 16 added `--t4` (4-bit resident, decision A1): the output stores
+`block_q4_0` **as-is** in the new T4_0 engine layout instead of decoding
+to F32 — Q4_0 source blocks are copied bit-exact (no re-quantisation,
+verified byte-for-byte against the source by the test suite), mixed-
+precision sources decode Q8_0/Q4_1 → F32 → `quantize_q40`, and
+`dim % 32 != 0` is refused loudly before any I/O. The output is
+≈ 4× smaller than the decoded path (e.g. 134,592 B vs 775,888 B on the
+mini fixture) and runs through the same engine with the same
+determinism guarantees; the test section also pins the quantiser's
+numpy fast path to be byte-identical to the pure-Python reference.
+
+Memory: the converter is two-pass streaming (round 16). Pass 1 computes
+the whole file geometry from tensor shapes only and writes the header;
+pass 2 regenerates and streams each payload through a bounded window
+while collecting the expert-directory CRCs incrementally, then patches
+the 48-byte directory records in place. A 1.73 GiB Q4_0 3B-geometry
+source therefore converts in ≈ 6 s at 2.58 GiB peak RSS (of which
+≈ 1.7 GiB is the mmap'd source's page cache; private allocations are
+O(chunk)) and the output is byte-deterministic across runs. The full
+3B-geometry end-to-end (synthetic real-shape Q4_0 GGUF → `--t4` →
+engine, 5.98 s/token on 2 cores) is exercised by the suite with
+`HYDRA2_3B_E2E=1`; see `docs/LARGE-MODELS.md` §8 for the measured
+numbers and the real-8B run recipe (≥ 6 GB RAM machine).

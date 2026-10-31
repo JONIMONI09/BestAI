@@ -57,6 +57,8 @@ static const char *g_at64path;    /* argv[6]: moe-full --moe-attn-ternary 64
                                      (ternary attention trunk tensors +
                                       paired F32 .scale tensors)          */
 static const char *g_gqapath;     /* argv[7]: GQA fixture (n_heads 4, n_kv_heads 2, dim 16) */
+static const char *g_q4path;      /* argv[8]: Q4_0 fixture (--moe-q4, round 16) */
+static const char *g_q4f32path;   /* argv[9]: same shape, F32 (visibility)   */
 
 static void make_dirs(void)
 {
@@ -1640,6 +1642,180 @@ static void test_moe_shape_gqa(void)
     hydra_moe_close(&m);
 }
 
+/* ================================================================== */
+/* Q4_0 (round 16): 4-bit resident weights, in-kernel dequant         */
+/* ================================================================== */
+
+/* Test-local Q4_0 block encoder: 18-byte block = F16 d + 16 nibble
+ * bytes (value 2j in the LOW nibble of byte j, 2j+1 in the HIGH).
+ * Mirrors tools/make_model.py q40_block and the ggml block_q4_0
+ * layout; the expected values below are hand-computed, not derived
+ * from the engine code. */
+static void enc_q40_block(uint8_t **pp, const float d,
+                          const uint8_t codes[32])
+{
+    uint8_t *p = *pp;
+    uint16_t dh;
+    /* pack F16 via a portable micro-encoder (d >= 0 in all test uses) */
+    uint32_t bits;
+    memcpy(&bits, &d, 4);
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t e = (int32_t)((bits >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3FFu;
+    if (e <= 0) dh = (uint16_t)sign; /* test values are normal-range */
+    else if (e >= 31) dh = (uint16_t)(sign | 0x7C00u | (mant >> 1));
+    else dh = (uint16_t)(sign | (uint32_t)e << 10 | (mant >> 1));
+    p[0] = (uint8_t)dh;
+    p[1] = (uint8_t)(dh >> 8);
+    for (int j = 0; j < 16; j++) {
+        p[2 + j] = (uint8_t)((codes[2 * j] & 0x0F) |
+                             ((codes[2 * j + 1] & 0x0F) << 4));
+    }
+    *pp = p + 18;
+}
+
+static void test_moe_q4_dequant_unit(void)
+{
+    section("Q4_0 dequant: hand-crafted block vs hand-computed values");
+    /* one block, d = 0.5 (exact in F16): w[i] = 0.5 * (q[i] - 8), so
+     * the values run from 0.5*(-8) = -4.0 (code 0) to 0.5*7 = 3.5
+     * (code 15). Codes: 0,15,8,7,9,0,15,8, ... (the full 32). */
+    static const uint8_t codes[32] = {
+        0, 15, 8, 7, 9, 0, 15, 8, 1, 14, 8, 6, 10, 2, 13, 8,
+        8, 0, 15, 1, 14, 2, 13, 3, 12, 4, 11, 5, 10, 6, 9, 7
+    };
+    uint8_t payload[18];
+    uint8_t *pp = payload;
+    enc_q40_block(&pp, 0.5f, codes);
+    CHECK(pp == payload + 18, "one 18-byte block written");
+
+    float out[32], ref[32];
+    CHECK(hydra_moe_dequant_q40(payload, 32, out) == 0, "dequant ok");
+    /* independent reference: value computed straight from the nibble
+     * arithmetic (no engine helper): d * (q - 8) in F32. */
+    int allmatch = 1;
+    for (int i = 0; i < 32; i++) {
+        ref[i] = 0.5f * ((float)codes[i] - 8.0f);
+        if (!(out[i] == ref[i])) allmatch = 0;
+    }
+    CHECK(allmatch, "engine dequant == hand reference (bit-strict)");
+    /* hand anchors across the code range: */
+    CHECK(out[0] == -4.0f, "code 0: 0.5 * (0-8) = -4.0");
+    CHECK(out[1] == 3.5f, "code 15: 0.5 * (15-8) = 3.5");
+    CHECK(out[2] == 0.0f, "code 8: zero weight");
+    CHECK(out[3] == -0.5f, "code 7: 0.5 * (7-8)");
+    CHECK(out[15] == 0.0f, "code 8 at index 15");
+    CHECK(out[31] == -0.5f, "code 7 (last): 0.5 * (7-8) = -0.5");
+
+    /* a second block with a different scale (d = 2.0) and an ALL-ZERO
+     * block (d = 0 -> every decode exactly 0.0). Three blocks total:
+     * n = 96. */
+    uint8_t payload2[54];
+    uint8_t *q = payload2;
+    static const uint8_t zcodes[32] = { 0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t hcodes[32] = {
+        12, 4, 9, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8
+    };
+    enc_q40_block(&q, 2.0f, hcodes);
+    enc_q40_block(&q, 0.0f, zcodes);
+    enc_q40_block(&q, 0.5f, codes);
+    CHECK(q == payload2 + 54, "three 18-byte blocks written");
+    float out2[96];
+    CHECK(hydra_moe_dequant_q40(payload2, 96, out2) == 0, "3-block ok");
+    CHECK(out2[0] == 8.0f, "d=2: code 12 -> 2*(12-8) = 8");
+    CHECK(out2[1] == -8.0f, "d=2: code 4 -> 2*(4-8) = -8");
+    CHECK(out2[2] == 2.0f, "d=2: code 9 -> 2");
+    int zok = 1;
+    for (int i = 32; i < 64; i++)
+        if (!(out2[i] == 0.0f)) zok = 0;
+    CHECK(zok, "zero-scale block decodes to exact zeros");
+    CHECK(out2[64] == -4.0f, "third block repeats the first values");
+    /* guard rails */
+    CHECK(hydra_moe_dequant_q40(NULL, 32, out) == -1, "NULL payload");
+    CHECK(hydra_moe_dequant_q40(payload, 32, NULL) == -1, "NULL out");
+    CHECK(hydra_moe_dequant_q40(payload, 31, out) == -1, "n not a multiple of 32");
+    CHECK(hydra_moe_dequant_q40(payload, 0, out) == -1, "n == 0");
+}
+
+static void test_moe_q4_open(void)
+{
+    section("Q4_0 fixture: open + geometry (layout 2)");
+    hydra_moe_t m;
+    int rc = hydra_moe_open(g_q4path, &m);
+    CHECK(rc == 0, "open the Q4_0 fixture");
+    if (rc != 0) return;
+    hydra_moe_config_t c;
+    hydra_moe_config(&m, &c);
+    CHECK(c.expert_layout == 2, "expert_layout 2");
+    /* dim=64, inter=64: each sub-matrix 64x64 = 4096 values = 128
+     * blocks = 2304 bytes; 3 sub-matrices -> 6912 bytes per expert. */
+    CHECK(m.expert_bytes == 6912, "6912 B per Q4_0 expert");
+    int all = (m.container.expert_dir_count == 8);
+    for (uint64_t i = 0; i < m.container.expert_dir_count; i++) {
+        const hydra2_expert_entry_t *e = &m.container.experts[i];
+        if (e->type_id != HYDRA2_Q4_0 || e->length != 6912) all = 0;
+    }
+    CHECK(all, "every directory entry: type 0x0030 + length");
+    /* the large trunk tensors carry the blocks, the small vectors
+     * stay F32 (the writer's convention, mirrored in real GGUFs). */
+    CHECK(m.layers[0].attn_q.type_id == HYDRA2_Q4_0, "attn_q is Q4_0");
+    CHECK(m.layers[0].attn_norm.type_id == HYDRA2_F32, "attn_norm is F32");
+    CHECK(m.layers[0].ffn_gate.type_id == HYDRA2_Q4_0, "ffn_gate is Q4_0");
+    CHECK(m.embed.type_id == HYDRA2_Q4_0, "embed is Q4_0");
+    /* embed bytes on disk: vocab*dim values * 18/32 = 16*64*18/32 =
+     * 576 bytes - the 4-bit residency that makes 8B fit on phones. */
+    const hydra2_tensor_entry_t *e;
+    CHECK(hydra2_find_tensor(&m.container, "embed", &e) == HYDRA2_OK,
+          "embed entry");
+    CHECK(e->n_bytes == 576, "embed resident bytes = 18/32 of F32");
+    CHECK(m.q4_scratch != NULL, "row scratch allocated");
+    hydra_moe_close(&m);
+}
+
+#define QPIN_STEPS 24
+/* Pinned greedy KV stream of the Q4_0 fixture (start token 7, seed
+ * 0x9E3779B97F4A7C15, 24 tokens; re-derive with the Makefile
+ * recipe's probe if the engine or the fixture changes). */
+static const uint32_t QPIN_TOKENS[QPIN_STEPS] = {
+    8, 8, 8, 8, 6, 6, 15, 8, 9, 6, 6, 6,
+    6, 15, 10, 8, 0, 13, 12, 8, 8, 8, 2, 2
+};
+static void test_moe_q4_pin(void)
+{
+    section("Q4_0 greedy stream pin (KV enabled) + quantisation visible");
+    uint32_t got[QPIN_STEPS];
+    CHECK(run_greedy_stream(g_q4path, 7, 0x9E3779B97F4A7C15ull,
+                            QPIN_STEPS, got) == 0, "Q4 run ok");
+    int mq4 = 1;
+    for (uint32_t i = 0; i < QPIN_STEPS; i++)
+        if (got[i] != QPIN_TOKENS[i]) mq4 = 0;
+    CHECK(mq4, "Q4 greedy KV stream matches the pinned tokens");
+    /* determinism: a second run from scratch reproduces the stream */
+    uint32_t got2[QPIN_STEPS];
+    CHECK(run_greedy_stream(g_q4path, 7, 0x9E3779B97F4A7C15ull,
+                            QPIN_STEPS, got2) == 0, "Q4 second run ok");
+    int d2 = 1;
+    for (uint32_t i = 0; i < QPIN_STEPS; i++)
+        if (got2[i] != got[i]) d2 = 0;
+    CHECK(d2, "Q4 stream is deterministic across runs");
+    /* the 4-bit rounding must CHANGE the model: the Q4 stream of the
+     * same LCG-drawn weights differs from the F32 stream of the
+     * same-shaped fixture (identical geometry: dim 64, inter 64,
+     * layers 2, experts 4, top_k 2 - argv[9]). */
+    uint32_t f32tok[QPIN_STEPS];
+    if (run_greedy_stream(g_q4f32path, 7, 0x9E3779B97F4A7C15ull,
+                          QPIN_STEPS, f32tok) == 0) {
+        int differs = 0;
+        for (uint32_t i = 0; i < QPIN_STEPS; i++)
+            if (f32tok[i] != got[i]) differs = 1;
+        CHECK(differs, "Q4 stream differs from the F32 stream");
+    }
+}
+
 int main(int argc, char **argv)
 {
     make_dirs();
@@ -1650,13 +1826,17 @@ int main(int argc, char **argv)
     if (argc > 5) g_nvpath = argv[5];
     if (argc > 6) g_at64path = argv[6];
     if (argc > 7) g_gqapath = argv[7];
+    if (argc > 8) g_q4path = argv[8];
+    if (argc > 9) g_q4f32path = argv[9];
     if (!g_fixpath || !g_t64path || !g_t128path || !g_t64lgpath ||
-        !g_nvpath || !g_at64path || !g_gqapath) {
+        !g_nvpath || !g_at64path || !g_gqapath || !g_q4path ||
+        !g_q4f32path) {
         printf("  FAIL: fixture paths missing - run make test-run (the "
                "Makefile passes F32 as argv[1], ternary S64 as argv[2], "
                "ternary S128 as argv[3], ternary S64 large as argv[4], "
                "no-vocab F32 as argv[5], attention-ternary S64 as argv[6], "
-               "GQA (n_heads 4, n_kv_heads 2) as argv[7])"
+               "GQA (n_heads 4, n_kv_heads 2) as argv[7], Q4_0 as argv[8], "
+               "Q4-same-shape F32 as argv[9])"
                "\n");
         g_fail = 1;
         g_tests = 1;
@@ -1676,6 +1856,9 @@ int main(int argc, char **argv)
     test_moe_ternary_open();
     test_moe_ternary_pin();
     test_moe_ternary_tamper();
+    test_moe_q4_dequant_unit();
+    test_moe_q4_open();
+    test_moe_q4_pin();
     test_moe_vocab_codec();
     test_moe_vocab_tamper();
     test_moe_attn_ternary();

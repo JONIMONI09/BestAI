@@ -242,6 +242,7 @@ static int64_t bytes_per_element(uint16_t type_id)
     case HYDRA2_BF16:     return 2;
     case HYDRA2_F32:      return 4;
     case HYDRA2_Q8_0:     return 0;   /* 34 bytes per 32-element block */
+    case HYDRA2_Q4_0:     return 0;   /* 18 bytes per 32-element block */
     default:              return -1;
     }
 }
@@ -268,6 +269,10 @@ static uint64_t tensor_n_bytes(uint16_t type_id, uint64_t n_elements)
         return n_elements * 4u;
     case HYDRA2_Q8_0:
         return (n_elements % 32u) ? 0 : (n_elements / 32u) * 34u;
+    case HYDRA2_Q4_0:
+        /* 18-byte blocks (round 16): F16 d + 16 bytes carrying two 4-bit
+         * codes each, 32 values per block (FORMAT-V2.md 3.2). */
+        return (n_elements % 32u) ? 0 : (n_elements / 32u) * 18u;
     default:
         return 0;
     }
@@ -845,7 +850,12 @@ int hydra2_open(hydra2_container_t *c, const char *path)
             free(td);
             goto fail;
         }
-        if (t->type_id == HYDRA2_Q4_0 || t->type_id == HYDRA2_Q4_K ||
+        /* Q4_0 graduated from reserved to implemented (round 16: the
+         * 4-bit resident tensor type, decoded in src/hydra_moe.c); the
+         * other two stay reserved and are refused by name. The negative
+         * controls here must never encode the behaviour under test
+         * (round-15 lesson, .agents/errors.md). */
+        if (t->type_id == HYDRA2_Q4_K ||
             t->type_id == HYDRA2_MXFP4) {
             rc = refuse(HYDRA2_E_TENSOR_BAD,
                             "tensor %llu ('%s'): type '%s' is reserved and "
