@@ -52,17 +52,49 @@ enum {
     HYDRA2_Q8_0     = 0x0020u, /* 34/32 bytes (34-byte blocks), /32    */
     HYDRA2_Q4_0     = 0x0030u, /* reserved - refuse by name            */
     HYDRA2_Q4_K     = 0x0031u, /* reserved - refuse by name            */
-    HYDRA2_MXFP4    = 0x0032u  /* reserved - refuse by name            */
+    HYDRA2_MXFP4    = 0x0032u, /* reserved - refuse by name            */
+    HYDRA2_TERNARY2_S64  = 0x0040u, /* ternary2 + per-64-group F32    */
+    HYDRA2_TERNARY2_S128 = 0x0041u, /*     + per-128-group F32 scales */
+    HYDRA2_VOCAB_UTF8   = 0x0050u,  /* NUL-terminated UTF-8 token     */
+    HYDRA2_U16_PAIRS    = 0x0051u   /* strings, one per token id; 4B  */
+                                    /* per merge rule (left u16,      */
+                                    /* right u16), FORMAT-V2.md 3.2.3 */
 };
 
-/* Tensor roles (FORMAT-V2.md section 4.2). */
+/* Vocabulary types (2026-10-30, FORMAT-V2.md 3.2.3): role VOCAB (8)
+ * tensors. 'vocab' carries the token strings: n_elements token strings
+ * in token-id order, each 1..n bytes of UTF-8 followed by ONE NUL byte;
+ * the structural rule is n_bytes >= 2 * n_elements (every token needs
+ * at least its NUL). 'merges' carries the BPE rules in priority order
+ * (rule 0 first): n_elements rules of 4 bytes each, little-endian
+ * (left u16, right u16); a model without merges omits the tensor. The
+ * container validates structure only; the MoE module parses and
+ * validates the payload (NUL walk, UTF-8, merge-target range). */
+
+/* Block-scale types (2026-10-27, FORMAT-V2.md 3.2): the payload is
+ * TERNARY2 packing, EXACTLY as TERNARY2 (2 codes/byte); the scales
+ * live in a PAIRED tensor named '<name>.scale' with type F32 and
+ * n_elements = rows * ceil(cols / group) for a 2-D (rows x cols)
+ * tensor (rows = 1 for a 1-D tensor). The inference semantics are
+ * hydra_tf_row_dot_scaled(): per-group integer-exact partial dot,
+ * then the documented f32 scale FMA. */
+
+/* Tensor roles (FORMAT-V2.md section 4.2). 2026-10-27: the three MoE
+ * inference roles 7/8/9 (FORMAT-V2.md 4.2, R12 design) — the reader
+ * accepts them; OLD readers refuse files that use them, which is the
+ * documented forward-compatibility direction. Role 6 is RESERVED
+ * (never assigned) and is refused. */
 enum {
     HYDRA2_ROLE_TRUNK         = 0u,
     HYDRA2_ROLE_ROUTER        = 1u,
     HYDRA2_ROLE_EMBEDDING     = 2u,
     HYDRA2_ROLE_NORM          = 3u,
     HYDRA2_ROLE_KV            = 4u,
-    HYDRA2_ROLE_SHARED_EXPERT = 5u
+    HYDRA2_ROLE_SHARED_EXPERT = 5u,
+    /* 6 = reserved */
+    HYDRA2_ROLE_ATTN          = 7u, /* attn_q/attn_k/attn_v/attn_o per layer */
+    HYDRA2_ROLE_VOCAB         = 8u, /* 'vocab' (0x0050 UTF8), 'merges' (0x0051) */
+    HYDRA2_ROLE_LM_HEAD       = 9u  /* optional; default = tied embedding */
 };
 
 /* Architecture names allowed in v2.architecture (section 3.1).
@@ -152,6 +184,15 @@ typedef struct {
     uint64_t experts_offset;
     uint64_t experts_bytes;
     uint32_t header_crc32;
+    /* Trunk mapping (FORMAT-V2.md 9.4, 2026-10-27): when the resident
+     * trunk region could be mmap'ed, tensor reads serve from trunk_map
+     * (offsets are trunk-relative, exactly as the tensor entries'
+     * offset field is); trunk_backend names which path is live
+     * ("mmap" or "pread" - the documented portable fallback). */
+    const uint8_t *trunk_map;
+    uint64_t trunk_map_len;      /* mapped bytes (page-aligned extent)  */
+    uint64_t trunk_map_base_off; /* file offset the mapping starts at   */
+    const char *trunk_backend;
     /* Parsed, validated directories (heap; owned by the container). */
     const hydra2_tensor_entry_t *tensors;
     const hydra2_expert_entry_t *experts;
@@ -168,6 +209,13 @@ typedef struct {
     uint64_t expert_bytes_typ;
     uint32_t router_runs_ahead;
 } hydra2_container_t;
+
+/* Human-readable names for the element type and tensor role ids
+ * (FORMAT-V2.md 3.2 / 4.2). Unknown ids map to "UNKNOWN" - the
+ * reader's own refusals already name reserved types, these are for
+ * reports (hydra-run --inspect). */
+const char *hydra2_type_name(uint16_t type_id);
+const char *hydra2_role_name(uint16_t role);
 
 /* Open and validate a .hydra2 file. On success the header is
  * CRC-checked, all region bounds are checked at BOTH ends, both

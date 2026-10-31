@@ -979,6 +979,68 @@ test('/api/models/inspect names a GGUF and refuses paths outside the models', as
   assert.strictEqual(noParam.status, 400, 'path is required');
 });
 
+/** Generates a REAL .hydra2 container (make_model.py --v2 fixture) in
+ * models/uploaded/ - the inspect route must report the C reader's
+ * verdict on a file that actually validates. */
+function writeHydra2File(name, truncateTo) {
+  const dir = path.join(ROOT, 'models', 'uploaded');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
+  execFileSync('python3', ['tools/make_model.py', file, '--v2'], { cwd: ROOT });
+  if (truncateTo !== undefined) fs.writeFileSync(file, fs.readFileSync(file).slice(0, truncateTo));
+  createdFiles.push(file);
+  return 'models/uploaded/' + name;
+}
+
+test('/api/models/inspect reports the .hydra2 container the reader validated', async () => {
+  const rel = writeHydra2File('fix2.hydra2');
+  const { status, body } = await json(`/api/models/inspect?path=${encodeURIComponent(rel)}`);
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.format, 'hydra2');
+  assert.strictEqual(body.reader, 'ok', `the fixture must validate: ${JSON.stringify(body)}`);
+  assert.strictEqual(body.routing.architecture, 'moe-transformer-v1');
+  assert.ok(body.routing.top_k >= 1, 'the reader extracts the required top_k');
+  assert.ok(Array.isArray(body.tensors) && body.tensors.length >= 6,
+    'every trunk tensor is listed (router.{l}, embed, norm)');
+  const roles = new Set(body.tensors.map((t) => t.role));
+  assert.ok(roles.has('ROUTER') && roles.has('EMBEDDING') && roles.has('NORM'),
+    `tensor roles are named, got ${[...roles]}`);
+  assert.ok(body.experts.count > 0 && Array.isArray(body.experts.sample),
+    'the expert directory count and a sample are reported');
+  assert.ok(Array.isArray(body.metadata) &&
+        body.metadata.some((m) => m.key === 'v2.top_k'),
+    'the metadata K/V block is reported');
+  assert.strictEqual(body.path, rel);
+});
+
+test('/api/models/inspect names the refusal for a broken .hydra2', async () => {
+  const rel = writeHydra2File('fix2-trunc.hydra2', 60);
+  const { status, body } = await json(`/api/models/inspect?path=${encodeURIComponent(rel)}`);
+  assert.strictEqual(status, 200, 'a refusal is a diagnosis, not a server error');
+  assert.strictEqual(body.format, 'hydra2');
+  assert.strictEqual(body.reader, 'refused');
+  assert.strictEqual(body.error_code, -3, 'HYDRA2_E_SMALL for a 60-byte file');
+  assert.ok(typeof body.reader_message === 'string' && body.reader_message.length > 0,
+    'the reader\'s stderr message (field/value/bound) travels with the report');
+});
+
+test('/api/models lists .hydra2 files with their own shape', async () => {
+  const rel = writeHydra2File('fix2-list.hydra2');
+  const { status, body } = await json('/api/models');
+  assert.strictEqual(status, 200);
+  const m = body.models.find((x) => x.path === rel);
+  assert.ok(m, 'the .hydra2 container must be listed');
+  assert.strictEqual(m.format, 'hydra2');
+  assert.strictEqual(m.valid, true);
+  assert.strictEqual(m.dim, null, 'v1-only header fields are null, not guessed');
+});
+
+test('/api/models/inspect refuses .hydra2 path escapes too', async () => {
+  const escape = await json('/api/models/inspect?path=' +
+    encodeURIComponent('../../etc/hostname.hydra2'));
+  assert.strictEqual(escape.status, 400, 'the suffix check must not open a new escape route');
+});
+
 test('the upload refusal and the inspect report state the same reason', async () => {
   /* Two code paths reporting on the same file must not drift apart: the
    * user is told one thing on upload and another in the console. */

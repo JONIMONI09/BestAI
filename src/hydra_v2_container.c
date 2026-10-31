@@ -37,6 +37,13 @@
 
 #include "hydra_v2_container.h"
 
+/* The trunk mapping (2026-10-27, FORMAT-V2.md 9.4): the resident trunk
+ * region is mapped read-only instead of pread per tensor; the streaming
+ * expert region stays pread by design (experts are never resident).
+ * MAP_PRIVATE + PROT_READ: a write through the mapping is impossible,
+ * and the file is never modified through it. */
+#include <sys/mman.h>
+
 /* The reader loads exactly three regions whole into RAM (metadata K/V
  * block, tensor directory, expert directory); trunk and expert payloads
  * are streamed with pread. Hostile multi-giB headers could otherwise
@@ -185,7 +192,7 @@ static int read_full(int fd, uint8_t *buf, uint64_t len, uint64_t off)
 /* three are reserved and MUST be refused by name.                    */
 /* ------------------------------------------------------------------ */
 
-static const char *type_name(uint16_t type_id)
+const char *hydra2_type_name(uint16_t type_id)
 {
     switch (type_id) {
     case HYDRA2_TERNARY2: return "TERNARY2";
@@ -196,7 +203,27 @@ static const char *type_name(uint16_t type_id)
     case HYDRA2_Q4_0:     return "Q4_0";
     case HYDRA2_Q4_K:     return "Q4_K";
     case HYDRA2_MXFP4:    return "MXFP4";
+    case HYDRA2_TERNARY2_S64:  return "TERNARY2_S64";
+    case HYDRA2_TERNARY2_S128: return "TERNARY2_S128";
+    case HYDRA2_VOCAB_UTF8:    return "VOCAB_UTF8";
+    case HYDRA2_U16_PAIRS:     return "U16_PAIRS";
     default:              return "UNKNOWN";
+    }
+}
+
+const char *hydra2_role_name(uint16_t role)
+{
+    switch (role) {
+    case HYDRA2_ROLE_TRUNK:         return "TRUNK";
+    case HYDRA2_ROLE_ROUTER:        return "ROUTER";
+    case HYDRA2_ROLE_EMBEDDING:     return "EMBEDDING";
+    case HYDRA2_ROLE_NORM:          return "NORM";
+    case HYDRA2_ROLE_KV:            return "KV";
+    case HYDRA2_ROLE_SHARED_EXPERT: return "SHARED_EXPERT";
+    case HYDRA2_ROLE_ATTN:          return "ATTN";
+    case HYDRA2_ROLE_VOCAB:         return "VOCAB";
+    case HYDRA2_ROLE_LM_HEAD:       return "LM_HEAD";
+    default:                        return "UNKNOWN";
     }
 }
 
@@ -206,6 +233,11 @@ static int64_t bytes_per_element(uint16_t type_id)
 {
     switch (type_id) {
     case HYDRA2_TERNARY2: return 0;   /* 2 elements/byte             */
+    case HYDRA2_TERNARY2_S64:
+    case HYDRA2_TERNARY2_S128:
+                          return 0;   /* same packing, paired scales */
+    case HYDRA2_VOCAB_UTF8: return 0; /* variable: n_bytes >= 2*n    */
+    case HYDRA2_U16_PAIRS:  return 4; /* (left u16, right u16)       */
     case HYDRA2_F16:
     case HYDRA2_BF16:     return 2;
     case HYDRA2_F32:      return 4;
@@ -220,7 +252,15 @@ static uint64_t tensor_n_bytes(uint16_t type_id, uint64_t n_elements)
 {
     switch (type_id) {
     case HYDRA2_TERNARY2:
+    case HYDRA2_TERNARY2_S64:
+    case HYDRA2_TERNARY2_S128:
+        /* S64/S128 use the EXACT TERNARY2 packing (two 2-bit codes per
+         * byte); the 64/128 group size is a property of the paired
+         * F32 "<name>.scale" tensor and of the inference kernel, not of
+         * this byte layout (FORMAT-V2.md 3.2). */
         return (n_elements % 2u) ? 0 : (n_elements / 2u);
+    case HYDRA2_U16_PAIRS:
+        return n_elements * 4u;
     case HYDRA2_F16:
     case HYDRA2_BF16:
         return n_elements * 2u;
@@ -737,7 +777,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
         rc = refuse(HYDRA2_E_META_REQUIRED,
                         "metadata: v2.router_dtype 0x%04X ('%s') is not a "
                         "known tensor type", c->router_dtype,
-                        type_name((uint16_t)c->router_dtype));
+                        hydra2_type_name((uint16_t)c->router_dtype));
         goto fail;
     }
     uint64_t vb = 0;
@@ -797,9 +837,10 @@ int hydra2_open(hydra2_container_t *c, const char *path)
         t->offset     = rd_u64le(e + 40);
         t->n_elements = rd_u64le(e + 48);
         t->n_bytes    = rd_u64le(e + 56);
-        if (t->role > HYDRA2_ROLE_SHARED_EXPERT) {
+        if (t->role == 6u || t->role > HYDRA2_ROLE_LM_HEAD) {
             rc = refuse(HYDRA2_E_TENSOR_BAD,
-                            "tensor %llu ('%s'): role %u outside 0..5",
+                            "tensor %llu ('%s'): role %u outside 0..5,7..9 "
+                            "(6 is reserved)",
                             (unsigned long long)i, t->name, t->role);
             free(td);
             goto fail;
@@ -811,7 +852,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                             "not implemented - refused by name "
                             "(FORMAT-V2.md 3.2)",
                             (unsigned long long)i, t->name,
-                            type_name(t->type_id));
+                            hydra2_type_name(t->type_id));
             free(td);
             goto fail;
         }
@@ -820,7 +861,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                             "tensor %llu ('%s'): type id 0x%04X ('%s') is "
                             "not a known tensor type",
                             (unsigned long long)i, t->name, t->type_id,
-                            type_name(t->type_id));
+                            hydra2_type_name(t->type_id));
             free(td);
             goto fail;
         }
@@ -846,6 +887,24 @@ int hydra2_open(hydra2_container_t *c, const char *path)
             free(td);
             goto fail;
         }
+        if (t->type_id == HYDRA2_VOCAB_UTF8) {
+            /* variable-length strings: every token needs at least its
+             * NUL byte, so n_bytes >= 2 * n_elements; the payload
+             * itself (NUL walk, UTF-8) is the MoE module's job. */
+            if (t->n_elements > UINT64_MAX / 2u ||
+                t->n_bytes < 2u * t->n_elements) {
+                rc = refuse(HYDRA2_E_TENSOR_BAD,
+                                "tensor %llu ('%s'): n_bytes %llu < "
+                                "2 * n_elements %llu - a VOCAB_UTF8 "
+                                "token string needs at least its NUL "
+                                "byte (FORMAT-V2.md 3.2.3)",
+                                (unsigned long long)i, t->name,
+                                (unsigned long long)t->n_bytes,
+                                (unsigned long long)t->n_elements);
+                free(td);
+                goto fail;
+            }
+        } else {
         uint64_t want = tensor_n_bytes(t->type_id, t->n_elements);
         if (want == 0u) {
             rc = refuse(HYDRA2_E_TENSOR_BAD,
@@ -853,7 +912,7 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                             "multiple of the %s element group",
                             (unsigned long long)i, t->name,
                             (unsigned long long)t->n_elements,
-                            type_name(t->type_id));
+                            hydra2_type_name(t->type_id));
             free(td);
             goto fail;
         }
@@ -863,11 +922,12 @@ int hydra2_open(hydra2_container_t *c, const char *path)
                             "n_elements * bytes_per_element(%s) = %llu",
                             (unsigned long long)i, t->name,
                             (unsigned long long)t->n_bytes,
-                            type_name(t->type_id),
+                            hydra2_type_name(t->type_id),
                             (unsigned long long)want);
             free(td);
             goto fail;
         }
+        } /* end VOCAB_UTF8 structural branch */
         /* Both ends against the trunk region (5.1.2); payload offsets
          * are 16-aligned (implementation decision recorded in the
          * spec). */
@@ -998,6 +1058,49 @@ int hydra2_open(hydra2_container_t *c, const char *path)
         free(ed);
     }
 
+    /* The trunk is resident by definition (FORMAT-V2.md 6.1): mapping it
+     * once lets every tensor read be a memcpy instead of a pread, and
+     * the page cache is the same one pread would use. The mapping is an
+     * OPTIMIZATION of the same validated bytes - if it is not possible
+     * (platform, HYDRA2_NO_MMAP=1, kernel refusal) the reader falls
+     * back to pread and nothing else changes. trunk_offset + trunk_bytes
+     * was validated against file_size above, so the mapping range is
+     * inside the file. */
+    c->trunk_map = NULL;
+    c->trunk_map_base_off = 0;
+    c->trunk_map_len = 0;
+    c->trunk_backend = "pread";
+    if (c->trunk_bytes > 0 &&
+        getenv("HYDRA2_NO_MMAP") == NULL) {
+        /* mmap offsets are PAGE-aligned: the mapping starts at the page
+         * boundary BELOW trunk_offset and ends at the page boundary AT
+         * OR ABOVE trunk end. The extra pages are inside the file
+         * (trunk_offset + trunk_bytes <= file_size was validated), so
+         * the mapping range is legal. */
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps > 0) {
+            const uint64_t page = (uint64_t)ps;
+            const uint64_t map_off = c->trunk_offset & ~(page - 1);
+            const uint64_t map_len =
+                (c->trunk_offset + c->trunk_bytes - map_off + (page - 1))
+                & ~(page - 1);
+            if ((unsigned long long)map_len <= (unsigned long long)SIZE_MAX) {
+                void *p = mmap(NULL, (size_t)map_len, PROT_READ,
+                               MAP_PRIVATE, c->fd, (off_t)map_off);
+                if (p != MAP_FAILED) {
+                    c->trunk_map = (const uint8_t *)p;
+                    c->trunk_map_base_off = map_off;
+                    /* round 13 (Qodo #5): the mapped extent MUST be
+                     * remembered - hydra2_close() munmaps with
+                     * trunk_map_len, and the pre-fix zero length made
+                     * the munmap a no-op (EINVAL), leaking the whole
+                     * mapping until process exit. */
+                    c->trunk_map_len = map_len;
+                    c->trunk_backend = "mmap";
+                }
+            }
+        }
+    }
     return HYDRA2_OK;
 
 fail:
@@ -1015,6 +1118,16 @@ void hydra2_close(hydra2_container_t *c)
     if (c->meta_blob) { free((void *)c->meta_blob); c->meta_blob = NULL; }
     if (c->meta) { free((void *)c->meta); c->meta = NULL; }
     c->meta_count = 0;
+    if (c->trunk_map) {
+        if (munmap((void *)c->trunk_map, (size_t)c->trunk_map_len) != 0) {
+            /* A failed unmap leaks the mapping, not memory safety: the
+             * process is the only writer and the fd is closed next. */
+        }
+        c->trunk_map = NULL;
+        c->trunk_map_len = 0;
+        c->trunk_map_base_off = 0;
+        c->trunk_backend = "pread";
+    }
     if (c->fd >= 0) { close(c->fd); c->fd = -1; }
 }
 
@@ -1071,6 +1184,16 @@ int hydra2_read_tensor(hydra2_container_t *c,
                        (unsigned long long)t->offset,
                        (unsigned long long)t->n_bytes);
         return rc;
+    }
+    if (c->trunk_map) {
+        /* Same validated bounds, same bytes: the mapping is a read view
+         * covering the trunk region (trunk_backend = "mmap"); the tensor
+         * sits at (trunk_offset + t->offset) in the file, which is
+         * (t->offset + trunk_offset - trunk_map_base_off) into the map. */
+        const uint64_t at =
+            t->offset + c->trunk_offset - c->trunk_map_base_off;
+        memcpy(buf, c->trunk_map + at, (size_t)t->n_bytes);
+        return HYDRA2_OK;
     }
     return read_full(c->fd, buf, t->n_bytes, c->trunk_offset + t->offset);
 }

@@ -19,9 +19,14 @@
  */
 #include "../android/app/src/main/cpp/hydra_batch.h"
 #include "../android/app/src/main/cpp/hydra_sample_cfg.h"
+#include "hydra_model.h"
 
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_BLOCKS 64
 
@@ -359,6 +364,452 @@ static void test_sampler_cfg_defaults_are_pinned(void)
           "the penalty lower bound is pinned to 1.0");
 }
 
+/* ====================================================================
+ * Transformer (v3/v4) dispatch through the JNI contract
+ * ====================================================================
+ * Java_dev_hydrastone_HydraBridge_runInferenceSampled is a THIN wrapper
+ * around three pieces that are testable on the host without a JVM:
+ *   1. hydra_sample_cfg_validate() (the same header, covered above),
+ *   2. the KV-cache geometry (hydra_jni.c: v3 -> one shared ring,
+ *      v4 -> one ring PER LAYER, cap = steps + 4, one sink),
+ *   3. hydra_run_steps() driving the engine's own dispatch
+ *      hydra_sampled_step() (src/hydra_engine.c: v1/v2 -> native step,
+ *      v3/v4 -> tf path, sampling on -> hydra_sample_token()).
+ *
+ * This section drives 2 + 3 with REAL models: deterministic v3/v4
+ * writers (same layout and LCG as tests/test_engine.c, copied to keep
+ * this binary self-contained) plus the exact allocation contract of
+ * the JNI wrapper. The load-bearing property: the BATCHED run (what
+ * the phone executes, blocks of HYDRA_JNI_BATCH crossing into Kotlin)
+ * must produce the token stream of the DIRECT run (same engine load,
+ * same KV, same step loop without batching) - the batching policy
+ * may shape blocks, it must never shape tokens. The greedy stream is
+ * additionally pinned, so a regression in the tf path cannot hide
+ * behind "batch equals direct".
+ * ==================================================================== */
+
+#define V3V4_STEPS_MAX 64
+#define V3V4_VOCAB 33u
+/* Pinned below after the first measured run (see the pinning CHECK). */
+#define V3V4_V4_GREEDY_T0 15u
+#define V3V4_V4_GREEDY_T1 12u
+#define V3V4_V4_GREEDY_T2 12u
+
+/* LCG + packing: identical to tests/test_engine.c (lcg_byte, v3_pack). */
+static uint32_t jb_lcg_state;
+static void jb_lcg_seed(uint32_t s) { jb_lcg_state = s; }
+static uint8_t jb_lcg_byte(void)
+{
+    jb_lcg_state = jb_lcg_state * 1103515245u + 12345u;
+    return (uint8_t)(jb_lcg_state >> 16);
+}
+static void jb_v3_pack(uint8_t *bytep, uint32_t j, int code)
+{
+    *bytep |= (uint8_t)((code & 0x03u) << (2 * (j & 3u)));
+}
+static void jb_v3_fill_block(uint8_t *blk, uint32_t dim, uint32_t rows,
+                             uint32_t cols)
+{
+    for (uint32_t i = 0; i < rows; ++i)
+        for (uint32_t j = 0; j < cols; ++j)
+            jb_v3_pack(blk + (size_t)i * (dim / 4) + (size_t)(j / 4), j,
+                       jb_lcg_byte() % 3);
+}
+static void jb_wr_u16le(FILE *f, uint16_t v)
+{
+    fputc(v & 0xff, f); fputc(v >> 8, f);
+}
+static void jb_wr_u32le(FILE *f, uint32_t v)
+{
+    fputc(v & 0xff, f); fputc((v >> 8) & 0xff, f);
+    fputc((v >> 16) & 0xff, f); fputc(v >> 24, f);
+}
+static void jb_wr_header_version(FILE *f, uint16_t version, uint16_t vocab,
+                                 uint32_t dim, uint32_t layers, uint32_t off,
+                                 uint32_t wlen)
+{
+    jb_wr_u32le(f, HYDRA_MAGIC);
+    jb_wr_u16le(f, version);
+    jb_wr_u16le(f, vocab);
+    jb_wr_u32le(f, dim);
+    jb_wr_u32le(f, layers);
+    jb_wr_u32le(f, off);
+    jb_wr_u32le(f, wlen);
+}
+
+/* v3 layout (docs/FORMAT.md "Version 3"): per layer
+ * Wg | Wu | w1 | u16 scale, plus the final W_out. */
+static void jb_write_v3_model(const char *path, uint32_t dim, uint32_t layers,
+                              uint16_t vocab, uint32_t seed)
+{
+    jb_lcg_seed(seed);
+    const size_t lb = (size_t)dim * dim / 2 + dim / 4 + 2;
+    const size_t body_len = (size_t)layers * lb + (size_t)dim * dim / 4;
+    uint8_t *body = (uint8_t *)malloc(body_len);
+    if (!body) { perror("malloc"); exit(1); }
+    memset(body, 0, body_len);
+    for (uint32_t l = 0; l < layers; ++l) {
+        uint8_t *base = body + (size_t)l * lb;
+        jb_v3_fill_block(base, dim, dim, dim);
+        jb_v3_fill_block(base + (size_t)dim * dim / 4, dim, dim, dim);
+        jb_v3_fill_block(base + (size_t)dim * dim / 2, dim, 1, dim);
+        base[lb - 2] = 0; /* scale = 256 (absmean 1.0, fixed-point 256) */
+        base[lb - 1] = 1;
+    }
+    jb_v3_fill_block(body + (size_t)layers * lb, dim, dim, dim);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
+    jb_wr_header_version(f, 3, vocab, dim, layers,
+                         (uint32_t)sizeof(HydraModelHeader),
+                         (uint32_t)body_len);
+    fwrite(body, 1, body_len, f);
+    fclose(f);
+    free(body);
+}
+
+/* v4 layout (docs/FORMAT.md "Version 4"): per layer
+ * Wg | Wu | Wq | Wk | Wv | w1 | u16 scale, plus the final W_out. */
+static void jb_write_v4_model(const char *path, uint32_t dim, uint32_t layers,
+                              uint16_t vocab, uint32_t seed)
+{
+    jb_lcg_seed(seed);
+    const size_t lb = 5u * (size_t)dim * dim / 4u + (size_t)dim / 4u + 2;
+    const size_t body_len = (size_t)layers * lb + (size_t)dim * dim / 4;
+    uint8_t *body = (uint8_t *)calloc(1, body_len);
+    if (!body) { perror("calloc"); exit(1); }
+    for (uint32_t l = 0; l < layers; ++l) {
+        uint8_t *base = body + (size_t)l * lb;
+        for (int b = 0; b < 5; ++b)
+            jb_v3_fill_block(base + (size_t)b * (size_t)dim * dim / 4,
+                             dim, dim, dim);
+        jb_v3_fill_block(base + 5 * (size_t)dim * dim / 4, dim, 1, dim);
+        base[lb - 2] = 0; /* scale = 256 */
+        base[lb - 1] = 1;
+    }
+    jb_v3_fill_block(body + (size_t)layers * lb, dim, dim, dim);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) { perror("open"); exit(1); }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { perror("fdopen"); close(fd); exit(1); }
+    jb_wr_header_version(f, 4, vocab, dim, layers,
+                         (uint32_t)sizeof(HydraModelHeader),
+                         (uint32_t)body_len);
+    fwrite(body, 1, body_len, f);
+    fclose(f);
+    free(body);
+}
+
+/* Emits the same blocks as the JNI emit callback but RECORDS the
+ * tokens, so the produced stream is comparable. */
+typedef struct {
+    int calls;
+    int sizes[MAX_BLOCKS];
+    int done[MAX_BLOCKS];
+    int total;
+    int done_count;
+    uint16_t tokens[V3V4_STEPS_MAX];
+    int ntok;
+} RecEmitter;
+
+static int rec_emit(void *user, const uint16_t *tokens, int n, int done)
+{
+    RecEmitter *e = (RecEmitter *)user;
+    if (e->calls < MAX_BLOCKS) {
+        e->sizes[e->calls] = n;
+        e->done[e->calls] = done;
+    }
+    e->calls++;
+    e->total += n;
+    if (done) e->done_count++;
+    if (e->ntok + n <= V3V4_STEPS_MAX) {
+        memcpy(e->tokens + e->ntok, tokens, (size_t)n * sizeof(uint16_t));
+        e->ntok += n;
+    }
+    return 0;
+}
+
+/* The exact per-run setup of runInferenceSampled (hydra_jni.c):
+ * n_kv = v4 ? layers : v3 ? 1 : 0, cap = steps + 4, one sink,
+ * per-cache stride (cap + sink) * dim floats, gen buffer of steps.
+ * Returns 0 on success and fills *stream (capacity steps),
+ * *blocks_out (when non-NULL) with the emitted block count. */
+static int jb_run_transformer(uint16_t version, const char *path, int steps,
+                              float temp, float minp, float rep, uint32_t seed,
+                              const uint16_t *prompt, int prompt_n,
+                              uint16_t *stream, int *blocks_out)
+{
+    HydraEngine engine;
+    if (hydra_engine_load(&engine, path) != 0)
+        return -1;
+    const uint32_t dim = engine.header.dim;
+    const uint32_t layers = engine.header.layers;
+    const uint32_t n_kv =
+        (version == 4) ? layers : ((version == 3) ? 1u : 0u);
+    float *kv_k = NULL, *kv_v = NULL;
+    hydra_kv_cache_t *kv_arr = NULL, *kv = NULL, *kv_layers = NULL;
+    if (n_kv > 0) {
+        const uint32_t cap = (uint32_t)steps + 4, nsink = 1;
+        const size_t per = ((size_t)cap + nsink) * (size_t)dim * sizeof(float);
+        kv_k = (float *)malloc(per * (size_t)n_kv);
+        kv_v = (float *)malloc(per * (size_t)n_kv);
+        kv_arr = (hydra_kv_cache_t *)calloc(n_kv, sizeof(hydra_kv_cache_t));
+        if (!kv_k || !kv_v || !kv_arr) {
+            free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return -1;
+        }
+        for (uint32_t l = 0; l < n_kv; ++l) {
+            if (hydra_kv_cache_init(&kv_arr[l],
+                    kv_k + (size_t)l * ((size_t)cap + nsink) * (size_t)dim,
+                    kv_v + (size_t)l * ((size_t)cap + nsink) * (size_t)dim,
+                    dim, cap, nsink) != 0) {
+                free(kv_k); free(kv_v); free(kv_arr);
+                hydra_engine_unload(&engine);
+                return -1;
+            }
+        }
+        kv = (version == 3) ? &kv_arr[0] : NULL;
+        kv_layers = (version == 4) ? kv_arr : NULL;
+    }
+    uint16_t *gen = (uint16_t *)malloc((size_t)steps * sizeof(uint16_t));
+    if (!gen) {
+        free(kv_k); free(kv_v); free(kv_arr);
+        hydra_engine_unload(&engine);
+        return -1;
+    }
+
+    hydra_sampled_step_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    /* Same prompt semantics as the wrapper: prefill the whole prompt,
+     * the LAST token is the generation seed, out-of-vocab values are
+     * modularised, not rejected. */
+    if (prompt_n > 0 &&
+        hydra_engine_prefill(&engine, prompt, (size_t)prompt_n) != 0) {
+        free(gen); free(kv_k); free(kv_v); free(kv_arr);
+        hydra_engine_unload(&engine);
+        return -1;
+    }
+    uint16_t seed_tok = prompt_n > 0 ? prompt[prompt_n - 1] : 0u;
+    if (seed_tok >= engine.header.vocab_size)
+        seed_tok = (uint16_t)(seed_tok % engine.header.vocab_size);
+    ctx.engine = &engine;
+    ctx.tok = seed_tok;
+    ctx.cfg.temperature = temp;
+    ctx.cfg.min_p = minp;
+    ctx.cfg.repetition_penalty = rep;
+    ctx.cfg.penalty_window = 64; /* the wrapper's fixed window */
+    ctx.cfg.rng_seed = seed;
+    ctx.gen = gen;
+    ctx.s = 0;
+    ctx.kv = kv;
+    ctx.kv_layers = kv_layers;
+
+    RecEmitter e;
+    memset(&e, 0, sizeof(e));
+    HydraBatch batch;
+    int blocks = 0, total = 0;
+    int rc = hydra_run_steps(&batch, steps, hydra_sampled_step, &ctx,
+                             rec_emit, &e, &blocks, &total);
+    const int ok =
+        (rc == HYDRA_RUN_OK) && (e.ntok == steps) && (total == steps) &&
+        (e.done_count == 1) && (e.calls == blocks);
+    if (ok)
+        memcpy(stream, e.tokens, (size_t)steps * sizeof(uint16_t));
+    if (blocks_out) *blocks_out = blocks;
+    free(gen);
+    free(kv_k); free(kv_v); free(kv_arr);
+    hydra_engine_unload(&engine);
+    return ok ? 0 : -2;
+}
+
+/* The same run WITHOUT batching: the step callback called directly,
+ * step for step. This is the reference the batched run must match. */
+static int jb_run_transformer_direct(uint16_t version, const char *path,
+                                     int steps, float temp, float minp,
+                                     float rep, uint32_t seed,
+                                     const uint16_t *prompt, int prompt_n,
+                                     uint16_t *stream)
+{
+    HydraEngine engine;
+    if (hydra_engine_load(&engine, path) != 0)
+        return -1;
+    const uint32_t dim = engine.header.dim;
+    const uint32_t layers = engine.header.layers;
+    const uint32_t n_kv =
+        (version == 4) ? layers : ((version == 3) ? 1u : 0u);
+    float *kv_k = NULL, *kv_v = NULL;
+    hydra_kv_cache_t *kv_arr = NULL, *kv = NULL, *kv_layers = NULL;
+    if (n_kv > 0) {
+        const uint32_t cap = (uint32_t)steps + 4, nsink = 1;
+        const size_t per = ((size_t)cap + nsink) * (size_t)dim * sizeof(float);
+        kv_k = (float *)malloc(per * (size_t)n_kv);
+        kv_v = (float *)malloc(per * (size_t)n_kv);
+        kv_arr = (hydra_kv_cache_t *)calloc(n_kv, sizeof(hydra_kv_cache_t));
+        if (!kv_k || !kv_v || !kv_arr) {
+            free(kv_k); free(kv_v); free(kv_arr);
+            hydra_engine_unload(&engine);
+            return -1;
+        }
+        for (uint32_t l = 0; l < n_kv; ++l) {
+            if (hydra_kv_cache_init(&kv_arr[l],
+                    kv_k + (size_t)l * ((size_t)cap + nsink) * (size_t)dim,
+                    kv_v + (size_t)l * ((size_t)cap + nsink) * (size_t)dim,
+                    dim, cap, nsink) != 0) {
+                free(kv_k); free(kv_v); free(kv_arr);
+                hydra_engine_unload(&engine);
+                return -1;
+            }
+        }
+        kv = (version == 3) ? &kv_arr[0] : NULL;
+        kv_layers = (version == 4) ? kv_arr : NULL;
+    }
+    uint16_t *gen = (uint16_t *)malloc((size_t)steps * sizeof(uint16_t));
+    if (!gen) {
+        free(kv_k); free(kv_v); free(kv_arr);
+        hydra_engine_unload(&engine);
+        return -1;
+    }
+    hydra_sampled_step_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    /* Mirror of the wrapper's prompt semantics (see the batched
+     * runner): prefill, last token = seed, modularised. */
+    if (prompt_n > 0 &&
+        hydra_engine_prefill(&engine, prompt, (size_t)prompt_n) != 0) {
+        free(gen); free(kv_k); free(kv_v); free(kv_arr);
+        hydra_engine_unload(&engine);
+        return -1;
+    }
+    uint16_t seed_tok = prompt_n > 0 ? prompt[prompt_n - 1] : 0u;
+    if (seed_tok >= engine.header.vocab_size)
+        seed_tok = (uint16_t)(seed_tok % engine.header.vocab_size);
+    ctx.engine = &engine;
+    ctx.tok = seed_tok;
+    ctx.cfg.temperature = temp;
+    ctx.cfg.min_p = minp;
+    ctx.cfg.repetition_penalty = rep;
+    ctx.cfg.penalty_window = 64;
+    ctx.cfg.rng_seed = seed;
+    ctx.gen = gen;
+    ctx.s = 0;
+    ctx.kv = kv;
+    ctx.kv_layers = kv_layers;
+
+    int ok = 1;
+    for (int s = 0; s < steps && ok; ++s) {
+        uint16_t tok = 0;
+        if (hydra_sampled_step(&ctx, &tok) != 0) ok = 0;
+        stream[s] = tok;
+    }
+    free(gen);
+    free(kv_k); free(kv_v); free(kv_arr);
+    hydra_engine_unload(&engine);
+    return ok ? 0 : -2;
+}
+
+static int jb_streams_equal(const uint16_t *a, const uint16_t *b, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+static void test_transformer_v3_v4_jni_contract(void)
+{
+    const uint32_t dim = 16, layers = 2;
+    char p3[80], p4[80];
+    snprintf(p3, sizeof p3, ".jb-v3-%d.hydra", (int)getpid());
+    snprintf(p4, sizeof p4, ".jb-v4-%d.hydra", (int)getpid());
+    jb_write_v3_model(p3, dim, layers, V3V4_VOCAB, 0x30C1u);
+    jb_write_v4_model(p4, dim, layers, V3V4_VOCAB, 0x41u);
+
+    uint16_t a[V3V4_STEPS_MAX], b[V3V4_STEPS_MAX];
+    const uint16_t p1[1] = { 7u };
+    const uint16_t p3p[3] = { 7u, 11u, 13u };
+    const int steps = 10;
+
+    /* v3 greedy: the batched JNI run must equal the direct run. */
+    CHECK(jb_run_transformer_direct(3, p3, steps, 0.0f, 0.0f, 1.0f, 777,
+                                    p3p, 3, a) == 0,
+          "v3: direct step loop runs (3-token prompt)");
+    int blocks = 0;
+    CHECK(jb_run_transformer(3, p3, steps, 0.0f, 0.0f, 1.0f, 777, p3p, 3,
+                             b, &blocks) == 0,
+          "v3: batched JNI-contract run emits its invariants");
+    CHECK(jb_streams_equal(a, b, steps),
+          "v3: batched run == direct run (greedy) - batching shapes "
+          "blocks, never tokens");
+    CHECK(blocks == 1, "v3: 10 steps fit one 16-token block (done=true once)");
+
+    /* v4 greedy: same contract with the per-layer cache array. */
+    CHECK(jb_run_transformer_direct(4, p4, steps, 0.0f, 0.0f, 1.0f, 777,
+                                    p3p, 3, a) == 0,
+          "v4: direct step loop runs (3-token prompt)");
+    CHECK(jb_run_transformer(4, p4, steps, 0.0f, 0.0f, 1.0f, 777, p3p, 3,
+                             b, &blocks) == 0,
+          "v4: batched JNI-contract run emits its invariants");
+    CHECK(jb_streams_equal(a, b, steps),
+          "v4: batched run == direct run (greedy, per-layer KV)");
+
+    /* v4 token stream is pinned (measured 2026-10-27, prompt 7,11,13,
+     * seed 777, greedy): a regression in the tf path or the writers
+     * cannot hide behind "batch equals direct". */
+    jb_run_transformer(4, p4, steps, 0.0f, 0.0f, 1.0f, 777, p3p, 3, b, NULL);
+    CHECK(b[0] == V3V4_V4_GREEDY_T0 && b[1] == V3V4_V4_GREEDY_T1 &&
+              b[2] == V3V4_V4_GREEDY_T2,
+          "v4: greedy stream pinned (first 3 tokens, prompt 7,11,13)");
+
+    /* v3 sampling: deterministic for a fixed seed (the wrapper passes
+     * the seed through; 0 maps to the engine fallback, never a
+     * degenerate stream). */
+    CHECK(jb_run_transformer(3, p3, steps, 1.0f, 0.5f, 1.5f, 4242, p3p, 3,
+                             a, NULL) == 0,
+          "v3: sampled run (temp 1.0, min-p 0.5, rp 1.5) runs");
+    CHECK(jb_run_transformer(3, p3, steps, 1.0f, 0.5f, 1.5f, 4242, p3p, 3,
+                             b, NULL) == 0,
+          "v3: second sampled run with the same seed runs");
+    CHECK(jb_streams_equal(a, b, steps),
+          "v3: sampled stream deterministic for a fixed seed");
+
+    /* v4 sampling through the per-layer caches. */
+    CHECK(jb_run_transformer(4, p4, steps, 1.5f, 0.25f, 1.2f, 99, p3p, 3,
+                             a, NULL) == 0,
+          "v4: sampled run runs");
+    CHECK(jb_run_transformer(4, p4, steps, 1.5f, 0.25f, 1.2f, 99, p3p, 3,
+                             b, NULL) == 0,
+          "v4: second sampled run runs");
+    CHECK(jb_streams_equal(a, b, steps),
+          "v4: sampled stream deterministic for a fixed seed");
+
+    /* Fixed point of the bias-free design: token 0 with the zero start
+     * state drives xeff = h + w1*0 = 0, and every layer is a mat-vec
+     * over that zero - the whole stream is 0. Guards the "no bias
+     * term" property of v3/v4 (an added bias would break this pin). */
+    CHECK(jb_run_transformer(4, p4, steps, 0.0f, 0.0f, 1.0f, 1, NULL, 0,
+                             b, NULL) == 0,
+          "v4: token-0/no-prompt run runs");
+    int zero_stream = 1;
+    for (int i = 0; i < steps; ++i)
+        if (b[i] != 0u) zero_stream = 0;
+    CHECK(zero_stream, "v4: token 0 from the zero state is the all-zero "
+          "fixed point (bias-free design)");
+    CHECK(jb_run_transformer(3, p3, steps, 0.0f, 0.0f, 1.0f, 1, NULL, 0,
+                             b, NULL) == 0 && b[0] == 0u && b[5] == 0u,
+          "v3: the same fixed point holds (token 0, zero state)");
+
+    /* steps=17 with a REAL step function: the last partial block is
+     * emitted with done=true (the fake-step sweep covers the policy;
+     * this proves it holds when the step callback is the engine). */
+    CHECK(jb_run_transformer(3, p3, 17, 0.0f, 0.0f, 1.0f, 5, p1, 1,
+                             a, &blocks) == 0,
+          "v3: 17-step run (16 + partial) runs");
+    CHECK(blocks == 2, "v3: 17 steps emit exactly two blocks");
+
+    unlink(p3);
+    unlink(p4);
+}
+
 int main(void)
 {
     printf("== JNI batching policy (HYDRA_JNI_BATCH=%d) ==\n", HYDRA_JNI_BATCH);
@@ -371,6 +822,8 @@ int main(void)
     test_sampler_cfg_boundaries();
     test_sampler_cfg_rejections();
     test_sampler_cfg_defaults_are_pinned();
+    printf("== transformer (v3/v4) through the JNI contract ==\n");
+    test_transformer_v3_v4_jni_contract();
     printf("\n%d checks, %d failed\n", tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;
 }

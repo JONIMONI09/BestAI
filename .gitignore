@@ -58,3 +58,4 @@ models/vocab/
 # Local working aids (never committed: they are aids, not gates;
 # tools/docs_claim_check.sh remains the committed CI-side audit).
 tools/local_scan.py
+hydra-moe-test

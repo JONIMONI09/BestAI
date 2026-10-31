@@ -46,6 +46,19 @@ also publish `::error::`/`::warning::` annotations deliberately for
 this reason (the Android lint gate prints the gradle tail into an
 annotation). Read the annotations FIRST, always.
 
+If a gate only prints PLAIN output + an exit code (e.g. cppcheck with
+`--error-exitcode=2` shows nothing but "Process completed with exit
+code 2"), the annotations cannot tell you WHICH check fired. Then add
+a TEMPORARY diagnostic step right after the gate: same command,
+`--error-exitcode=0` (or a no-op exit), `if: always()`, every output
+line re-emitted as `echo "::error::[gate] $line"`. Push, read the new
+annotations, fix the findings, then REMOVE the diagnostic step in the
+final commit. Verified live 2026-10-30 (R12 cppcheck incident,
+errors.md). Two caveats learned there: a failure annotation's
+`start_line` points INSIDE the failing step's run block (locate the
+step, don't trust the line), and cppcheck ABORTS at the first
+error-severity finding — re-run the analysis to 100% after fixes.
+
 ## Step 3 — Recognize the zero-job signature
 
 A run with **0 jobs**, `conclusion: failure`, `created_at ==
@@ -70,7 +83,7 @@ trigger event — every file naming it produced this signature
 |---|---|
 | gate 1a gcc strict | exact command from `.agents/skills/engine-ci-verify/SKILL.md` |
 | gate 1b clang strict | `/tmp/zvenv/bin/python-zig cc -target x86_64-linux-gnu -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iinclude -Isrc -Iandroid/app/src/main/cpp -c <file> -o /dev/null` (zig bundles a real Clang frontend; apt has no clang) |
-| gate 1c cppcheck | `/tmp/lintvenv/bin/cppcheck --enable=warning,portability --inline-suppr --std=c99 --platform=unix64 -Iinclude src/ tests/` |
+| gate 1c cppcheck | NOT reachable in the current sandbox (2026-10-30: the proxy whitelist serves llama.cpp/cpython/git/openssl/... but 404s cppcheck/cppcheck for codeload+git+api; no root for apt; pypi only has a useless 1.5.3 wrapper). Fallback per the annotation recipe in Step 2: a temporary diagnostic step that re-emits the CI cppcheck output as annotations. Local substitute for C-code review: `gcc -fanalyzer -std=c99 -Wall -Wextra -Werror` + ASan/UBSan. |
 | Kotlin compile (Android lint/APK) | `bash tools/kotlin_stub_check/kotlin_stub_check.sh` (kotlinc via npm; stub check 0 errors required) |
 | workflow compile | the two workflow gates above |
 | macOS portability | `python-zig cc -target arm64-apple-darwin -fsyntax-only ...` (compile only) |

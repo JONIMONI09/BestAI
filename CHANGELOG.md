@@ -2,6 +2,165 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-30 (round 13, Qodo/CodeQL audit of PR #73 @ c5fcd38) — engine hardening: all 26 open, fixable findings fixed with regression tests (+ the CodeQL alert)
+
+Owner directive 2026-10-30 (verbatim intent): review every Qodo
+finding + the CodeQL alert of PR #73 and verify whether each is really
+fixed or still open, then fix what is open. Audit result: all 29
+still-open findings + the CodeQL alert CONFIRMED (0 false positives,
+0 already fixed by a later commit). Outcome of the 30: 26 Qodo
+findings fixed in this round (23 code + 3 docs) + the 1 CodeQL alert
+fixed (code); the 1 already-resolved finding confirmed; 3 explicit
+deferrals with the reason.
+
+1. **Converter (5 fixes, 38-check gate).** File-order tensor copy
+   (the v1/v2 layout bug), expert up/gate scaling (gate rows x E,
+   up rows x E — `masked_block`), strict token normalization
+   (general `normalize_token`), U16 merge-operand overflow refusal,
+   norm-shape refusal. Gate: `gguf_to_hydra2_test.py` 26 -> 38 checks.
+2. **MoE engine (9 fixes).** Ternary in-place dequant aliasing
+   (separate packed buffer + public `hydra_moe_dequant_flat`, AT64
+   stream re-pinned — the pre-fix stream was silently wrong);
+   sampler temperature now scales the EXPONENT (`exp((v-mx)/T)`;
+   pre-fix T cancelled out entirely, pinned by a 3-temperature test);
+   repetition penalty walks the whole window (pre-fix capped at the
+   vocab size); stochastic path requires a non-NULL RNG; UTF-8
+   validator distinguishes "invalid at offset 0"; 64-bit shape
+   products + `n_heads % n_kv_heads == 0` refusal; GQA BLOCK mapping
+   (head i reads KV head `i/(nh/nkv)`, llama.cpp convention — the
+   pre-fix interleave `i % nkv` is wrong for nkv > 1, new GQA
+   fixture + stream pin); mismatched KV-cache dim refused; trunk
+   mapping munmapped with the REMEMBERED length (pre-fix
+   `munmap(ptr, 0)` leaked it — CI LeakSanitizer now runs ENABLED
+   on all five binaries, all clean).
+3. **CLI (5 fixes).** Repetition ring is a true circular buffer
+   (pre-fix: every post-fill write hit slot 0; `--rep-window 0` was a
+   SIGFPE — both pinned in `text_prompt_check.sh`); positional
+   defaults/clamp apply to `.hydra2` too (pre-fix a bare
+   `hydra-run model.hydra2` ran with start=-1/steps=-1); the prompt
+   now CONDITIONS the model (prefill + continue from the last prompt
+   token — pre-fix the generated stream ignored the prompt
+   entirely); generated stream printed as decoded text (`[Text-out]:`
+   + JSON `generated_text`); `--inspect` JSON emits complete JSON
+   values (no more double-quoted hex blobs) and a failed read no
+   longer echoes the path.
+4. **Server (1 fix).** `/api/models/inspect` uses ASYNC `execFile`
+   (the pre-fix `execFileSync` stalled the whole event loop for up to
+   the 10 s timeout; the async error carries the exit code in `.code`,
+   probed alongside `.status`).
+5. **CI (1 fix).** Sanitizer gate: `detect_leaks=1` (verified clean
+   on all five binaries in the local sandbox before enabling) + the
+   7th MoE fixture (GQA) in the suite invocation.
+6. **Docs.** `.agents/session.md` rounds 6-11 archived verbatim to
+   `.agents/docs/SESSION-ARCHIVE.md` (the archive rule); `CHANGELOG`
+   "local" verification lines now name the machine; FORMAT-V2.md
+   updated (GQA block mapping, 64-bit shape checks, KV-dim refusal,
+   sampler contract, `trunk_map_len`, inspect JSON contract).
+
+Deferrals (recorded, not silent): JNI batch test for the `.hydra2`
+MoE engine (separate milestone — the JNI bridge has v3/v4 coverage),
+SIMD dispatch for the MoE matvecs (scalar is correct; a benchmark
+round decides), zero-copy expert streaming (the packed-buffer
+contract of fix 2 makes it a format-level decision, not a patch).
+
+Verification (local sandbox 2026-10-30: Linux e2b.local 6.1.158+
+x86_64, gcc 12.2.0, Python 3.11.2): `make test-run` -> hydra-test
+234/0 (x86 baseline 234), jni-batch 128/0, large-model 7/0, hydra2
+152/0, **hydra-moe 180/0** (138 -> 180: the dequant-aliasing unit,
+the shape/GQA + wrap-tamper section incl. the new GQA fixture, the
+temperature / whole-window / NULL-RNG sampler pins, the UTF-8
+offset-0 refusal; the ring + defaults CLI pins live in
+text_prompt_check.sh), gguf 101/0, converter 38/0;
+`text_prompt_check.sh` ok (parity + ring pin + defaults pin);
+`server_test.js` 47/0; ASan+UBSan **with detect_leaks=1** all five
+binaries 0 errors / 0 leaks; gcc -fanalyzer rc 0 on all four
+translation units (26 pre-existing false-positive notes in
+hydra_moe.c, down from 40 before the fixes); workflow YAML/lint
+gates ok; test-count baseline 234 unchanged (main suite untouched).
+
+## 2026-10-27..30 (round 12, issue #72) — the `.hydra2` MoE inference engine, block-scaled ternary, the BPE vocabulary path, and the GGUF -> `.hydra2` converter (M1-M5 full scope)
+
+Owner directive 2026-10-27: "alles fixen was geht!!!!" (fix everything that can be fixed) — every
+actionable item of issue #72 in one branch/PR (audit with per-claim
+file:line evidence: `.agents/docs/ISSUE-72-AUDIT.md`).
+
+1. **JNI v3/v4 batch gap (M1).** `tests/test_jni_batch.c` 109 -> **128**:
+   deterministic v3/v4 writers, batched-run == direct-run stream
+   equality for greedy AND fixed-seed sampling through the same C
+   logic the bridge calls, the v4 stream pin, the token-0 fixed point
+   of the bias-free design, the 17-step partial block with a real step
+   function.
+2. **Trunk mmap (M3.2).** `src/hydra_v2_container.c` maps the resident
+   trunk region when possible (page-aligned extent + base offset);
+   tensor reads serve from the mapping, `pread` stays the documented
+   portable fallback; `trunk_backend` names the live path. The
+   hydra2 suite grew to **152** checks (both backends pinned).
+3. **Block-scaled ternary (M2.2).** New types `0x0040` TERNARY2_S64 /
+   `0x0041` TERNARY2_S128 (2-bit codes + per-group F32 scales, paired
+   `<name>.scale` tensor, `ceil(n/G)` scale count — FORMAT-V2.md 3.2.1);
+   `hydra_tf_row_dot_scaled` (integer-exact group partials * F32 FMA,
+   group-64 SIMD / group-128 scalar split); +9 main-suite checks
+   (x86 baseline 234 / arm 243 in `tools/test_count_baseline.txt`).
+4. **MoE inference engine (M3.1).** NEW `src/hydra_moe.c` +
+   `include/hydra_moe.h`: `.hydra2` `moe-transformer-v1` models run in
+   `hydra-run` — per-layer GQA (F32 attention, partial RoPE from
+   `v2.rope_theta`, per-layer sink+ring KV), deterministic top-k
+   routing, one-pread-per-expert FFN (F32 or ternary+scales layout),
+   real per-vocabulary logits, min-p/rep sampler. Documented
+   deviations: non-causal attention over cached positions, fixed 1e-6
+   RMSNorm epsilon, bounded KV (2+8). NEW `tests/test_hydra_moe.c`:
+   **138 checks** (parity vs independent reference, greedy stream pins
+   per layout — incl. the attention-ternary fixture — KV pins, ternary
+   dequant unit vs independent reference, tamper + metadata refusals).
+   `main.c` magic-dispatches `.hydra2` to the engine; the v1 path is
+   bit-identical (pinned streams re-verified).
+5. **Vocabulary + BPE + web inspection (M4).** Role-8 tensors
+   (`vocab` 0x0050 VOCAB_UTF8 / `merges` 0x0051 U16_PAIRS, FORMAT-V2.md
+   3.2.3), strict codec in the engine (byte-level tokens, loud
+   refusals: duplicates, out-of-range ids, missing concat target,
+   missing trailing NUL), `hydra-run --text-prompt` (BPE-encodes user
+   text with the embedded vocab; parity with numeric `--prompt`
+   pinned; JSON "text" echo; mutual exclusion; refusals), web console
+   `.hydra2` inspection (`/api/models/inspect`, `public/app.js`;
+   `server_test.js` 47 checks), `make_model.py --moe-full`
+   vocab/merges fixtures. Gate: `tools/text_prompt_check.sh` (CI gate
+   1h).
+6. **GGUF -> .hydra2 converter (M2.2/M3.1/M4).** NEW
+   `tools/gguf_to_hydra2.py`: a decoder-only llama GGUF (official AND
+   pinned-build tensor names; F32/F16/BF16/Q8_0) becomes a
+   complete-contract `.hydra2` MoE model — linears transposed, dense
+   FFN decomposed into E full-width masked experts (gate/up rows
+   partitioned and x E, down full, all-zero uniform router -> exact up
+   to F32 order), embedded vocab 1:1, merges filtered to expressible
+   rules (skips documented), rope_theta/bos carried; loud refusals for
+   non-GGUF / non-llama / undecodable tensors / missing tokens / dim
+   mismatch. NEW gate `tools/gguf_to_hydra2_test.py` (26 checks:
+   engine determinism, expert-CRC tamper refusal, F32-exact embed
+   transpose + masked-expert identity + byte-exact vocab + metadata,
+   merges roundtrip, five refusal controls); Makefile
+   `gguf-conv-test` in `test-run`; CI gate 1i. Docs: GGUF-IMPORT.md
+   12, FORMAT-V2.md 3.2.1/3.2.3 + implementation status.
+7. **Sanitizers in CI (found a real UB).** An ASan+UBSan rebuild
+   (same sources) flagged a misaligned float load in the ternary
+   expert scale read (rows*cols % 4 == 2): fixed with a memcpy read in
+   `src/hydra_moe.c` + the test reference (bit-identical values); NEW
+   CI step "Sanitizers (ASan+UBSan) over the whole test suite" runs
+   all five test binaries with `UBSAN_OPTIONS=halt_on_error=1`.
+   `errors.md` entry. Also fixed: the lint job never built `./hydra-run`
+   although gate 1h drives it — a build step now precedes the
+   binary-driven gates.
+
+Verification (local sandbox 2026-10-30: Linux e2b.local 6.1.158+
+x86_64, gcc 12.2.0, Python 3.11.2): `make clean && make && make test`
+green; `make test-run`: hydra-test 234/0 (x86 baseline), jni-batch
+128/0, large-model 7/0, gguf 101/0 (v1 gate untouched), gguf-conv
+26/0, hydra2-test 152/0, hydra-moe-test 138/0;
+`node --test tools/server_test.js` 47/0; ASan+UBSan all five binaries
+0 runtime errors; gcc -fanalyzer clean on all translation units;
+cppcheck 2.13.2 exact CI command NOT runnable in this sandbox (the
+repo-proxy whitelist stopped serving cppcheck/cppcheck and the sandbox
+has no root) — covered by the CI lint gate; all shell gates green.
+
 ## 2026-10-26 (round 11) — post-merge audit: sampler contract across all surfaces, .hydra2 Android validation, and the tf_row_dot SIMD completion (M1–M5)
 
 1. **One sampler validation contract across C, JNI and the web

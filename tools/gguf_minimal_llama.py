@@ -219,6 +219,17 @@ def build(seed, dtype='f32'):
     def mat(rows, cols):
         return [rng.sample() for _ in range(rows * cols)]
 
+    # VALUE ORDER follows the ggml layout the dims arrays declare
+    # (ne[0] is the contiguous dimension): a linear with dims [in, out]
+    # stores its bytes as [out] rows of [in] contiguous values, so the
+    # value list is mat(out, in); an embedding with dims [dim, vocab]
+    # stores [vocab] rows of [dim] values (token t's vector is the
+    # contiguous run at offset t*dim). The pinned llama.cpp proves the
+    # convention (ggml_get_rows / ggml_can_mul_mat). 2026-10-30: the
+    # original fixture packed the linears as mat(in, out) - a numpy
+    # reading of ggml dims - which the (equally wrong) old converter
+    # transpose compensated for; both are now corrected to the real
+    # ggml order, which makes this file a faithful llama GGUF.
     w.tensor('token_embd.weight', [dim, v], mat(v, dim), dtype)
     for l in range(layers):
         w.tensor('blk.%d.attn_q.weight' % l, [dim, dim], mat(dim, dim), dtype)
@@ -227,10 +238,10 @@ def build(seed, dtype='f32'):
         w.tensor('blk.%d.attn_output.weight' % l, [dim, dim], mat(dim, dim), dtype)
         w.tensor('blk.%d.attn_norm.weight' % l, [dim], mat(dim, 1), dtype)
         # layout of the pinned v0.5.0 llama arch (src/models/llama.cpp):
-        # gate/up = {n_embd, n_ff}, down = {n_ff, n_embd}
-        w.tensor('blk.%d.ffn_gate.weight' % l, [dim, ffn], mat(dim, ffn), dtype)
-        w.tensor('blk.%d.ffn_up.weight' % l, [dim, ffn], mat(dim, ffn), dtype)
-        w.tensor('blk.%d.ffn_down.weight' % l, [ffn, dim], mat(ffn, dim), dtype)
+        # gate/up dims = {n_embd, n_ff}, down dims = {n_ff, n_embd}
+        w.tensor('blk.%d.ffn_gate.weight' % l, [dim, ffn], mat(ffn, dim), dtype)
+        w.tensor('blk.%d.ffn_up.weight' % l, [dim, ffn], mat(ffn, dim), dtype)
+        w.tensor('blk.%d.ffn_down.weight' % l, [ffn, dim], mat(dim, ffn), dtype)
         w.tensor('blk.%d.ffn_norm.weight' % l, [dim], mat(dim, 1), dtype)
     w.tensor('output_norm.weight', [dim], mat(dim, 1), dtype)
     w.tensor('output.weight', [dim, v], mat(v, dim), dtype)

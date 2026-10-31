@@ -217,6 +217,19 @@ int hydra_transformer_forward_step(HydraEngine *engine, uint16_t token_in,
 int hydra_engine_prefill(HydraEngine *engine, const uint16_t *tokens, size_t n);
 int hydra_verify_axiom(float humanity_factor, float proposed_score, float *safe_score);
 
+/* Block-scaled ternary row dot (2026-10-27, FORMAT-V2.md 3.2
+ * TERNARY2_S64/S128): dim MUST be a multiple of group (64 or 128)
+ * and group must divide dim exactly. The result is
+ *   sum over g of  scale[g] * (integer dot of input group g)
+ * where each group dot is INTEGER EXACT (|group dot| <= group*127)
+ * and computed by the same SIMD-dispatched kernel as the plain
+ * tf_row_dot; only the per-group scale fusion is float (one f32
+ * FMA per group, left to right). That is the documented precision
+ * contract: exact where it is exact, f32 where the scale says so. */
+float hydra_tf_row_dot_scaled(const uint8_t *row, const int8_t *x,
+                              uint32_t dim, const float *scale,
+                              uint32_t group);
+
 /* ---------------------------------------------------------------------
  * Sampling (min-p + repetition penalty)
  *

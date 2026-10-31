@@ -1,8 +1,133 @@
 # Error Log — Hydra-Stone
-
 > Protocol: see `.agents/skills/session-workflow/SKILL.md`.
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
+
+## 2026-10-30 (round 13) — self-inflicted test/pin mistakes during the Qodo-fix round (five distinct traps, all caught before commit)
+
+- **Symptom:** after the engine fixes, the moe suite and the CLI gate
+  failed in ways the fixes could not have caused: six dequant unit
+  anchors wrong, a "divergence" between text and numeric prompt
+  streams, a meta-tamper test that refused the wrong file, a GQA pin
+  that could not distinguish old from new mapping, and one server
+  test receiving 500 instead of 200.
+- **Cause (each one real, each one mine):**
+  (1) The `test_moe_dequant_flat_unit` anchors were computed by hand
+  against a WRONG code pattern (0,0,3,3,2,1,1,2 instead of the
+  generator's 0,0,3,0,2,1,1,2) and a WRONG payload size (n/4 bytes
+  instead of the n/2 the engine reads, `payload[k/2]`) — a 64-byte
+  payload for 256 elements let groups 2/3 read OOB stack garbage,
+  which is exactly why only their anchors failed while 0/1 passed.
+  The compiler warnings ("iteration 64 invokes UB", "writing 32 bytes
+  into region of size 0") pointed at the first overflow variant.
+  (2) The #23 dispatch move made `--prompt` win over the positional
+  start token on .hydra2 too, so the R12 text/numeric parity check
+  compared different START tokens (the header line differs); the
+  streams only become equal with the #30 prefill. The gate's byte
+  comparison then needed to exclude the metadata header line — and
+  my first regex excluded `^\[Hydra\]:` (with a colon) while the
+  line is `[Hydra] .hydra2 ...` (no colon), so the exclusion
+  silently did nothing until the second fix.
+  (3) The meta-tamper helper computed FILE offsets from the
+  container's `meta_blob` offsets — but the blob is a COMPACT
+  re-serialization (key bytes, value bytes, no headers), not the
+  on-disk region; the tamper wrote the wrong 4 bytes, the file still
+  opened, and the refusal check failed. The on-disk wire format
+  (u32 count, then klen/vlen-prefixed pairs) has to be walked from
+  `metadata_offset`.
+  (4) The first GQA pin (`12 12 12 12 12 12 5 5 5 5 13 5`) was
+  captured from a binary that had NOT been rebuilt after the
+  mapping fix — it is the OLD interleave stream; a scripted
+  A/B (build-swap-build-run per mapping) showed every tested
+  geometry actually differs, and the corrected pin is
+  `15 9 12 12 9 13 13 13 13 13 10 13`.
+  (5) Node's ASYNC execFile error object carries the exit code in
+  `.code` (the SYNC throw uses `.status`), so the refusal branch
+  (`rc === 2`) after the #27 async conversion never matched and the
+  inspect endpoint returned 500 for broken .hydra2 files.
+- **Fix/lesson (one rule each):** anchors and pins are ALWAYS
+  verified by an independent implementation (byte-level Python replay
+  for the packing; a scripted build/swap/run A/B for any stream pin,
+  which must prove old != new before the pin is meaningful); offsets
+  across an API boundary are re-derived from the on-disk format, not
+  from the in-memory view; a rebuilt binary is verified (mtime or a
+  canary behavior) before it pins anything; sync/async subprocess
+  error shapes differ in every runtime — read the docs, don't assume.
+
+
+## 2026-10-30 (round 12) — cppcheck found two warnings the local gates could not (one a real latent OOB), and the CI logs were unreadable from this sandbox
+
+- **Symptom:** every CI run of the R12 branch failed in the `lint`
+  job with only "Process completed with exit code 2" visible. `gh run
+  view --log-failed` and `gh run download` hit the sandbox network
+  whitelist (results-receiver / blob storage -> EOF) and the jobs API
+  returned an empty step list, so the failing step was unknown.
+  Meanwhile all local gates (gcc/clang -Werror, -fanalyzer, ASan+UBSan,
+  full test suite) were green — only cppcheck could not be run locally
+  (the proxy whitelist no longer serves the cppcheck repo; no root for
+  apt).
+- **Cause (gate red):** two real findings, both in round-12 code:
+  (1) `tests/test_hydra_moe.c` reference top-k used a `best = -1`
+  sentinel; with zero experts the elimination write `rk[best]` would
+  index -1 — `[negativeIndex]` error. (2) `src/hydra_moe.c` casts the
+  raw expert scratch buffer `uint8_t *` -> `const float *` for the F32
+  path — `[invalidPointerCast]` (portability). Second subtlety:
+  cppcheck ABORTS at 82% when it hits the first error-severity
+  finding, so a second analysis pass after the fixes was required to
+  prove the remaining files were clean (they were: 9/9, 0 findings).
+- **Fix:** (1) restructured the reference scan to a `best = 0` start
+  with a strict `>` comparison (epl >= 1 is guaranteed by the model
+  config; identical winner, tie -> lower id; 138/0 re-verified).
+  (2) documented the cast inline (malloc-aligned buffer, F32 payload by
+  format contract) + `cppcheck-suppress invalidPointerCast` — the gate
+  is explicitly run with `--inline-suppr`. Triage method that worked:
+  check-run ANNOTATIONS API (`/check-runs/<id>/annotations`) exposes
+  the failing line + exit code, and a temporary workflow step that
+  re-ran cppcheck with `--error-exitcode=0` re-emitting every line as
+  a `::error::` annotation made the findings visible. The diagnostic
+  step was removed again in the final commit.
+- **Prevention:** (1) a `-1` sentinel that can reach an array index is
+  a defect even when the caller's invariants make it unreachable —
+  write index loops so the sentinel cannot be used (init from a
+  provably-valid element); (2) for any gate whose tool is unreachable
+  locally, keep the CI reproducible from the log AND keep the
+  annotation-API fallback (see the ci-triage skill); (3) after fixing
+  findings from an aborted static-analysis run, re-run it to 100% —
+  the first pass hides what comes after the abort point.
+
+## 2026-10-30 (round 12) — the ternary expert dequant read its scales through a misaligned float pointer (UBSan-only: the -O3 suite was green)
+
+- **Symptom:** an ASan+UBSan rebuild of `hydra-moe-test` (same
+  sources, `-fsanitize=address,undefined`) reported
+  `runtime error: load of misaligned address … for type 'const float'`
+  at `src/hydra_moe.c:911` (and in the test's independent reference
+  dequant). The regular `-O3` build ran all 138 checks green, so
+  nothing in the existing gates could have seen it.
+- **Cause:** in the block-scaled ternary expert layout the per-group
+  F32 scales are stored directly AFTER the packed code bytes (`n/2`
+  bytes). When `rows*cols % 4 == 2` (e.g. the dequant unit test's
+  inter=2 x dim=3 blob, and any valid .hydra2 expert matrix of that
+  shape) the scale section starts at a 2-byte-aligned, not
+  4-byte-aligned, offset. `const float *scales = (const float
+  *)(p + n/2)` and then `scales[i]` is a misaligned load: silently
+  "works" on x86-64, a trap/perf hazard on ARM. The format's
+  code|scales concatenation makes the misalignment unavoidable, so
+  the READ side must be portable, not the layout.
+- **Fix:** read each scale through `memcpy` (4-byte copy, identical
+  value, portable) in both `src/hydra_moe.c` (`moe_dequant_block`)
+  and the independent reference in `tests/test_hydra_moe.c`
+  (`ref_dequant_expert`). No numeric change - the dequant values are
+  bit-identical, the pinned greedy streams re-verified.
+- **Prevention:** CI now has a "Sanitizers (ASan+UBSan) over the
+  whole test suite" step (build-test job, both matrix legs): all
+  five test binaries are rebuilt with
+  `-fsanitize=address,undefined` and run with
+  `UBSAN_OPTIONS=halt_on_error=1`, so any runtime error - including
+  misaligned accesses the -O3 build serves silently - fails the
+  build. Rule: a cast from `uint8_t *` to `float *` (or any wider
+  type) is only legal when the alignment is PROVEN by construction
+  (malloc/aligned array/16-byte-aligned section); byte-stream offsets
+  get a memcpy.
 
 ## 2026-10-26 (round 10) — the documented smoke recipe never ran llama-cli: `timeout` treated `OMP_NUM_THREADS=1` as the executable (Qodo issue, confirmed)
 

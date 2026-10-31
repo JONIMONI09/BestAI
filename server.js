@@ -41,6 +41,10 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+/* execFile: async, used by the request handlers. execFileSync: ONLY
+ * at startup (ensureDefaultModel, before server.listen - there is no
+ * event-loop traffic yet); a sync spawn inside a request handler
+ * would stall every other request (round 13, Qodo #27). */
 const { execFile, execFileSync } = require('child_process');
 const { randomUUID } = require('node:crypto');
 const trainer = require('./tools/hydra_train');
@@ -159,7 +163,11 @@ function readBody(req) {
  * error message revealed the target's size). The path is therefore resolved
  * with realpath and checked again, and it must be a regular file. */
 function safeModelPath(p) {
-  if (typeof p !== 'string' || !p.endsWith('.hydra')) return null;
+  /* .hydra2 containers pass through too: inspection (and later
+   * tooling) must reach them with the SAME escape protection as
+   * .hydra files. No other suffix is accepted. */
+  if (typeof p !== 'string' ||
+      (!p.endsWith('.hydra') && !p.endsWith('.hydra2'))) return null;
   if (p.includes('\0')) return null;
   const abs = path.resolve(ROOT, p);
   if (!abs.startsWith(ROOT + path.sep)) return null;
@@ -643,7 +651,10 @@ function listHydraFiles(dir, prefix) {
   }
   const out = [];
   for (const e of entries) {
-    if (e.isFile() && e.name.endsWith('.hydra')) {
+    /* .hydra2 containers are listed too: they are inspectable
+     * (GET /api/models/inspect dispatches on the format) even though
+     * the v1 infer path does not run them. */
+    if (e.isFile() && (e.name.endsWith('.hydra') || e.name.endsWith('.hydra2'))) {
       out.push(path.join(prefix, e.name));
     } else if (e.isDirectory() && e.name !== 'vocab' && !e.name.startsWith('.')) {
       out.push(...listHydraFiles(path.join(dir, e.name), path.join(prefix, e.name)));
@@ -659,13 +670,35 @@ function inspectHeader(relPath) {
   let fd;
   try {
     fd = fs.openSync(abs, 'r');
-    const buf = Buffer.alloc(24);
-    const n = fs.readSync(fd, buf, 0, 24, 0);
+    const buf = Buffer.alloc(128);
+    const n = fs.readSync(fd, buf, 0, 128, 0);
     if (n < 24) return null;
     const st = fs.fstatSync(fd);
+    /* The .hydra2 container starts with the 8-byte magic "HYDRA2\0\0"
+     * (a 128-byte header): the list entry carries its own shape - the
+     * full report is GET /api/models/inspect. */
+    if (n >= 8 && buf.toString('latin1', 0, 8) === 'HYDRA2\u0000\u0000') {
+      return {
+        path: relPath,
+        bytes: st.size,
+        format: 'hydra2',
+        magic: null,
+        version: n >= 10 ? buf.readUInt16LE(8) : null,
+        vocab: null,
+        dim: null,
+        layers: null,
+        weightsOffset: null,
+        weightsLen: null,
+        valid: true,
+        trained: relPath.startsWith('models' + path.sep + 'trained' + path.sep),
+        uploaded: relPath.startsWith('models' + path.sep + 'uploaded' + path.sep),
+        converted: relPath.startsWith('models' + path.sep + 'converted' + path.sep),
+      };
+    }
     return {
       path: relPath,
       bytes: st.size,
+      format: 'hydra',
       magic: buf.readUInt32LE(0),
       version: buf.readUInt16LE(4),
       vocab: buf.readUInt16LE(6),
@@ -1110,7 +1143,7 @@ const server = http.createServer(async (req, res) => {
        * deliberately conflates the two (realpath fails for a missing file),
        * which would make "no such model" indistinguishable from "not
        * allowed". */
-      if (rel.includes('\0') || !rel.endsWith('.hydra')) {
+      if (rel.includes('\0') || (!rel.endsWith('.hydra') && !rel.endsWith('.hydra2'))) {
         return sendJSON(res, 400, { error: 'invalid model path', checked: rel });
       }
       const resolved = path.resolve(ROOT, rel);
@@ -1125,10 +1158,60 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 400, { error: 'invalid model path', checked: rel });
       }
       let report;
-      try {
-        report = analyseHydraFile(abs);
-      } catch (e) {
-        return sendJSON(res, 500, { error: 'model could not be read', detail: e.message });
+      if (rel.endsWith('.hydra2')) {
+        /* The .hydra2 report is the C container reader's OWN verdict
+         * (hydra-run --inspect): one validator, the same one the
+         * engine runs. Round 13 (Qodo #27): ASYNC execFile - the
+         * sync variant blocked the ENTIRE event loop for up to the
+         * 10 s timeout, stalling every other request (health checks,
+         * running inferences) behind one inspect call. No shell, the
+         * same invariant as every other spawn in this file. */
+        try {
+          const out = await new Promise((resolve, reject) => {
+            execFile(
+              HYDRA_RUN,
+              ['--inspect', abs],
+              {
+                timeout: 10000,
+                maxBuffer: 8 * 1024 * 1024,
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+              },
+              (err, stdout, stderr) => {
+                if (err) {
+                  err.stdout = stdout;
+                  err.stderr = stderr;
+                  reject(err);
+                } else {
+                  resolve(stdout);
+                }
+              }
+            );
+          });
+          report = JSON.parse(out);
+        } catch (e) {
+          /* rc 2 = the reader refused the file: that is still a
+           * successful diagnosis. Anything else (binary missing,
+           * crash) is a server-side failure. The ASYNC execFile error
+           * carries the exit code in .code (the sync throw used
+           * .status), so both are probed (round 13, Qodo #27). */
+          const rc = e.status !== undefined ? e.status : e.code;
+          if (rc === 2) {
+            try { report = JSON.parse(e.stdout || '{}'); } catch { report = {}; }
+            report.reader_message = (e.stderr || '').trim();
+          } else {
+            return sendJSON(res, 500, {
+              error: 'hydra-run --inspect failed',
+              detail: e.message,
+            });
+          }
+        }
+      } else {
+        try {
+          report = analyseHydraFile(abs);
+        } catch (e) {
+          return sendJSON(res, 500, { error: 'model could not be read', detail: e.message });
+        }
       }
       report.path = rel;
       report.trained = rel.startsWith('models' + path.sep + 'trained' + path.sep);
