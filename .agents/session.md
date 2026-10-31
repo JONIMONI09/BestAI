@@ -413,3 +413,22 @@ at `c5fcd38`, PR #73 ready for merge:**
 **Verification (local sandbox 2026-10-30):** make test-run -> hydra 234/0 (baseline 234 unchanged), jni 128/0, large 7/0, hydra2 152/0, **hydra-moe 180/0** (138 -> 180), gguf 101/0, converter 38/0; text_prompt_check ok; server_test.js 47/0; ASan+UBSan **detect_leaks=1** all five binaries 0 errors/0 leaks; gcc -fanalyzer rc 0 (hydra_moe.c notes 40 -> 26, pre-existing false positives); workflow gates ok.
 
 **Status:** all gates local green. Next: commit + push + CI + PR body update (FACTS ONLY).
+
+**Status:** all gates local green. Next: commit + push + CI + PR body update (FACTS ONLY).
+
+## Round 14 (2026-10-31) — merge follow-up: macOS sanitizer crash, fix, re-green
+
+**Session start (R33):** 2026-10-31, branch `arena/44edb923-bestai` (PR #73 already merged as `d1729ba`), base = origin/main. Read: `.agents/errors.md` (macOS/AppleClang entries), `.github/workflows/ci.yml` (sanitizer step), PR #73 merge run.
+
+**Owner directive (verbatim):** "Please merge the pull request." / after the red main run: "fixen und so!!" (fix it and the usual follow-up).
+
+**What happened:**
+- PR #73 merged (merge commit `d1729ba`, merge-commit style per the repo convention of PR #70).
+- The main-tier CI run of the merge FAILED exactly one step: `build-test (macos-latest)` → "Sanitizers (ASan+UBSan) over the whole test suite", exit 134 (SIGABRT). All other jobs/steps passed, including the ubuntu leg of the same step and the full Release workflow.
+- Root cause: round 13 (Qodo #6) set `ASAN_OPTIONS=detect_leaks=1` unconditionally. AppleClang ships NO LeakSanitizer; with detect_leaks requested the ASan runtime aborts at startup on macOS. The ubuntu-green leg was no proof for the macOS leg - a platform-specific runtime option was changed without a macOS verification path (no macOS toolchain in this sandbox).
+- Fix (commit `fe2edc6`, PR #75): platform-conditional option in the sanitizer step - `detect_leaks=1` on Linux, empty on macOS; ASan + UBSan (`halt_on_error=1`) stay fully active on both legs. workflow_yaml_check + workflow_lint_check green.
+- PR #75 merged (`5ff3011`). Main-tier run: all three workflows SUCCESS, `build-test (macos-latest)` success (9/9 jobs). Main green.
+
+**Lesson (recorded in `.agents/errors.md`):** sanitizer/ASan-RT options are platform-specific; a change to them must be verified on EVERY matrix leg (or guarded by `uname -s`) before it can run on one. Exit 134 = SIGABRT at runtime startup pointed at a runtime-option problem, not a test failure.
+
+**Workspace note (2026-10-31):** after the merge the sandbox workspace was re-created as a fresh clone (branch pointer at the session base `94f8e08`); 7 files newly added in round 12 were missing from the restored working tree (present in the commits - nothing lost). Working tree restored via `git reset --hard 3c448c9` before the follow-up fix.

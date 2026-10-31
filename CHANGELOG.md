@@ -2,6 +2,23 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-31 (round 14, merge follow-up) — macOS sanitizer leg: LeakSanitizer is Linux-only
+
+PR #73 merged (`d1729ba`). The main-tier CI run failed exactly one step:
+`build-test (macos-latest)` → "Sanitizers (ASan+UBSan) over the whole test
+suite", exit 134 (SIGABRT). Cause: the round-13 `detect_leaks=1` (Qodo #6)
+- AppleClang ships no LeakSanitizer, and the ASan runtime aborts at
+startup when detect_leaks is requested on macOS. The ubuntu leg of the
+same step was green, which masked the platform-specific option.
+
+Fix (PR #75, merged `5ff3011`): the sanitizer step selects the option per
+platform (`uname -s`) - `detect_leaks=1` on Linux, empty on macOS; ASan +
+UBSan (`halt_on_error=1`) stay fully active on both legs. Verified:
+workflow gates green; after the merge all three main workflows succeeded
+(9/9 CI jobs incl. `build-test (macos-latest)`). `.agents/errors.md` +
+`.agents/session.md` round-14 entries. Also removed an orphaned
+preamble block that had sat mid-file since an earlier round.
+
 ## 2026-10-30 (round 13, Qodo/CodeQL audit of PR #73 @ c5fcd38) — engine hardening: all 26 open, fixable findings fixed with regression tests (+ the CodeQL alert)
 
 Owner directive 2026-10-30 (verbatim intent): review every Qodo
@@ -754,9 +771,6 @@ byte-identical, and no v1/v2/v3 file or code path was rewritten.
    concurrency findings; flawfinder `--minlevel=4` no hits;
    `make test-run` rc=0; gguf_test 59/0; server_test 37/37;
    test_count 142 vs baseline.
-
-All notable changes to this project, per change, are recorded here and in
-`.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
 ## 2026-10-26 — Local lint stack (no CI deferral), PR/main CI split, code-scanning alert handling, .agents/Environment.md
 
