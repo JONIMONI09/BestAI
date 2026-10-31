@@ -1,8 +1,9 @@
 /* hydra_moe.h - the sparse-MoE inference engine on top of the
  * .hydra2 container (FORMAT-V2.md, architecture "moe-transformer-v1",
- * round 12 design, 2026-10-27). Expert layouts:
- *   0 = flat F32 (the contract of round 12 stage 4)
- *   1 = TERNARY2 + per-group F32 scales (stage 5): each expert blob is
+ * round 12 design, 2026-10-27; layout 2 added round 16, 2026-10-31).
+ * Expert layouts:
+ *   0 = flat F32
+ *   1 = TERNARY2 + per-group F32 scales: each expert blob is
  *       [gate payload][gate scales][up payload][up scales]
  *       [down payload][down scales], one block per sub-matrix, where a
  *       (rows x cols) block is the exact TERNARY2 payload (n/2 bytes,
@@ -14,6 +15,11 @@
  *       scale, exact in F32) and runs the IDENTICAL F32 expert path -
  *       there is deliberately no separate ternary mat-vec kernel, so
  *       the downstream arithmetic is provably the F32 path's.
+ *   2 = Q4_0 blocks (round 16, FORMAT-V2.md 3.2.4): [gate][up][down] as
+ *       18-byte blocks (F16 d + 16 nibble bytes, w = d*(q-8)); the
+ *       mat-vec kernels dequantize ONE row at a time into a shared
+ *       scratch, so the expert's resident memory stays 4-bit and F32 is
+ *       never materialized (that is the point of the type).
  *
  * This module is ADDITIVE: it opens a .hydra2 file through the
  * container reader (mmap trunk + pread fallback), reads the trunk
@@ -21,14 +27,17 @@
  * experts per token. It does not touch the v1-v4 engine paths; the
  * pinned legacy token streams stay bit-identical.
  *
- * MODEL (expert_layout 0 = F32 flat, the contract of this round):
+ * MODEL (all expert layouts; 0 = F32 flat, 1 = ternary+scales,
+ * 2 = Q4_0 blocks):
  *
  *   h = embed[token]                                  (dim floats)
  *   for each layer l:
  *     a = RMSNorm(h, attn_norm[l])
  *     q = attn_q[l] * a ; k = attn_k[l] * a ; v = attn_v[l] * a
  *     GQA: q has n_heads heads of head_dim, k/v have n_kv_heads;
- *          head i of q attends to head (i % n_kv_heads) of k/v.
+ *          head i of q attends to head (i / (n_heads / n_kv_heads))
+ *          of k/v (BLOCK mapping, round 13; the pre-fix interleave
+ *          i % n_kv_heads is wrong for any n_kv_heads > 1).
  *     RoPE on q and k at position pos (theta = v2.rope_theta,
  *          default 10000.0).
  *     kv cache per layer: sink (v2.kv_sink, default 4) + ring

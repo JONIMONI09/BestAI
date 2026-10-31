@@ -503,3 +503,52 @@
    annotations API (`gh api .../check-runs/<id>/annotations`) plus
    the job page on github.com (lists which step failed), and
    reproduce locally with the matching tool version (item 3).
+
+## 2026-10-31 (rounds 16/16.5/17) — /tmp reset again, CI diagnosis without logs, apt blocked
+
+Measurements from the R16.5 CI fix and the R17 documentation audit (this
+sandbox session, Debian 12 container, gcc 12.2.0, Python 3.11.2, Node 20):
+
+1. **/tmp is wiped between sandbox sessions** (again): `/tmp/lintenv` was
+   gone. Rebuilt in ~9 s: `python3 -m venv /tmp/lintenv &&
+   /tmp/lintenv/bin/pip install -q cppcheck pyflakes bandit pyyaml`
+   (measured: cppcheck 2.22.0, pyflakes, bandit 1.9.x, pyyaml). `npm ci`
+   (eslint) also re-run, ~8 s, rc=0. Both are prerequisites for the local
+   gates — check them first in every new session.
+2. **apt is BLOCKED in this sandbox (measured):** `sudo` works, but
+   `deb.debian.org` (and `debian-security`) fail with "Connection failed"
+   from `apt-get update` (egress allowlist). Therefore clang, clang-tidy,
+   flawfinder, javac, gcc-12-aarch64-linux-gnu and qemu-user-static are
+   NOT installable here — the clang strict syntax gate, L2/L3 (clang
+   analyzer / clang-tidy), flawfinder, the JNI signature gate and the
+   NEON/aarch64 parity gate must run in CI (ubuntu-latest has them all).
+   `gcc -fanalyzer`, cppcheck (pip wheel), pyflakes, bandit, pyyaml and
+   `npm ci` (registry.npmjs.org) DO work locally (measured green this
+   session). A "blocked, not measured" claim for the apt-gated tools is
+   the honest verdict here; the rest of the gate stack ran locally.
+3. **CI diagnosis without logs (R16.5 incident 41222651267):**
+   - `gh run view <run> --log` EOFs repeatedly from
+     results-receiver.actions.githubusercontent.com (known block, but
+     worse than before: no partial log). Do not retry-loop.
+   - `gh api .../check-runs/<id>` returns `steps: null` (not
+     expandable); `.../actions/jobs/{id}/steps` does not exist (404).
+   - What DOES work: `gh api .../actions/jobs?per_page=100` (job list
+     with per-job conclusion) and `gh api .../actions/jobs/{job_id}`
+     (per-job `steps[]` with name/status/conclusion). Step conclusions
+     + timing + a local byte-for-byte reproduction is a complete proof
+     without the log.
+   - `gh run view <run> --job <jobid> --log` prints nothing while the
+     run is in progress ("logs will be available when it is complete").
+   - Timing heuristic that caught the false "30 s = skipped?" alarm:
+     compare the green run's build-test duration (30 s) with the red
+     run's time-to-failure in the SAME step (36–38 s) — 30 s total is
+     this repo's normal build-test duration, not a skip.
+4. **The llama.cpp submodule is NOT checked out in a fresh sandbox**
+   (measured: `tools/llama_pin_check.sh` failed 2/5 on the missing
+   LICENSE). Fix, ~25 s: `git submodule update --init
+   android/app/src/main/cpp/llama` (github.com reachable). Run it once
+   per fresh checkout before the pin gates.
+5. **`tools/ci_release_version_test.sh` needs pyyaml on `python3`** —
+   the sandbox system python has none. Run it with the venv on PATH:
+   `PATH=/tmp/lintenv/bin:$PATH bash tools/ci_release_version_test.sh`
+   (measured green that way; fails with ModuleNotFoundError otherwise).

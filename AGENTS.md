@@ -26,8 +26,11 @@ and nothing merged without the user (R17/R18), and never `git checkout`
 
 ## 2. Architecture map
 
-One C engine, four consumers. The engine has exactly one implementation
-(`src/hydra_engine.c`, R12); everything else wraps it or converts into it.
+Two C inference engines, four consumers. The v1–v4 recurrent/transformer
+engine has exactly one implementation (`src/hydra_engine.c`, R12); the
+`.hydra2` MoE engine is the second one (`src/hydra_moe.c` on the
+`src/hydra_v2_container.c` reader, rounds 12–16). Everything else wraps
+an engine or converts into one of its formats.
 
 ```
                     ┌────────────────────────────────────────────────┐
@@ -137,9 +140,10 @@ failure) operation: a failed swap is a no-op.
 
 ### 2.3 The Python conversion pipeline (`tools/`)
 
-`gguf_reader.py` (stdlib only) reads GGUF v2/v3: F32/F16/BF16 dense plus Q8_0
-block dequant (34-byte blocks, `w = d·q`); everything else is refused **by
-name**. `gguf_to_hydra.py` converts a GGUF into a v1 `.hydra`: it ternarises
+`gguf_reader.py` (stdlib only) reads GGUF v2/v3: six layouts (F32/F16/BF16
+dense, Q8_0 34-byte blocks `w = d·q`, Q4_0 18-byte blocks `w = d·(q−8)`,
+Q4_1 19-byte blocks `w = d·(q−8)+m`) with C-speed decoders; everything else
+is refused **by name**. `gguf_to_hydra.py` converts a GGUF into a v1 `.hydra`: it ternarises
 the real float weights with the b1.58 absmean rule (threshold `mean|W|/2`,
 rounding half-away-from-zero), sums per column, folds to 64 dimensions,
 rescales to peak ±127 and emits a file whose aggregation equals the computed
@@ -152,16 +156,34 @@ of `step()`, a real `hydra-run` comparison, and 12 negative controls.
 not state-blind). `gguf_inspect.py` answers "is this file convertible" before
 a long conversion. `gguf_speed.py` measures the converter (wall time,
 throughput, peak RSS) — re-run it rather than quoting a stale number.
+`gguf_to_hydra2.py` is the GGUF → `.hydra2` (v2 container) converter: a
+full-fidelity MoE model (all experts, embedded BPE vocabulary, 32-chunk
+streaming; `tools/gguf_to_hydra2_test.py` is its 44-check gate). Since round
+16 it also supports `--t4` (trunk tensors written as the resident Q4_0
+type 0x0030 — the file that fits a phone) and `--probe` (Q4_0-clean report).
+`make_moe_fixtures.sh <base>` is the SINGLE source of the nine
+`hydra-moe-test` fixtures — the Makefile `test-run` recipe and the ci.yml
+sanitizer step both call it, so a fixture has exactly one home
+(.agents/errors.md 2026-10-31). `build_3b_synth_gguf.py` writes the
+3B-geometry synthetic GGUF that the opt-in 3B E2E gate
+(`HYDRA2_3B_E2E=1`) converts and runs.
 
 ### 2.4 The Node training/web suite
 
 `server.js` is a zero-dependency console: static UI (`public/`) plus
 `/api/{models,model,models/upload,models/import,models/inspect,infer,train,
-vocab,axiom,cancel,errors}`. All model paths go through realpath (R28);
-uploads are size-capped with a streaming guard that answers 413 **before**
-destroying the socket (.agents/errors.md: "The 413 that was never delivered");
-`/api/models/import` is single-active with HTTP 429 + `Retry-After` on the
-second caller. The heavy lifting — inference and training — runs in the
+vocab,axiom,cancel,errors,config}`. All model paths go through realpath
+(R28); uploads are size-capped with a streaming guard that answers 413
+**before** destroying the socket (.agents/errors.md: "The 413 that was never
+delivered"); `/api/models/import` is single-active with HTTP 429 +
+`Retry-After` on the second caller. Since round 16 the configuration is
+env-driven (`HYDRA_DEFAULT_MODEL`, `HYDRA_MAX_TRAIN_BODY`,
+`HYDRA_MAX_PROMPT` — a cap only, `HYDRA_INFER_TIMEOUT_MS`,
+`HYDRA_DEFAULT_STEPS`, `HYDRA_IMPORT_MODE`) and documented read-only at
+`GET /api/config`; import takes `?mode=auto|v1|v2&t4=auto|force|none&max_
+experts=1..8`, and a v2 target is written to `models/converted/<name>.hydra2`
+(the `.hydra2` MoE engine of §2 then loads it — the console can therefore
+serve real 4-bit MoE models, e.g. the 3B E2E target). The heavy lifting — inference and training — runs in the
 compiled C engine and in `tools/hydra_train.js`, whose `step()` is a
 line-by-line mirror of `hydra_engine_step()` and which hill-climbs on the
 whole-sample score (ternary moves, best snapshot returned). The console
@@ -195,8 +217,14 @@ make test-run                              # RUNS them (test-run, not test)
 
 # 1. Native engine suites
 ./hydra-test                               # expect "N Tests, 0 failures" (N parsed, never assumed)
-./jni-batch-test                           # expect "109 checks, 0 failed" (count parses from output)
+./jni-batch-test                           # expect "128 checks, 0 failed" (count parses from output)
 ./large-model-test                         # 5 GiB sparse model + 32-bit offset refusals
+./hydra2-test                              # .hydra2 container reader (152 checks)
+bash tools/make_moe_fixtures.sh /tmp/moe > /tmp/moe.args
+./hydra-moe-test $(tail -n 1 /tmp/moe.args)   # 216 checks; the script's last
+                                           # stdout line IS the argv path list
+                                           # (single source — Makefile + CI
+                                           # call the same script)
 bash tools/test_count_check.sh ./hydra-test x86   # parsed count vs reviewed baseline (R21)
 bash tools/sampler_contract_check.sh      # C header <-> JNI header <-> server.js sampler
                                           # contract (34 checks; the C header is the
@@ -224,12 +252,13 @@ bash tools/ci_syntax_mirror_test.sh             # the EXACT ci.yml syntax comman
 
 # 2. Python pipeline
 python3 tools/gguf_test.py --engine ./hydra-run   # expect "N checks, 0 failed" (N parsed, never assumed)
+python3 tools/gguf_to_hydra2_test.py ./hydra-run  # .hydra2 converter gate (44 checks, `make gguf-conv-test`)
 python3 tools/gguf_speed.py                        # converter throughput (host-labelled)
 python3 tools/string_format_check.py               # format-string/specifier contract
 bash tools/string_format_negative_test.sh          # the gate must be able to fail (R25)
 
 # 3. Node server, trainer, UI
-node --test tools/server_test.js           # 43 live HTTP tests (incl. the 6-sampler
+node --test tools/server_test.js           # 57 live HTTP tests (incl. the 6-sampler
                                            # suite: bit-parity legacy==temp0, flag
                                            # plumbing, boundaries, 400 bad-value suite)
 node tools/console_train_test.js           # trainer vs the COMPILED engine, bit-for-bit
@@ -290,9 +319,10 @@ same tokens). Cross-platform claims require running both platforms.
 | Topic | Document |
 |---|---|
 | v1 binary format + validation rules | `docs/FORMAT.md` |
-| `.hydra2` container (specification only, no loader) | `docs/FORMAT-V2.md` |
-| What GGUF import actually does | `docs/GGUF-IMPORT.md` |
+| `.hydra2` container + MoE engine (implemented, rounds 12–16) | `docs/FORMAT-V2.md` |
+| What GGUF import actually does (incl. the `.hydra2` path) | `docs/GGUF-IMPORT.md` |
 | Engine architecture + memory model | `docs/ARCHITECTURE.md` |
+| Large models: what fits where, 2026 techniques, phone path | `docs/LARGE-MODELS.md` |
 | v2 research brief | `.agents/docs/HYDRA2-RESEARCH.md` |
 | GPU feasibility | `.agents/docs/gpu-feasibility.md` |
 | Android build/verify (long form) | `.agents/docs/ANDROID_SKILL.md` |

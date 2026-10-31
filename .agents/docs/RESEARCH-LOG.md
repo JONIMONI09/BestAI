@@ -22,6 +22,8 @@
 | 2026-10-26 | GitHub workflow compiler vs PyYAML (duplicate keys) | zero-job red run; gate 1h shipped |
 | 2026-10-26 | Auto-close target: issues → code-scanning alerts | issue-verify removed; auto-close is native GitHub behaviour — an event-triggered workflow cannot exist (see §7 correction) |
 | 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in .agents/Environment.md |
+| 2026-10-26 | Local/CI syntax drift: the five-file lesson (PR #55 first run) | ci_syntax_mirror_test.sh gate shipped |
+| 2026-10-26 | Darwin feature-test inversion: _POSIX_C_SOURCE hides, not enables | control-based string-format gate; release.yml green |
 
 ---
 
@@ -373,15 +375,42 @@ aarch64 rc=0 (pin active), zig arm-32-bit rc=0 (pin inactive), C++
 parse rc=0, exact CI 1a rc=0, C suites green. Note: the PR tier
 caught this **before merge** - exactly the behaviour the owner asked
 for ("CI findet die Fehler auf dem PR").
-Second red of the same run (android-lint, step 9 "Kotlin-/C-
-Kompilierung"): the **universal** 664-byte compile-time pin broke the
-NDK **armeabi-v7a** build - 32-bit ABIs use the smaller ILP32 layout
-(sizeof != 664), reproduced locally with `zig cc -target
-arm-linux-gnueabihf` (the exact negative-size-array error). Fix: the
-pin is now LP64-conditional (`__LP64__`/`_LP64`/`__LP64`); the
-documented 664 B claim is a 64-bit statement, 32-bit targets
-legitimately compile a smaller layout. Verified: x86-64 rc=0, zig
-aarch64 rc=0 (pin active), zig arm-32-bit rc=0 (pin inactive), C++
-parse rc=0, exact CI 1a rc=0, C suites green. Note: the PR tier
-caught this **before merge** - exactly the behaviour the owner asked
-for ("CI findet die Fehler auf dem PR").
+
+## 11. CI fixture-list drift: 216 checks green locally, red on main (2026-10-31, after the round-16 merge)
+
+**Question:** after PR #77 merged (round 16), the main-tier `build-test`
+(macOS + Ubuntu) failed in the Sanitizers step (run 41222651267) while
+`make test-run` stayed green locally and in the PR-tier build. What was
+the drift, and how do you make the class of bug unrepeatable?
+
+**Method:** job conclusions + step timestamps from the REST jobs API
+(`gh run view --log` EOF'd repeatedly from the results-receiver — the
+known log-fetch block, see .agents/Environment.md), then local
+reproduction: built the 9-fixture `hydra-moe-test` from the merge commit
+and ran it with the 7 argv paths the ci.yml step still inlined.
+
+**Finding:** round 16 added two fixtures (`-q4`, `-q4f32`) to the
+`hydra-moe-test` argv contract (the binary now hard-requires 9 fixture
+paths, argv-count check before any test) and updated the Makefile's
+`test-run` recipe — but the ci.yml sanitizer step carried its OWN inline
+copy of the fixture list from before the addition. The binary refused
+loudly (`fixture paths missing`); the drift was invisible on the PR tier
+(lint-only by owner rule) and on local runs (Makefile updated), so the
+first main-tier functional run was the first to see it.
+
+**Resolution:** the fixture list now lives exactly once in
+`tools/make_moe_fixtures.sh <base>` — it generates all nine fixtures and
+prints their paths as the last stdout line; the Makefile recipe and the
+ci.yml sanitizer step both call it (`… | tee <args-file>` keeps the
+generator's byte-count lines in the logs, `tail -n 1` extracts the path
+list). Verified: the 7-argv error reproduced before the fix; after it,
+`make test-run` 234/128/7/101/152/216 all 0 and the sanitizer leg
+reproduced byte-for-byte locally (ASan + UBSan, `detect_leaks=1`,
+`halt_on_error=1`) → exit 0. Merged as PR #78 (`c5d281e`, main `8606d58`);
+main CI 41225936406 = 9/9 success.
+
+**Permanent artifact:** `tools/make_moe_fixtures.sh` (single source);
+prevention rule — any list that must stay in sync across build entries
+(fixtures, env contract, sampler ranges) is a script or a check, not a
+copy (the same reasoning that produced `tools/sampler_contract_check.sh`).
+Full incident record: `.agents/errors.md` (2026-10-31 entry).

@@ -1,10 +1,18 @@
 # Hydra-2 Research: Best Math, Bounded Memory
 
-> **Status: RESEARCH SPECIFICATION. No engine code, no measurements.**
-> Nothing in this document has been built. Every number is either measured and
-> attributed, projected and labelled, or explicitly **NOT MEASURED**. Where this
-> document says a benchmark will decide something, the benchmark has not been
-> run and the question is open.
+> **Status: RESEARCH SPECIFICATION (historical).** Written before anything
+> was built; every number is either measured and attributed, projected and
+> labelled, or explicitly **NOT MEASURED**. Where this document says a
+> benchmark will decide something, the benchmark has not been run and the
+> question is open.
+>
+> **Note (2026-10-31, round 17):** the engine this spec motivated IS built —
+> rounds 12–16 implemented the container, the MoE engine (expert layouts
+> 0/1/2 incl. the resident Q4_0 type) and the GGUF converter. See
+> `docs/FORMAT-V2.md` ("Implementation status") and `docs/LARGE-MODELS.md`
+> §8 for the current state; the research that has NOT been run (section 6
+> performance numbers, the GPU feasibility program) remains open and
+> NOT MEASURED.
 >
 > The canonical format specification is [`FORMAT-V2.md`](../../docs/FORMAT-V2.md). This
 > document explains *why* that format, and what would have to be true for it to

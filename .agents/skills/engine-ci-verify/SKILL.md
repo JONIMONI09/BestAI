@@ -1,12 +1,14 @@
 ---
 name: engine-ci-verify
-description: "Run all local Hydra-Stone quality gates in CI-identical order: compilers, analyzers, sanitizers, cppcheck, flawfinder, ESLint, build, the unit tests, ARM/NEON cross-path parity check via qemu, runtime smoke test."
+description: "Run all local Hydra-Stone quality gates in CI-identical order: compilers, analyzers, sanitizers, cppcheck, flawfinder, ESLint, build, the six C test suites (incl. the .hydra2 MoE engine), the Python converter gates, the Node server suite, ARM/NEON cross-path parity check via qemu, runtime smoke test."
 ---
 
 # Engine CI Verification — Hydra-Stone
 
 Run all local quality gates before committing. These mirror the CI
-pipeline (`.github/workflows/ci.yml`) exactly.
+pipeline (`.github/workflows/ci.yml` + `.github/workflows/lint.yml`);
+the canonical command list with comments is `AGENTS.md` §3 — this skill
+is the executable form.
 
 ## When to use
 
@@ -18,26 +20,32 @@ pipeline (`.github/workflows/ci.yml`) exactly.
 ## Gates (run all, in order — fails fast)
 
 ```bash
-# 1. gcc strict syntax (CI gate 1a)
+# 1. gcc strict syntax (CI lint job, gate 1a)
 gcc -fsyntax-only -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
     -Wall -Wextra -Werror -Iinclude \
     src/hydra_engine.c src/main.c tests/test_engine.c
 
-# 2. clang strict syntax (CI gate 1b, the double review)
+# 2. clang strict syntax (CI lint job, gate 1b, the double review)
 clang -fsyntax-only -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
     -Wall -Wextra -Werror -Iinclude \
     src/hydra_engine.c src/main.c tests/test_engine.c
 
-# 3. cppcheck static analysis (CI gate 1c)
+# 3. cppcheck static analysis (CI lint job, gate 1c — ALL of src/ + tests/)
 cppcheck --enable=warning,portability --inline-suppr --std=c99 \
     --platform=unix64 -Iinclude --error-exitcode=2 src/ tests/
 
-# 4. Python gate (CI gate 1d)
+# 4. Python gate (CI lint job, gate 1d)
 python3 -m py_compile tools/make_model.py
 python3 -c "import struct; assert struct.calcsize('<IHHIIII') == 24"
 
-# 5. Build + full test suite (scalar path)
-make all && make test && ./hydra-test
+# 5. Build + the full C suite (CI build-test: six binaries, make test-run)
+make clean && make && make test        # builds engine + ALL test binaries
+make test-run                           # RUNS all six suites:
+#   hydra-test (234 x86 / arch-dependent)  jni-batch-test (128)
+#   large-model-test (7)  gguf (101, python)  hydra2-test (152)
+#   hydra-moe-test (216)  -- the moe fixtures come from
+#   tools/make_moe_fixtures.sh (the SINGLE source; the Makefile recipe
+#   and the CI sanitizer step both call it — never an inline copy)
 
 # 6. NEON path + scalar/NEON parity (CI job "neon-test").
 #    ONE TIME SETUP:
@@ -68,12 +76,35 @@ aarch64-linux-gnu-gcc-12 -O2 -static -DHYDRA_DROP_CACHE -Iinclude \
     src/hydra_engine.c tests/test_engine.c -lm -o /tmp/t-drop
 qemu-aarch64-static /tmp/t-drop                # expect "M Tests, 0 failures" (parse M)
 
+# 9. Python pipeline gates (CI lint job + build-test)
+python3 tools/gguf_test.py --engine ./hydra-run    # 101 checks vs the REAL engine
+python3 tools/gguf_to_hydra2_test.py ./hydra-run   # 44 checks (make gguf-conv-test)
+python3 tools/string_format_check.py
+bash tools/text_prompt_check.sh                   # the CLI BPE gate
+bash tools/docs_claim_check.sh                    # banned claims in any .md
+bash tools/workflow_yaml_check.sh && bash tools/workflow_lint_check.sh
+bash tools/session_start_check.sh                 # the R33 marker gate
+
+# 10. Node gates (CI lint job / Lint & Security)
+node --test tools/server_test.js                  # 57 live HTTP tests
+node tools/console_train_test.js                  # trainer vs compiled engine, bit-for-bit
+node tools/contrast_check.js                      # WCAG AA, 17 pairs
+npm ci && npm run lint                            # ESLint (dev-only dependency)
+
+# 11. Shell guardrails (the full list in AGENTS.md §3):
+#     jni_signature_check.sh (+negative), android_autostart_check.sh
+#     (+negative), android_header_check.sh, android_crash_check.sh,
+#     llama_pin_check.sh (+negative), sampler_contract_check.sh,
+#     test_count_check.sh ./hydra-test x86, compose_scroll_check.sh,
+#     ci_syntax_mirror_test.sh, ci_release_version_test.sh
+
 rm -f smoke.hydra parity.hydra hydra-run hydra-test hydra-run-arm hydra-test-arm
 ```
 
-The `.github/workflows/lint.yml` pipeline adds these further gates (run them
-locally before touching engine code — see the note below on why the
-sanitizer one is not optional):
+## The local-only hardening gates (beyond CI, same discipline)
+
+These ran in CI in earlier revisions and now stay local (they are strictly
+stronger or redundant-with-CI; keep them green anyway):
 
 ```bash
 # L1. GCC static analyzer
@@ -98,37 +129,53 @@ clang-tidy src/hydra_engine.c src/main.c tests/test_engine.c \
 #     mkstemp and char array — pure false positives in this codebase.
 flawfinder -m 4 --error-level=4 -C -Q src/ tests/ android/app/src/main/cpp/
 
-# L5. ASan + UBSan. THE gate that actually reports arithmetic UB.
-gcc -O1 -g -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
-    -fsanitize=address,undefined -fno-sanitize-recover=all \
-    -fno-omit-frame-pointer -Wall -Wextra -Iinclude \
-    src/hydra_engine.c tests/test_engine.c -lm -o /tmp/hydra-san
-ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 /tmp/hydra-san
+# L5. ASan + UBSan — the gate that actually reports arithmetic UB.
+#     VERBATIM CI SHAPE (build-test sanitizer step): five binaries, the
+#     pyfix container via make_model.py --v2, and the moe fixture list
+#     from tools/make_moe_fixtures.sh (NEVER inline):
+CF="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude"
+cc $CF -o /tmp/asan-hydra-test src/hydra_engine.c tests/test_engine.c -lm
+cc $CF -o /tmp/asan-jni-batch-test tests/test_jni_batch.c src/hydra_engine.c -lm
+cc $CF -o /tmp/asan-large-model-test src/hydra_engine.c tests/test_large_model.c -lm
+cc $CF -o /tmp/asan-hydra2-test src/hydra_v2_container.c src/hydra_engine.c tests/test_hydra2_container.c -lm
+cc $CF -o /tmp/asan-hydra-moe-test src/hydra_moe.c src/hydra_v2_container.c src/hydra_engine.c tests/test_hydra_moe.c -lm
+# detect_leaks=1 is Linux-only (AppleClang ships no LSan; on Darwin CI
+# exports an empty ASAN_OPTIONS instead — the ASan+UBSan checks stay on):
+export UBSAN_OPTIONS=halt_on_error=1
+export ASAN_OPTIONS=detect_leaks=1
+/tmp/asan-hydra-test
+/tmp/asan-jni-batch-test
+/tmp/asan-large-model-test
+python3 tools/make_model.py .asan-pyfix.hydra2 --v2
+/tmp/asan-hydra2-test "$PWD/.asan-pyfix.hydra2"
+tools/make_moe_fixtures.sh "$PWD/.asan-moefix" | tee .asan-moefix-args
+/tmp/asan-hydra-moe-test $(tail -n 1 .asan-moefix-args)
+rm -f .asan-pyfix.hydra2 .asan-moefix-args .asan-moefix*.hydra2
 
-# L6. Web console (ESLint, dev-only dependency)
-npm ci && npm run lint
-
-# L7. Android Lint — must report "No issues found"
-cd android && /opt/gradle-8.7/bin/gradle lintDebug --no-daemon -q
-grep -q "No issues found" app/build/reports/lint-results-debug.txt
+# L6/L7. Web console ESLint + Android lint ("No issues found") are the
+#     CI "Lint & Security" jobs — see AGENTS.md §3 gates 4/5 and the
+#     android-ndk-build skill.
 ```
 
-Toolchain install for L1–L5 (once per machine):
+Toolchain install for L1–L4 (once per machine):
 `sudo apt-get install -y clang clang-tidy clang-tools flawfinder cppcheck gcc-12-aarch64-linux-gnu qemu-user-static`
 
 ## Expected result
 
 - Gates 1-4: silent, exit 0
-- Gate 5: `<N> Tests, 0 failures` (x86 scalar path). **Do not hard-code N.**
-  Parse it from the binary's output; the count differs per architecture
-  because the NEON comparison tests are compiled out on x86.
+- Gate 5: `make test-run` runs six suites, every one "N tests, 0
+  failures" (234/128/7/101/152/216 on x86-64). **Do not hard-code N** in
+  your checks — parse it from the output; the count differs per
+  architecture (the NEON comparison tests are compiled out on x86) and
+  drift is gated against `tools/test_count_baseline.txt`.
 - Gate 6: `<M> Tests, 0 failures` on ARM, where `M > N` because of the
   NEON-vs-scalar comparison tests, then `x86: [...]` / `arm: [...]` with
   **identical** token and state arrays
 - Gate 7: 16 tokens printed + axiom check allows at 1.0, blocks at 0.0
-- L1–L4, L6: no output, exit 0
-- L5: `<N> Tests, 0 failures` (parse N from the output) and no sanitizer diagnostics
-- L7: Android Lint "No issues found"
+- Gates 9-11: each "N checks, 0 failed" (parsed, never assumed)
+- L1–L4: no output, exit 0
+- L5: all five binaries exit 0 with no sanitizer diagnostics
+- L6/L7: ESLint clean, Android Lint "No issues found"
 
 ## Notes
 
@@ -144,6 +191,11 @@ Toolchain install for L1–L5 (once per machine):
   behaviour. Every static analyzer stayed silent about the layer-overflow
   bug; UBSan reported `signed integer overflow: 2147483640 + 127 cannot be
   represented in type 'int'` on the reverted code. Never skip it.
+- **The fixture list is a script, not a copy.** `tools/make_moe_fixtures.sh`
+  is the single source of the nine `hydra-moe-test` fixtures — the
+  Makefile and CI both call it (the round-16.5 incident: an inline copy in
+  ci.yml drifted and main went red while local stayed green — see
+  `.agents/errors.md` 2026-10-31 and `.agents/docs/RESEARCH-LOG.md` §11).
 - **Before adding any new gate, prove it can fail**: revert the fix it
   should catch and confirm the gate goes red. A gate that has never gone
   red is decoration (rule R25).
