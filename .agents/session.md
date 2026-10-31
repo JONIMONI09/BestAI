@@ -311,3 +311,7 @@ owner request: project **Hydra-Stone (BestAI)** created
 - **PRO-60** — CI incident 41222651267, moe fixture drift (Done; PR #78
   attached, merged `8606d58`).
 - **PRO-61** — this round 17 audit (In Progress until merge).
+
+**PR:** [#79](https://github.com/JONIMONI09/BestAI/pull/79) opened
+(FACTS ONLY message, docs-only scope). Linear PRO-61 moves to Done on
+merge; the PR line in the PR body stays untouched (facts only).
