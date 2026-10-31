@@ -2609,3 +2609,45 @@
   (zig for the NEON side, since there is no local ARM runtime);
   (5) the pinned token-stream tests are the real regression gate for
   kernel swaps — they caught Bug 1 before the parity test existed.
+
+## 2026-10-31 (R16) — the hydra-moe-test fixture list existed twice (Makefile + ci.yml ASan leg) and drifted: main-tier CI red on both matrix legs
+
+- **Symptom:** the merge of PR #77 (round 16) to `main` failed the CI
+  workflow run 41222651267 on BOTH `build-test` matrix legs
+  (ubuntu-latest + macos-latest), in the "Sanitizers (ASan+UBSan) over
+  the whole test suite" step:
+  `FAIL: fixture paths missing - run make test-run (the Makefile passes
+  F32 as argv[1], … Q4_0 as argv[8], Q4-same-shape F32 as argv[9])` →
+  `=== 1 Tests, 1 failures ===`, exit 1. Lint & Security and Release
+  were green; every suite in the user-visible log was green right up to
+  the moe line.
+- **Root cause:** round 16 added two fixtures to the moe suite (the Q4_0
+  engine pins: `--moe-q4` and the same-shape F32 cross-check) and updated
+  the `test-run` recipe in the Makefile accordingly (7 → 9 fixtures).
+  But ci.yml's sanitizer leg does NOT run `make test-run` — it compiles
+  its own ASan binaries into `/tmp` (the Makefile has no sanitizer
+  CFLAGS) and therefore carries an **inline copy** of the fixture list,
+  which still had the old 7 entries. The binary now hard-requires 9
+  argv fixtures (argv count check before any test) → loud refusal.
+  Local `make test-run` was green, the PR-tier CI is lint-only by owner
+  rule, so the drift was invisible until the first main-tier functional
+  run after the merge.
+- **Fix:** the fixture list now lives exactly once in
+  `tools/make_moe_fixtures.sh <base>` — it generates all nine fixtures
+  (the seven original shapes + `-q4` + `-q4f32`) and prints their paths
+  as the last stdout line, in the argv order `tests/test_hydra_moe.c`
+  expects. The Makefile's `test-run` recipe and the ci.yml sanitizer
+  leg both call the script (`… | tee <args-file>` keeps the generator's
+  byte-count lines in the logs; `tail -n 1` extracts the path list).
+  Verified: local `make test-run` 216/0, and the sanitizer leg
+  reproduced byte-for-byte locally (ASan+UBSan build,
+  `ASAN_OPTIONS=detect_leaks=1`, `UBSAN_OPTIONS=halt_on_error=1`) —
+  failing with the old 7-fixture list, 216/0 and sanitizer-clean with
+  the script.
+- **Prevention:** any list that must stay in sync across build entries
+  (fixtures, env contract, sampler ranges) is a script or a check, not
+  a copy — the same reasoning that produced `tools/sampler_contract_check.sh`
+  for the Android/server sampler ranges. If a new fixture is ever added,
+  there is exactly one place to edit (the script), and both the Makefile
+  and every CI leg pick it up automatically; a count mismatch still
+  fails loudly in the test binary itself.

@@ -548,15 +548,15 @@ jobs:
           /tmp/asan-large-model-test
           python3 tools/make_model.py .asan-pyfix.hydra2 --v2
           /tmp/asan-hydra2-test "$PWD/.asan-pyfix.hydra2"
-          python3 tools/make_model.py .asan-moefix1.hydra2 --moe-full --layers 2
-          python3 tools/make_model.py .asan-moefix2.hydra2 --moe-full --layers 2 --moe-ternary
-          python3 tools/make_model.py .asan-moefix3.hydra2 --moe-full --layers 2 --moe-ternary 128
-          python3 tools/make_model.py .asan-moefix4.hydra2 --moe-full --layers 1 --experts 4 --top-k 2 --dim 256 --n-heads 8 --head-dim 32 --inter 64 --moe-ternary 64
-          python3 tools/make_model.py .asan-moefix5.hydra2 --moe-full --layers 2 --moe-no-vocab
-          python3 tools/make_model.py .asan-moefix6.hydra2 --moe-full --layers 2 --moe-attn-ternary
-          python3 tools/make_model.py .asan-moefix7.hydra2 --moe-full --layers 2 --n-heads 4 --head-dim 4 --n-kv-heads 2
-          /tmp/asan-hydra-moe-test .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2 .asan-moefix7.hydra2
-          rm -f .asan-pyfix.hydra2 .asan-moefix1.hydra2 .asan-moefix2.hydra2 .asan-moefix3.hydra2 .asan-moefix4.hydra2 .asan-moefix5.hydra2 .asan-moefix6.hydra2 .asan-moefix7.hydra2
+          # The moe fixture list lives ONCE in tools/make_moe_fixtures.sh
+          # (it used to be inlined here AND in the Makefile and the two
+          # copies drifted when the round-16 Q4_0 fixtures were added -
+          # CI incident 41222651267 failed on both matrix legs). The
+          # script's last stdout line is the path list, in the argv order
+          # the test expects.
+          tools/make_moe_fixtures.sh "$PWD/.asan-moefix" | tee .asan-moefix-args
+          /tmp/asan-hydra-moe-test $(tail -n 1 .asan-moefix-args)
+          rm -f .asan-pyfix.hydra2 .asan-moefix-args .asan-moefix*.hydra2
 
       - name: Upload failure logs
         if: failure()
