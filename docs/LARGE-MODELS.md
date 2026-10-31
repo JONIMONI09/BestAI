@@ -324,3 +324,35 @@ repo of choice, ≈ 1.9 GB), run
 (this sandbox's 3.8 GiB is the only reason the 8B-class run is
 documented instead of executed here: 8B Q4_0 ≈ 4.9 GB weights + F32
 activation buffer).
+
+### 8.5 Server: "intelligent + configurable everywhere" (decision, via ask_user)
+
+The console server got the round-16 configuration treatment — every hard-coded
+knob now has an env override, a header-only probe makes the import decision
+*before* any conversion work, and one endpoint exposes the whole surface:
+
+- `GET /api/config` — every setting with its effective value, its default,
+  whether an env variable overrode it, and the request-level override where
+  one exists. A client can always see what it runs against.
+- Env overrides (all defaults unchanged — a server started without any of
+  them behaves exactly like before): `HYDRA_DEFAULT_MODEL`,
+  `HYDRA_INFER_TIMEOUT_MS`, `HYDRA_MAX_PROMPT` (may only lower the engine's
+  256 cap), `HYDRA_MAX_TRAIN_BODY`, `HYDRA_DEFAULT_STEPS`,
+  `HYDRA_IMPORT_MODE`. An invalid value is refused at startup with the
+  variable named — never silently ignored.
+- `POST /api/models/import?name=x.gguf&mode=v2` converts through the
+  streaming round-16 converter into the full-fidelity `.hydra2` container:
+  t4 is size-optimal by default (an all-Q4_0 source is a bit-exact raw copy,
+  anything else is re-quantised deterministically), `&t4=force|none` and
+  `&max_experts=1..8` override, and the header-only `--probe` verdict
+  (geometry + `t4.all_q4_0`) comes back in the response. `mode=auto` — the
+  default — keeps the existing v1 behaviour for existing clients and reports
+  the v2 verdict alongside it.
+- `.hydra2` files are uploadable (`/api/models/upload`, magic-level header
+  check; the deep verdict stays with inspect and the engine).
+
+Gates: `tools/server_test.js` 47 → 57 checks (config surface, env override
+effective + marked, invalid env refuses to start, v2 import of F32 and Q4_0
+sources incl. the bit-exact verdict, t4=none override, auto-mode v2 report,
+invalid mode/t4/max_experts 400s, `.hydra2` upload accept/refuse). All 57
+green, 3 consecutive runs.

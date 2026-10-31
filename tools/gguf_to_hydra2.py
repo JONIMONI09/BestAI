@@ -439,7 +439,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description='Convert a llama GGUF to a .hydra2 MoE model')
     ap.add_argument('in_gguf')
-    ap.add_argument('out_hydra2')
+    ap.add_argument('out_hydra2', nargs='?',
+                    help='output .hydra2 path (not needed with --probe)')
+    ap.add_argument('--probe', action='store_true',
+                    help='header-only acceptance probe: run every '
+                         'acceptance check, print a JSON report, write '
+                         'nothing (used by the server to decide the '
+                         'import mode)')
     ap.add_argument('--t4', action='store_true',
                     help='store the large matrices (embed, attn_q/k/v/o, '
                          'ffn_gate/up/down, lm_head) and the expert '
@@ -460,6 +466,8 @@ def main(argv=None):
                          'of the FFN width within the bound; costs E '
                          'times the FFN storage per layer)')
     args = ap.parse_args(argv)
+    if not args.probe and args.out_hydra2 is None:
+        ap.error('out_hydra2 is required unless --probe is given')
 
     try:
         gguf = gguf_reader.GgufFile.open(args.in_gguf)
@@ -568,6 +576,9 @@ def main(argv=None):
         fe = 0
         expert_dir = []
         expert_producers = []
+        # every tensor whose payload dominates the file: the probe
+        # reports whether all of them are Q4_0 (the bit-exact t4 path)
+        weight_names = {tok_emb.name}
         if args.t4:
             # 18 bytes per 32 values, per sub-matrix, three sub-matrices
             # ([gate][up][down]) - the parentheses matter: 18 // 32 is 0.
@@ -607,6 +618,7 @@ def main(argv=None):
             # FILE ORDER of such a tensor is already [out][in] row-major
             # (the engine layout) - validate the dims, copy in file
             # order, no transpose.
+            weight_names.update(t.name for t in (q, k, v, o, gate, up, down))
             for t, exp in ((q, [dim, dim]), (k, [dim, kvdim]),
                            (v, [dim, kvdim]), (o, [dim, dim]),
                            (an, [dim]), (fn, [dim]),
@@ -677,6 +689,36 @@ def main(argv=None):
         if (norm_t.n_dims != 1 or list(norm_t.dims) != [dim]):
             die('output norm %s is %s, expected 1-D [dim=%d]'
                 % (norm_t.name, list(norm_t.dims), dim))
+
+        if args.probe:
+            # header-only verdict: everything above was checked without
+            # touching a payload byte; the server uses this to offer the
+            # right import mode before spending a conversion.
+            import json as _json
+            all_q4_0 = all(gguf.find(n).ggml_type == gguf_reader.T_Q4_0
+                           for n in weight_names)
+            report = {
+                'ok': True,
+                'architecture': arch,
+                'dim': dim,
+                'n_heads': n_heads,
+                'n_kv_heads': n_kv,
+                'layers': layers,
+                'inter': inter,
+                'vocab': vocab,
+                'experts': E,
+                'has_output_tensor': output is not None,
+                't4': {
+                    # dim % 32 == 0 is the loud-refusal condition; t4 is
+                    # the size-correct mode, all_q4_0 is the bit-exact one
+                    'ok': dim % 32 == 0,
+                    'all_q4_0': all_q4_0,
+                },
+                'source_bytes': os.path.getsize(args.in_gguf),
+            }
+            print(_json.dumps(report))
+            return 0
+
         trunk.add('final_norm', 3, 0x0012, 1, dim, dim * 4,
                   prod_bytes(flat_f32(gguf, norm_t)))
         if output is not None:

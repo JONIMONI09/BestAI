@@ -269,8 +269,10 @@ tensor.
 
 | Route | Behaviour |
 |---|---|
-| `POST /api/models/import?name=x.gguf` | streams to a temp file, converts, validates with the **same** header analysis as every other path, deletes the source GGUF, returns `{ok, model, conversion}` |
+| `POST /api/models/import?name=x.gguf` | streams to a temp file, converts, validates with the **same** header analysis as every other path, deletes the source GGUF, returns `{ok, model, conversion}`. Round 16: `?mode=auto\|v1\|v2` (default `auto` = this v1 path, bit-identical output for existing clients) — `v2` runs the streaming full-fidelity converter (`tools/gguf_to_hydra2.py`) into `models/converted/x.hydra2` with `&t4=auto\|force\|none` (auto = size-optimal: Q4_0 storage whenever the geometry allows, bit-exact for an all-Q4_0 source) and `&max_experts=1..8`; the response carries the probe's verdict (`t4.all_q4_0`, the geometry) and the auto/v1 paths carry a `v2: {available, ...}` field so the client sees the full-fidelity option for the exact file it just imported. A header-only `--probe` run decides that before any conversion work |
 | `GET /api/models` | lists the result; models under `models/converted/` are flagged `converted: true` so the chat selector can mark them |
+| `GET /api/config` | the whole server configuration surface (round 16 "configurable everywhere"): every knob with its effective value, default, source (`default`/`env`) and the override that changes it — env: `PORT`, `HYDRA_ALLOW_REMOTE`, `HYDRA_DEFAULT_MODEL`, `HYDRA_INFER_TIMEOUT_MS`, `HYDRA_MAX_PROMPT` (may lower the engine's 256 cap, never raise it), `HYDRA_MAX_TRAIN_BODY`, `HYDRA_MAX_UPLOAD`, `HYDRA_CONVERT_TIMEOUT_MS`, `HYDRA_DEFAULT_STEPS`, `HYDRA_IMPORT_MODE` (`auto`/`v1`/`v2`) |
+| `POST /api/models/upload?name=x.hydra2` | round 16: `.hydra2` containers are uploadable too (8-byte magic + 128-byte minimum checked at the header layer; the deep verdict stays with inspect and the engine) |
 
 The converted file is validated against the engine's own header rules before it
 is offered. A converter that produced something the engine would refuse is a
