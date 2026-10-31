@@ -534,8 +534,15 @@ jobs:
           # since the container munmaps its trunk mapping with the
           # REMEMBERED length (trunk_map_len was never set, so
           # munmap(ptr, 0) was a no-op leak). Verified 2026-10-30 on
-          # all five binaries below.
-          export ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1
+          # all five binaries below. macOS leg (merge follow-up):
+          # AppleClang ships no LeakSanitizer, and detect_leaks=1
+          # aborts the runtime at startup (SIGABRT) there - LSan is
+          # Linux-only; ASan+UBSan stay fully active on both legs.
+          case "$(uname -s)" in
+            Darwin) export ASAN_OPTIONS= ;;
+            *)      export ASAN_OPTIONS=detect_leaks=1 ;;
+          esac
+          export UBSAN_OPTIONS=halt_on_error=1
           /tmp/asan-hydra-test
           /tmp/asan-jni-batch-test
           /tmp/asan-large-model-test
