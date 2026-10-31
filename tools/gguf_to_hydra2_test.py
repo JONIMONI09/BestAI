@@ -389,9 +389,11 @@ def main():
             fh.write(b'this is not a gguf file')
         must_fail('non-gguf', txt, 'not a GGUF')
 
-        # a GGUF whose embedding is stored as Q4_0: metadata and tokens
-        # are complete, so the ONLY problem is the undecodable layout -
-        # that is what the converter must refuse loudly.
+        # a GGUF whose embedding is stored as IQ2_XXS (ggml_type 16):
+        # metadata and tokens are complete, so the ONLY problem is the
+        # undecodable layout - that is what the converter must refuse
+        # loudly. (Q4_0/Q4_1 itself is decodable since round 15 and is
+        # covered by the parity section below.)
         q4 = os.path.join(tmp, 'q40.gguf')
         q4_w = gguf_minimal_llama.Writer()
         q4_w.s('general.architecture', 'llama')
@@ -408,7 +410,7 @@ def main():
             ('tok_emb', [8, 4], 0x10, b'\x01\x00' * 17))
         with open(q4, 'wb') as fh:
             fh.write(q4_w.serialize())
-        must_fail('q4-0-weights', q4, 'does not implement')
+        must_fail('undecodable-weights', q4, 'does not implement')
 
         badarch = os.path.join(tmp, 'badarch.gguf')
         with open(gguf, 'rb') as fh:
@@ -503,6 +505,72 @@ def main():
                                + ['t000000t065536'],
                                merges=['t000000 t065536'])
         must_fail('merge-u16-overflow', bigtok, '16-bit')
+
+        # ---- Q4_0 / Q4_1 (round 15: the 8B-class quants) -------------
+        # 4-bit block-scaled GGUF (the format 8B downloads actually use)
+        # converts and runs; the stored F32 must be BIT-EXACT against an
+        # independent from-scratch decode of the ggml block format.
+        def f32(x):
+            return struct.unpack('<f', struct.pack('<f', x))[0]
+
+        def indep_q4_decode(g, t, kind):
+            bb = 18 if kind == 'q40' else 20
+            n = t.n_elements
+            if n % 32:
+                raise AssertionError('element count not a multiple of 32')
+            out = []
+            for b0 in range(0, n, 32):
+                off = t.data_start + (b0 // 32) * bb
+                d = f32(struct.unpack_from('<e', g.data, off)[0])
+                if kind == 'q41':
+                    m = f32(struct.unpack_from('<e', g.data, off + 2)[0])
+                    nbs = g.data[off + 4:off + 20]
+                else:
+                    m = 0.0
+                    nbs = g.data[off + 2:off + 18]
+                for k in range(16):
+                    lo = nbs[k] & 0x0F
+                    hi = nbs[k] >> 4
+                    out.append(f32(f32((lo - 8) * d) + m))
+                    out.append(f32(f32((hi - 8) * d) + m))
+            return out
+
+        for kind in ('q40', 'q41'):
+            src = os.path.join(tmp, 'minilama-%s.gguf' % kind)
+            with open(src, 'wb') as fh:
+                fh.write(gguf_minimal_llama.build(7, dtype=kind))
+            dst = os.path.join(tmp, 'minilama-%s.hydra2' % kind)
+            rcc = subprocess.run([sys.executable,
+                                  os.path.join(HERE, 'gguf_to_hydra2.py'),
+                                  src, dst],
+                                 capture_output=True, text=True)
+            check('converter exits 0 on the %s fixture' % kind,
+                  rcc.returncode == 0, rcc.stderr)
+            ra, sa = run_engine(binary, dst, 7, 24)
+            check('engine runs the %s-converted model' % kind,
+                  ra == 0 and sa, str((ra, sa)))
+            rb, sb = run_engine(binary, dst, 7, 24)
+            check('%s stream deterministic (two runs identical)' % kind,
+                  rb == 0 and sa == sb, '%r vs %r' % (sa, sb))
+            if kind == 'q40':
+                check('%s stream differs from the F32 stream '
+                      '(quantisation is visible)' % kind, sa != t1,
+                      'the 4-bit weights must change the tokens')
+            gq = gguf_reader.GgufFile.open(src)
+            tq = gq.find('token_embd.weight')
+            ref = indep_q4_decode(gq, tq, kind)
+            gq.close()
+            _, ttensors, _, ttrunk, _, _ = parse_v2(dst)
+            eoff = ttensors['embed'][4]
+            ok = True
+            detail = ''
+            for i, val in enumerate(ref):
+                if f32_at_off(ttrunk, eoff + i * 4) != val:
+                    ok = False
+                    detail = 'i=%d' % i
+                    break
+            check('%s embed == independent block decode (F32-exact)' % kind,
+                  ok, detail)
 
         print('\nAll gguf_to_hydra2 checks passed.')
         return 0

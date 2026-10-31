@@ -3,7 +3,8 @@
 
     python3 tools/gguf_to_hydra2.py in.gguf out.hydra2 [--max-experts 16]
 
-Reads a decoder-only **llama** GGUF (F32/F16/BF16/Q8_0 weights) and writes
+Reads a decoder-only **llama** GGUF (F32/F16/BF16/Q8_0/Q4_0/Q4_1
+weights) and writes
 a complete-contract `.hydra2` file (FORMAT-V2.md, architecture
 `moe-transformer-v1`) that the MoE engine (`src/hydra_moe.c`) runs
 directly: per-layer GQA attention, expert FFN, RMSNorm, real logits,
@@ -92,7 +93,8 @@ LOUD REJECTIONS (exit 2, message names the problem)
   - not a GGUF / bad version / empty file
   - general.architecture is not 'llama'
   - no tokenizer.ggml.tokens
-  - a tensor stored in a layout this reader cannot decode (Q4_0, ...)
+  - a tensor stored in a layout this reader cannot decode
+    (Q4_K, Q5_0, MXFP4, ...)
   - a required llama tensor is missing
   - head_count does not divide embedding_length
 """

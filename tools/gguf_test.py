@@ -967,10 +967,12 @@ def _convert_fails(out, src):
 
 def _quantised_message(tmp):
     path = os.path.join(tmp, 'q.gguf')
-    # type 2 == Q4_0, a block layout this reader does not implement. It used
-    # to be type 8 (Q8_0), which is now supported - a negative control that
-    # silently starts passing is worse than no control at all.
-    tensors = [('token_embd.weight', [4, 4], 2, [0.0] * 16)]
+    # type 12 == Q4_K, a block layout this reader does not implement.
+    # It used to be type 8 (Q8_0), then type 2 (Q4_0) - a negative
+    # control that silently starts passing is worse than no control at
+    # all. Q4_0/Q4_1 became decodable in round 15 (parity gates in
+    # tools/gguf_to_hydra2_test.py), so the control moves to Q4_K.
+    tensors = [('token_embd.weight', [4, 4], 12, [0.0] * 16)]
     build_gguf(path, tensors)
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
@@ -1270,7 +1272,7 @@ def _q8_0_is_decodable(tmp):
     codes = _q8_0_codes() * 2
     path = os.path.join(tmp, 'q80list.gguf')
     build_gguf(path, [('w', [2, 32], gguf_reader.T_Q8_0, codes, Q8_0_SCALE),
-                      ('blk.0.ffn_q.weight', [2, 32], 2, [0.0] * 64)])
+                      ('blk.0.ffn_q.weight', [2, 32], 12, [0.0] * 64)])
     with gguf_reader.GgufFile.open(path) as gguf:
         tensor = gguf.tensors[0]
         if not tensor.is_block_quantised or tensor.is_dense_float:

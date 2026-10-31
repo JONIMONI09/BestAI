@@ -2,6 +2,61 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-31 (round 15) — large-model analysis (700B→8B), 2026 technique scan, README architecture diagram, Q4_0/Q4_1 GGUF import
+
+Owner round: analyse how a 700B model reaches every device (or why not),
+search the current (2026) techniques and integrate what fits, add the
+final Mermaid architecture diagram to the main README (GitHub-rendered),
+extend the test pipeline toward 8B-class models, docs.
+
+1. **Q4_0 + Q4_1 GGUF import (the 8B-class quants).** `tools/gguf_reader.py`
+   now decodes six layouts (F32/F16/BF16/Q8_0/Q4_0/Q4_1): the 4-bit pair
+   follows ggml's `block_q4_0`/`block_q4_1` exactly (`w = d*(q-8)` /
+   `w = d*(q-8)+m`, low-nibble-first packing) with C-speed decoders
+   (strided gather + `bytes.translate` + `array` maps - no Python value
+   loop). `gguf_minimal_llama.py` gains `--dtype q40/q41`. The v2
+   converter therefore takes a real 8B Q4_0 GGUF (4.9 GB) without a
+   `--convert-f16` re-export; the `.hydra2` output stays F32-resident
+   (the container's own `Q4_0` type `0x0030` stays reserved - the
+   4-bit-resident engine type is the next engine milestone, documented in
+   `docs/LARGE-MODELS.md`). Gates: converter 35 -> **44 checks**
+   (Q4_0/Q4_1 convert + run + deterministic, quantisation visibly changes
+   the stream vs F32, embedded F32 bit-exact against an independent
+   from-scratch block decode); `gguf_test.py` 101/0 (its two
+   "undecodable" negative controls moved from Q4_0 to Q4_K - a control
+   must never encode the behaviour under test).
+2. **`docs/LARGE-MODELS.md` (new).** The honest 700B answer: 350 GB at
+   4-bit, 185 GB at 2-bit - no device path exists, and "no loss" is the
+   F32 reference, so the product answer is a precision ladder (Q8 server /
+   Q4 phone / 2-bit small) + QAT for the Q4 gap; "no lag" is a bandwidth
+   story (8B Q4 = 4-15 tok/s on 2026 flagships). Memory table
+   8B→700B x F32/16/8/4/2-bit; 2026 technique scan with per-technique
+   verdicts (MXFP4/NVFP4 landed in llama.cpp March-April 2026 - adopted at
+   the converter boundary now, `T4_0` engine type next; KV INT8/FP8 =
+   round-16 candidate; speculative decoding = best fit, v1 ternary as
+   draft for the v2 target; prefix caching = cheap server win; NPU
+   QNN/LiteRT-LM = the phone no-lag answer); the concrete 8B path with a
+   4-step phone milestone list; the 120B-MoE showcase case (expert
+   streaming is its access pattern); the hybrid 8B-local + big-server
+   architecture; the Android section (nothing breaks this round; the app
+   already runs 8B GGUFs via the bundled llama.cpp); sources.
+3. **README:** new `## Architecture` section - one Mermaid flowchart of
+   the whole system (sources -> converter -> .hydra2 -> MoE/v1 engines ->
+   CLI/web/Android -> gate wall), rendered natively by GitHub; honest
+   v1-vs-v2 paragraph; converter bullet now names the six decoded layouts
+   and the 44-check gate.
+4. **Docs sync:** `docs/GGUF-IMPORT.md` (reader table, Q4 layout
+   descriptions, §9, §12, gate paragraph), `docs/FORMAT-V2.md` (decoder
+   paragraph + import-path sentence; v2 container type table unchanged),
+   `tools/gguf_to_hydra.py` refusal messages now name all six layouts.
+
+Verified (local sandbox 2026-10-31: Linux e2b.local 6.1.158+ x86_64,
+gcc 12.2.0, Python 3.11.2): hydra 234/0 (x86 baseline 234, count gate),
+jni 128/0, large 7/0, hydra2 152/0, hydra-moe 180/0, gguf_test 101/0,
+converter 44/0, text_prompt_check ok, server_test 47/0, workflow gates
+ok, docs_claim_check ok, pyflakes rc 0, bandit rc 0. C sources unchanged
+this round (Python + docs only).
+
 ## 2026-10-31 (round 14, merge follow-up) — macOS sanitizer leg: LeakSanitizer is Linux-only
 
 PR #73 merged (`d1729ba`). The main-tier CI run failed exactly one step:
@@ -34,7 +89,7 @@ deferrals with the reason.
    (the v1/v2 layout bug), expert up/gate scaling (gate rows x E,
    up rows x E — `masked_block`), strict token normalization
    (general `normalize_token`), U16 merge-operand overflow refusal,
-   norm-shape refusal. Gate: `gguf_to_hydra2_test.py` 26 -> 38 checks.
+   norm-shape refusal. Gate: `gguf_to_hydra2_test.py` 26 -> 35 checks (the "38" written at the time was a miscount - the file at commit 3c448c9 runs 35 checks, re-verified 2026-10-31).
 2. **MoE engine (9 fixes).** Ternary in-place dequant aliasing
    (separate packed buffer + public `hydra_moe_dequant_flat`, AT64
    stream re-pinned — the pre-fix stream was silently wrong);

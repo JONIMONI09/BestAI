@@ -54,6 +54,8 @@ GGUF_MAGIC = 0x46554747
 GGUF_VERSION = 3
 T_F16 = 1
 T_F32 = 0  # ggml_type F32 (dense)
+T_Q4_0 = 2
+T_Q4_1 = 3
 AL = 32
 
 # gguf_metadata_value_type (spec order: 0 u8, 1 i8, 2 u16, 3 i16,
@@ -104,9 +106,38 @@ class Writer:
         if dtype == 'f32':
             raw = struct.pack('<%df' % len(values), *values)
             self.tensors.append((name, dims, T_F32, raw))
-        else:
+        elif dtype == 'f16':
             raw = b''.join(struct.pack('<e', v) for v in values)
             self.tensors.append((name, dims, T_F16, raw))
+        elif dtype in ('q40', 'q41'):
+            n = len(values)
+            if n % 32:
+                raise ValueError('Q4 tensors need a multiple of 32 values '
+                                 '(got %d for %s)' % (n, name))
+            # Deterministic quantisation: fixed F16-exact scales, codes
+            # clipped to the 4-bit range. The VALUES are what get stored -
+            # the converter's decode of these blocks must come out
+            # bit-exact against an independent decode (gate 1i).
+            d = 0.1
+            m = 0.05 if dtype == 'q41' else 0.0
+            raw = b''
+            for b0 in range(0, n, 32):
+                chunk = values[b0:b0 + 32]
+                q = []
+                for v in chunk:
+                    c = int(round(v / d)) + 8
+                    q.append(0 if c < 0 else 15 if c > 15 else c)
+                nib = b''
+                for i in range(0, 32, 2):
+                    nib += bytes(((q[i] & 0x0F) | ((q[i + 1] & 0x0F) << 4)))
+                if dtype == 'q40':
+                    raw += struct.pack('<e', d) + nib
+                else:
+                    raw += struct.pack('<ee', d, m) + nib
+            gtype = T_Q4_0 if dtype == 'q40' else T_Q4_1
+            self.tensors.append((name, dims, gtype, raw))
+        else:
+            raise ValueError('unknown dtype %r' % dtype)
 
     # -- serialization --------------------------------------------------
     def serialize(self):
@@ -252,8 +283,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', required=True)
     ap.add_argument('--seed', type=int, default=7)
-    ap.add_argument('--dtype', choices=('f16', 'f32'), default='f32',
-                    help='weight dtype (f32 is the verified llama.cpp smoke)')
+    ap.add_argument('--dtype',
+                    choices=('f16', 'f32', 'q40', 'q41'), default='f32',
+                    help='weight dtype (f32 is the verified llama.cpp '
+                         'smoke; q40/q41 store Q4_0/Q4_1 blocks)')
     args = ap.parse_args()
     raw = build(args.seed, dtype=args.dtype)
     with open(args.out, 'wb') as fh:

@@ -254,7 +254,8 @@ def pick_tensors(gguf, a_name, b_name):
     only one candidate, B is A's column sums rolled by one dimension, which
     is arbitrary but deterministic and stated in the report.
 
-    Readable means F32, F16, BF16 or Q8_0 (dequantised at read time).
+    Readable means F32, F16, BF16, Q8_0, Q4_0 or Q4_1 (block types
+    dequantised at read time by the shared reader).
     """
     candidates = gguf.decodable_candidates()
     if not candidates:
@@ -267,7 +268,7 @@ def pick_tensors(gguf, a_name, b_name):
                  if not t.is_decodable and t.shape() is not None]
         detail = ', '.join(parts[:6]) if parts else 'none'
         raise gguf_reader.GgufError(
-            'no F32/F16/BF16/Q8_0 1-D or 2-D tensor in this file. '
+            'no F32/F16/BF16/Q8_0/Q4_0/Q4_1 1-D or 2-D tensor in this file. '
             'Unsupported quantised tensors: %s. Re-export with '
             'llama.cpp --convert-f16 and import again.' % detail)
 
@@ -279,7 +280,7 @@ def pick_tensors(gguf, a_name, b_name):
         if not a_t.is_decodable:
             raise gguf_reader.GgufError(
                 'tensor %r is %s, which this converter cannot read '
-                '(supported: F32, F16, BF16, Q8_0)'
+                '(supported: F32, F16, BF16, Q8_0, Q4_0, Q4_1)'
                 % (a_name, a_t.type_name))
         if a_t.shape() is None:
             raise gguf_reader.GgufError(
@@ -303,7 +304,7 @@ def pick_tensors(gguf, a_name, b_name):
         if not b_t.is_decodable:
             raise gguf_reader.GgufError(
                 'tensor %r is %s, which this converter cannot read '
-                '(supported: F32, F16, BF16, Q8_0)' % (b_name, b_t.type_name))
+                '(supported: F32, F16, BF16, Q8_0, Q4_0, Q4_1)' % (b_name, b_t.type_name))
         if b_t.shape() is None:
             raise gguf_reader.GgufError(
                 'tensor %r has %d dimensions; only 1-D and 2-D tensors can '
