@@ -239,3 +239,88 @@ user gets "700B-class answers" on their phone: the phone never holds the
   arXiv 2609.39223 Oct 2026, ICLR-2026 NVFP4/MXFP4 study, tensorfoundry
   quantisation field guide June 2026); on-device runtime spread
   (ai-tldr June 2026, grokipedia March 2026, distillabs August 2026).
+
+## 8. Round 16 results: 4-bit resident engine + 3B-geometry end-to-end
+
+### 8.1 The T4_0 engine (decision A1, chosen via ask_user)
+
+`block_q4_0` is now a **first-class resident layout** in the MoE GEMM path
+(layout 2 of `hydra_moe.h`), not just a decode-at-read type. Every Q4_0
+tensor is stored as raw GGUF blocks and dequantised in the hot loop
+(`dequant_block_q4_0`): embed/lm_head, attention projections, router, and
+the per-expert gate/up/down sub-matrices. The engine does not grow with
+the weights anymore: the weight bytes ARE the weights.
+
+Evidence (all in-tree, all green):
+- `tests/test_hydra_moe.c` — 216 checks (10 new Q4_0 pins added in round 16,
+  existing pins untouched), including the cross-precision identity
+  `q4_0(w) → q8_0(w) → w` on the same token stream.
+- `./hydra-run /tmp/q4fix.hydra2 0 10` → `2 6 5 6 14 6 5 12 14 14`
+  (deterministic across runs).
+
+### 8.2 Converter `--t4`: bit-exact, streaming
+
+`tools/gguf_to_hydra2.py --t4` keeps Q4_0 sources **bit-exact** (raw block
+copy, zero re-quantisation) and converts mixed-precision sources by
+decoding Q8_0/Q4_1 → F32 → `quantize_q40` (a new pure-Python reference
+plus a vectorised numpy fast path, verified byte-identical by the test
+suite). `dim % 32 != 0` is refused loudly before any I/O.
+
+Memory: the in-memory implementation held every payload in `bytes`
+(3B Q4_0 ≈ 3.5 GB peak, F32 source ≈ 8.4 GB — OOM in this 3.8 GB
+sandbox). The round-16 rewrite is **two-pass streaming**: pass 1 computes
+the full file geometry from shapes only (O(tensors) memory, the GGUF
+header is 8 KiB) and writes the header first; pass 2 regenerates and
+streams each payload through a bounded window (O(chunk) — 256 rows for
+F32, one block for Q4_0 raw copies) while collecting the expert CRCs
+incrementally (`_CrcSink`), then patches the 48-byte expert-directory
+records in place (the header CRC covers bytes 0..119 only, so it stays
+valid). Result for the 3B geometry below: **peak RSS 2.58 GiB** of which
+~1.7 GiB is the mmap'd source file's page cache (kernel-managed,
+evictable); private allocations are O(chunk). Both conversion runs of
+the 3B source produced byte-identical output (same md5).
+
+### 8.3 3B-geometry end-to-end in the sandbox
+
+Real Llama weights are **not obtainable from this sandbox** (egress
+allowlist; verified in round 16: HF, hf-mirror, raw/objects GitHub, git-lfs,
+and GitHub-hosted .gguf all unreachable). So the full-scale test uses
+`tools/build_3b_synth_gguf.py`: a streamed builder that writes a
+**real-geometry Llama-3.2-3B-shaped** Q4_0 GGUF — 28 layers, dim 3072,
+heads 8 / kv 4, inter 8192, vocab 128256, rope 500000, tied embed, no
+output tensor — with deterministic synthetic weights (MT19937, seed
+1234567) in O(chunk) memory.
+
+Measured in this sandbox (2 cores, 3.8 GiB RAM, x86_64, Python 3.11.2):
+
+| Step | Number |
+|---|---|
+| Synthetic Q4_0 source | **1,859,256,480 B (1.73 GiB)**, build ≈ 120 s |
+| `--t4` conversion | **3,047,794,320 B (2.84 GiB)** output, ≈ 6 s, byte-deterministic |
+| Conversion peak RSS | 2.58 GiB (≈1.7 GiB of it = mmap'd source page cache) |
+| `hydra-run` 10 tokens | **59.8 s → 5.98 s/token** (≈ 10.5 GFLOP/token, 2 cores, no AVX-512) |
+| Determinism | two runs → identical token stream |
+| Token stream | constant `77348` — expected for random synthetic weights (the 2-layer mini models show the same fixed-point attractor; the stream identity check against the F32 path is the meaningful invariant, see 8.4) |
+
+The test suite runs this end-to-end with `HYDRA2_3B_E2E=1`
+(`tools/gguf_to_hydra2_test.py`): source build → `--t4` conversion →
+engine determinism → token count. Opt-in because it takes ≈ 4 minutes
+and needs ~3 GiB of RAM.
+
+### 8.4 What this proves — and what it does not
+
+Proves: the v2 container, the reader, the T4_0 GEMM path, and the
+converter all hold at real 3B scale; memory stays O(chunk) for the
+converter; the pipeline is byte-deterministic; no pin of any existing
+code path changed (round 16 only added pins).
+
+Does **not** prove quality: the weights are synthetic, so the token
+stream carries no meaning. To run a *real* model: download
+`Meta-Llama-3.2-3B-Instruct` from Hugging Face
+(`https://huggingface.co/llama-3.2-3B-instruct-q4_0.gguf` or the GGUF
+repo of choice, ≈ 1.9 GB), run
+`python3 tools/gguf_to_hydra2.py --t4 model.gguf model.hydra2 &&
+./hydra-run model.hydra2 <bos> <steps>` on any machine with ≥ 6 GB RAM
+(this sandbox's 3.8 GiB is the only reason the 8B-class run is
+documented instead of executed here: 8B Q4_0 ≈ 4.9 GB weights + F32
+activation buffer).

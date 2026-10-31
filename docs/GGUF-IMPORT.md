@@ -685,3 +685,26 @@ the merge rules survive the conversion; the Q4_0 and Q4_1 fixtures
 convert, run, and their embedded F32 is bit-exact against an
 independent from-scratch decode of the ggml block format; and each
 refusal class fires.
+Round 16 added `--t4` (4-bit resident, decision A1): the output stores
+`block_q4_0` **as-is** in the new T4_0 engine layout instead of decoding
+to F32 — Q4_0 source blocks are copied bit-exact (no re-quantisation,
+verified byte-for-byte against the source by the test suite), mixed-
+precision sources decode Q8_0/Q4_1 → F32 → `quantize_q40`, and
+`dim % 32 != 0` is refused loudly before any I/O. The output is
+≈ 4× smaller than the decoded path (e.g. 134,592 B vs 775,888 B on the
+mini fixture) and runs through the same engine with the same
+determinism guarantees; the test section also pins the quantiser's
+numpy fast path to be byte-identical to the pure-Python reference.
+
+Memory: the converter is two-pass streaming (round 16). Pass 1 computes
+the whole file geometry from tensor shapes only and writes the header;
+pass 2 regenerates and streams each payload through a bounded window
+while collecting the expert-directory CRCs incrementally, then patches
+the 48-byte directory records in place. A 1.73 GiB Q4_0 3B-geometry
+source therefore converts in ≈ 6 s at 2.58 GiB peak RSS (of which
+≈ 1.7 GiB is the mmap'd source's page cache; private allocations are
+O(chunk)) and the output is byte-deterministic across runs. The full
+3B-geometry end-to-end (synthetic real-shape Q4_0 GGUF → `--t4` →
+engine, 5.98 s/token on 2 cores) is exercised by the suite with
+`HYDRA2_3B_E2E=1`; see `docs/LARGE-MODELS.md` §8 for the measured
+numbers and the real-8B run recipe (≥ 6 GB RAM machine).

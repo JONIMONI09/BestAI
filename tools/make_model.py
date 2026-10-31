@@ -37,6 +37,7 @@ tools/hydra_train.js and POST /api/train are for.
 """
 
 import argparse
+import math
 import os
 import struct
 
@@ -286,7 +287,7 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
                    rope_theta=10000.0, kv_sink=2, kv_ring=8,
                    tied_embedding=1, bos_token=0, seed=20240703,
                    ternary_group=0, include_vocab=True,
-                   attn_group=0):
+                   attn_group=0, q4=False):
     """Return a COMPLETE-CONTRACT .hydra2 file for the moe-transformer-v1
     inference engine (src/hydra_moe.c, round 12):
 
@@ -329,6 +330,9 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
         raise ValueError('n_heads * head_dim must equal dim')
     if not 2 <= vocab <= 256:
         raise ValueError('vocab must be 2..256')
+    if q4 and (dim % 32 or inter % 32):
+        raise ValueError('q4 mode needs dim and inter divisible by 32 '
+                         '(a Q4_0 row holds whole 32-value blocks)')
 
     state = [seed]
 
@@ -360,6 +364,43 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
             state[0] = lcg(state[0])
             out.append(((state[0] >> 8) % 4096) / 2048.0 - 1.0)
         return out
+
+    def q40_block(vals, rows, cols):
+        """Q4_0 block encoding of a row-major (rows x cols) F32 matrix
+        (round 16, FORMAT-V2.md 3.2): 18-byte blocks of 32 consecutive
+        values in row-major order - F16 scale d = round-half-even of
+        max|w| / 7 (struct '<e'), then 16 bytes carrying two 4-bit
+        codes each (value 2j in the LOW nibble of byte j, 2j+1 in the
+        HIGH nibble); code = clamp(floor(w/d + 8.5), 0, 15)
+        (round-half-up, writer's convention), so w ~ d * (code - 8).
+        d == 0 (all-zero block) -> every code 8 -> exact zeros on
+        decode. cols must be a multiple of 32."""
+        n = rows * cols
+        if n % 32:
+            raise ValueError('q40 sub-matrix rows*cols must be a '
+                             'multiple of 32')
+        out = bytearray()
+        for b in range(n // 32):
+            gw = vals[b * 32:(b + 1) * 32]
+            mx = max((abs(x) for x in gw), default=0.0)
+            d = struct.unpack('<e', struct.pack('<e', mx / 7.0))[0]
+            nb = bytearray(16)
+            for i, x in enumerate(gw):
+                if d == 0.0:
+                    c = 8
+                else:
+                    c = int(math.floor(x / d + 8.5))
+                    if c < 0:
+                        c = 0
+                    elif c > 15:
+                        c = 15
+                if i % 2 == 0:
+                    nb[i // 2] |= c & 0x0F
+                else:
+                    nb[i // 2] |= (c & 0x0F) << 4
+            out += struct.pack('<e', d)
+            out += bytes(nb)
+        return bytes(out)
 
     def ternary_flat(vals, group):
         """FLAT group convention for plain trunk tensors (FORMAT-V2.md
@@ -396,7 +437,17 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
     def attn_tid(group):
         return 0x40 if group == 64 else 0x41
 
-    add_trunk('embed', 2, 2, vocab * dim, f32s(vocab * dim))
+    def q4s(rows, cols):
+        """Q4_0 payload for a (rows x cols) matrix drawn from the SAME
+        LCG stream f32s() would fill (values identical, only encoded
+        as 4-bit blocks). The small vectors (norms, router) stay F32 -
+        the same convention real GGUFs use (small tensors float)."""
+        vals = f32_vals(rows * cols)
+        return q40_block(vals, rows, cols)
+
+    add_trunk('embed', 2, 2, vocab * dim,
+              q4s(vocab, dim) if q4 else f32s(vocab * dim),
+              0x0030 if q4 else 0x12)
     for l in range(layers):
         attn_specs = (('attn_q.%d' % l, dim, dim),
                       ('attn_k.%d' % l, n_kv_heads * head_dim, dim),
@@ -404,7 +455,10 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
                       ('attn_o.%d' % l, dim, dim))
         for nm, r, c in attn_specs:
             if not attn_group:
-                add_trunk(nm, 7, 2, r * c, f32s(r * c))
+                if q4:
+                    add_trunk(nm, 7, 2, r * c, q4s(r, c), 0x0030)
+                else:
+                    add_trunk(nm, 7, 2, r * c, f32s(r * c))
             else:
                 vals = f32_vals(r * c)
                 p, sc, ng = ternary_flat(vals, attn_group)
@@ -413,12 +467,20 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
         add_trunk('attn_norm.%d' % l, 3, 1, dim, f32s(dim))
         add_trunk('ffn_norm.%d' % l, 3, 1, dim, f32s(dim))
         add_trunk('router.%d' % l, 1, 2, experts * dim, f32s(experts * dim))
-        add_trunk('ffn_gate.%d' % l, 0, 2, inter * dim, f32s(inter * dim))
-        add_trunk('ffn_up.%d' % l, 0, 2, inter * dim, f32s(inter * dim))
-        add_trunk('ffn_down.%d' % l, 0, 2, dim * inter, f32s(dim * inter))
+        add_trunk('ffn_gate.%d' % l, 0, 2, inter * dim,
+                  q4s(inter, dim) if q4 else f32s(inter * dim),
+                  0x0030 if q4 else 0x12)
+        add_trunk('ffn_up.%d' % l, 0, 2, inter * dim,
+                  q4s(inter, dim) if q4 else f32s(inter * dim),
+                  0x0030 if q4 else 0x12)
+        add_trunk('ffn_down.%d' % l, 0, 2, dim * inter,
+                  q4s(dim, inter) if q4 else f32s(dim * inter),
+                  0x0030 if q4 else 0x12)
     add_trunk('final_norm', 3, 1, dim, f32s(dim))
     if not tied_embedding:
-        add_trunk('lm_head', 9, 2, vocab * dim, f32s(vocab * dim))
+        add_trunk('lm_head', 9, 2, vocab * dim,
+                  q4s(vocab, dim) if q4 else f32s(vocab * dim),
+                  0x0030 if q4 else 0x12)
 
     # ---- vocabulary + BPE merges (role 8, FORMAT-V2.md 3.2.3) --------
     # Deterministic mini-vocabulary: single letters a..e, the BPE words
@@ -459,7 +521,8 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
     # pre-ternary writer.
     expert_elems = 3 * inter * dim
     expert_type = 0x40 if ternary_group == 64 else (
-        0x41 if ternary_group == 128 else 0x12)
+        0x41 if ternary_group == 128 else (
+            0x0030 if q4 else 0x12))
 
     def ternary_block(vals, rows, cols, group):
         """TERNAry2 + block-scale encoding of a row-major (rows x cols)
@@ -501,7 +564,7 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
     for l in range(layers):
         for e in range(experts):
             vals = f32_vals(expert_elems)
-            if not ternary_group:
+            if not ternary_group and not q4:
                 expert_payloads.append(
                     b''.join(_struct.pack('<f', v) for v in vals))
             else:
@@ -511,9 +574,15 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
                 parts = []
                 for mv, r, c in ((gate, inter, dim), (up, inter, dim),
                                  (down, dim, inter)):
-                    p, sc = ternary_block(mv, r, c, ternary_group)
-                    parts.append(p)
-                    parts.append(sc)
+                    if q4:
+                        # layout 2: raw [gate][up][down] Q4_0 blocks,
+                        # no interleaved scales (the scale rides in
+                        # every 18-byte block).
+                        parts.append(q40_block(mv, r, c))
+                    else:
+                        p, sc = ternary_block(mv, r, c, ternary_group)
+                        parts.append(p)
+                        parts.append(sc)
                 expert_payloads.append(b''.join(parts))
     expert_dir = []
     exp_off = 0
@@ -542,7 +611,8 @@ def build_moe_full(layers=1, experts=4, top_k=2, dim=8, n_heads=2,
         ('v2.n_kv_heads', _struct.pack('<I', n_kv_heads)),
         ('v2.head_dim', _struct.pack('<I', head_dim)),
         ('v2.inter', _struct.pack('<I', inter)),
-        ('v2.expert_layout', _struct.pack('<I', 1 if ternary_group else 0)),
+        ('v2.expert_layout', _struct.pack('<I',
+                                 1 if ternary_group else (2 if q4 else 0))),
         ('v2.rope_theta', _struct.pack('<f', rope_theta)),
         ('v2.kv_sink', _struct.pack('<I', kv_sink)),
         ('v2.kv_ring', _struct.pack('<I', kv_ring)),
@@ -603,6 +673,14 @@ def main():
                          '(attn_q/k/v/o) as TERNARY2 with a paired F32 '
                          '<name>.scale trunk tensor (flat group '
                          'convention, group 64 or 128)')
+    ap.add_argument('--moe-q4', action='store_true',
+                    help='moe-full: store the large matrices (embed, '
+                         'attn_q/k/v/o, ffn_gate/up/down, lm_head) as '
+                         'Q4_0 blocks (18 bytes per 32 values, F16 '
+                         'scale, w = d*(q-8)) and the experts as layout '
+                         '2 (raw [gate][up][down] Q4_0 payloads); norms '
+                         'and router stay F32. Needs dim and inter '
+                         'divisible by 32 (round 16).')
     args = ap.parse_args()
 
     if args.moe_full:
@@ -623,7 +701,8 @@ def main():
                               inter=args.inter,
                               ternary_group=args.moe_ternary,
                               include_vocab=not args.moe_no_vocab,
-                              attn_group=args.moe_attn_ternary)
+                              attn_group=args.moe_attn_ternary,
+                              q4=args.moe_q4)
         parent = os.path.dirname(os.path.abspath(args.out))
         os.makedirs(parent, exist_ok=True)
         tmp = args.out + '.tmp'

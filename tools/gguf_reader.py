@@ -514,6 +514,26 @@ class GgufFile:
                             'tensors can be read' % (tensor.name, tensor.n_dims))
         return self.decode_rows(tensor, 0, shape[0])
 
+    def raw_bytes(self, tensor):
+        """The tensor's raw payload bytes, UNDECODED (round 16).
+
+        This is what `--t4` in tools/gguf_to_hydra2.py needs: a Q4_0
+        tensor is copied block-for-block into the .hydra2 file instead
+        of being decoded to F32 and re-quantized (a re-quantization is
+        a second, unnecessary rounding of already-rounded values). The
+        file order of a GGUF llama tensor IS the .hydra2 layout the
+        engine expects (the same convention flat_f32 relies on), and
+        the blocks are flat 32-value units, so the copy is bit-exact
+        as long as the engine's row width is a multiple of 32 (the
+        engine enforces that at open for Q4_0 files)."""
+        if not tensor.is_decodable:
+            raise GgufError(
+                'tensor %r is %s - a layout this reader cannot read at all; '
+                'no raw copy is possible'
+                % (tensor.name, tensor.type_name))
+        start = tensor.data_start
+        return self.data[start:start + tensor.size_bytes]
+
 
 def _decode_q8_0(raw):
     """Dequantise Q8_0 blocks: w[i] = d * qs[i], 34 bytes per 32 values.

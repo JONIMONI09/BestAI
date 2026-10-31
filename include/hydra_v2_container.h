@@ -50,7 +50,7 @@ enum {
     HYDRA2_BF16     = 0x0011u, /* 2 bytes                              */
     HYDRA2_F32      = 0x0012u, /* 4 bytes                              */
     HYDRA2_Q8_0     = 0x0020u, /* 34/32 bytes (34-byte blocks), /32    */
-    HYDRA2_Q4_0     = 0x0030u, /* reserved - refuse by name            */
+    HYDRA2_Q4_0     = 0x0030u, /* 18/32 bytes (18-byte blocks), /32    */
     HYDRA2_Q4_K     = 0x0031u, /* reserved - refuse by name            */
     HYDRA2_MXFP4    = 0x0032u, /* reserved - refuse by name            */
     HYDRA2_TERNARY2_S64  = 0x0040u, /* ternary2 + per-64-group F32    */

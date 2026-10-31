@@ -77,7 +77,9 @@ typedef struct hydra_moe_config {
     uint32_t layers;         /* v2.layers == container layers       */
     uint32_t experts_per_layer; /* container v2.experts_per_layer   */
     uint32_t top_k;          /* container v2.top_k               */
-    uint32_t expert_layout;  /* v2.expert_layout: 0 = F32 flat, 1 = ternary+scales */
+    uint32_t expert_layout;  /* v2.expert_layout: 0 = F32 flat,
+                                * 1 = ternary+scales,
+                                * 2 = Q4_0 (round 16) */
     uint32_t ternary_group;  /* layout 1: 64 (0x0040) / 128 (0x0041), else 0 */
     double   rope_theta;     /* v2.rope_theta, default 10000.0    */
     uint32_t kv_sink;        /* v2.kv_sink, default 4             */
@@ -86,11 +88,19 @@ typedef struct hydra_moe_config {
     uint32_t bos_token;      /* v2.bos_token, default 0           */
 } hydra_moe_config_t;
 
-/* One resolved trunk tensor: name + F32 buffer + element count. */
+/* One resolved trunk tensor: name + data + element count.
+ * type_id is HYDRA2_F32 (0x0012): data holds n_elements floats.
+ * type_id is HYDRA2_Q4_0 (0x0030, round 16): data holds the RAW 18-byte
+ * blocks (n_elements/32 blocks; 18 bytes = F16 d + 16 nibble bytes,
+ * w = d*(q-8), FORMAT-V2.md 3.2) and is NEVER materialized to F32 -
+ * the mat-vec kernels dequantize one row at a time into a shared
+ * scratch, so the resident memory stays 4-bit (that is the point of
+ * the type). */
 typedef struct hydra_moe_tensor {
     const char *name;      /* the required name (for the refusal msg) */
-    float *data;           /* n_elements floats, owned by the handle  */
+    float *data;           /* F32 buffer or raw Q4_0 blocks (see above)*/
     uint64_t n_elements;
+    uint16_t type_id;      /* HYDRA2_F32 or HYDRA2_Q4_0 */
 } hydra_moe_tensor_t;
 
 /* Per-layer tensor group (all F32, layout 0). */
@@ -122,6 +132,8 @@ struct hydra_moe {
     size_t expert_bytes;
     uint8_t *expert_scratch;
     float *expert_f32buf;        /* layout 1: dequantized expert (F32) */
+    float *q4_scratch;           /* round 16: one-row Q4_0 dequant
+                                   scratch (max(dim, inter) floats) */
     /* Vocabulary (role 8, FORMAT-V2.md 3.2.3) - present when the file
      * carries a 'vocab' tensor; inference works without it. */
     int has_vocab;
@@ -203,6 +215,21 @@ int hydra_moe_dequant_expert(const uint8_t *blob, float *out,
  * hydra_moe_dequant_expert. */
 int hydra_moe_dequant_flat(const uint8_t *payload, const float *scales,
                            uint64_t n, uint32_t group, float *out);
+
+/* Dequantize a flat Q4_0 payload (round 16, FORMAT-V2.md 3.2) into n
+ * F32 values: 18-byte blocks of 32 values, F16 scale d at block
+ * offset 0, then 16 bytes carrying two 4-bit codes each (value 2j in
+ * the LOW nibble of byte j, 2j+1 in the HIGH nibble), dequantizing as
+ * w[i] = d * (q[i] - 8) - exactly the ggml block_q4_0 layout the GGUF
+ * reader decodes (tools/gguf_reader.py, bit-exact parity gated in
+ * tools/gguf_to_hydra2_test.py). n must be a multiple of 32.
+ * payload must NOT alias out: out[i] is written at byte 4i while the
+ * payload is read at byte i*18/32, so an aliased in-place call
+ * corrupts the blocks still to be read (the same no-alias rule as
+ * hydra_moe_dequant_flat, round-13 Qodo #3). Exported for the test
+ * parity suite. Returns 0 on success, -1 on a bad argument (n not a
+ * multiple of 32) or a NULL pointer. */
+int hydra_moe_dequant_q40(const uint8_t *payload, uint64_t n, float *out);
 
 /* ------------------------------------------------------------------ */
 /* vocabulary + BPE text codec (role 8 tensors, FORMAT-V2.md 3.2.3)   */

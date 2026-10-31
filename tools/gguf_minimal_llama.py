@@ -183,14 +183,15 @@ class LCG:
         return ((self.s >> 11) / float(1 << 53) * 2.0 - 1.0) * scale
 
 
-def build(seed, dtype='f32'):
+def build(seed, dtype='f32', dim=64, ffn=192):
     w = Writer()
     rng = LCG(seed)
 
-    dim = 64
+    # dim/ffn are parameters (round 16): the --t4 tests need a
+    # dim % 32 != 0 variant for the loud refusal; the defaults are the
+    # historical fixture shape.
     layers = 2
     heads = 4
-    ffn = 192
 
     # --- vocab: 95 single-char BPE tokens (printable ASCII 32..126) plus
     # the four specials at the end. No merges: a mergeless BPE is still a

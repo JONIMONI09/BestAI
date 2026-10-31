@@ -610,7 +610,12 @@ static void mut_t_name_full(fx *f) {
 }
 static void mut_t_role_high(fx *f)   { p16(f, f->tentry[0] + 32, 10); }
 static void mut_t_role_six(fx *f)    { p16(f, f->tentry[0] + 32, 6); }
-static void mut_t_type_q40(fx *f)    { p16(f, f->tentry[0] + 34, HYDRA2_Q4_0); }
+/* Reserved-type negative control: Q4_0 (0x0030) is implemented
+ * since round 16 (4-bit resident weights), so the control moved
+ * to Q4_K (0x0031, still reserved) - a control that hard-codes
+ * the behaviour under test goes stale the moment it changes
+ * (round-15 lesson, .agents/errors.md). */
+static void mut_t_type_q4k(fx *f)    { p16(f, f->tentry[0] + 34, HYDRA2_Q4_K); }
 
 /* Block-scaled ternary (FORMAT-V2.md 3.2, M2.2): the packing is the
  * TERNARY2 rule (two 2-bit codes per byte), so n_bytes = n_elements / 2;
@@ -853,7 +858,7 @@ static void test_tensor_refusals(void)
     CHECK(open_mutated(mut_t_name_full) == HYDRA2_E_TENSOR_BAD, "name not NUL-terminated");
     CHECK(open_mutated(mut_t_role_high) == HYDRA2_E_TENSOR_BAD, "role 10");
     CHECK(open_mutated(mut_t_role_six) == HYDRA2_E_TENSOR_BAD, "role 6 (reserved)");
-    CHECK(open_mutated(mut_t_type_q40) == HYDRA2_E_TENSOR_BAD, "type Q4_0");
+    CHECK(open_mutated(mut_t_type_q4k) == HYDRA2_E_TENSOR_BAD, "type Q4_K");
     CHECK(open_mutated(mut_t_type_unknown) == HYDRA2_E_TENSOR_BAD, "type 0x99");
     CHECK(open_mutated(mut_t_ndims_zero) == HYDRA2_E_TENSOR_BAD, "n_dims 0");
     CHECK(open_mutated(mut_t_ndims_five) == HYDRA2_E_TENSOR_BAD, "n_dims 5");
