@@ -452,4 +452,4 @@ at `c5fcd38`, PR #73 ready for merge:**
 
 **Verification (local sandbox 2026-10-31: Linux e2b.local 6.1.158+ x86_64, gcc 12.2.0, Python 3.11.2):** hydra 234/0 (baseline `x86` 234, count gate passes), jni 128/0, large 7/0, hydra2 152/0, hydra-moe 180/0, gguf_test 101/0, **converter 44/0**, text_prompt_check ok, server_test 47/0, workflow_yaml + workflow_lint ok, docs_claim_check ok, pyflakes rc 0, bandit rc 0. C sources unchanged this round (Python + docs only), so the ASan/fanalyzer states of round 14 carry over unchanged.
 
-**Status:** all gates green; next: commit + push + CI + PR (FACTS ONLY).
+**Status:** all gates green; committed and pushed, **PR #77** opened (FACTS ONLY). PR-tier CI: `CI` 4/4 runnable jobs success (build-test/neon-test/Android APK/GPU bench skip by design - main tier), `Lint & Security` 11/11 success. Awaiting the owner's merge signal (main-tier jobs run after the merge).
