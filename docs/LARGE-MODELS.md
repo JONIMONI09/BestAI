@@ -42,8 +42,10 @@ Where that lands, per the 2026 on-device and server numbers:
 | 13-30B | 8-19 GB | 32 GB laptop / 16-32 GB phone (top tier, tight) | 30B is the practical server-class model on a 32 GB box |
 | 70B | 37-40 GB | 48-64 GB GPU/laptop RAM | desktop GPUs (A100 80 GB comfortable) |
 | 120B MoE (5B active) | ~60 GB | **one 80 GB GPU** | GPT-OSS-120B: single H100/MI300X, 128k context |
-| 405B (MoE 17B active) | ~210 GB Q4 / 405 GB FP8 | **8x H100 NVLink node** (FP8) | the 2026 "big open model" reference point |
-| 700B | 370 GB Q4 | multi-node GPU cluster | datacenter only |
+| 405B (MoE 17B active) | ~210 GB Q4 / 405 GB FP8 | **8x H100 NVLink node** (FP8) | the "big open model" reference point |
+| 1.6T MoE (49B active) | ~865 GB native FP4/FP8 | **8x B200** (or 4x GB300) | DeepSeek V4 Pro (2026): the 700B-class question has an answer - it runs, but only in a datacenter; 1M context, MIT weights |
+| 284B MoE (13B active) | ~160 GB native FP4/FP8 | **4x H100** (or 2x H200) | DeepSeek V4 Flash (2026): the "30B+ that a single box runs" reference |
+| 700B dense | 370 GB Q4 | multi-node GPU cluster | datacenter only |
 
 **Conclusions the arithmetic forces:**
 
@@ -110,14 +112,25 @@ Verified against current sources (October 2026), not the 2024 literature:
 | Technique | 2026 status | Verdict for Hydra-Stone |
 |---|---|---|
 | **Block-scaled 4-bit float (MXFP4 / NVFP4)** | Landed in llama.cpp in March-April 2026 (`GGML_TYPE_NVFP4=40`; MXFP4 since the GPT-OSS release, OCP multi-vendor standard). E2M1 4-bit values + per-block scale (MXFP4: 32-elem blocks, E8M0 exponent; NVFP4: 16-elem blocks, FP8 scale + per-tensor scale). GPT-OSS-120B ships natively MXFP4 - that is why 120B fits one 80 GB card. | **Adopted at the converter boundary this round** (Q4_0/Q4_1 int4 block-scale = the same lineage, ggml's CPU formats). A native `T4_0`/MXFP4 *engine* tensor type (4-bit weights resident, dequant in-kernel) is the next engine milestone - it is what turns "32 GB F32 file" into "4.5 GB phone file". |
-| **KV-cache quantization (INT8/FP8)** | Standard in vLLM et al. (`kv_cache_dtype=fp8`): halves KV memory, <1% quality impact, biggest long-context lever. | **Candidate for round 16.** The `.hydra2` KV is F32 with the sink+ring geometry; INT8 KV with per-head scales halves the cache. Requires re-pinning the stream pins (KV changes the math) - a deliberate milestone, not a sneak-in. |
-| **Speculative decoding** | 2-3x latency reduction at *zero* quality loss (accept/reject keeps the target distribution); 2026 CPU work (e.g. SubTernary, transactional KV rollback) pushes 4x on commodity CPUs. | **Best architectural fit of all**: the v1 ternary engine (2*d integer adds per token, zero heap) is a natural *draft* for a v2 *target* - draft and target already coexist in the same binary. The rollback primitive is a KV write-pointer reset, which the ring geometry already approximates. Milestone: draft/target pair + acceptance loop. |
+| **KV-cache quantization (INT8/FP8)** | Halves KV memory. 2026 measurement update: FP8 E4M3 KV costs ~0.3-0.7 points on long-context retrieval (89% vs 91% on needle-in-a-haystack - within noise for most workloads); **INT8 costs 1.5-3 points** on the same tasks - not free. llama.cpp: `--cache-type-k/v q8_0` is the standard INT8 switch. | **Candidate for round 16, with a caveat.** The `.hydra2` KV is F32 with the sink+ring geometry; INT8 KV with per-head scales halves the cache. Our ring is SMALL (128 positions), so the benefit is modest here and large only for long contexts (the server story). The 1.5-3 point INT8 retrieval loss is acceptable for chat, not for RAG-over-documents - document which. Requires re-pinning the stream pins (KV changes the math) - a deliberate milestone, not a sneak-in. |
+| **Speculative decoding** | 2-3x latency reduction at *zero* quality loss (accept/reject keeps the target distribution). 2026 acceptance data: same-family drafts hit 70-85% at gamma=5 (1.8-2.5x), self-speculation (early layers as draft) 1.8-2.1x, n-gram drafts cost 0 VRAM and reach 90%+ on repetitive text; EAGLE-3 heads 4-6x but need training. It only pays at greedy/low temperature, on models >= 3B, low batch. | **Best architectural fit of all**: the v1 ternary engine (2*d integer adds per token, zero heap) is a natural *draft* for a v2 *target* - draft and target already coexist in the same binary, and the v2 CLI defaults to greedy (temperature 0), exactly the regime where acceptance is highest (70-85%). The rollback primitive is a KV write-pointer reset, which the ring geometry already approximates. Milestone: draft/target pair + acceptance loop. |
 | **Prefix caching** | 2x+ throughput where many requests share a system prompt; vLLM default. | **Cheap win for the server**: `server.js` can hold the prompt-prefix KV between requests for the same model (the engine already prefills the prompt into KV, round 13 #30). Milestone, small. |
 | **Paged attention / continuous batching** | The serving standard for *concurrency* (many users). | **Not needed for the single-stream CLI/engine** (bounded KV by design). Relevant only if the web server grows multi-user generation - then it is a server-side design decision, not an engine format change. Documented, deferred. |
-| **QAT / distillation** | QAT closes the Q4 gap; distillation trades 5-10% for 5-10x. | Out of scope (training-side), but it is the answer to "no loss at 4-bit": you cannot post-hoc-quantize to zero loss - you train against it. Stated in the precision ladder. |
-| **NPU delegation (Qualcomm QNN / AI Engine Direct, Google AI Edge LiteRT-LM, MediaTek NeuroPilot)** | 2026: INT8/INT16 LLM inference on the Hexagon HTP via QNN is the supported path; vendor claims up to ~100x CPU on 8 Elite for the NPU path; LiteRT-LM runs Llama/Gemma classes on-device. | **The "no lag" answer for the phone** is the NPU - no CPU kernel of ours will beat it for decode. Our options: (a) keep the NEON CPU path (portable, works on every SoC, 4-15 tok/s), (b) export the converted model to the NPU toolchain's format for the flagship tier. Both are app-milestone work; the engine's job is the *format + weights + routing*, which is done. |
+| **QAT / distillation** | QAT closes the 4-bit gap. 2026 data: NVFP4 QAT reaches BF16-parity on code benchmarks (83.0% vs 82.3% LiveCodeBench, Qwen3.5-9B); QATFactory (Oct 2026) exports Q4_K/NVFP4/MXFP4 checkpoints directly to llama.cpp for 8B-230B models. Field rule 2026: PTQ is fine at 4-bit and up, below 4-bit QAT is required. | Out of scope (training-side), but it is the answer to "no loss at 4-bit": you cannot post-hoc-quantize to zero loss - you train against it. It is also the path for our 2-bit TERNARY2 family to become a *trained* format rather than a projection - noted, not planned. |
+| **NPU delegation (Qualcomm QNN / AI Engine Direct, Google LiteRT-LM, MediaTek NeuroPilot)** | 2026 reality check: LiteRT-LM is **production-grade since April 2026** (Apache-2.0, INT4/INT8/FP16, Qualcomm+MediaTek NPU + GPU backends, OpenAI-compatible server mode; current v0.13.1) and its Multi-Token-Prediction support (v0.10.1) gives 2x+ decode on mobile GPUs at zero quality loss. The NPU speedup is real (3B model: ~48 tok/s NPU vs ~10 CPU on 8 Elite), BUT most consumer apps do not reach the NPU at all: NNAPI was deprecated in Android 15, and the Hexagon requires deliberately targeting the vendor QNN SDK (100+ TOPS on 8 Elite Gen 5, 10B+ params claimed - unreachable from a generic CPU/GPU app). | **The "no lag" answer for the phone** is the NPU - no CPU kernel of ours will beat it for decode. Our options: (a) keep the NEON CPU path (portable, works on every SoC, 4-15 tok/s), (b) for the flagship tier, export the converted model into the NPU toolchain (LiteRT-LM/QNN format). Both are app-milestone work with real vendor lock-in cost; the engine's job is the *format + weights + routing*, which is done. |
 
 ## 4. The 8B path, concretely (this round's target)
+
+**"Are we limited to ~200M?" - no, and the limit is not a format limit.**
+The *v1 projection* path (`gguf_to_hydra.py`) is by design a 64-dimensional
+ternary state (weights ceiling 256 KiB) - that is the ~200M-class thing.
+The *v2 MoE path* has no parameter-count ceiling in the format: every
+offset and length in the `.hydra2` container is 64-bit (verified against
+`src/hydra_v2_container.c` this round), `dim` is a u16 (<= 65535), layer
+counts are u16 (<= 1023), and the only real ceilings are RAM and the
+model's own shape (dim/layers/heads all carry through from the GGUF
+metadata). So an 8B, 30B or 70B GGUF converts to a `.hydra2` that the
+engine executes; whether it *fits* is the arithmetic of section 3.
 
 **What works today (tested, gated):**
 
@@ -215,3 +228,14 @@ user gets "700B-class answers" on their phone: the phone never holds the
 - Android NPU 2026 (QNN/AI Engine Direct, LiteRT-LM backends incl.
   MediaTek/Intel, INT8/INT16 LLM on HTP): Google AI Edge developer docs
   (2026); aipotluck QNN capability summary (2026-08).
+- Second research round (2026-10-31): DeepSeek V4 Pro/Flash hardware and
+  pricing (morphllm Sept 2026, spheron Oct 2026, opslyft Sept 2026);
+  speculative-decoding acceptance tables and n-gram/EAGLE data (misar.blog
+  May 2026, teqvolt June 2026, glukhov.org, yobitel July 2026, SparseSpec-L
+  arXiv 2607.27735); KV INT8/FP8 loss measurements (dev.to June 2026,
+  localaimaster May 2026, digitalapplied April 2026, gpuaas May 2026);
+  LiteRT-LM production status + MTP + QNN lock-in (groundy June/July 2026,
+  happycapyguide April 2026, phoneprice360 Oct 2026); QAT 2026 (QATFactory
+  arXiv 2609.39223 Oct 2026, ICLR-2026 NVFP4/MXFP4 study, tensorfoundry
+  quantisation field guide June 2026); on-device runtime spread
+  (ai-tldr June 2026, grokipedia March 2026, distillabs August 2026).
