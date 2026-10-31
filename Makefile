@@ -90,19 +90,13 @@ test-run: hydra-test jni-batch-test large-model-test gguf-test gguf-conv-test hy
 	python3 tools/make_model.py $(CURDIR)/.hydra2-pyfix.hydra2 --v2
 	./hydra2-test "$(CURDIR)/.hydra2-pyfix.hydra2"
 	rm -f $(CURDIR)/.hydra2-pyfix.hydra2
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix.hydra2 --moe-full --layers 2
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-t64.hydra2 --moe-full --layers 2 --moe-ternary
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-t128.hydra2 --moe-full --layers 2 --moe-ternary 128
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-t64-lg.hydra2 --moe-full --layers 1 --experts 4 --top-k 2 --dim 256 --n-heads 8 --head-dim 32 --inter 64 --moe-ternary 64
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-nv.hydra2 --moe-full --layers 2 --moe-no-vocab
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-at64.hydra2 --moe-full --layers 2 --moe-attn-ternary
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-gqa.hydra2 --moe-full --layers 2 --n-heads 4 --head-dim 4 --n-kv-heads 2
-	# Q4_0 (round 16): dim/inter must be multiples of 32; argv[9] is
-	# the SAME shape + LCG draws in F32 (quantisation-visibility).
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-q4.hydra2 --moe-full --layers 2 --dim 64 --n-heads 2 --head-dim 32 --inter 64 --experts 4 --top-k 2 --moe-q4
-	python3 tools/make_model.py $(CURDIR)/.hydra2-moefix-q4f32.hydra2 --moe-full --layers 2 --dim 64 --n-heads 2 --head-dim 32 --inter 64 --experts 4 --top-k 2
-	./hydra-moe-test "$(CURDIR)/.hydra2-moefix.hydra2" "$(CURDIR)/.hydra2-moefix-t64.hydra2" "$(CURDIR)/.hydra2-moefix-t128.hydra2" "$(CURDIR)/.hydra2-moefix-t64-lg.hydra2" "$(CURDIR)/.hydra2-moefix-nv.hydra2" "$(CURDIR)/.hydra2-moefix-at64.hydra2" "$(CURDIR)/.hydra2-moefix-gqa.hydra2" "$(CURDIR)/.hydra2-moefix-q4.hydra2" "$(CURDIR)/.hydra2-moefix-q4f32.hydra2"
-	rm -f $(CURDIR)/.hydra2-moefix.hydra2 $(CURDIR)/.hydra2-moefix-t64.hydra2 $(CURDIR)/.hydra2-moefix-t128.hydra2 $(CURDIR)/.hydra2-moefix-t64-lg.hydra2 $(CURDIR)/.hydra2-moefix-nv.hydra2 $(CURDIR)/.hydra2-moefix-at64.hydra2 $(CURDIR)/.hydra2-moefix-gqa.hydra2 $(CURDIR)/.hydra2-moefix-q4.hydra2 $(CURDIR)/.hydra2-moefix-q4f32.hydra2
+	# The moe fixture list lives ONCE in tools/make_moe_fixtures.sh (it
+	# used to be copied here AND in ci.yml's sanitizer leg and the two
+	# copies drifted - CI incident 41222651267). The script's last stdout
+	# line is the path list, in the argv order the test expects.
+	tools/make_moe_fixtures.sh "$(CURDIR)/.hydra2-moefix" | tee "$(CURDIR)/.moefix-args"
+	./hydra-moe-test $$(tail -n 1 "$(CURDIR)/.moefix-args")
+	rm -f "$(CURDIR)/.moefix-args" $(CURDIR)/.hydra2-moefix*.hydra2
 
 # GPU feasibility benchmark, CPU reference only. The device build adds
 # -DHYDRA_WITH_GLES and links -lEGL -lGLESv2; see tools/gpu_bench/README.md.
