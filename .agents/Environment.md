@@ -552,3 +552,46 @@ sandbox session, Debian 12 container, gcc 12.2.0, Python 3.11.2, Node 20):
    the sandbox system python has none. Run it with the venv on PATH:
    `PATH=/tmp/lintenv/bin:$PATH bash tools/ci_release_version_test.sh`
    (measured green that way; fails with ModuleNotFoundError otherwise).
+
+## 2026-11-01 (round 17.6) — runner image refresh, blocked artifact/dispatch, shallow session branches
+
+Measurements from the round-17.5/17.6 session (this sandbox segment,
+Debian 12 container):
+
+1. **The GitHub ubuntu-latest runner image was refreshed around
+   2026-11-01** — one event, two CI symptoms (both fixed):
+   - newer distro **cppcheck** → newly reported 32
+     `nullPointerOutOfMemory` findings in the round-16 test code
+     (red lint job, run 41337186327) — fixed in code (PR #80, clean
+     under cppcheck 2.22 = superset).
+   - **`gcc-12-aarch64-linux-gnu` removed** from the image's apt
+     sources → `neon-test` and Release `CLI (Linux)` failed at their
+     install step (runs 41337186425, 41339831264, two days apart —
+     persistent, not transient) — fixed in ci.yml + release.yml with
+     the unversioned `gcc-aarch64-linux-gnu` + printed compiler
+     version. Lesson for all CI tool choices: "default tool +
+     behaviour gate" beats "pinned old version" (pins rot when the
+     image moves; gates don't). See RESEARCH-LOG.md §12/§13.
+2. **Workflow artifact download is blocked here:** `gh run download
+   <run> -n <artifact>` → EOF from
+   `productionresultssa19.blob.core.windows.net` (not on the egress
+   allowlist; same class as the results-receiver log EOF). The
+   artifact is visible in the run but unreadable from this sandbox —
+   diagnose via the Jobs API step conclusions + local reproduction
+   instead.
+3. **`gh run rerun` and `gh workflow run` (dispatch) are 403** from
+   this sandbox's token ("Resource not accessible by integration" /
+   "run cannot be rerun; its workflow file may be broken"). Only
+   push-triggered runs are controllable from here — a red
+   push-triggered job is re-tested by the next push to the triggering
+   branch, not by a manual rerun.
+4. **Session branches after a merge are SHALLOW clones:** the new
+   branch arrives with a pruned object DB (`.git/shallow` boundaries,
+   `origin/main~1` unknown). `git merge --ff-only origin/main` fails
+   with "refusing to merge unrelated histories" until the missing
+   chain is fetched: `git fetch --depth=50 origin main` restores it
+   (measured). Check `git rev-parse --is-shallow-repository` in every
+   fresh session segment before assuming the history is complete.
+5. **/tmp is wiped between sandbox segments** (again): rebuild
+   `/tmp/lintenv` (pyyaml et al.) at the start of each segment; the
+   `workflow_yaml_check.sh` gate needs `PATH=/tmp/lintenv/bin:$PATH`.

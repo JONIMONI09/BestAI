@@ -2,6 +2,58 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-11-01 (round 17.6) — runner image refresh: unversioned AArch64 cross-compiler in CI + Release
+
+The ubuntu-latest runner image was refreshed (the same event that
+brought the newer cppcheck, round 17.5). The refresh removed
+`gcc-12-aarch64-linux-gnu` from the image's apt sources, so two
+main-tier jobs failed at their install step: `CI` → `neon-test`
+(run 41339831236) and `Release` → `CLI (Linux)` (run 41339831264) —
+both on `apt-get install gcc-12-aarch64-linux-gnu qemu-user-static`.
+
+- **Fix (this PR):** `ci.yml` (neon-test install + both aarch64 build
+  steps + failure-report text) and `release.yml` (install + arm64
+  build) now use the unversioned cross-compiler
+  (`gcc-aarch64-linux-gnu` → `aarch64-linux-gnu-gcc`), whatever gcc
+  the image ships. The install step prints the compiler version so a
+  future drift shows in the log.
+- **Why the pin is not missed:** the NEON correctness gates already
+  make the compiler version non-load-bearing — the ARM test-count
+  baseline (`tools/test_count_baseline.txt`), the NEON-vs-scalar
+  comparison tests, and the x86-vs-ARM/NEON bit-identical parity
+  check in both workflows prove behaviour on every run.
+- **Proof the failure was persistent, not transient:** the identical
+  step failed on two consecutive runs, two days apart, on two
+  different commits (41337186425 on `07bf74d`, 41339831264 on
+  `2c11d20`).
+
+## 2026-11-01 (round 17.5, entry written late — PR #80 shipped without one) — newer distro cppcheck flags round-16 test allocations (merged `2c11d20`)
+
+Main CI went red in the `lint` job's cppcheck step after the round-17
+docs audit merged (`07bf74d`, run 41337186327): the refreshed runner
+image's newer cppcheck reports `nullPointerOutOfMemory` for the
+round-16 KV test code (unchecked calloc/malloc chains — 27× in
+`tests/test_hydra_moe.c`, 5× + 1× `nullPointerArithmeticOutOfMemory`
+in `tests/test_engine.c`). `--error-exitcode=2` turned the warnings
+into a job failure. The code was green on `8606d58` with the older
+distro cppcheck; the doc PR itself only touched comments (verified by
+diff).
+
+- **Fix (PR #80):** `kv_set_alloc`/`kv_set_free` helpers in
+  `tests/test_hydra_moe.c` own the whole per-layer cache chain
+  (checked allocations, full cleanup on OOM, no leak); all five KV
+  test sites use them; the eviction sink's `k0/v0/ak/av` buffers and
+  the four unchecked `ref_get` calls got checks; the two
+  `tests/test_engine.c` blocks got the file's own OOM convention.
+- **Proof:** local cppcheck 2.22 (a superset of the distro version)
+  with the exact CI command: 32 findings before, 0 after. Tests
+  234/128/7/101/152/216 all 0 failures, counts identical to baseline
+  (the OOM paths never execute in practice). ASan+UBSan moe+engine
+  clean. PR #80 CI: all 16 executed checks SUCCESS.
+- **Verification:** post-merge main re-run on `2c11d20` — see the
+  round 17.6 entry above for the two unrelated image-drift jobs that
+  failed in the same window.
+
 ## 2026-10-31 (round 16 follow-up) — main CI red after #77: one script owns the hydra-moe-test fixture list (merged `8606d58`)
 
 The main-tier `build-test` (macOS + Ubuntu) went red in the Sanitizers step

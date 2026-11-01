@@ -24,6 +24,9 @@
 | 2026-10-26 | Local lint stack from PyPI wheels (no apt needed) | 6 real pre-merge defects caught; path in .agents/Environment.md |
 | 2026-10-26 | Local/CI syntax drift: the five-file lesson (PR #55 first run) | ci_syntax_mirror_test.sh gate shipped |
 | 2026-10-26 | Darwin feature-test inversion: _POSIX_C_SOURCE hides, not enables | control-based string-format gate; release.yml green |
+| 2026-10-31 | CI fixture-list drift: 216 checks green locally, red on main | tools/make_moe_fixtures.sh single source; main 9/9 (§11) |
+| 2026-11-01 | Newer distro cppcheck flags R16 test allocations (main red post-#79) | checked allocations via kv_set_alloc/kv_set_free; PR #80 (§12) |
+| 2026-11-01 | Runner image drop: gcc-12-aarch64-linux-gnu gone from apt sources | unversioned gcc-aarch64-linux-gnu in ci.yml + release.yml (§13) |
 
 ---
 
@@ -414,3 +417,80 @@ prevention rule — any list that must stay in sync across build entries
 (fixtures, env contract, sampler ranges) is a script or a check, not a
 copy (the same reasoning that produced `tools/sampler_contract_check.sh`).
 Full incident record: `.agents/errors.md` (2026-10-31 entry).
+
+## 12. Newer distro cppcheck flags round-16 test allocations (2026-11-01, main red post-#79) — FIXED, PR #80 merged `2c11d20`
+
+**Question:** main CI run 41337186327 (the push of the round-17 docs
+audit, `07bf74d`) failed exactly one step: `lint` job → "Static
+analysis (cppcheck)". The identical code was green on `8606d58`
+(run 41225936406). Why?
+
+**Method:** the job log and the `lint-errors` artifact were both
+unreadable from this sandbox (results-receiver EOF; artifact blob host
+`productionresultssa19.blob.core.windows.net` also EOF — not on the
+egress allowlist). Proof without the log, in three steps:
+1. `git diff 8606d58..07bf74d -- src/ include/` = comments only
+   (`hydra_moe.h`, `hydra_v2_container.c`) + `.md` files → the doc PR
+   cannot change cppcheck's verdict on code.
+2. Reproduce the exact CI command locally with the newest available
+   cppcheck (2.22.0 from the PyPI wheel — a superset of the distro
+   2.13.x era): 32 findings, all `nullPointerOutOfMemory` (27× in
+   `tests/test_hydra_moe.c`) + 5× `nullPointerOutOfMemory` + 1×
+   `nullPointerArithmeticOutOfMemory` (512-cases block already checked
+   at line 2107, the two pinned-extremes/asymmetry blocks were not).
+3. All findings sit in the round-16 test code (KV cache helpers added
+   in PR #77) — pre-existing, invisible to the older distro cppcheck,
+   visible to the newer one. The runner image was refreshed between
+   the two runs; the cppcheck version change is the drift vector
+   (same event that also dropped `gcc-12-aarch64-linux-gnu`, §13).
+
+**Resolution:** `kv_set_alloc`/`kv_set_free` helpers in
+`tests/test_hydra_moe.c` own the whole per-layer cache chain (checked
+calloc + per-layer malloc, full cleanup on OOM, no leak, no NULL
+reaches `hydra_kv_cache_init`/`hydra_moe_forward`); all five KV test
+sites use them; the eviction sink's `k0/v0/ak/av` and the four
+unchecked `ref_get` calls got checks; the two `tests/test_engine.c`
+blocks got the file's own OOM convention. Post-fix: cppcheck 2.22
+(exact CI command) 0 findings; tests 234/128/7/101/152/216 all 0
+(baseline unchanged — the OOM paths never execute in practice);
+ASan+UBSan moe+engine clean.
+
+**Lesson:** unversioned apt packages in CI are a drift vector in BOTH
+directions — a newer version can newly REJECT code (this incident) and
+an image refresh can DELETE a pinned old version (§13). A code fix
+that is clean under the newest superset tool is the durable fix;
+pinning the old version would just move the failure to the next image
+refresh.
+
+## 13. Runner image drop: gcc-12-aarch64-linux-gnu no longer in apt sources (2026-11-01) — FIXED in ci.yml + release.yml
+
+**Question:** two main-tier jobs failed at their first real step after
+the #80 merge: `CI` → `neon-test` (run 41339831236) and `Release` →
+`CLI (Linux)` (run 41339831264), both at "Install AArch64
+cross-compiler and qemu-user" / "Install cross toolchain + qemu" —
+`sudo apt-get install -y -qq gcc-12-aarch64-linux-gnu qemu-user-static`.
+The same step succeeded on the previous image (e.g. the 07bf74d
+Release run's sibling jobs all passed; only the apt step failed).
+
+**Method:** job steps via the Jobs API (`/actions/jobs/{id}` — the
+steps endpoint that works while the log endpoint EOFs): both failures
+are the apt install step, everything downstream skipped. The identical
+step failed on two consecutive runs two days apart on two different
+commits → not transient, the package is gone from the current image's
+apt sources. Consistent with the same image refresh that bumped
+cppcheck (§12) — one event, two symptoms.
+
+**Resolution:** the unversioned cross-compiler
+(`gcc-aarch64-linux-gnu` → `aarch64-linux-gnu-gcc`, whatever gcc the
+image ships) in both workflows, plus `aarch64-linux-gnu-gcc --version`
+printed in the install step so a future toolchain drift shows up in
+the log. The gates that make the version non-load-bearing already
+exist: the test-count drift gate (ARM baseline), the NEON-vs-scalar
+comparison tests, and the x86-vs-ARM/NEON bit-identical parity check
+in both workflows. If any future compiler change broke NEON
+behaviour, those gates would catch it — the pin was buying nothing
+that the gates don't already prove.
+
+**Lesson:** in CI, prefer "default + prove it" (unversioned tool +
+behaviour gates) over "pin the exact old version" — pins rot when the
+image moves, behaviour gates don't.

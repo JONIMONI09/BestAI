@@ -362,3 +362,63 @@ code.
 branch to `8606d58`; the fix was committed, rebased onto
 `origin/main` (`07bf74d`) and pushed as `48d21f7` — the PR #80 diff
 vs main is the two test files only.
+
+## Round 17.6 (2026-11-01) — runner image drift: cross-compiler fix + documentation completion
+
+**Session start (R33):** new session branch
+(`arena/67ff8065-bestai`, active, ff'ed to `2c11d20` = main post-#80):
+read session.md (current rounds), rules.md, Environment.md before
+working.
+
+**Owner request (2026-11-01, verbatim):** "ok weiter, und prüfen und
+ob alles drauf ist???" — continue (the doc-completion promised after
+the #80 merge) and verify everything is in place.
+
+**Findings this session (all measured):**
+1. New branch arrived as a **shallow clone** (`origin/main~1`
+   unknown, `git merge --ff-only` → "unrelated histories"); fixed
+   with `git fetch --depth=50 origin main` (Environment.md note).
+2. Main CI after the #80 merge (`2c11d20`): **two new red jobs**,
+   both at the AArch64 apt install step — `neon-test` (run
+   41339831236) and Release `CLI (Linux)` (run 41339831264). Same
+   step already failed on `07bf74d` (run 41337186425) → persistent.
+   Root cause: the runner image refresh (same event as the new
+   cppcheck, §12/§13 of RESEARCH-LOG) removed
+   `gcc-12-aarch64-linux-gnu` from the image's apt sources.
+3. `gh run download` (artifact) → EOF (blob host not on egress
+   allowlist); `gh run rerun` / `gh workflow run` → 403 (sandbox
+   token) — recorded in Environment.md.
+
+**Work (this PR):**
+- **CI fix:** ci.yml (neon-test install + both aarch64 builds +
+  report text) and release.yml (install + arm64 build) now use the
+  unversioned `gcc-aarch64-linux-gnu` / `aarch64-linux-gnu-gcc`;
+  the install step prints the compiler version. The NEON gates
+  (ARM test-count baseline, NEON-vs-scalar tests, x86-vs-ARM
+  bit-identical parity) already prove behaviour, so the version pin
+  bought nothing.
+- **Documentation completion (promised after #80):**
+  - CHANGELOG.md: round 17.5 entry (written late — #80 shipped
+    without one) + round 17.6 entry.
+  - RESEARCH-LOG.md: §12 (cppcheck version drift, #80) + §13
+    (cross-compiler image drop) + index lines §11–§13 (the §11 line
+    was missing — the table had §1–§10 only).
+  - errors.md: entries for both incidents (newest first).
+  - Environment.md: 2026-11-01 section (image-drift event, blocked
+    artifact/dispatch, shallow session branches, /tmp wipe).
+
+**Gates (local, after the edits):**
+- `workflow_yaml_check.sh`: ok (5 files, negative control proven).
+- `workflow_lint_check.sh`: ok (4 files, negative control proven).
+- `git diff -- .github/workflows/` reviewed: only the
+  gcc-12 → unversioned swaps + comments; no structural change.
+- C/test code untouched this round (no re-run of the C gates
+  needed; the #80 state remains: cppcheck 2.22 clean,
+  234/128/7/101/152/216, ASan+UBSan clean).
+- `session_start_check.sh`: ok (this section carries the R33 marker).
+
+**Verification on main happens automatically** with this PR's merge
+(push to main re-runs CI + Release — the neon-test and CLI (Linux)
+jobs re-execute the fixed install step on the current image).
+
+**PR:** (opened after this line — FACTS ONLY, per owner rule)
