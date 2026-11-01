@@ -3,6 +3,62 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
+## 2026-11-01 (round 17.6) — runner image refresh dropped gcc-12-aarch64-linux-gnu; two jobs red at their apt install step
+
+- **Symptom:** after the #80 merge (`2c11d20`), two main-tier jobs
+  failed at their first real step: `CI` → `neon-test` (run
+  41339831236) at "Install AArch64 cross-compiler and qemu-user" and
+  `Release` → `CLI (Linux)` (run 41339831264) at "Install cross
+  toolchain + qemu" — both running
+  `sudo apt-get install -y -qq gcc-12-aarch64-linux-gnu
+  qemu-user-static`. Every other job in both runs was green (Android
+  APK, all lint jobs, GPU bench).
+- **Cause:** the ubuntu-latest runner image was refreshed (the same
+  event that also brought the newer cppcheck, round 17.5). The
+  refresh removed `gcc-12-aarch64-linux-gnu` from the image's apt
+  sources, so the version-pinned install fails. Proven non-transient:
+  the identical step failed on two consecutive runs, two days apart,
+  on two different commits (41337186425 on `07bf74d`, 41339831264 on
+  `2c11d20`).
+- **Fix:** unversioned cross-compiler in both workflows
+  (`gcc-aarch64-linux-gnu` → `aarch64-linux-gnu-gcc`, whatever gcc the
+  image ships), plus the compiler version printed in the install step
+  so a future drift shows in the log. The NEON correctness gates
+  (ARM test-count baseline, NEON-vs-scalar tests, x86-vs-ARM/NEON
+  bit-identical parity) already make the compiler version
+  non-load-bearing — they prove behaviour, the pin only proved age.
+- **Prevention:** prefer "default tool + behaviour gate" over
+  "pinned old version" in CI: pins rot when the image moves, gates
+  don't. See RESEARCH-LOG.md §13.
+
+## 2026-11-01 (round 17.5) — newer distro cppcheck turned 32 nullPointerOutOfMemory findings into a red lint job
+
+- **Symptom:** main run 41337186327 (the docs-audit push `07bf74d`)
+  failed exactly one step: `lint` job → "Static analysis (cppcheck)"
+  with `--error-exitcode=2`. Identical code was green on `8606d58`
+  (run 41225936406) the day before.
+- **Cause:** the round-16 KV test helpers allocated per-layer
+  calloc/malloc chains without checking the results. The older distro
+  cppcheck did not report it; the image refresh shipped a newer
+  cppcheck that does (27× in `tests/test_hydra_moe.c`, 5× + 1
+  `nullPointerArithmeticOutOfMemory` in `tests/test_engine.c`).
+  Verified not the doc PR: `git diff 8606d58..07bf74d -- src/
+  include/` = comments only. Job log and lint-errors artifact were
+  unreadable from this sandbox (log endpoint EOF; artifact blob host
+  not on the egress allowlist) — the diagnosis used the Jobs API step
+  conclusions + local reproduction with cppcheck 2.22 (superset).
+- **Fix (PR #80, merged `2c11d20`):** `kv_set_alloc`/`kv_set_free`
+  helpers own the whole cache chain (checked allocations, full
+  cleanup on OOM, no leak); all five KV test sites + the sink
+  `k0/v0/ak/av` buffers + the four unchecked `ref_get` calls now
+  checked; the two `tests/test_engine.c` blocks got the file's own
+  OOM convention.
+- **Prevention:** unchecked allocations in test code are a landmine
+  for any future static-analysis version bump — the fix is clean
+  under cppcheck 2.22 (a superset of the distro version), so the
+  next version bump cannot re-flag the same class. RESEARCH-LOG.md
+  §12.
+
 ## 2026-10-31 (round 15) — making Q4_0 decodable broke two tests that ENCODED the old behaviour
 
 - **Symptom:** after adding the Q4_0/Q4_1 decoders to

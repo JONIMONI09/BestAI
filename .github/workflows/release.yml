@@ -214,10 +214,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Unversioned cross-compiler = whatever gcc the runner image ships
+      # (the old gcc-12 pin vanished from the current image's apt sources
+      # on 2026-11-01 and failed this step twice in a row - same image
+      # refresh that bumped the runner's cppcheck). The parity gate below
+      # still proves the arm64 binary bit-exactly.
       - name: Install cross toolchain + qemu
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-12-aarch64-linux-gnu qemu-user-static
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+          aarch64-linux-gnu-gcc --version | head -1
 
       - name: Build linux-x64
         run: |
@@ -228,7 +234,7 @@ jobs:
 
       - name: Build linux-arm64 (static)
         run: |
-          aarch64-linux-gnu-gcc-12 -O3 -static -Wall -Wextra \
+          aarch64-linux-gnu-gcc -O3 -static -Wall -Wextra \
               -Iinclude src/hydra_engine.c src/main.c src/hydra_v2_container.c \
               src/hydra_moe.c -lm -o dist/hydra-run-linux-arm64
 

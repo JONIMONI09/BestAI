@@ -240,15 +240,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The unversioned cross-compiler package tracks whatever gcc the
+      # runner image ships. (The old pin, gcc-12-aarch64-linux-gnu,
+      # vanished from the current image's apt sources on 2026-11-01 -
+      # the same image refresh that also brought the newer cppcheck -
+      # and broke this job twice in a row.) The version is printed so a
+      # future toolchain drift is visible in the log, and the parity +
+      # test-count gates below still prove the NEON path bit-exactly.
       - name: Install AArch64 cross-compiler and qemu-user
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-12-aarch64-linux-gnu qemu-user-static
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+          aarch64-linux-gnu-gcc --version | head -1
 
       - name: Build + run tests for aarch64 (NEON path active)
         run: |
           set +e
-          aarch64-linux-gnu-gcc-12 -O2 -static -Wall -Wextra \
+          aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra \
               -Iinclude \
               src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm \
               > /tmp/neon-build.log 2>&1
@@ -291,7 +299,7 @@ jobs:
           # -lm: the M4 float primitives (RMSNorm/RoPE/SwiGLU) and the M2
           # sampler link against libm; a static aarch64 build does not
           # pull it in implicitly.
-          aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \
+          aarch64-linux-gnu-gcc -O2 -static -Iinclude \
               src/hydra_engine.c src/main.c src/hydra_v2_container.c \
               src/hydra_moe.c -lm -o hydra-run-arm
           qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
@@ -314,7 +322,7 @@ jobs:
           {
             echo "=== Hydra-Stone NEON failure (${GITHUB_SHA::7}) ==="
             echo "Reproduce locally:"
-            echo "  aarch64-linux-gnu-gcc-12 -O2 -static -Iinclude \\"
+            echo "  aarch64-linux-gnu-gcc -O2 -static -Iinclude \\"
             echo "      src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm"
             echo "  qemu-aarch64-static ./hydra-test-arm"
           } > neon-report.txt
