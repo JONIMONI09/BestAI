@@ -479,4 +479,75 @@ sandbox.
 current 26.04 image; the Checks-API annotations make any remaining
 failure immediately diagnosable).
 
+**Result (post-merge, runs 41342270169/41342270201):** the gcc
+probe succeeded (`gcc-aarch64-linux-gnu` installed — the metapackage
+IS on 26.04), but both jobs failed at the next command:
+`qemu-user-static` has no installation candidate on 26.04. Side
+finding: the #81 failure was that qemu line, not the gcc package.
+→ fixed in round 17.8.
+
+**PR:** #82 (opened after this line — FACTS ONLY, per owner rule),
+merged `b086a92`.
+
+## Round 17.8 (2026-11-01) — Ubuntu 26.04 dropped qemu-user-static too: qemu probe + $QEMU_AARCH64
+
+**Session start (R33):** new session branch
+(`arena/241b5472-bestai`, branched from main `b086a92` = post-#82):
+session.md (current rounds), rules.md, Environment.md read before
+working. (Latest-round marker for `session_start_check.sh` —
+protocol: `.agents/skills/session-workflow/SKILL.md`.)
+
+**Trigger:** user pasted the post-#82 main-run error verbatim:
+`installed cross package: gcc-aarch64-linux-gnu` / `E: Package
+'qemu-user-static' has no installation candidate` / exit 100 —
+runs 41342270169 (CI, neon-test) + 41342270201 (Release, CLI Linux)
+failed at the install step a THIRD time.
+
+**Findings (verified against the runs):**
+- the round-17.7 gcc probe WORKED on 26.04 — `gcc-aarch64-linux-gnu`
+  is installable (the metapackage IS on the new image);
+- side finding: the #81 failure was almost certainly the
+  `qemu-user-static` line of the same apt command (apt fails the
+  whole install if ANY listed package is missing) — the "unversioned
+  gcc also gone" theory from 17.7 was wrong;
+- the real 26.04 drop (second one) is `qemu-user-static`.
+
+**Fix (this PR, workflows only, no C code):**
+- qemu install = probe: `qemu-user-static` → `qemu-user` (dynamic
+  variant); working emulator exported as `$QEMU_AARCH64`
+  (GITHUB_ENV);
+- all three emulator invocations use it: neon-test run, ARM
+  test-count drift gate, cross-arch parity (ci.yml) + release parity
+  (release.yml); the neon failure-report echo updated too;
+- emulator is always invoked explicitly (never via binfmt) → static
+  vs dynamic is irrelevant;
+- same self-diagnosis pattern as the gcc probe: if nothing
+  installs, `::error::`/`::notice::` annotations with the apt error
+  tail + `apt-cache search qemu` candidates (Checks-API readable).
+- Documentation: CHANGELOG 17.8 + 17.7 header; errors.md 17.8 +
+  17.7 correction (the #81 failure was qemu, not gcc); RESEARCH-LOG
+  §13 third phase + updated title; this section.
+
+**Gates (local, after the edits):**
+- `workflow_yaml_check.sh`: ok (5 files, negative control proven).
+- `workflow_lint_check.sh`: ok (4 files, negative control proven).
+- `bash -n` on both extracted install scripts: ok.
+- Install script functionally simulated with stubbed apt binaries
+  reproducing the exact 26.04 state (gcc metapackage available,
+  qemu-user-static "no installation candidate", qemu-user
+  available): qemu-user fallback selected,
+  `QEMU_AARCH64=qemu-aarch64` + `CC_AARCH64=aarch64-linux-gnu-gcc`
+  exported, exit 0 — the production failure scenario is proven
+  fixed before push.
+- `session_start_check.sh`: ok (this section carries the R33 marker).
+- C/test code untouched this round (state since #80: cppcheck 2.22
+  clean, 234/128/7/101/152/216, ASan+UBSan clean).
+
+**Verification on main happens automatically** with this PR's merge
+(neon-test + CLI (Linux) re-execute the new install step; the
+gcc-probe-success + qemu-fallback path is the expected green).
+
+**Linear:** PRO task for the 26.04 incident created after the merge
+decision (incident spans #81/#82/this PR).
+
 **PR:** (opened after this line — FACTS ONLY, per owner rule)

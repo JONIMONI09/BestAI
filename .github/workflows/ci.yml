@@ -271,7 +271,31 @@ jobs:
             tail -n 8 /tmp/apt-cross.log | sed 's/^/::error::apt: /'
             exit 1
           fi
-          sudo apt-get install -y -qq qemu-user-static
+          # qemu-user family: Ubuntu 26.04 dropped qemu-user-static
+          # (2026-11-01, runs 41342270169/41342270201 — the gcc probe
+          # above succeeded, the metapackage IS on the new image).
+          # Fall back to qemu-user (dynamic variant); the emulator is
+          # always invoked explicitly below, so static vs dynamic
+          # binfmt is irrelevant here.
+          if ! sudo apt-get install -y -qq qemu-user-static 2>>/tmp/apt-qemu.log; then
+            tail -n 3 /tmp/apt-qemu.log | sed 's/^/::notice::apt(qemu-user-static) /'
+            sudo apt-get install -y -qq qemu-user 2>>/tmp/apt-qemu.log || {
+              echo "::error::no qemu-user package installable on this image"
+              apt-cache search qemu 2>/dev/null \
+                | sed 's/^/::error::candidate: /' | head -15
+              tail -n 8 /tmp/apt-qemu.log | sed 's/^/::error::apt: /'
+              exit 1
+            }
+          fi
+          if command -v qemu-aarch64-static >/dev/null 2>&1; then
+            QEMU_AARCH64=qemu-aarch64-static
+          elif command -v qemu-aarch64 >/dev/null 2>&1; then
+            QEMU_AARCH64=qemu-aarch64
+          else
+            echo "::error::qemu package installed but no aarch64 emulator found"
+            exit 1
+          fi
+          echo "QEMU_AARCH64=$QEMU_AARCH64" >> "$GITHUB_ENV"
           if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
             CC_AARCH64=aarch64-linux-gnu-gcc
           else
@@ -295,7 +319,7 @@ jobs:
               src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm \
               > /tmp/neon-build.log 2>&1
           brc=$?
-          qemu-aarch64-static ./hydra-test-arm > /tmp/neon-run.log 2>&1
+          "$QEMU_AARCH64" ./hydra-test-arm > /tmp/neon-run.log 2>&1
           rrc=$?
           set -e
           if [ $brc -ne 0 ] || [ $rrc -ne 0 ]; then
@@ -318,12 +342,12 @@ jobs:
       # legitimately higher than x86 because the NEON-vs-scalar comparison
       # tests only exist in an NEON build.
       #
-      # qemu-aarch64-static is passed as the command prefix rather than
-      # relying on binfmt_misc: this runner is x86-64, and executing the
-      # AArch64 binary directly would depend on host binfmt registration
-      # that a GitHub runner does not guarantee.
+      # $QEMU_AARCH64 (set by the install step) is passed as the command
+      # prefix rather than relying on binfmt_misc: this runner is x86-64,
+      # and executing the AArch64 binary directly would depend on host
+      # binfmt registration that a GitHub runner does not guarantee.
       - name: Test-count drift gate (ARM64/NEON)
-        run: bash tools/test_count_check.sh ./hydra-test-arm arm qemu-aarch64-static
+        run: bash tools/test_count_check.sh ./hydra-test-arm arm "$QEMU_AARCH64"
 
       - name: Cross-arch determinism check (x86 vs ARM/NEON)
         run: |
@@ -337,7 +361,7 @@ jobs:
           "$CC_AARCH64" -O2 -static -Iinclude \
               src/hydra_engine.c src/main.c src/hydra_v2_container.c \
               src/hydra_moe.c -lm -o hydra-run-arm
-          qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
+          "$QEMU_AARCH64" ./hydra-run-arm parity.hydra 42 8 --json \
               2>/dev/null > /tmp/arm.json
           python3 - << 'EOF'
           import json, sys
@@ -359,7 +383,7 @@ jobs:
             echo "Reproduce locally:"
             echo "  \$CC_AARCH64 (set by the install step) -O2 -static -Iinclude \\"
             echo "      src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm"
-            echo "  qemu-aarch64-static ./hydra-test-arm"
+            echo "  \$QEMU_AARCH64 (set by the install step) ./hydra-test-arm"
           } > neon-report.txt
           exit 0
 

@@ -462,7 +462,7 @@ that is clean under the newest superset tool is the durable fix;
 pinning the old version would just move the failure to the next image
 refresh.
 
-## 13. Runner image drop: AArch64 cross-compiler gone from apt sources (2026-11-01) — FIXED in ci.yml + release.yml (probe list, round 17.7)
+## 13. Runner image drop: AArch64 toolchain gone from apt sources (2026-11-01) — FIXED in ci.yml + release.yml (probe lists, rounds 17.7–17.8)
 
 **Question:** two main-tier jobs failed at their first real step after
 the #80 merge: `CI` → `neon-test` (run 41339831236) and `Release` →
@@ -500,6 +500,24 @@ and — if the whole list fails — emit `::error::`/`::notice::`
 annotations with the apt error tail and `apt-cache search`
 candidates, readable through the Checks API without the log
 endpoint.
+
+**Third phase (round 17.8):** the post-#82 main runs
+(41342270169/41342270201) proved the gcc probe works —
+`gcc-aarch64-linux-gnu` installed fine (the metapackage IS on
+26.04; the #81 failure was this next line all along) — but failed at
+`sudo apt-get install -y -qq qemu-user-static` with `E: Package
+'qemu-user-static' has no installation candidate`. The qemu install
+is now a probe too (`qemu-user-static` → `qemu-user`), exporting
+`$QEMU_AARCH64` for all three emulator invocations. The emulator is
+always invoked explicitly (never via binfmt), so the static-vs-
+dynamic distinction is irrelevant. Two further lessons from this
+phase: (a) in a multi-package `apt-get install a b c`, the failing
+package is not necessarily the one in apt's summary — audit the
+workflow's whole package list when an image major move breaks the
+install; (b) the self-diagnosis pattern (probe list + export +
+`::error::`/`::notice::` annotations with `apt-cache search`
+candidates) made each of the three failures diagnosable in one
+Checks-API call without the log endpoint.
 
 **Gates that make the compiler version non-load-bearing** (unchanged):
 the test-count drift gate (ARM baseline), the NEON-vs-scalar
