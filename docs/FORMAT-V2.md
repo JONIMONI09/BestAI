@@ -1,12 +1,15 @@
 # The `.hydra2` Container Format (v2)
 
-> **Status: SPECIFICATION, container implemented.** The container reader
-> (`src/hydra_v2_container.c`), the fixture generator
-> (`tools/make_model.py --v2`) and the test suite
-> (`tests/test_hydra2_container.c`) exist and are gated in CI. What does
-> **not** exist yet: MoE inference on top of the container, an expert cache,
-> and any measured throughput (section 6 is still a worked example, not a
-> result). See "Implementation status" below for the exact boundary.
+> **Status: IMPLEMENTED (rounds 12–16).** The container reader
+> (`src/hydra_v2_container.c`), the MoE inference engine
+> (`src/hydra_moe.c`), the fixture generators (`tools/make_model.py --v2`,
+> `tools/make_moe_fixtures.sh`) and both test suites exist and are gated in
+> CI. Expert layouts 0 (F32), 1 (TERNARY2 + block scales) and 2 (Q4_0, the
+> resident 4-bit type) are implemented; the GGUF input path is
+> `tools/gguf_to_hydra2.py`. What does **not** exist yet: the expert cache
+> (6.2), prefetch (6.4), and any measured throughput — section 6 is still a
+> worked example, not a result. See "Implementation status" below for the
+> exact boundary.
 >
 > **v1 is untouched.** Every `.hydra` v1 file written by any v1 release loads
 > under any v1 loader, and no v2 change alters that. v1 and v2 have different
@@ -120,7 +123,8 @@ Stated precisely, with the boundary between implemented and not:
   min-p / repetition-penalty sampler over them. `hydra-run` dispatches on
   the file magic: `.hydra2` files run the MoE engine (v1–v4 files run the
   legacy engine, bit-identical, untouched). Expert layouts: **0** = flat
-  F32 and **1** = TERNARY2 + per-group F32 scales (section 3.2.2);
+  F32, **1** = TERNARY2 + per-group F32 scales (section 3.2.2) and
+  **2** = Q4_0 blocks (section 3.2.4, round 16);
   **trunk** tensors of the block-scaled ternary types are materialized
   through their paired `<name>.scale` sibling at read time (section
   3.2.1), and the optional **role-8 vocabulary** (`vocab` / `merges`,
@@ -136,9 +140,10 @@ Stated precisely, with the boundary between implemented and not:
   only seeded the repetition ring and the display). The generated stream
   is reported as decoded text as well as token ids (`[Text-out]:` line
   and the JSON `generated_text` field, round 13 Qodo #7). Covered by
-  `tests/test_hydra_moe.c` (`make test-run`, 180 checks: independent-
+  `tests/test_hydra_moe.c` (`make test-run`, 216 checks: independent-
   reference forward parity, greedy stream pins for the F32 / S64 / S128 /
-  dim-256 multi-group / attention-ternary / GQA fixtures, KV eviction,
+  dim-256 multi-group / attention-ternary / GQA fixtures (round 16 adds
+  the two Q4_0 fixtures: Q4_0-source and F32-quantized), KV eviction,
   sampler extremes incl. the temperature-scaling pin, the hand-crafted
   dequant round-trips (the in-place aliasing regression of round 13
   Qodo #3 included), the vocab codec + tamper refusals, the
@@ -170,7 +175,24 @@ Stated precisely, with the boundary between implemented and not:
   positional-argument defaults/clamp (start 42, steps 1..256) now
   precede the magic dispatch so `.hydra2` files get them too (Qodo
   #23). All regression tests are in `tests/test_hydra_moe.c` and
-  `tools/text_prompt_check.sh`; the suite grew 138 -> 180 checks.
+  `tools/text_prompt_check.sh`; the suite grew 138 -> 180 checks (it is
+  216 after round 16).
+- **Implemented `[CODE]` (2026-10-31, round 16):** the 4-bit *resident*
+  type. `Q4_0` (`0x0030`) graduated from reserved to implemented: the
+  container validates the 18 B/32 block layout (F16 `d` + 16 nibble bytes,
+  `w = d*(q-8)` — the ggml `block_q4_0` layout), and the MoE engine's
+  mat-vec kernels dequantize ONE row at a time into a shared scratch, so
+  the resident memory of a Q4_0 tensor stays 4-bit — F32 is never
+  materialized (that is the point of the type). New `v2.expert_layout`
+  **2** (section 3.2.4): the expert blob is [gate][up][down] Q4_0 blocks.
+  The converter writes this layout with `--t4` (trunk tensors as Q4_0
+  blocks; a Q4_0 GGUF source is copied bit-exact; dim/inter must be
+  divisible by 32), and `--probe` reports a model's Q4_0-clean status.
+  The opt-in 3B E2E (`HYDRA2_3B_E2E=1`, `tools/build_3b_synth_gguf.py`)
+  imports a 3072 MB Q4_0-trunk GGUF through `server.js` and runs the MoE
+  forward: 1569 MB `.hydra2`, peak 2.58 GiB RSS, md5-pinned 16-token
+  stream (docs/LARGE-MODELS.md §8). Suite 180 -> 216 checks; layout-2
+  parity vs the F32 fixture within the test eps (40 checks).
 - **SIMD status (2026-10-26).** The transformer formats v3/v4 (the engine's
   per-layer ternary projections) compute their inner product through
   `tf_row_dot`, which is **integer-exact** and has AVX2 and NEON kernels
@@ -188,14 +210,15 @@ Stated precisely, with the boundary between implemented and not:
   converters). They are Python readers for somebody else's file format:
   `gguf_to_hydra.py` projects to a **v1** `.hydra`, `gguf_to_hydra2.py`
   writes a **v2** `.hydra2` (round 15: the Q4_0/Q4_1 GGUF inputs decode in
-  place to F32, so an 8B Q4 download converts without a re-export; the v2
-  container itself still stores F32 - its own `Q4_0` type id `0x0030`
-  remains reserved, which is the milestone for 4-bit *resident* weights).
+  place to F32, so an 8B Q4 download converts without a re-export; since
+  round 16 `--t4` instead writes the resident `Q4_0` type `0x0030`
+  directly — section 3.2.4).
   The v2 container validates Q8_0 *entries* (element-group and byte-size
-  rules) but does not **decode** Q8_0 values; the same is true for F16/BF16.
-  The types the current test fixtures exercise are F32, TERNARY2_S64/S128
-  (expert layout 1 and attention trunk tensors) and the role-8 pair
-  VOCAB_UTF8/U16_PAIRS (section 3.2.3).
+  rules) but does not **decode** Q8_0 values; the same is true for F16/BF16
+  (no fixture stores them). The types the current test fixtures exercise
+  are F32, TERNARY2_S64/S128 (expert layout 1 and attention trunk tensors),
+  Q4_0 (expert layout 2 fixtures + `--t4` trunk tensors, round 16) and the
+  role-8 pair VOCAB_UTF8/U16_PAIRS (section 3.2.3).
 - The **research** that motivates the sparse-MoE path is in
   [`.agents/docs/HYDRA2-RESEARCH.md`](../.agents/docs/HYDRA2-RESEARCH.md). Its benchmark plan is
   explicitly **not yet run**; nothing in it may be quoted as a result.
@@ -281,8 +304,8 @@ table is refused before a single tensor directory entry is read. **[SPEC]**
 | `0x0010` | `F16` | 2 | IEEE binary16 |
 | `0x0011` | `BF16` | 2 | top 16 bits of an F32 |
 | `0x0012` | `F32` | 4 | |
-| `0x0020` | `Q8_0` | 34/32 | 34-byte blocks: F16 `d` + 32 int8, `w = d*q` **[CODE]** — implemented in `tools/gguf_reader.py` for the GGUF import path, not yet in a C v2 reader |
-| `0x0030` | `Q4_0` | 18/32 | reserved, **not implemented** |
+| `0x0020` | `Q8_0` | 34/32 | 34-byte blocks: F16 `d` + 32 int8, `w = d*q` **[CODE]** — value-decoded in `tools/gguf_reader.py` (GGUF import path); the C v2 container validates entries structurally but never value-decodes them |
+| `0x0030` | `Q4_0` | 18/32 | 18-byte blocks: F16 `d` + 16 nibble bytes, `w = d*(q-8)` (ggml `block_q4_0`) **[CODE]** — **implemented** (round 16) and **resident**: the MoE engine dequantizes row-by-row, never materializing F32 (section 3.2.4); element group 32; also value-decoded in `tools/gguf_reader.py` |
 | `0x0031` | `Q4_K` | reserved, **not implemented** |
 | `0x0032` | `MXFP4` | reserved, **not implemented** |
 | `0x0040` | `TERNARY2_S64` | 0.5 | TERNARY2 packing + per-64-element block scales, sections 3.2.1 / 3.2.2 **[CODE]** |
@@ -290,21 +313,26 @@ table is refused before a single tensor directory entry is read. **[SPEC]**
 | `0x0050` | `VOCAB_UTF8` | var (>= 2) | NUL-terminated UTF-8 token strings, one per token id, section 3.2.3 **[CODE]** |
 | `0x0051` | `U16_PAIRS` | 4 | BPE merge rules `(left u16, right u16)` LE, section 3.2.3 **[CODE]** |
 
-The v2 reader **validates** all seven implemented types structurally
+The v2 reader **validates** every implemented type structurally
 (`n_elements` multiple of the element group, `n_bytes == n_elements *
-bytes_per_element`; the variable-length pair follows its own rule,
+bytes_per_element`; the grouped types use 34 (Q8_0) and 18 (Q4_0) bytes
+per 32-element block; the variable-length pair follows its own rule,
 section 3.2.3: `VOCAB_UTF8` needs `n_bytes >= 2 * n_elements` — at least
 one data byte plus the NUL per token — and `U16_PAIRS` needs exactly
-`4 * n_elements`) and **refuses** the last four **by name** rather than by
-falling through to "unsupported" (`[CODE]` `src/hydra_v2_container.c`,
-tensor/expert entry validation). Value **decoders** exist in this repository
-in the sense that `tools/gguf_reader.py` can read F32/F16/BF16/Q8_0/Q4_0/Q4_1
-for the **GGUF import path** (v1 `.hydra` via `gguf_to_hydra.py`, v2
-`.hydra2` via `gguf_to_hydra2.py`), and the MoE module
-(`src/hydra_moe.c`) decodes the expert payloads it streams: F32 (layout 0)
-and TERNARY2_S64/S128 (layout 1, section 3.2.2). The container itself
-still only streams expert bytes into caller buffers; the section 6.2 expert
-cache and the 6.4 prefetch remain open. **[SPEC]** + **[CODE]**
+`4 * n_elements`) and **refuses** the reserved `Q4_K` / `MXFP4` **by
+name** rather than by falling through to "unsupported" (`[CODE]`
+`src/hydra_v2_container.c`, tensor/expert entry validation). Value
+**decoders** exist in this repository in the sense that
+`tools/gguf_reader.py` can read F32/F16/BF16/Q8_0/Q4_0/Q4_1 for the
+**GGUF import path** (v1 `.hydra` via `gguf_to_hydra.py`, v2 `.hydra2`
+via `gguf_to_hydra2.py`), and the MoE module (`src/hydra_moe.c`) decodes
+the payloads it uses: F32 (expert layout 0), TERNARY2_S64/S128 (layout 1,
+section 3.2.2) and Q4_0 (layout 2, section 3.2.4 — row-by-row dequant
+inside the mat-vec kernels; trunk Q4_0 tensors are dequantized exactly
+the same way). Q8_0/F16/BF16 entries are validated but never value-
+decoded (no fixture stores them). The container itself still only streams
+expert bytes into caller buffers; the section 6.2 expert cache and the
+6.4 prefetch remain open. **[SPEC]** + **[CODE]**
 
 #### 3.2.1 Block-scaled ternary (M2.2)
 
@@ -462,6 +490,41 @@ the CLI are parity/pin-tested in `tests/test_hydra_moe.c`
 `tests/test_hydra2_container.c` (`test_vocab_types`) and
 `tools/text_prompt_check.sh`. **[CODE]**
 
+#### 3.2.4 Q4_0 MoE experts (`v2.expert_layout` 2, round 16, 2026-10-31)
+
+The 4-bit *resident* layout: the expert blob is the three sub-matrices
+[gate][up][down] in the same order as layout 0, but every sub-matrix is
+the exact ggml `block_q4_0` payload — 18-byte blocks, 32 values each
+(F16 `d` + 16 nibble bytes, low-nibble-first, `w = d*(q-8)`). **[CODE]**
+
+* **resident** — unlike layout 1 (dequantize the selected expert to F32,
+  then run the F32 path), layout 2 keeps the expert 4-bit while it is
+  read: the mat-vec kernels dequantize ONE row at a time into a shared
+  scratch buffer (sized for the widest sub-matrix row), so the resident
+  memory of an expert is its on-disk size — `3 · dim · inter / 32` blocks
+  × 18 bytes, ≈7.1× smaller than layout 0 — and no F32 copy of the expert
+  ever exists (that is the point of the type).
+* **exactness** — Q4_0 is a quantized format (4-bit codes): layout-2
+  streams are therefore NOT bit-identical to layout 0. The test suite
+  pins them against a fixture built from the same source floats and
+  checks parity within the test eps — the 4-bit error is the expected
+  difference, not a bug. A Q4_0 GGUF *source* tensor is copied bit-exact
+  (its block payload becomes the container payload unchanged).
+* **size** — per expert: `Σ over the three sub-matrices of
+  ceil(rows·cols / 32) * 18` bytes; the converter enforces dim/inter
+  divisible by 32, so for the required shapes rows·cols is always a
+  multiple of 32. Example (dim 8, inter 4): gate/up `4x8` → 18 B each,
+  down `8x4` → 18 B, total **54 B** versus 384 B for layout 0 (≈7.1×).
+* **metadata** — `v2.expert_layout = 2` and `v2.expert_bytes_typ` set to
+  the layout-2 byte count.
+
+The fixtures pin the greedy streams of two layout-2 models (`-q4`: Q4_0
+source, bit-exact blocks; `-q4f32`: F32 source quantized by the
+converter's reference quantizer) in `tests/test_hydra_moe.c`;
+`tools/make_moe_fixtures.sh` generates them (the single source of the
+fixture list). Layout-2 checks: 40 (parity vs the F32 fixture within
+test eps, dequant round-trips, size/refusal controls). **[CODE]**
+
 ### 3.3 Out of scope
 
 Mamba / SSM / structured-state-space layers are **out of scope for v2**. They
@@ -611,15 +674,18 @@ them. Missing or malformed values are a refusal (code −4), never a default:
 | `v2.n_kv_heads` | `uint32` | KV heads, `1..n_heads` AND `n_heads % n_kv_heads == 0` (GQA block mapping, round 13) |
 | `v2.head_dim` | `uint32` | `> 0`, and `dim == n_heads * head_dim` (checked in 64-bit arithmetic, round 13) |
 | `v2.inter` | `uint32` | FFN width `> 0` |
-| `v2.expert_layout` | `uint32` | `0` F32 flat, `1` ternary + block scales (§3.2.2) |
+| `v2.layers` | `uint32` | layer count `> 0`, must equal the container's layer count |
+| `v2.expert_layout` | `uint32` | `0` F32 flat, `1` ternary + block scales (§3.2.2), `2` Q4_0 blocks (§3.2.4) |
 | `v2.rope_theta` | `float32` | RoPE base, default `10000.0` |
 | `v2.kv_sink` | `uint32` | pinned KV entries, default `4`, `<= 0x10000` |
 | `v2.kv_ring` | `uint32` | ring KV entries, default `128`, `<= 0x10000` |
 | `v2.tied_embedding` | `uint32` | `1` logits use the embed matrix, `0` the `lm_head` tensor |
 | `v2.bos_token` | `uint32` | beginning-of-sequence token, default `0` |
 
-All ten are required for `moe-transformer-v1` files opened through the MoE
-module; the required trunk tensors are `embed`, per layer
+All thirteen are required for `moe-transformer-v1` files opened through the
+MoE module (plus the container routing keys `v2.experts_per_layer` and
+`v2.top_k`, section 4.3, which the module must also find); the required
+trunk tensors are `embed`, per layer
 `attn_q/k/v/o.{L}`, `attn_norm.{L}`, `ffn_norm.{L}`, `router.{L}`,
 `ffn_gate/up/down.{L}` (roles per §4.2), and `final_norm`, plus `lm_head`
 when `v2.tied_embedding` is `0`. The shape relations are enforced at open

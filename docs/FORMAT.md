@@ -5,8 +5,11 @@
 > 24-byte format (same magic `HYDRA`, `version` field = 2, 4 weights per
 > byte). The `.hydra2` **container** in `docs/FORMAT-V2.md` (magic
 > `HYDRA2\0\0`, 128-byte header, sparse-MoE) is a different, larger format
-> that has no loader in this repository. See the disambiguation at the end of
-> the Version 2 section below.
+> that IS implemented in this repository: the container reader is
+> `src/hydra_v2_container.c` and the MoE inference engine on top of it is
+> `src/hydra_moe.c` (rounds 12–16; GGUF input via
+> `tools/gguf_to_hydra2.py`). See the disambiguation at the end of the
+> Version 2 section below.
 
 ## Layout
 
@@ -323,12 +326,12 @@ tensor is smaller; it does not pretend to be the full source model.
 ## Validation Rules (Loader, `src/hydra_engine.c`)
 
 1. `magic == 0x48594452`
-2. `version == 1`, `2` or `3` (versions 2 **and** 3 additionally require `dim % 4 == 0`, see their sections)
+2. `version == 1`, `2`, `3` or `4` (versions 2, 3 **and** 4 additionally require `dim % 4 == 0`, see their sections)
 3. `1 <= dim <= 64` and `1 <= vocab_size <= 1024`
 4. `layers <= 4096` (`HYDRA_MAX_LAYERS`) — bounds the worst-case accumulator magnitude to `4096 × 254`, well below `INT32_MAX`. (Discovered via proof-of-concept: without this rule, `layers = 16909321` with `dim = 1` and all weights `+1` overflows a signed accumulator after ~16.9 MB of file.)
 5. `weights_offset >= 24` — the weight region may not overlap the header, otherwise header bytes would be executed as weights.
 6. `weights_offset + weights_len <= file_size` — prevents out-of-bounds reads past the mmap. **The sum is computed in 64 bits**, even though both operands are `uint32`: in 32-bit arithmetic `0xFFFFF000 + 0x1000` wraps to `0`, the model looks valid, and the aggregation walk runs off the mapping. Measured: with a 32-bit sum, `tests/test_large_model.c` loses its child process with SIGSEGV.
-7. The required weight body must be covered by `weights_len`, sized per version: `layers * dim` (v1), `layers * dim / 2` (v2), `layers * (dim*dim/2 + dim/4 + 2) + dim*dim/4` (v3). The loader reads exactly those bytes — the v1/v2 aggregates once at load, v3 directly from the mapping at token time — so the declared weight region must cover them. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
+7. The required weight body must be covered by `weights_len`, sized per version: `layers * dim` (v1), `layers * dim / 2` (v2), `layers * (dim*dim/2 + dim/4 + 2) + dim*dim/4` (v3), `layers * (5*dim*dim/4 + dim/4 + 2) + dim*dim/4` (v4). The loader reads exactly those bytes — the v1/v2 aggregates once at load, v3/v4 directly from the mapping at token time — so the declared weight region must cover them. (Discovered via proof-of-concept: without this rule, a crafted header could read up to ~4 GiB past the file mapping.)
 8. v3 only: no layer may carry `scale == 0` (a zero scale would divide by zero in the forward pass); the loader walks the mapped scale words once at load and refuses the file.
 
 If any load rule is violated, the mapping is torn down immediately through a single cleanup path and a negative error code is returned (`-5` magic, `-7` version, `-8` dim/vocab, `-9` file bounds, `-10` weight region, `-11` layer cap, `-12` header overlap, `-15` v3 zero scale). Runtime guards on top: `hydra_engine_step()`/`hydra_engine_step_fast()` refuse v3 engines with `-14` (and `hydra_engine_step_tf()` refuses v1/v2 engines with the same code), the TF forward pass returns `-16` on any non-finite intermediate, and a failed KV append returns `-17` (see the "Version 3" section above).

@@ -187,9 +187,11 @@ static int read_full(int fd, uint8_t *buf, uint64_t len, uint64_t off)
 }
 
 /* ------------------------------------------------------------------ */
-/* Tensor types (FORMAT-V2.md 3.2). The first five have decoders      */
-/* somewhere in this repository (GGUF import path, v1); the last      */
-/* three are reserved and MUST be refused by name.                    */
+/* Tensor types (FORMAT-V2.md 3.2). F32 and Q4_0 are decoded by the   */
+/* MoE engine (Q4_0 row-by-row, round 16); F16/BF16/Q8_0 are          */
+/* validated structurally (their value decoders live only in the      */
+/* GGUF import path); Q4_K and MXFP4 are reserved and MUST be refused */
+/* by name.                                                           */
 /* ------------------------------------------------------------------ */
 
 const char *hydra2_type_name(uint16_t type_id)

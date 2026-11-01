@@ -26,7 +26,10 @@ python3 tools/gguf_to_hydra2.py model.gguf models/converted.hydra2
 POST /api/models/import?name=model.gguf
 ```
 
-Python **standard library only** — no numpy, no torch, no pip install. The
+Python **standard library only** — no numpy, no torch, no pip install (the
+§12 v2 converter's Q4_0 quantizer is an exception by design: its reference
+path is stdlib-only, and it uses a vectorized numpy fast path only when
+numpy happens to be importable — byte-identical output either way). The
 GGUF converter streams, so it does not have to hold the whole tensor in
 memory. The safetensors path is a second, independent converter (§10) that
 emits the version-2 packing.

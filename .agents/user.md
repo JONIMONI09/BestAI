@@ -156,3 +156,19 @@
     round, regardless of any other instruction; .gitignore itself is
     not to be touched. Proceed thoroughly: legacy behaviour stays
     bit-identical, every local gate green before any commit.
+
+31. **(2026-10-31)** Full documentation audit (owner text, verbatim):
+    "Ok lese dir die ganze DOKU durch, und bitte alles aktualisieren,
+    auch wenn du was auf Linear gepostet hast und so, bitte alles
+    aktualisieren, finde in jedem ordner ne Readme und prüfe diese gegen
+    den Code bitte!" — STANDING for this task: (a) EVERY .md in the repo
+    is read and checked against the code (stale counts/claims/paths
+    fixed, proof obligation R6/R7 applies to docs too); (b) every folder
+    gets a README (create the missing ones: src/, include/, tests/,
+    public/, tools/, docs/); (c) the Linear project is brought up to date
+    (round 16 + the CI fix + this audit); (d) process per the
+    `.agents/skills/repo-docs-audit/SKILL.md` (4 mechanical checks green
+    + per-file findings list in session.md). Dated point-in-time audit
+    records (.agents/docs/TECHNICAL-AUDIT.md, ANDROID-AUDIT.md,
+    SESSION-ARCHIVE.md) keep their historical state — they are records,
+    not live docs.

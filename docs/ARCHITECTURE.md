@@ -21,14 +21,19 @@
 |---|---|
 | `include/hydra_model.h` | Public API, header struct, defines; also the sampler config (`hydra_sampler_config_t`), the transformer primitives (`hydra_rmsnorm`/`hydra_rope_inplace`/`hydra_swiglu`) and the streaming `hydra_kv_cache_t` |
 | `src/hydra_engine.c` | Loader (mmap), inference step, axiom gate, the min-p/repetition-penalty sampler, the zero-heap transformer primitives + KV cache, and the v3/v4 per-layer passes (`hydra_engine_step_tf` / `hydra_transformer_forward_step`) |
-| `src/main.c` | CLI entry point (`--json` mode, `--temp`/`--min-p`/`--rep-penalty`/`--rep-window`/`--seed`) |
+| `src/main.c` | CLI entry point (`--json` mode, `--temp`/`--min-p`/`--rep-penalty`/`--rep-window`/`--seed`); dispatches on the file magic — `.hydra2` files run the MoE engine, v1–v4 files the legacy engine |
+| `include/hydra_v2_container.h` / `src/hydra_v2_container.c` | `.hydra2` container reader (128-byte header, tensor directory, routing + inference metadata; mmap trunk + pread fallback; loud refusals) — FORMAT-V2.md |
+| `include/hydra_moe.h` / `src/hydra_moe.c` | `.hydra2` MoE inference engine (GQA attention, per-vocab logits, top-k routing, streamed expert FFN in layouts 0/1/2, BPE vocab codec) — FORMAT-V2.md |
+| `tools/gguf_to_hydra2.py` (+ `gguf_to_hydra2_test.py`) | GGUF → `.hydra2` converter (full-fidelity MoE model, embedded BPE vocab, 32-chunk streaming; `--t4` resident Q4_0 output, `--probe`); 44-check gate |
+| `tools/make_moe_fixtures.sh` | single source of the 9 `hydra-moe-test` fixtures (Makefile + CI both call it) |
 | `src/hydra_neon.h` | NEON SIMD kernel — **actively integrated**: `step()` uses it on ARM in 16-lane chunks; bit-identical scalar fallback for remainders and x86 (proven by a same-build comparison test) |
 | `src/hydra_simd.h` | AVX2 kernel — **actively integrated** on x86-64 `-mavx2` builds: `hydra_avx2_accumulate_agg` (step) + `hydra_avx2_unpack_v2_plane` (load-time v2 LUT), runtime CPU dispatch with scalar fallback (proven by `test_avx2_step_kernel` / `test_avx2_v2_unpack`) |
 | `tools/make_model.py` | Test model generator (reference implementation of the format) |
 | `tools/gguf_to_hydra.py` | GGUF → `.hydra` (v1) converter, absmean ternarisation |
 | `tools/safetensors_to_hydra.py` | safetensors → `.hydra` (version 2, 4 ternary weights/byte) converter, stdlib only |
 | `tests/test_engine.c` | unit tests (hand-computed cases, NEON-vs-scalar, AVX2-vs-scalar, sampler suite, transformer primitives + KV cache, security regressions). The count is architecture-dependent and drift-gated: see `tools/test_count_baseline.txt` |
-| `server.js` | Web console server (Node, zero npm dependencies) |
+| `tests/test_hydra2_container.c` / `tests/test_hydra_moe.c` | `.hydra2` suites: container reader (152 checks) + MoE engine (216 checks) |
+| `server.js` | Web console server (Node, zero npm dependencies); env-driven configuration documented at `GET /api/config`, GGUF import into v1 `.hydra` or v2 `.hydra2` (`?mode=…&t4=…`) |
 | `public/` | Hydra-Stone Console frontend (plain HTML/CSS/JS) |
 
 ## Memory Model: Zero-Heap Inference via mmap
@@ -199,11 +204,14 @@ Design notes, stated as facts:
   used for v1/v2; `hydra_engine_step()` and `hydra_engine_step_fast()`
   refuse v3 engines with `-14`, and `hydra_engine_step_tf()` refuses
   v1/v2 engines with the same code — no silent cross-version fallback.
-- **The per-layer pass is scalar** (`tf_row_dot` walks 2-bit codes with
-  int32 accumulation). There is no SIMD kernel for the v3 path yet; the
-  SIMD table below applies to the v1/v2 step. `dim ≤ 64` keeps the cost
-  to `layers·dim²` add/subs per token, exact in int32 for every layer
-  count the loader accepts (`4096 · 64 · 127 ≈ 3.3e7 << INT32_MAX`).
+- **The per-layer pass is integer-exact SIMD** (`tf_row_dot` walks 2-bit
+  codes with int32 accumulation and has AVX2 and NEON kernels since round
+  11 — `src/hydra_simd.h` / `src/hydra_neon.h`, parity-pinned bit-identical
+  to the scalar fallback; the v1/v2 SIMD table below is the other engine
+  path). The float parts (RMSNorm/RoPE/SwiGLU) stay scalar by design.
+  `dim ≤ 64` keeps the cost to `layers·dim²` add/subs per token, exact in
+  int32 for every layer count the loader accepts
+  (`4096 · 64 · 127 ≈ 3.3e7 << INT32_MAX`).
 
 The format details (block layout, packing, error codes, forward-pass
 contract) are canonical in `docs/FORMAT.md`, "Version 3".
@@ -253,8 +261,10 @@ The engine stays zero-heap: the only per-token allocations are the attention
 score/scratch buffers on the v4 path (sized by the caller's resident set,
 freed before every return, including errors). Runtime error codes: the shared
 ones plus `-16` (non-finite intermediate), `-17` (KV append failed), `-18`
-(KV read failed / no allocation). The v4 path is scalar (`tf_row_dot`), same
-honest assessment as v3: exact int32 add/sub, `dim ≤ 64`, no SIMD kernel yet.
+(KV read failed / no allocation). The v4 projection path is the same
+integer-exact `tf_row_dot` as v3 (AVX2 + NEON kernels, round 11): exact
+int32 add/sub, `dim ≤ 64`; the float parts (RMSNorm/RoPE/SwiGLU) are
+scalar by design so the pinned streams survive reassociation.
 
 The full layout and contract (block bytes, constraints, return codes, the
 "no shipped Python v4 writer" status) are canonical in `docs/FORMAT.md`,

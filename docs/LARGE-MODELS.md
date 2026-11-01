@@ -111,7 +111,7 @@ Verified against current sources (October 2026), not the 2024 literature:
 
 | Technique | 2026 status | Verdict for Hydra-Stone |
 |---|---|---|
-| **Block-scaled 4-bit float (MXFP4 / NVFP4)** | Landed in llama.cpp in March-April 2026 (`GGML_TYPE_NVFP4=40`; MXFP4 since the GPT-OSS release, OCP multi-vendor standard). E2M1 4-bit values + per-block scale (MXFP4: 32-elem blocks, E8M0 exponent; NVFP4: 16-elem blocks, FP8 scale + per-tensor scale). GPT-OSS-120B ships natively MXFP4 - that is why 120B fits one 80 GB card. | **Adopted at the converter boundary this round** (Q4_0/Q4_1 int4 block-scale = the same lineage, ggml's CPU formats). A native `T4_0`/MXFP4 *engine* tensor type (4-bit weights resident, dequant in-kernel) is the next engine milestone - it is what turns "32 GB F32 file" into "4.5 GB phone file". |
+| **Block-scaled 4-bit float (MXFP4 / NVFP4)** | Landed in llama.cpp in March-April 2026 (`GGML_TYPE_NVFP4=40`; MXFP4 since the GPT-OSS release, OCP multi-vendor standard). E2M1 4-bit values + per-block scale (MXFP4: 32-elem blocks, E8M0 exponent; NVFP4: 16-elem blocks, FP8 scale + per-tensor scale). GPT-OSS-120B ships natively MXFP4 - that is why 120B fits one 80 GB card. | **Adopted at the converter boundary this round** (Q4_0/Q4_1 int4 block-scale = the same lineage, ggml's CPU formats). The native 4-bit *resident* engine type landed in round 16 as `Q4_0` (0x0030, `expert_layout` 2 — 4-bit weights resident, dequant in the mat-vec kernel, FORMAT-V2 §3.2.4) - it turns "32 GB F32 file" into a phone-sized file (measured 3B: 1569 MB file, 2.58 GiB peak, §8.1). |
 | **KV-cache quantization (INT8/FP8)** | Halves KV memory. 2026 measurement update: FP8 E4M3 KV costs ~0.3-0.7 points on long-context retrieval (89% vs 91% on needle-in-a-haystack - within noise for most workloads); **INT8 costs 1.5-3 points** on the same tasks - not free. llama.cpp: `--cache-type-k/v q8_0` is the standard INT8 switch. | **Candidate for round 16, with a caveat.** The `.hydra2` KV is F32 with the sink+ring geometry; INT8 KV with per-head scales halves the cache. Our ring is SMALL (128 positions), so the benefit is modest here and large only for long contexts (the server story). The 1.5-3 point INT8 retrieval loss is acceptable for chat, not for RAG-over-documents - document which. Requires re-pinning the stream pins (KV changes the math) - a deliberate milestone, not a sneak-in. |
 | **Speculative decoding** | 2-3x latency reduction at *zero* quality loss (accept/reject keeps the target distribution). 2026 acceptance data: same-family drafts hit 70-85% at gamma=5 (1.8-2.5x), self-speculation (early layers as draft) 1.8-2.1x, n-gram drafts cost 0 VRAM and reach 90%+ on repetitive text; EAGLE-3 heads 4-6x but need training. It only pays at greedy/low temperature, on models >= 3B, low batch. | **Best architectural fit of all**: the v1 ternary engine (2*d integer adds per token, zero heap) is a natural *draft* for a v2 *target* - draft and target already coexist in the same binary, and the v2 CLI defaults to greedy (temperature 0), exactly the regime where acceptance is highest (70-85%). The rollback primitive is a KV write-pointer reset, which the ring geometry already approximates. Milestone: draft/target pair + acceptance loop. |
 | **Prefix caching** | 2x+ throughput where many requests share a system prompt; vLLM default. | **Cheap win for the server**: `server.js` can hold the prompt-prefix KV between requests for the same model (the engine already prefills the prompt into KV, round 13 #30). Milestone, small. |
@@ -147,15 +147,19 @@ on any 64 GB machine; it is NOT the phone path.
 
 **What the phone path needs (milestone order, no stubs until built):**
 
-1. **`T4_0` engine tensor type** (4-bit weights resident): the 8B stays
-   4.5 GB end-to-end. This is a kernel milestone - new dequant-in-matvec
-   path, NEON port with the scalar parity test, new stream pins. The
-   converter already emits the raw 4-bit blocks (this round); the engine
-   type is the missing half.
-2. **Configurable KV geometry**: the sink+ring cache (2+8) bounds the
-   context; a 4k-8k chat needs the ring widened from metadata
-   (`v2.kv_ring` already exists as a field - the engine currently enforces
-   its small default; making it load-bearing + paged is the change).
+1. ~~**`T4_0` engine tensor type** (4-bit weights resident)~~ — **done in
+   round 16** (§8.1): the type is `Q4_0` (0x0030) with `expert_layout` 2;
+   the mat-vec kernels dequantize one row at a time into a shared scratch,
+   so the resident memory stays 4-bit and F32 is never materialized. The
+   NEON port of these kernels is still open (item 3) — today's layout-2
+   parity is x86-only.
+2. **KV geometry beyond the converter's default**: the geometry is
+   metadata-driven and load-bearing (`v2.kv_sink`/`v2.kv_ring`, engine
+   default 4+128, capped at 0x10000) — but the converter currently writes
+   a small fixed 2+8 geometry (long contexts are truncated, GGUF-IMPORT
+   §12), and the cache is a flat sink+ring, not paged. A 4k-8k chat needs
+   the converter to carry the model's real context through and a paged
+   long-context cache: that is the change.
 3. **NEON port of the v2 kernels** (attention, FFN, dequant): the app's
    arm64 `.so` today runs the v1 engine only; the v2 engine is
    host-only by design until the ARM parity gate exists (no stubs).

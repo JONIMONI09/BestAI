@@ -2,6 +2,86 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
+## 2026-10-31 (round 16 follow-up) — main CI red after #77: one script owns the hydra-moe-test fixture list (merged `8606d58`)
+
+The main-tier `build-test` (macOS + Ubuntu) went red in the Sanitizers step
+after the round-16 merge: that step carried an inline copy of the
+`hydra-moe-test` fixture list from before `-q4`/`-q4f32` existed, while the
+binary hard-requires 9 fixture argv entries (argv-count check before any
+test), so it refused loudly. `make test-run` stayed green because the
+Makefile had been updated, and the PR tier is lint-only by owner rule, so
+the drift was only visible on the first main-tier functional run.
+
+- **Fix (PR #78, `c5d281e`):** `tools/make_moe_fixtures.sh <base>` is now
+  the single source of the fixture list — it generates all nine fixtures
+  (`<base>`, `-t64`, `-t128`, `-t64-lg`, `-nv`, `-at64`, `-gqa`, `-q4`,
+  `-q4f32`) and prints their paths as the last stdout line, in the argv
+  order `tests/test_hydra_moe.c` expects. The Makefile `test-run` recipe
+  and the ci.yml sanitizer step both call the script — the copy is gone,
+  and a future fixture has exactly one place to be added. The 9-argv
+  contract in the test binary is unchanged.
+- **Proof:** the 7-argv error was reproduced locally before the fix; after
+  the fix `make test-run` 234/128/7/101/152/216 all 0, and the sanitizer
+  leg reproduced byte-for-byte locally (ASan + UBSan,
+  `ASAN_OPTIONS=detect_leaks=1`, `UBSAN_OPTIONS=halt_on_error=1`) → exit 0.
+- **Verification:** main CI run 41225936406 = 9/9 jobs success (build-test
+  30 s, the red run needed 36–38 s to reach the same step); Lint
+  41225936262 success; Release 41225936402 success. Main is fully green.
+
+## 2026-10-31 (round 16) — T4_0 4-bit resident engine, streaming converter (--t4/--probe), server configuration surface, 3B-geometry E2E
+
+Owner task: "Bereite uns 3B + die 4bit Engine vor". A1 = the 4-bit resident
+engine type; A2 = the streaming converter path for it; B1 = the server
+configuration surface; B2 = a 3B-geometry synthetic model as the E2E
+target. No Android changes; no release (PR-tier CI verifies functionality,
+the release stays on the main tier).
+
+1. **A1 — T4_0 4-bit resident engine type (the main deliverable).**
+   `HYDRA2_Q4_0` (0x0030) graduates from reserved to implemented: the
+   container validates the 18 B/32 block layout and the /32 element group;
+   `expert_layout` 2 = Q4_0 expert blob ([gate][up][down] as 18-byte
+   blocks). The mat-vec kernels dequantize ONE row at a time into a shared
+   scratch — the resident memory stays 4-bit and F32 is never materialized
+   (that is the point of the type). A block is F16 `d` + 16 nibble bytes,
+   `w = d*(q-8)` (FORMAT-V2 §3.2). Parity against the F32 fixture within
+   the test eps (40 checks in `tests/test_hydra_moe.c`).
+2. **A2 — streaming Q4_0 converter path.** `tools/gguf_to_hydra2.py`:
+   `--t4` (all trunk tensors written as Q4_0 blocks; a Q4_0 SOURCE tensor
+   is copied bit-exact; dim/inter must be divisible by 32) and `--probe`
+   (reports whether a model is Q4_0-clean, per tensor family). Still
+   32-chunk streaming. The reference quantizer is Python standard
+   library only; when numpy happens to be importable a vectorized fast
+   path is used instead — bit-identical output either way.
+   `gguf_to_hydra2_test.py`: 44 checks.
+3. **B1 — server configuration surface.** New env: `HYDRA_DEFAULT_MODEL`,
+   `HYDRA_MAX_TRAIN_BODY`, `HYDRA_MAX_PROMPT` (only a CAP — the request may
+   pass a smaller value, never a larger one; default 256),
+   `HYDRA_INFER_TIMEOUT_MS`, `HYDRA_DEFAULT_STEPS`, `HYDRA_IMPORT_MODE`,
+   documented read-only at `GET /api/config`. Import gains
+   `?mode=auto|v1|v2&t4=auto|force|none&max_experts=1..8`; a v2 target is
+   written to `models/converted/<name>.hydra2`. `server_test.js`: 57/57.
+4. **B2 — 3B synthetic fixture.** `tools/build_3b_synth_gguf.py`: a 3072 MB
+   GGUF with a 11,696-tensor listing (llama architecture: vocab 128256,
+   36 layers, 32/8 GQA heads, inter 7680, rope 5e6, BOS 128005) whose trunk
+   is Q4_0 (10,153 entries) with F32 attention/routing, tied embed, 16 B
+   merges. md5 `51943c49967b`.
+5. **E2E (opt-in, `HYDRA2_3B_E2E=1`, on a 64 GB host):** the server imports
+   the 3B with `--t4` → `models/converted/3B-geometry-synth-v2.hydra2`
+   (1569 MB); the container loads; the MoE forward runs 16 tokens
+   (`64241 360 360 360 …`); md5 `6848f37ecd55c2777674d97aea1865bf`; peak
+   2.58 GiB RSS (vs 10.7 GiB F32); 5.98 s/token; fixed point 77348.
+   Golden pins: mini-f32 `4e3fc239bd63`, mini-q40 `da9a59aca458`,
+   t4src-f32 `c9ce7a1074d2`.
+6. **Verification:** `make test-run` 234/128/7/101/152/216;
+   `node --test tools/server_test.js` 57/57; `python3
+   tools/gguf_to_hydra2_test.py` 44; PR-tier CI 16/16. PR #77 `aeb978e`
+   (commits `208c1d5` server config, `ce906a4` engine + converter + 3B,
+   `297c4b5` docs).
+7. **State after this round:** tests 216 (moe) / 152 (v2 container) /
+   128 (jni) / 101 (gguf) / 44 (v2 converter) / 57 (server);
+   FORMAT-V2.md implementation status + LARGE-MODELS.md §8 record the
+   round.
+
 ## 2026-10-31 (round 15) — large-model analysis (700B→8B), 2026 technique scan, README architecture diagram, Q4_0/Q4_1 GGUF import
 
 Owner round: analyse how a 700B model reaches every device (or why not),
