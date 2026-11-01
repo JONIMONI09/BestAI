@@ -39,6 +39,46 @@ static int g_tests = 0, g_fail = 0;
 
 static void section(const char *name) { printf("== %s\n", name); }
 
+/* KV cache array set (one cache per layer + per-layer k/v buffers).
+ * Round 17 (CI 41337186327): the five call sites allocated these
+ * chains with unchecked calloc/malloc, which the newer cppcheck
+ * rejects (nullPointerOutOfMemory) and which also leaked on OOM.
+ * The helper owns the whole chain: on failure it frees everything
+ * allocated so far, NULLs the out params and returns -1; on success
+ * every buffer is valid and the caches are initialized. */
+static int kv_set_alloc(uint32_t layers, uint32_t cap, uint32_t kvd,
+                        uint32_t sink, hydra_kv_cache_t **kvs,
+                        float ***ks, float ***vs)
+{
+    *kvs = (hydra_kv_cache_t *)calloc(layers, sizeof(**kvs));
+    *ks = (float **)calloc(layers, sizeof(**ks));
+    *vs = (float **)calloc(layers, sizeof(**vs));
+    if (!*kvs || !*ks || !*vs) {
+        free(*kvs); free(*ks); free(*vs);
+        *kvs = 0; *ks = 0; *vs = 0;
+        return -1;
+    }
+    for (uint32_t l = 0; l < layers; l++) {
+        (*ks)[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
+        (*vs)[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
+        if (!(*ks)[l] || !(*vs)[l]) {
+            for (uint32_t j = 0; j <= l; j++) { free((*ks)[j]); free((*vs)[j]); }
+            free(*kvs); free(*ks); free(*vs);
+            *kvs = 0; *ks = 0; *vs = 0;
+            return -1;
+        }
+        hydra_kv_cache_init(&(*kvs)[l], (*ks)[l], (*vs)[l], kvd, cap, sink);
+    }
+    return 0;
+}
+
+static void kv_set_free(hydra_kv_cache_t *kvs, float **ks, float **vs,
+                        uint32_t layers)
+{
+    for (uint32_t l = 0; l < layers; l++) { free(ks[l]); free(vs[l]); }
+    free(ks); free(vs); free(kvs);
+}
+
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
@@ -420,39 +460,29 @@ static void test_moe_forward_parity(void)
          * THEIR OWN previous appends produced). */
         const uint32_t cap = c.kv_sink + c.kv_ring;
         const uint32_t kvd = c.n_kv_heads * c.head_dim;
-        hydra_kv_cache_t *kvs_e = (hydra_kv_cache_t *)calloc(c.layers,
-                                                             sizeof(hydra_kv_cache_t));
-        hydra_kv_cache_t *kvs_r = (hydra_kv_cache_t *)calloc(c.layers,
-                                                             sizeof(hydra_kv_cache_t));
-        float **ks_e = (float **)calloc(c.layers, sizeof(float *));
-        float **vs_e = (float **)calloc(c.layers, sizeof(float *));
-        float **ks_r = (float **)calloc(c.layers, sizeof(float *));
-        float **vs_r = (float **)calloc(c.layers, sizeof(float *));
-        for (uint32_t l = 0; l < c.layers; l++) {
-            ks_e[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-            vs_e[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-            ks_r[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-            vs_r[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-            hydra_kv_cache_init(&kvs_e[l], ks_e[l], vs_e[l], kvd, cap, c.kv_sink);
-            hydra_kv_cache_init(&kvs_r[l], ks_r[l], vs_r[l], kvd, cap, c.kv_sink);
+        hydra_kv_cache_t *kvs_e = 0, *kvs_r = 0;
+        float **ks_e = 0, **vs_e = 0, **ks_r = 0, **vs_r = 0;
+        if (kv_set_alloc(c.layers, cap, kvd, c.kv_sink, &kvs_e, &ks_e,
+                         &vs_e) != 0 ||
+            kv_set_alloc(c.layers, cap, kvd, c.kv_sink, &kvs_r, &ks_r,
+                         &vs_r) != 0) {
+            CHECK(0, "kv cache allocation (OOM)");
+        } else {
+            ok = 1;
+            const uint32_t chain[6] = { 0, 3, 11, 5, 1, 15 };
+            for (uint32_t i = 0; i < 6; i++) {
+                if (hydra_moe_forward(&m, chain[i], i, logit, kvs_e) != 0) { ok = 0; break; }
+                if (ref_forward(g_fixpath, &c, chain[i], i, ref_logit, kvs_r) != 0) { ok = 0; break; }
+                for (uint32_t t = 0; t < c.vocab_size; t++)
+                    if (logit[t] != ref_logit[t]) ok = 0;
+                /* the caches themselves must end up bit-identical */
+                if (hydra_kv_cache_size(&kvs_e[0]) != hydra_kv_cache_size(&kvs_r[0]))
+                    ok = 0;
+            }
+            CHECK(ok, "6-token KV chain bit-identical to the reference");
+            kv_set_free(kvs_e, ks_e, vs_e, c.layers);
+            kv_set_free(kvs_r, ks_r, vs_r, c.layers);
         }
-        ok = 1;
-        const uint32_t chain[6] = { 0, 3, 11, 5, 1, 15 };
-        for (uint32_t i = 0; i < 6; i++) {
-            if (hydra_moe_forward(&m, chain[i], i, logit, kvs_e) != 0) { ok = 0; break; }
-            if (ref_forward(g_fixpath, &c, chain[i], i, ref_logit, kvs_r) != 0) { ok = 0; break; }
-            for (uint32_t t = 0; t < c.vocab_size; t++)
-                if (logit[t] != ref_logit[t]) ok = 0;
-            /* the caches themselves must end up bit-identical */
-            if (hydra_kv_cache_size(&kvs_e[0]) != hydra_kv_cache_size(&kvs_r[0]))
-                ok = 0;
-        }
-        CHECK(ok, "6-token KV chain bit-identical to the reference");
-        for (uint32_t l = 0; l < c.layers; l++) {
-            free(ks_e[l]); free(vs_e[l]); free(ks_r[l]); free(vs_r[l]);
-        }
-        free(ks_e); free(vs_e); free(ks_r); free(vs_r);
-        free(kvs_e); free(kvs_r);
     }
     hydra_moe_close(&m);
 }
@@ -475,14 +505,11 @@ static void test_moe_forward_sanity(void)
      * cfg.layers) - like the v4 forward step */
     const uint32_t cap = c.kv_sink + c.kv_ring;
     const uint32_t kvd = c.n_kv_heads * c.head_dim;
-    hydra_kv_cache_t *kvs = (hydra_kv_cache_t *)calloc(c.layers,
-                                                       sizeof(hydra_kv_cache_t));
-    float **ks = (float **)calloc(c.layers, sizeof(float *));
-    float **vs = (float **)calloc(c.layers, sizeof(float *));
-    for (uint32_t l = 0; l < c.layers; l++) {
-        ks[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-        vs[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-        hydra_kv_cache_init(&kvs[l], ks[l], vs[l], kvd, cap, c.kv_sink);
+    hydra_kv_cache_t *kvs = 0; float **ks = 0, **vs = 0;
+    if (kv_set_alloc(c.layers, cap, kvd, c.kv_sink, &kvs, &ks, &vs) != 0) {
+        CHECK(0, "kv cache allocation (OOM)");
+        hydra_moe_close(&m);
+        return;
     }
     /* NOTE: an EMPTY cache is legitimately self-only (joint RoPE
      * rotation leaves the q.k dot product invariant), so prefill one
@@ -494,8 +521,7 @@ static void test_moe_forward_sanity(void)
     for (uint32_t t = 0; t < 16; t++)
         if (lk[t] != lo[t]) differs = 1;
     CHECK(differs, "KV attention changes the logits vs self-only");
-    for (uint32_t l = 0; l < c.layers; l++) { free(ks[l]); free(vs[l]); }
-    free(ks); free(vs); free(kvs);
+    kv_set_free(kvs, ks, vs, c.layers);
     hydra_moe_close(&m);
 }
 
@@ -519,17 +545,12 @@ static void test_moe_stream_pin(void)
     hydra_moe_config_t c;
     hydra_moe_config(&m, &c);
     const uint32_t cap = c.kv_sink + c.kv_ring;
-    hydra_kv_cache_t *kvs =
-        (hydra_kv_cache_t *)calloc(c.layers, sizeof(hydra_kv_cache_t));
-    float **ks = (float **)calloc(c.layers, sizeof(float *));
-    float **vs = (float **)calloc(c.layers, sizeof(float *));
-    for (uint32_t l = 0; l < c.layers; l++) {
-        ks[l] = (float *)malloc((size_t)cap * c.n_kv_heads * c.head_dim *
-                                sizeof(float));
-        vs[l] = (float *)malloc((size_t)cap * c.n_kv_heads * c.head_dim *
-                                sizeof(float));
-        hydra_kv_cache_init(&kvs[l], ks[l], vs[l],
-                            c.n_kv_heads * c.head_dim, cap, c.kv_sink);
+    const uint32_t kvd = c.n_kv_heads * c.head_dim;
+    hydra_kv_cache_t *kvs = 0; float **ks = 0, **vs = 0;
+    if (kv_set_alloc(c.layers, cap, kvd, c.kv_sink, &kvs, &ks, &vs) != 0) {
+        CHECK(0, "kv cache allocation (OOM)");
+        hydra_moe_close(&m);
+        return;
     }
     uint64_t rng = 0x9E3779B97F4A7C15ull;
     uint32_t tok = 7; /* fixed seed token */
@@ -544,8 +565,7 @@ static void test_moe_stream_pin(void)
         tok = got;
     }
     CHECK(match, "greedy KV stream matches the pinned tokens");
-    for (uint32_t l = 0; l < c.layers; l++) { free(ks[l]); free(vs[l]); }
-    free(kvs); free(ks); free(vs);
+    kv_set_free(kvs, ks, vs, c.layers);
     hydra_moe_close(&m);
 }
 
@@ -559,14 +579,11 @@ static void test_moe_kv_eviction(void)
     const uint32_t sinks = c.kv_sink, ring = c.kv_ring;
     const uint32_t cap = sinks + ring;
     const uint32_t kvd = c.n_kv_heads * c.head_dim;
-    hydra_kv_cache_t *kvs = (hydra_kv_cache_t *)calloc(c.layers,
-                                                       sizeof(hydra_kv_cache_t));
-    float **ks = (float **)calloc(c.layers, sizeof(float *));
-    float **vs = (float **)calloc(c.layers, sizeof(float *));
-    for (uint32_t l = 0; l < c.layers; l++) {
-        ks[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-        vs[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-        hydra_kv_cache_init(&kvs[l], ks[l], vs[l], kvd, cap, sinks);
+    hydra_kv_cache_t *kvs = 0; float **ks = 0, **vs = 0;
+    if (kv_set_alloc(c.layers, cap, kvd, sinks, &kvs, &ks, &vs) != 0) {
+        CHECK(0, "kv cache allocation (OOM)");
+        hydra_moe_close(&m);
+        return;
     }
     const uint32_t chain[32] = { 0, 1, 2, 3, 4, 5, 6, 7,
                                  8, 9, 10, 11, 12, 13, 14, 15,
@@ -585,22 +602,34 @@ static void test_moe_kv_eviction(void)
     float *v0 = (float *)malloc((size_t)kvd * sizeof(float));
     float *ak = (float *)malloc((size_t)kvd * sizeof(float));
     float *av = (float *)malloc((size_t)kvd * sizeof(float));
+    if (!k0 || !v0 || !ak || !av) {
+        CHECK(0, "sink reference buffers (OOM)");
+        free(k0); free(v0); free(ak); free(av);
+        kv_set_free(kvs, ks, vs, c.layers);
+        hydra_moe_close(&m);
+        return;
+    }
     /* compute the expected first k/v: rmsnorm(embed[0]) then attn_k/v
      * mat-vec + rope at pos 0 (rope at pos 0 is the identity) */
     {
         float *embed = 0, *attnk = 0, *attnv = 0, *anorm = 0;
         const uint32_t dim = c.dim;
         uint64_t kvdim_e = (uint64_t)c.n_kv_heads * c.head_dim;
-        ref_get(g_fixpath, "embed", (uint64_t)c.vocab_size * dim, &embed);
-        ref_get(g_fixpath, "attn_k.0", kvdim_e * dim, &attnk);
-        ref_get(g_fixpath, "attn_v.0", kvdim_e * dim, &attnv);
-        ref_get(g_fixpath, "attn_norm.0", dim, &anorm);
-        float a[8];
-        memcpy(a, embed, dim * sizeof(float)); /* token 0 */
-        hydra_rmsnorm(a, anorm, dim, 1e-6f, a);
-        ref_matvec(attnk, a, ak, (uint32_t)kvdim_e, dim);
-        ref_matvec(attnv, a, av, (uint32_t)kvdim_e, dim);
-        free(embed); free(attnk); free(attnv); free(anorm);
+        int rg = ref_get(g_fixpath, "embed", (uint64_t)c.vocab_size * dim, &embed);
+        rg |= ref_get(g_fixpath, "attn_k.0", kvdim_e * dim, &attnk);
+        rg |= ref_get(g_fixpath, "attn_v.0", kvdim_e * dim, &attnv);
+        rg |= ref_get(g_fixpath, "attn_norm.0", dim, &anorm);
+        if (rg != 0) {
+            CHECK(0, "sink reference tensors unreadable");
+            free(embed); free(attnk); free(attnv); free(anorm);
+        } else {
+            float a[8];
+            memcpy(a, embed, dim * sizeof(float)); /* token 0 */
+            hydra_rmsnorm(a, anorm, dim, 1e-6f, a);
+            ref_matvec(attnk, a, ak, (uint32_t)kvdim_e, dim);
+            ref_matvec(attnv, a, av, (uint32_t)kvdim_e, dim);
+            free(embed); free(attnk); free(attnv); free(anorm);
+        }
     }
     int sink_ok = 1;
     if (hydra_kv_cache_sink(&kvs[0], 0, k0, v0) == 0) {
@@ -611,8 +640,8 @@ static void test_moe_kv_eviction(void)
         sink_ok = 0;
     }
     CHECK(sink_ok, "sink 0 holds token-0 k/v bit-exact after 32 appends");
-    for (uint32_t l = 0; l < c.layers; l++) { free(ks[l]); free(vs[l]); }
-    free(ks); free(vs); free(kvs); free(k0); free(v0); free(ak); free(av);
+    kv_set_free(kvs, ks, vs, c.layers);
+    free(k0); free(v0); free(ak); free(av);
     hydra_moe_close(&m);
 }
 
@@ -787,16 +816,17 @@ static int run_greedy_stream(const char *path, uint32_t start,
     if (hydra_moe_config(&m, &c) != 0) { hydra_moe_close(&m); return -1; }
     const uint32_t cap = c.kv_sink + c.kv_ring;
     const uint32_t kvd = c.n_kv_heads * c.head_dim;
-    hydra_kv_cache_t *kvs = (hydra_kv_cache_t *)calloc(c.layers,
-                                                       sizeof(hydra_kv_cache_t));
-    float **ks = (float **)calloc(c.layers, sizeof(float *));
-    float **vs = (float **)calloc(c.layers, sizeof(float *));
-    for (uint32_t l = 0; l < c.layers; l++) {
-        ks[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-        vs[l] = (float *)malloc((size_t)cap * kvd * sizeof(float));
-        hydra_kv_cache_init(&kvs[l], ks[l], vs[l], kvd, cap, c.kv_sink);
+    hydra_kv_cache_t *kvs = 0; float **ks = 0, **vs = 0;
+    if (kv_set_alloc(c.layers, cap, kvd, c.kv_sink, &kvs, &ks, &vs) != 0) {
+        hydra_moe_close(&m);
+        return -1;
     }
     float *lo = (float *)malloc((size_t)c.vocab_size * sizeof(float));
+    if (!lo) {
+        kv_set_free(kvs, ks, vs, c.layers);
+        hydra_moe_close(&m);
+        return -1;
+    }
     int rc = 0;
     uint32_t tok = start;
     for (uint32_t i = 0; i < steps; i++) {
@@ -805,8 +835,8 @@ static int run_greedy_stream(const char *path, uint32_t start,
                              NULL, &rng) != 0) { rc = -3; break; }
         out[i] = tok;
     }
-    for (uint32_t l = 0; l < c.layers; l++) { free(ks[l]); free(vs[l]); }
-    free(kvs); free(ks); free(vs); free(lo);
+    kv_set_free(kvs, ks, vs, c.layers);
+    free(lo);
     hydra_moe_close(&m);
     return rc;
 }
