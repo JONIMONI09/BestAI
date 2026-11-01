@@ -2,7 +2,39 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
-## 2026-11-01 (round 17.7) — AArch64 cross-compiler: probe list + $CC_AARCH64 (supersedes the round-17.6 attempt)
+## 2026-11-01 (round 17.8) — Ubuntu 26.04 also dropped qemu-user-static: qemu probe + $QEMU_AARCH64
+
+The post-#82 main runs (41342270169 CI, 41342270201 Release)
+confirmed the round-17.7 gcc probe works — `gcc-aarch64-linux-gnu`
+installed fine on 26.04 (the unversioned metapackage IS on the new
+image; the round-17.6 failure was actually this next line) — but
+both jobs failed at the very next command:
+`E: Package 'qemu-user-static' has no installation candidate`.
+
+- **Fix (this PR, workflows only):** the qemu install is now a probe
+  — `qemu-user-static` first, then `qemu-user` (dynamic variant) —
+  and the working emulator is exported as `$QEMU_AARCH64`
+  (GITHUB_ENV), used by all three emulator invocations (neon-test
+  run, ARM test-count drift gate, cross-arch parity in ci.yml;
+  release parity in release.yml) + the neon failure-report echo.
+  The emulator is always invoked explicitly (never via binfmt), so
+  the static-vs-dynamic distinction is irrelevant. Same
+  self-diagnosis pattern as the gcc probe: `::error::`/`::notice::`
+  annotations with the apt error tail + `apt-cache search qemu`
+  candidates if nothing installs.
+- **Proof the new logic matches the production failure:** the
+  install script was executed locally with stubbed apt binaries
+  reproducing the exact 26.04 state (gcc metapackage available,
+  qemu-user-static "no installation candidate", qemu-user
+  available) → qemu-user fallback selected,
+  `QEMU_AARCH64=qemu-aarch64` + `CC_AARCH64=aarch64-linux-gnu-gcc`
+  exported, exit 0.
+- **Incident record:** three install-step failures on three
+  different packages across three runs (gcc-12 pin → unversioned
+  gcc [actually qemu] → qemu-user-static). All caused by the single
+  event `ubuntu-latest` → Ubuntu 26.04 (actions/runner-images#14748).
+
+## 2026-11-01 (round 17.7, completed by 17.8) — AArch64 cross-compiler: probe list + $CC_AARCH64 (supersedes the round-17.6 attempt)
 
 The round-17.6 attempt (unversioned `gcc-aarch64-linux-gnu`) was
 insufficient: after that merge, `neon-test` (run 41340751971) and

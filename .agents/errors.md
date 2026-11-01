@@ -3,7 +3,41 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
-## 2026-11-01 (round 17.7) — the unversioned cross-compiler is ALSO gone on Ubuntu 26.04; self-diagnosing probe list
+## 2026-11-01 (round 17.8) — Ubuntu 26.04 dropped qemu-user-static too; third install-step failure on the same step
+
+- **Symptom:** after the #82 merge (`b086a92`), `CI` → `neon-test`
+  (run 41342270169) and `Release` → `CLI (Linux)` (run
+  41342270201) failed at the install step a third time — but this
+  time the gcc probe had succeeded (`installed cross package:
+  gcc-aarch64-linux-gnu`): the failure was the very next command,
+  `sudo apt-get install -y -qq qemu-user-static` → `E: Package
+  'qemu-user-static' has no installation candidate` (exit 100).
+- **Cause:** same single event as rounds 17.6/17.7 — `ubuntu-latest`
+  moved to Ubuntu 26.04 (actions/runner-images#14748), which drops
+  more than one package from the workflow's toolchain. Side finding:
+  the round-17.6 "unversioned gcc" failure was almost certainly this
+  same qemu line all along (apt fails the whole install if ANY
+  listed package is missing; `gcc-aarch64-linux-gnu` is on 26.04, as
+  the #82 run proved).
+- **Fix:** qemu install is now a probe — `qemu-user-static`, then
+  `qemu-user` (dynamic variant) — with the working emulator
+  exported as `$QEMU_AARCH64` (GITHUB_ENV); all three emulator
+  invocations (neon run, ARM test-count gate, cross-arch parity) +
+  the release parity use it. The emulator is invoked explicitly
+  (never via binfmt), so static vs dynamic is irrelevant. Same
+  self-diagnosis pattern as the gcc probe (annotations with apt
+  error tail + `apt-cache search qemu` candidates).
+- **Proof:** local execution of the install script with stubbed apt
+  binaries reproducing the exact 26.04 state → fallback selected,
+  both env vars exported, exit 0.
+- **Prevention:** when a runner image major-version move breaks an
+  apt install, do not fix only the named package — audit every
+  package the workflow installs and give each one a probe +
+  fallback + self-diagnosis. And remember: in a multi-package
+  `apt-get install a b c`, the failing package is not necessarily
+  the one apt's summary line names.
+
+## 2026-11-01 (round 17.7, completed by round 17.8) — the unversioned cross-compiler is ALSO gone on Ubuntu 26.04; self-diagnosing probe list
 
 - **Symptom:** after the #81 merge (`a3f5c44`, the round-17.6
   unversioned fix), the same two jobs failed at the same step again:
@@ -13,10 +47,12 @@
   qemu-user-static`.
 - **Cause:** the image refresh was a major-version move, not a patch:
   `ubuntu-latest` switched to Ubuntu 26.04 in November 2026
-  (actions/runner-images#14748). Neither the gcc-12 pin nor the
-  unversioned metapackage could be installed from the new image's apt
-  sources (and the log endpoint stayed unreachable — EOF — so the
-  exact apt error text was not retrievable).
+  (actions/runner-images#14748). The gcc-12 pin is gone from the new
+  image's apt sources; the exact apt error text for the #81 failure
+  was not retrievable (log endpoint EOF) — **corrected by round
+  17.8:** the #82 run proved `gcc-aarch64-linux-gnu` IS on 26.04, so
+  the #81 failure was the `qemu-user-static` line of the same
+  command (see the round-17.8 entry), not the gcc package.
 - **Fix:** the install steps in `ci.yml` (neon-test) and `release.yml`
   (CLI Linux) now walk a probe list — `gcc-aarch64-linux-gnu`, then
   `gcc-15/14/13-aarch64-linux-gnu` — and export the working binary
