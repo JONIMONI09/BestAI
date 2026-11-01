@@ -363,7 +363,7 @@ branch to `8606d58`; the fix was committed, rebased onto
 `origin/main` (`07bf74d`) and pushed as `48d21f7` — the PR #80 diff
 vs main is the two test files only.
 
-## Round 17.6 (2026-11-01) — runner image drift: cross-compiler fix + documentation completion
+## Round 17.6 (2026-11-01) — runner image drift: cross-compiler fix attempt + documentation completion (fix superseded by 17.7)
 
 **Session start (R33):** new session branch
 (`arena/67ff8065-bestai`, active, ff'ed to `2c11d20` = main post-#80):
@@ -420,5 +420,63 @@ the #80 merge) and verify everything is in place.
 **Verification on main happens automatically** with this PR's merge
 (push to main re-runs CI + Release — the neon-test and CLI (Linux)
 jobs re-execute the fixed install step on the current image).
+
+**PR:** (opened after this line — FACTS ONLY, per owner rule)
+
+## Round 17.7 (2026-11-01) — the unversioned cross-compiler is ALSO gone (Ubuntu 26.04): self-diagnosing probe list
+
+**Session start (R33):** same session branch as round 17.6
+(`arena/67ff8065-bestai`, active): session.md (current rounds),
+rules.md, Environment.md read before working. (Latest-round marker
+for `session_start_check.sh` — protocol:
+`.agents/skills/session-workflow/SKILL.md`.)
+
+**Trigger:** owner "ok weiter, und prüfen und ob alles drauf ist???"
+(continue + verify completeness). After the #81 merge (`a3f5c44`),
+verification of the main-tier runs found the round-17.6 fix
+insufficient: `CI` → `neon-test` (run 41340751971) and `Release` →
+`CLI (Linux)` (run 41340751982) failed at the SAME install step, now
+on `apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static`.
+
+**Root cause (verified against actions/runner-images):** the refresh
+was a major-version move — `ubuntu-latest` switched to **Ubuntu
+26.04 in November 2026** (issue actions/runner-images#14748, GA
+#14747). The new image's apt sources provide neither the gcc-12 pin
+nor the unversioned metapackage. The log endpoint stayed unreachable
+(EOF) → the exact apt error text was not retrievable from the
+sandbox.
+
+**Fix (this PR, `ci.yml` + `release.yml` only, no C code):**
+- both install steps (neon-test, CLI-Linux) walk a **probe list**:
+  `gcc-aarch64-linux-gnu` → `gcc-15-aarch64-linux-gnu` →
+  `gcc-14-…` → `gcc-13-…`;
+- the working compiler is exported as **`$CC_AARCH64`**
+  (GITHUB_ENV) and used by all three aarch64 build steps
+  (ci.yml neon-test build, ci.yml cross-arch build, release.yml
+  arm64 build) + the neon failure-report echo;
+- if the whole list fails, the step emits **`::error::`/`::notice::`
+  annotations** with the apt error tail + `apt-cache search
+  aarch64-linux-gnu | grep gcc` candidates — readable through the
+  Checks API (`/check-runs/{id}/annotations`) without the log
+  endpoint, so the next red run (if any) is diagnosable in one
+  API call.
+- Documentation corrected to reflect reality: CHANGELOG 17.6 entry
+  marked superseded + new 17.7 entry; RESEARCH-LOG §13 title +
+  second-phase paragraph + updated lesson; errors.md 17.6 entry
+  corrected + new 17.7 entry; this section.
+
+**Gates (local, after the edits):**
+- `workflow_yaml_check.sh`: ok (5 files, negative control proven).
+- `workflow_lint_check.sh`: ok (4 files, negative control proven).
+- `bash -n` on the two new install scripts: ok.
+- C/test code untouched this round (no re-run of the C gates
+  needed; the #80 state remains: cppcheck 2.22 clean,
+  234/128/7/101/152/216, ASan+UBSan clean).
+- `session_start_check.sh`: ok (this section carries the R33 marker).
+
+**Verification on main happens automatically** with this PR's merge
+(neon-test + CLI (Linux) re-execute the new install step on the
+current 26.04 image; the Checks-API annotations make any remaining
+failure immediately diagnosable).
 
 **PR:** (opened after this line — FACTS ONLY, per owner rule)

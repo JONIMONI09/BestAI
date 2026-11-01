@@ -462,7 +462,7 @@ that is clean under the newest superset tool is the durable fix;
 pinning the old version would just move the failure to the next image
 refresh.
 
-## 13. Runner image drop: gcc-12-aarch64-linux-gnu no longer in apt sources (2026-11-01) — FIXED in ci.yml + release.yml
+## 13. Runner image drop: AArch64 cross-compiler gone from apt sources (2026-11-01) — FIXED in ci.yml + release.yml (probe list, round 17.7)
 
 **Question:** two main-tier jobs failed at their first real step after
 the #80 merge: `CI` → `neon-test` (run 41339831236) and `Release` →
@@ -480,17 +480,38 @@ commits → not transient, the package is gone from the current image's
 apt sources. Consistent with the same image refresh that bumped
 cppcheck (§12) — one event, two symptoms.
 
-**Resolution:** the unversioned cross-compiler
-(`gcc-aarch64-linux-gnu` → `aarch64-linux-gnu-gcc`, whatever gcc the
-image ships) in both workflows, plus `aarch64-linux-gnu-gcc --version`
-printed in the install step so a future toolchain drift shows up in
-the log. The gates that make the version non-load-bearing already
-exist: the test-count drift gate (ARM baseline), the NEON-vs-scalar
+**Resolution (round 17.6, PR #81, merged `a3f5c44`):** the
+unversioned cross-compiler (`gcc-aarch64-linux-gnu` →
+`aarch64-linux-gnu-gcc`, whatever gcc the image ships) in both
+workflows. **Insufficient** — see the second phase below.
+
+**Second phase (round 17.7):** the unversioned fix was red on the
+next main push (runs 41340751971 neon-test, 41340751982 CLI Linux —
+same step). The refresh turned out to be a major-version move:
+`ubuntu-latest` switched to **Ubuntu 26.04 in November 2026**
+(actions/runner-images#14748, GA issue #14747), and the new image's
+apt sources provide neither the gcc-12 pin nor the unversioned
+metapackage (the log endpoint stayed unreachable — EOF — so the
+exact apt error was not retrievable from here). The install steps now
+walk a **probe list** (`gcc-aarch64-linux-gnu`, then
+`gcc-15/14/13-aarch64-linux-gnu`), export the working compiler as
+`$CC_AARCH64` via GITHUB_ENV (all three aarch64 build steps use it),
+and — if the whole list fails — emit `::error::`/`::notice::`
+annotations with the apt error tail and `apt-cache search`
+candidates, readable through the Checks API without the log
+endpoint.
+
+**Gates that make the compiler version non-load-bearing** (unchanged):
+the test-count drift gate (ARM baseline), the NEON-vs-scalar
 comparison tests, and the x86-vs-ARM/NEON bit-identical parity check
 in both workflows. If any future compiler change broke NEON
 behaviour, those gates would catch it — the pin was buying nothing
 that the gates don't already prove.
 
-**Lesson:** in CI, prefer "default + prove it" (unversioned tool +
-behaviour gates) over "pin the exact old version" — pins rot when the
-image moves, behaviour gates don't.
+**Lesson (updated 17.7):** in CI, prefer "default + prove it"
+(unversioned tool + behaviour gates) over "pin the exact old version"
+— pins rot when the image moves, behaviour gates don't. But a
+major-version image move can drop even the default *name*, so an
+install step that is load-bearing for the job should **probe a small
+list, export what it found, and self-diagnose via annotations** —
+especially while the log endpoint is not reachable.
