@@ -3,7 +3,35 @@
 > Every error gets an entry immediately, with symptom, cause, fix and
 > prevention. Newest entries at the top.
 
-## 2026-11-01 (round 17.6) — runner image refresh dropped gcc-12-aarch64-linux-gnu; two jobs red at their apt install step
+## 2026-11-01 (round 17.7) — the unversioned cross-compiler is ALSO gone on Ubuntu 26.04; self-diagnosing probe list
+
+- **Symptom:** after the #81 merge (`a3f5c44`, the round-17.6
+  unversioned fix), the same two jobs failed at the same step again:
+  `CI` → `neon-test` (run 41340751971) and `Release` → `CLI
+  (Linux)` (run 41340751982), now on
+  `sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+  qemu-user-static`.
+- **Cause:** the image refresh was a major-version move, not a patch:
+  `ubuntu-latest` switched to Ubuntu 26.04 in November 2026
+  (actions/runner-images#14748). Neither the gcc-12 pin nor the
+  unversioned metapackage could be installed from the new image's apt
+  sources (and the log endpoint stayed unreachable — EOF — so the
+  exact apt error text was not retrievable).
+- **Fix:** the install steps in `ci.yml` (neon-test) and `release.yml`
+  (CLI Linux) now walk a probe list — `gcc-aarch64-linux-gnu`, then
+  `gcc-15/14/13-aarch64-linux-gnu` — and export the working binary
+  as `$CC_AARCH64` (GITHUB_ENV), which all three aarch64 build steps
+  use. If the whole list fails, the step emits `::error::`/
+  `::notice::` annotations with the apt error tail and
+  `apt-cache search` candidates — diagnosable through the Checks API
+  without the log endpoint.
+- **Prevention:** on infra moves that change a package inventory, do
+  not assume the "obvious" package name survives; probe + export +
+  self-diagnose. And keep the behaviour gates (parity, test-count
+  baseline) so the compiler version stays non-load-bearing. See
+  RESEARCH-LOG.md §13.
+
+## 2026-11-01 (round 17.6, fix superseded by round 17.7) — runner image refresh dropped gcc-12-aarch64-linux-gnu; two jobs red at their apt install step
 
 - **Symptom:** after the #80 merge (`2c11d20`), two main-tier jobs
   failed at their first real step: `CI` → `neon-test` (run
@@ -20,16 +48,15 @@
   the identical step failed on two consecutive runs, two days apart,
   on two different commits (41337186425 on `07bf74d`, 41339831264 on
   `2c11d20`).
-- **Fix:** unversioned cross-compiler in both workflows
-  (`gcc-aarch64-linux-gnu` → `aarch64-linux-gnu-gcc`, whatever gcc the
-  image ships), plus the compiler version printed in the install step
-  so a future drift shows in the log. The NEON correctness gates
-  (ARM test-count baseline, NEON-vs-scalar tests, x86-vs-ARM/NEON
-  bit-identical parity) already make the compiler version
-  non-load-bearing — they prove behaviour, the pin only proved age.
-- **Prevention:** prefer "default tool + behaviour gate" over
-  "pinned old version" in CI: pins rot when the image moves, gates
-  don't. See RESEARCH-LOG.md §13.
+- **Attempt (PR #81, merged `a3f5c44`):** unversioned cross-compiler
+  in both workflows (`gcc-aarch64-linux-gnu` →
+  `aarch64-linux-gnu-gcc`). **Insufficient** — see the round-17.7
+  entry above; the metapackage is also not installable on the 26.04
+  image.
+- **Prevention (updated in 17.7):** prefer "default tool + behaviour
+  gate" over "pinned old version" in CI — but a major image move can
+  drop even the default name, so the install must probe and
+  self-diagnose. See RESEARCH-LOG.md §13.
 
 ## 2026-11-01 (round 17.5) — newer distro cppcheck turned 32 nullPointerOutOfMemory findings into a red lint job
 

@@ -240,23 +240,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The unversioned cross-compiler package tracks whatever gcc the
-      # runner image ships. (The old pin, gcc-12-aarch64-linux-gnu,
-      # vanished from the current image's apt sources on 2026-11-01 -
-      # the same image refresh that also brought the newer cppcheck -
-      # and broke this job twice in a row.) The version is printed so a
-      # future toolchain drift is visible in the log, and the parity +
-      # test-count gates below still prove the NEON path bit-exactly.
+      # 2026-11-01: ubuntu-latest moved to Ubuntu 26.04 (actions/
+      # runner-images#14748); the old gcc-12 pin is gone from the new
+      # image's apt sources (this job failed three times in a row on
+      # the install step). Try the image default first, then the
+      # recent versioned packages, and record the resulting compiler
+      # in $CC_AARCH64 for the build steps below. If NOTHING is
+      # installable, the ::error:: annotations name the exact failure
+      # and the candidate packages (readable through the Checks API -
+      # the log endpoint is not always reachable). The NEON parity +
+      # test-count gates below still prove the NEON path bit-exactly,
+      # so the compiler version is not load-bearing.
       - name: Install AArch64 cross-compiler and qemu-user
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
-          aarch64-linux-gnu-gcc --version | head -1
+          installed=0
+          for pkg in gcc-aarch64-linux-gnu gcc-15-aarch64-linux-gnu \
+                     gcc-14-aarch64-linux-gnu gcc-13-aarch64-linux-gnu; do
+            if sudo apt-get install -y -qq "$pkg" 2>>/tmp/apt-cross.log; then
+              installed=1
+              echo "installed cross package: $pkg"
+              break
+            fi
+            tail -n 3 /tmp/apt-cross.log | sed 's/^/::notice::apt($pkg) /'
+          done
+          if [ "$installed" -ne 1 ]; then
+            echo "::error::no AArch64 cross-compiler package installable on this image"
+            apt-cache search aarch64-linux-gnu 2>/dev/null \
+              | grep -i gcc | sed 's/^/::error::candidate: /' | head -15
+            tail -n 8 /tmp/apt-cross.log | sed 's/^/::error::apt: /'
+            exit 1
+          fi
+          sudo apt-get install -y -qq qemu-user-static
+          if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            CC_AARCH64=aarch64-linux-gnu-gcc
+          else
+            for v in 15 14 13 12; do
+              if command -v "aarch64-linux-gnu-gcc-$v" >/dev/null 2>&1; then
+                CC_AARCH64="aarch64-linux-gnu-gcc-$v"
+                break
+              fi
+            done
+          fi
+          [ -n "${CC_AARCH64:-}" ] || {
+            echo "::error::cross package installed but no compiler binary found"; exit 1; }
+          echo "CC_AARCH64=$CC_AARCH64" >> "$GITHUB_ENV"
+          "$CC_AARCH64" --version | head -1
 
       - name: Build + run tests for aarch64 (NEON path active)
         run: |
           set +e
-          aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra \
+          "$CC_AARCH64" -O2 -static -Wall -Wextra \
               -Iinclude \
               src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm \
               > /tmp/neon-build.log 2>&1
@@ -298,8 +332,9 @@ jobs:
           ./hydra-run parity.hydra 42 8 --json 2>/dev/null > /tmp/x86.json
           # -lm: the M4 float primitives (RMSNorm/RoPE/SwiGLU) and the M2
           # sampler link against libm; a static aarch64 build does not
-          # pull it in implicitly.
-          aarch64-linux-gnu-gcc -O2 -static -Iinclude \
+          # pull it in implicitly. $CC_AARCH64 is set by the install
+          # step (whichever cross compiler this image actually ships).
+          "$CC_AARCH64" -O2 -static -Iinclude \
               src/hydra_engine.c src/main.c src/hydra_v2_container.c \
               src/hydra_moe.c -lm -o hydra-run-arm
           qemu-aarch64-static ./hydra-run-arm parity.hydra 42 8 --json \
@@ -322,7 +357,7 @@ jobs:
           {
             echo "=== Hydra-Stone NEON failure (${GITHUB_SHA::7}) ==="
             echo "Reproduce locally:"
-            echo "  aarch64-linux-gnu-gcc -O2 -static -Iinclude \\"
+            echo "  \$CC_AARCH64 (set by the install step) -O2 -static -Iinclude \\"
             echo "      src/hydra_engine.c tests/test_engine.c -lm -o hydra-test-arm"
             echo "  qemu-aarch64-static ./hydra-test-arm"
           } > neon-report.txt

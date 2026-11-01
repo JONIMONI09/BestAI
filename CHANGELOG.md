@@ -2,30 +2,50 @@
 All notable changes to this project, per change, are recorded here and in
 `.agents/session.md` (.agents/rules.md R2). Newest entries first.
 
-## 2026-11-01 (round 17.6) — runner image refresh: unversioned AArch64 cross-compiler in CI + Release
+## 2026-11-01 (round 17.7) — AArch64 cross-compiler: probe list + $CC_AARCH64 (supersedes the round-17.6 attempt)
 
-The ubuntu-latest runner image was refreshed (the same event that
-brought the newer cppcheck, round 17.5). The refresh removed
+The round-17.6 attempt (unversioned `gcc-aarch64-linux-gnu`) was
+insufficient: after that merge, `neon-test` (run 41340751971) and
+Release `CLI (Linux)` (run 41340751982) failed at the install step
+again — the unversioned package is not installable on the new image
+either. The log endpoint was unreachable (EOF), so the install step
+is now self-diagnosing.
+
+- **Fix (this PR):** both install steps (ci.yml neon-test,
+  release.yml CLI-Linux) now try a probe list —
+  `gcc-aarch64-linux-gnu`, then `gcc-15/14/13-aarch64-linux-gnu` —
+  and record the working compiler in `$CC_AARCH64` (GITHUB_ENV),
+  which all three aarch64 build steps use. If nothing is
+  installable, `::error::`/`::notice::` annotations (readable through
+  the Checks API) name the exact apt failure and the candidate
+  packages from `apt-cache search`, so the next red run is
+  diagnosable without the log. The install step still prints the
+  resolved compiler version.
+- **Why the compiler version is not load-bearing:** unchanged — the
+  ARM test-count baseline, the NEON-vs-scalar comparison tests, and
+  the x86-vs-ARM/NEON bit-identical parity check in both workflows
+  prove behaviour on every main push.
+
+## 2026-11-01 (round 17.6, superseded by 17.7) — runner image moved to Ubuntu 26.04; first cross-compiler fix attempt
+
+The `ubuntu-latest` runner image moved to Ubuntu 26.04 in
+November 2026 (actions/runner-images#14748) — the same event that
+brought the newer cppcheck (round 17.5). The refresh removed
 `gcc-12-aarch64-linux-gnu` from the image's apt sources, so two
 main-tier jobs failed at their install step: `CI` → `neon-test`
 (run 41339831236) and `Release` → `CLI (Linux)` (run 41339831264) —
 both on `apt-get install gcc-12-aarch64-linux-gnu qemu-user-static`.
 
-- **Fix (this PR):** `ci.yml` (neon-test install + both aarch64 build
-  steps + failure-report text) and `release.yml` (install + arm64
-  build) now use the unversioned cross-compiler
-  (`gcc-aarch64-linux-gnu` → `aarch64-linux-gnu-gcc`), whatever gcc
-  the image ships. The install step prints the compiler version so a
-  future drift shows in the log.
-- **Why the pin is not missed:** the NEON correctness gates already
-  make the compiler version non-load-bearing — the ARM test-count
-  baseline (`tools/test_count_baseline.txt`), the NEON-vs-scalar
-  comparison tests, and the x86-vs-ARM/NEON bit-identical parity
-  check in both workflows prove behaviour on every run.
+- **Attempt (PR #81, merged `a3f5c44`):** the unversioned
+  cross-compiler (`gcc-aarch64-linux-gnu` →
+  `aarch64-linux-gnu-gcc`). **Insufficient** — the unversioned
+  package is also not installable on the new image (runs
+  41340751971/41340751982 red at the same step). Superseded by the
+  round-17.7 probe-list fix above.
 - **Proof the failure was persistent, not transient:** the identical
-  step failed on two consecutive runs, two days apart, on two
-  different commits (41337186425 on `07bf74d`, 41339831264 on
-  `2c11d20`).
+  step failed on three runs in a row across two image generations
+  (41337186425 on `07bf74d`, 41339831264 on `2c11d20`,
+  41340751971+41340751982 on `a3f5c44`).
 
 ## 2026-11-01 (round 17.5, entry written late — PR #80 shipped without one) — newer distro cppcheck flags round-16 test allocations (merged `2c11d20`)
 
