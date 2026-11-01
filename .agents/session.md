@@ -315,3 +315,50 @@ owner request: project **Hydra-Stone (BestAI)** created
 **PR:** [#79](https://github.com/JONIMONI09/BestAI/pull/79) opened
 (FACTS ONLY message, docs-only scope). Linear PRO-61 moves to Done on
 merge; the PR line in the PR body stays untouched (facts only).
+
+## Round 17.5 (2026-11-01) — post-merge CI incident: new distro cppcheck flags R16 test allocations
+
+**Session start (R33):** same session as round 17 (marker there):
+read session.md (current rounds), rules.md, Environment.md before
+working; this section continues that session after the #79 merge.
+
+**What happened:** after PR #79 merged (`07bf74d`), the main-only `CI`
+run 41337186327 failed in the `lint` job — step "Static analysis
+(cppcheck)". Same code was green on `8606d58` (run 41225936406): the
+distro cppcheck on the ubuntu runner got newer and now reports
+`nullPointerOutOfMemory` (27× `tests/test_hydra_moe.c`) +
+`nullPointerOutOfMemory`×5 + `nullPointerArithmeticOutOfMemory`×1
+(`tests/test_engine.c`) for the round-16 test allocations (unchecked
+calloc/malloc chains in the KV test helpers). `--error-exitcode=2`
+turned the warnings into a job failure.
+
+**Diagnosis method:** artifact download blocked (blob host not on the
+egress allowlist — EOF, same class as the results-receiver EOF); proof
+= exact CI command reproduced locally with cppcheck 2.22 (32 findings)
++ `git diff 8606d58..07bf74d -- src/ include/` = comments only, so the
+findings are pre-existing R16 code, not the doc PR.
+
+**Fix (PR #80, `48d21f7`):** `kv_set_alloc`/`kv_set_free` helpers in
+`tests/test_hydra_moe.c` (checked calloc + per-layer malloc, full
+cleanup on OOM, no leak); all five KV test sites + the sink
+`k0/v0/ak/av` + the unchecked `ref_get` calls; the two
+`hydra_tf_row_dot_scaled` blocks in `tests/test_engine.c` got the
+file's own OOM convention (line-2107 pattern).
+
+**Gates (local):** cppcheck (exact CI command, 2.22) 0 findings;
+tests 234/128/7/101/152/216 all 0 (baseline unchanged — OOM paths
+unreachable in practice); test_count = baseline; ASan+UBSan moe+engine
+clean (detect_leaks=1, halt_on_error=1); gcc strict rc=0.
+
+**Release side-effect:** run 41337186425 `CLI (Linux)` failed at
+"Install cross toolchain + qemu" (plain apt step — runner-side; all
+other jobs incl. Android APK green). `gh run rerun` and
+`workflow_dispatch` both 403 from this sandbox's token, so the
+re-test happens automatically on the next main push (the PR #80
+merge). If it fails again it is a runner-image package issue, not
+code.
+
+**Branch note:** after the #79 merge the platform reset this session
+branch to `8606d58`; the fix was committed, rebased onto
+`origin/main` (`07bf74d`) and pushed as `48d21f7` — the PR #80 diff
+vs main is the two test files only.
