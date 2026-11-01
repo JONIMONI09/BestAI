@@ -2135,6 +2135,7 @@ static void test_tf_row_dot_scaled(void)
         uint8_t *row = (uint8_t *)malloc(dim / 4);
         int8_t *x = (int8_t *)malloc(dim);
         float *scale = (float *)malloc(4 * sizeof(float));
+        if (!row || !x || !scale) { free(row); free(x); free(scale); exit(1); }
         memset(row, 0x55, dim / 4);
         for (uint32_t b = 0; b < dim; ++b) x[b] = 127;
         for (uint32_t g = 0; g < 4; ++g) scale[g] = 1.0f;
@@ -2161,6 +2162,7 @@ static void test_tf_row_dot_scaled(void)
         uint8_t *row = (uint8_t *)malloc(dim / 4);
         int8_t *x = (int8_t *)malloc(dim);
         float scale[2] = { 1.0f, -1.0f };
+        if (!row || !x) { free(row); free(x); exit(1); }
         memset(row, 0x55, 16);
         memset(row + 16, 0xAA, 16);
         for (uint32_t b = 0; b < 64; ++b) x[b] = 127;
