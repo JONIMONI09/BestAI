@@ -547,7 +547,22 @@ failed at the install step a THIRD time.
 (neon-test + CLI (Linux) re-execute the new install step; the
 gcc-probe-success + qemu-fallback path is the expected green).
 
-**Linear:** PRO task for the 26.04 incident created after the merge
-decision (incident spans #81/#82/this PR).
+**Result (post-merge, main `dc0675d`): GREEN.**
+- CI run 41352411587: success — `neon-test: success` (install step
+  with both probes, NEON tests, ARM test-count gate, cross-arch
+  parity).
+- Release run 41352411542: success — `CLI (Linux): success` with
+  `Install cross toolchain + qemu: success`,
+  `Verify x64 vs arm64 parity: success`, checksums, and
+  `Publish GitHub Release: success`. Lint & Sec 41352411538:
+  success. Main fully green; the third consecutive install-step
+  failure is resolved and a release was published.
+- The qemu-user fallback (dynamic variant) proved sufficient: the
+  explicit-invocation design (no binfmt) means static vs dynamic
+  made no difference.
 
-**PR:** (opened after this line — FACTS ONLY, per owner rule)
+**Linear:** PRO-63 created in the "Hydra-Stone (BestAI)" project,
+state Done (the incident spanned #81/#82/this PR; all three
+referenced, #83 attached).
+
+**PR:** #83 (FACTS ONLY, per owner rule), merged `dc0675d`.
